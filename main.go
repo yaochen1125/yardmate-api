@@ -1,53 +1,72 @@
-// Package main is the entry point of yardmate-api, the secret-vending HTTP
-// service for the YardMate iOS app. Subsequent commits add App Attest
-// verification (commit 2), the /v1/app-secrets endpoint (commit 3),
-// per-device rate limiting (commit 4), and deploy tooling (commit 5).
+// Package main is the entry point of yardmate-api, the App-Attest-gated
+// secret-vending HTTP service for the YardMate iOS app. See attest/SPEC.md
+// and secrets/SPEC.md for the design contracts.
 package main
 
 import (
-	"encoding/json"
 	"log"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	"github.com/yaochen1125/yardmate-api/attest"
+	"github.com/yaochen1125/yardmate-api/secrets"
 )
 
-const defaultAddr = "127.0.0.1:8080"
+const (
+	defaultAddr        = "127.0.0.1:8080"
+	defaultDBPath      = "/var/lib/yardmate-api/credentials.db"
+	defaultSecretsPath = "/etc/yardmate-api/secrets.env"
+	defaultAppID       = "PMX32RG52M.com.chenyao.plantapp"
+)
 
 func main() {
-	addr := os.Getenv("YARDMATE_API_ADDR")
-	if addr == "" {
-		addr = defaultAddr
+	addr := envOr("YARDMATE_API_ADDR", defaultAddr)
+	dbPath := envOr("YARDMATE_API_DB_PATH", defaultDBPath)
+	secretsPath := envOr("YARDMATE_API_SECRETS_PATH", defaultSecretsPath)
+	appID := envOr("YARDMATE_API_APP_ID", defaultAppID)
+
+	vault, err := secrets.Load(secretsPath)
+	if err != nil {
+		log.Fatalf("load secrets: %v", err)
+	}
+	allowDev := vault.GetBool("ATTEST_ALLOW_DEV", false)
+	log.Printf("config: addr=%s db=%s secrets=%s appID=%s allowDev=%v",
+		addr, dbPath, secretsPath, appID, allowDev)
+
+	store, err := attest.OpenStore(dbPath)
+	if err != nil {
+		log.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	verifier, err := attest.New(attest.Options{
+		AppID:    appID,
+		AllowDev: allowDev,
+		Store:    store,
+	})
+	if err != nil {
+		log.Fatalf("attest.New: %v", err)
 	}
 
-	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(10 * time.Second))
-
-	r.Get("/healthz", healthz)
-
-	srv := &http.Server{
+	srv := newServer(verifier, vault)
+	httpSrv := &http.Server{
 		Addr:              addr,
-		Handler:           r,
+		Handler:           srv,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-
 	log.Printf("yardmate-api listening on %s", addr)
-	if err := srv.ListenAndServe(); err != nil {
+	if err := httpSrv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func healthz(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
