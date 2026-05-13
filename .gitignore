@@ -1,0 +1,22 @@
+# Compiled binary (built locally during dev or on the deploy host)
+/yardmate-api
+yardmate-api.darwin
+yardmate-api.linux
+
+# Secrets (production env file lives only on the server, never committed)
+secrets.env
+*.env.local
+
+# BoltDB store (created at runtime, per-deployment data)
+*.db
+
+# Test / coverage outputs
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# macOS / IDE
+.DS_Store
+.vscode/
+.idea/
