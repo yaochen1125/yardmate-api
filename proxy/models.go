@@ -1,0 +1,104 @@
+package proxy
+
+// IdentifyResult is the client-facing JSON shape for POST /v1/identify (SPEC §2.1).
+// Sanitized from Plant.id's raw response — only fields V1 client needs.
+type IdentifyResult struct {
+	IsPlant           bool         `json:"is_plant"`
+	IsPlantConfidence float64      `json:"is_plant_confidence"`
+	Suggestions       []Suggestion `json:"suggestions"`
+}
+
+// Suggestion is one plant-identification suggestion. Top-3 only per SPEC §2.1.
+type Suggestion struct {
+	Name           string   `json:"name"`
+	ScientificName string   `json:"scientific_name"`
+	CommonNames    []string `json:"common_names"`
+	Confidence     float64  `json:"confidence"`
+}
+
+// ChatResult is the client-facing JSON shape for POST /v1/ai-chat (SPEC §2.2).
+// Single field by design — system prompt is server-controlled; client just
+// shows the assistant's answer.
+type ChatResult struct {
+	Answer string `json:"answer"`
+}
+
+// openAIChatRequest is the body sent to OpenAI's chat/completions endpoint.
+// Locked: model + max_tokens + temperature are server-policy, not exposed.
+type openAIChatRequest struct {
+	Model       string          `json:"model"`
+	Messages    []openAIMessage `json:"messages"`
+	MaxTokens   int             `json:"max_tokens"`
+	Temperature float64         `json:"temperature"`
+}
+
+type openAIMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// openAIChatResponse is the subset of OpenAI chat/completions response we
+// consume. Extra fields (id, usage, etc.) ignored.
+type openAIChatResponse struct {
+	Choices []struct {
+		Message struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+}
+
+// plantIDAPIResponse is the subset of Plant.id v3 /identification response
+// that we consume. Extra fields (access_token, model_version, similar_images,
+// entity_id, etc.) are ignored.
+type plantIDAPIResponse struct {
+	Result struct {
+		IsPlant struct {
+			Probability float64 `json:"probability"`
+			Binary      bool    `json:"binary"`
+		} `json:"is_plant"`
+		Classification struct {
+			Suggestions []struct {
+				Name        string  `json:"name"`
+				Probability float64 `json:"probability"`
+				Details     struct {
+					CommonNames    []string `json:"common_names"`
+					ScientificName string   `json:"scientific_name"`
+				} `json:"details"`
+			} `json:"suggestions"`
+		} `json:"classification"`
+	} `json:"result"`
+}
+
+// toIdentifyResult sanitizes Plant.id's raw response into the V1 client shape.
+// Top-3 suggestions max (SPEC §2.1). common_names is normalized to non-nil
+// (empty slice instead of null on the wire).
+func (r *plantIDAPIResponse) toIdentifyResult() *IdentifyResult {
+	const maxSuggestions = 3
+
+	out := &IdentifyResult{
+		IsPlant:           r.Result.IsPlant.Binary,
+		IsPlantConfidence: r.Result.IsPlant.Probability,
+		Suggestions:       []Suggestion{},
+	}
+
+	n := len(r.Result.Classification.Suggestions)
+	if n > maxSuggestions {
+		n = maxSuggestions
+	}
+	for i := 0; i < n; i++ {
+		s := r.Result.Classification.Suggestions[i]
+		common := s.Details.CommonNames
+		if common == nil {
+			common = []string{}
+		}
+		out.Suggestions = append(out.Suggestions, Suggestion{
+			Name:           s.Name,
+			ScientificName: s.Details.ScientificName,
+			CommonNames:    common,
+			Confidence:     s.Probability,
+		})
+	}
+	return out
+}

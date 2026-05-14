@@ -3,6 +3,9 @@
 yardmate-api.darwin
 yardmate-api.linux
 
+# deploy.sh cross-compile output (yardmate-api-linux-amd64)
+/bin/
+
 # Secrets (production env file lives only on the server, never committed)
 secrets.env
 *.env.local
