@@ -22,19 +22,16 @@ type Server struct {
 	vault    *secrets.Vault
 	limiter  *ratelimit.Limiter
 	plantID  *proxy.PlantIDClient // optional; nil disables /v1/identify
-	openAI   *proxy.OpenAIClient  // optional; nil disables /v1/ai-chat
 	router   chi.Router
 }
 
-// newServer wires routes. plantID / openAI may be nil (tests / setups that
-// don't exercise the proxy endpoints); when nil, the corresponding route is
-// not registered.
+// newServer wires routes. plantID may be nil (tests / setups that don't
+// exercise the proxy endpoints); when nil, /v1/identify is not registered.
 func newServer(
 	verifier *attest.Verifier,
 	vault *secrets.Vault,
 	lim *ratelimit.Limiter,
 	plantID *proxy.PlantIDClient,
-	openAI *proxy.OpenAIClient,
 ) *Server {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -58,22 +55,19 @@ func newServer(
 			r.Post("/app-secrets", handleAppSecrets(verifier, vault, lim.PerKeyID))
 		})
 
-		// Slow proxy endpoints — upstream calls (Plant.id, OpenAI) can take
-		// up to 30 s (proxy/SPEC §5.2). No chi-level Timeout middleware here;
-		// each handler manages its own context deadline.
-		r.Group(func(r chi.Router) {
-			if plantID != nil {
+		// Slow proxy endpoints — upstream call (Plant.id) can take up to 30 s
+		// (proxy/SPEC §5.2). No chi-level Timeout middleware here; the handler
+		// manages its own context deadline.
+		if plantID != nil {
+			r.Group(func(r chi.Router) {
 				r.Post("/identify", proxy.HandleIdentify(plantID))
-			}
-			if openAI != nil {
-				r.Post("/ai-chat", proxy.HandleAIChat(openAI))
-			}
-		})
+			})
+		}
 	})
 
 	return &Server{
 		verifier: verifier, vault: vault, limiter: lim,
-		plantID: plantID, openAI: openAI, router: r,
+		plantID: plantID, router: r,
 	}
 }
 

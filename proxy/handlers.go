@@ -22,21 +22,6 @@ const identifyMaxBody = 9 << 20 // 9 MiB
 // so Plant.id has up to 30 s — the proxy is the slow-path tenant.
 const identifyUpstreamTimeout = 30 * time.Second
 
-// AI chat constants per SPEC §2.2 + §4.2.
-const (
-	aiChatMaxBody          = 64 << 10 // 64 KiB JSON body cap
-	aiChatUpstreamTimeout  = 30 * time.Second
-	aiChatPlantNameMaxLen  = 100
-	aiChatQuestionMaxLen   = 500
-)
-
-// chatRequest is the inbound JSON body for /v1/ai-chat (SPEC §2.2).
-type chatRequest struct {
-	PlantName           string `json:"plant_name"`
-	PlantScientificName string `json:"plant_scientific_name,omitempty"`
-	Question            string `json:"question"`
-}
-
 // HandleIdentify returns the http.HandlerFunc for POST /v1/identify.
 // See SPEC §2.1, §3 for the contract.
 //
@@ -160,98 +145,6 @@ func HandleIdentify(client *PlantIDClient) http.HandlerFunc {
 		// 8. Success — single-line structured log (SPEC §5.2 forensics).
 		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v mime=%s isPlant=%v suggestions=%d",
 			deviceID, appVer, attKeyID, attAssertPresent, mime, result.IsPlant, len(result.Suggestions))
-		writeJSON(w, http.StatusOK, result)
-	}
-}
-
-// HandleAIChat returns the http.HandlerFunc for POST /v1/ai-chat.
-// See SPEC §2.2, §3, §4.3 for the contract.
-//
-// V1 NOTES (per SPEC):
-//   - per-IP rate limit is applied by ratelimit.PerIPMiddleware at the /v1
-//     scope (server.go); this handler does not call it directly.
-//   - per-deviceInstallId rate limit is a TODO V1.1 (SPEC §4.1).
-//   - App Attest assertion headers are read + logged; never enforced (iOS 26
-//     issue, memory option_d_progress.md).
-//   - System prompt is server-controlled (SPEC §4.3 + §6 pitfall 10). User
-//     input is only ever placed in the USER message.
-//   - No conversation history (V1 stateless).
-func HandleAIChat(client *OpenAIClient) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// 1. Body cap.
-		r.Body = http.MaxBytesReader(w, r.Body, aiChatMaxBody)
-
-		// 2. Required headers.
-		deviceID := r.Header.Get("X-Device-Install-Id")
-		if !isUUID(deviceID) {
-			writeError(w, http.StatusBadRequest, "missing_device_id")
-			return
-		}
-		appVer := r.Header.Get("X-App-Version")
-		if appVer == "" {
-			writeError(w, http.StatusBadRequest, "missing_app_version")
-			return
-		}
-
-		// 3. Optional App Attest signals (logged only V1).
-		attKeyID := r.Header.Get("X-AppAttest-KeyID")
-		attAssertPresent := r.Header.Get("X-AppAttest-Assertion") != ""
-
-		// 4. Content-Type.
-		if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
-			writeError(w, http.StatusBadRequest, "bad_json")
-			return
-		}
-
-		// 5. Parse + validate JSON.
-		var req chatRequest
-		dec := json.NewDecoder(r.Body)
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil {
-			if isMaxBytesErr(err) {
-				writeError(w, http.StatusRequestEntityTooLarge, "body_too_large")
-				return
-			}
-			writeError(w, http.StatusBadRequest, "bad_json")
-			return
-		}
-
-		if strings.TrimSpace(req.PlantName) == "" || strings.TrimSpace(req.Question) == "" {
-			writeError(w, http.StatusBadRequest, "missing_field")
-			return
-		}
-		if len(req.PlantName) > aiChatPlantNameMaxLen ||
-			len(req.PlantScientificName) > aiChatPlantNameMaxLen {
-			writeError(w, http.StatusBadRequest, "plant_name_too_long")
-			return
-		}
-		if len(req.Question) > aiChatQuestionMaxLen {
-			writeError(w, http.StatusBadRequest, "question_too_long")
-			return
-		}
-
-		// 6. Call OpenAI.
-		ctx, cancel := context.WithTimeout(r.Context(), aiChatUpstreamTimeout)
-		defer cancel()
-		result, err := client.Chat(ctx, req.PlantName, req.PlantScientificName, req.Question)
-		if err != nil {
-			log.Printf("ai-chat upstream err: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v err=%v",
-				deviceID, appVer, attKeyID, attAssertPresent, err)
-			switch {
-			case errors.Is(err, ErrOpenAIUnauthorized):
-				writeError(w, http.StatusBadGateway, "openai_unauthorized")
-			case errors.Is(err, ErrOpenAIRateLimit), errors.Is(err, ErrOpenAIUnavailable):
-				writeError(w, http.StatusBadGateway, "openai_unavailable")
-			default:
-				writeError(w, http.StatusBadGateway, "openai_unavailable")
-			}
-			return
-		}
-
-		// 7. Success — structured log (no question content; just lengths).
-		log.Printf("ai-chat ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v plantNameLen=%d questionLen=%d answerLen=%d",
-			deviceID, appVer, attKeyID, attAssertPresent,
-			len(req.PlantName), len(req.Question), len(result.Answer))
 		writeJSON(w, http.StatusOK, result)
 	}
 }

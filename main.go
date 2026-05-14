@@ -78,15 +78,7 @@ func main() {
 		log.Printf("WARN: PLANT_ID_API_KEY missing; /v1/identify will not be registered")
 	}
 
-	// OpenAI proxy client (V1 — server-side AI care advice).
-	var openAI *proxy.OpenAIClient
-	if v := vault.Get("OPENAI_API_KEY"); v != "" {
-		openAI = proxy.NewOpenAIClient(v)
-	} else {
-		log.Printf("WARN: OPENAI_API_KEY missing; /v1/ai-chat will not be registered")
-	}
-
-	srv := newServer(verifier, vault, lim, plantID, openAI)
+	srv := newServer(verifier, vault, lim, plantID)
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream). Headroom 5 s.
 	httpSrv := &http.Server{

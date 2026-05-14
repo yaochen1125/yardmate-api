@@ -16,39 +16,6 @@ type Suggestion struct {
 	Confidence     float64  `json:"confidence"`
 }
 
-// ChatResult is the client-facing JSON shape for POST /v1/ai-chat (SPEC §2.2).
-// Single field by design — system prompt is server-controlled; client just
-// shows the assistant's answer.
-type ChatResult struct {
-	Answer string `json:"answer"`
-}
-
-// openAIChatRequest is the body sent to OpenAI's chat/completions endpoint.
-// Locked: model + max_tokens + temperature are server-policy, not exposed.
-type openAIChatRequest struct {
-	Model       string          `json:"model"`
-	Messages    []openAIMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens"`
-	Temperature float64         `json:"temperature"`
-}
-
-type openAIMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-// openAIChatResponse is the subset of OpenAI chat/completions response we
-// consume. Extra fields (id, usage, etc.) ignored.
-type openAIChatResponse struct {
-	Choices []struct {
-		Message struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		} `json:"message"`
-		FinishReason string `json:"finish_reason"`
-	} `json:"choices"`
-}
-
 // plantIDAPIResponse is the subset of Plant.id v3 /identification response
 // that we consume. Extra fields (access_token, model_version, similar_images,
 // entity_id, etc.) are ignored.
