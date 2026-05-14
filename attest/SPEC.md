@@ -37,7 +37,7 @@ All `[]byte` are the raw decoded bytes — base64 decoding happens at the HTTP l
 | Function | Output | Error cases |
 |---|---|---|
 | `IssueChallenge` | 32-byte random challenge | — |
-| `VerifyAttestation` | `nil` on success (credential stored) | `ErrBadCBOR`, `ErrCertChain`, `ErrAppIDMismatch`, `ErrAAGUIDMismatch`, `ErrCounterNotZero`, `ErrChallengeUnknown`, `ErrChallengeExpired`, `ErrChallengeReplay`, `ErrCredentialIDMismatch` |
+| `VerifyAttestation` | `nil` on success (credential stored) | `ErrBadCBOR`, `ErrCertChain`, `ErrAttestNonce`, `ErrAppIDMismatch`, `ErrAAGUIDMismatch`, `ErrCounterNotZero`, `ErrChallengeUnknown`, `ErrChallengeExpired`, `ErrChallengeReplay`, `ErrCredentialIDMismatch` |
 | `VerifyAssertion` | `nil` on success (counter updated) | `ErrCredentialUnknown`, `ErrBadSignature`, `ErrCounterNotMonotonic`, `ErrChallengeUnknown`/`Expired`/`Replay`, `ErrAppIDMismatch` |
 
 Errors are typed sentinels so callers can map them to HTTP `401` vs `409` precisely.
@@ -139,7 +139,7 @@ Source: <https://developer.apple.com/documentation/devicecheck/validating_apps_t
 2. **Build `clientDataHash`** = `SHA256(challenge_bytes)`. Append it to `authData` (also in the attestation object). Call the concatenation `composite`.
 3. **Compute `nonce`** = `SHA256(composite)`.
 4. **Extract embedded nonce** from `credCert`'s extension with OID `1.2.840.113635.100.8.2`. The extension is a DER-encoded ASN.1 SEQUENCE containing a single OCTET STRING. **Verify equality** with the `nonce` from step 3.
-5. **Extract publicKey** from `credCert` (P-256 SubjectPublicKeyInfo). Compute `SHA256(SPKI)` and verify it equals the keyID claimed by the client.
+5. **Extract publicKey** from `credCert` (P-256). Compute SHA256 of the uncompressed EC point (`0x04 || X || Y`, 65 bytes — obtained via `(*ecdsa.PublicKey).ECDH().Bytes()`) and verify it equals the keyID claimed by the client. Apple's docs say "SHA-256 hash of the public key"; the uncompressed-point form is the convention used by every open-source verifier and by Apple's WWDC 2020 sample, NOT the full SPKI DER.
 6. **Compute `appIDHash`** = `SHA256("<TeamID>.<BundleID>")` — for YardMate: `SHA256("PMX32RG52M.com.chenyao.plantapp")`. Verify it equals the first 32 bytes of `authData` (the RP ID hash slot).
 7. **Verify counter** in `authData` equals **0** (it must be a fresh key).
 8. **Verify aaguid** in `authData` is in the set permitted by `ATTEST_ALLOW_DEV` (see §6.1):
@@ -203,6 +203,10 @@ Path: `/var/lib/yardmate-api/credentials.db` (created on first start, `chmod 600
 |---|---|---|
 | `credentials` | `keyID` (32 bytes) | `{ PublicKeyDER []byte, Counter uint32, RegisteredAt time.Time }` |
 | `challenges` | `challenge` (32 bytes) | `{ Purpose string, IssuedAt time.Time, Consumed bool }` |
+
+### Path resolution
+
+Default path `/var/lib/yardmate-api/credentials.db` is overridable via the `YARDMATE_API_DB_PATH` env var (see §8.3). Resolved once at process start; the effective path is logged at INFO.
 
 ### Lifecycle
 
@@ -292,17 +296,17 @@ Sweeping consumed-and-expired entries is the background goroutine's job, not the
 
 ### 6.8 CBOR decoding tolerance
 
-Apple's attestation/assertion are *valid* CBOR but not always canonical (e.g. integer encoding choices). Configure `fxamacker/cbor` with:
+Apple's attestation/assertion are *valid* CBOR but not always canonical (e.g. integer encoding choices). Configure `fxamacker/cbor` (v2.9.2) with:
 
 ```
 cbor.DecOptions{
-    DupMapKey: cbor.DupMapKeyEnforcedAPIError,
+    DupMapKey:   cbor.DupMapKeyEnforcedAPF,
     IndefLength: cbor.IndefLengthAllowed,
-    TagsMd: cbor.TagsForbidden,
+    TagsMd:      cbor.TagsForbidden,
 }
 ```
 
-(Final values to confirm during implementation review — these are the conservative defaults.)
+`DupMapKeyEnforcedAPF` is the v2 enum name (the original SPEC said `DupMapKeyEnforcedAPIError`, which does not exist in the library — corrected in commit 7).
 
 ### 6.9 Public key storage format
 
@@ -331,12 +335,59 @@ There is **no Apple-published official App Attest test fixture** (unlike FIDO2/W
 
 ---
 
-## 8. Open questions for commit-2 author (resolve before coding)
+## 8. Decisions (resolved 2026-05-13)
 
-- **Endpoint paths**: stick with `/v1/attest/challenge` + `/v1/attest/register` + `/v1/secrets/challenge` + `/v1/app-secrets`? Or collapse the two challenge endpoints into one with a `purpose` body field?
-- **Challenge bytes encoding on the wire**: base64-std or base64-url? Doc says "base64", which is ambiguous. Pick one and document it; iOS client must match.
-- **BoltDB file path**: `/var/lib/yardmate-api/credentials.db` per §5, or under `/etc/yardmate-api/`? `/var/lib/` is FHS-conventional for mutable state.
-- **First-attestation rate limit**: should `/v1/attest/register` have its own rate limit (e.g. 3 per IP per hour) to prevent storage flooding? Ratelimit package (commit 4) is per-keyID, but a fresh attestation has no established keyID yet. Open for design in commit 4.
+The four questions left open by the SPEC commit are resolved as follows. Each is locked unless re-opened by an explicit follow-up PR.
+
+### 8.1 Endpoint paths — keep all four, no collapse
+
+| Path | Purpose |
+|---|---|
+| `POST /v1/attest/challenge` | Issue challenge for the attestation (register) flow |
+| `POST /v1/attest/register` | Submit attestation, register credential |
+| `POST /v1/secrets/challenge` | Issue challenge for the assertion (secrets) flow |
+| `POST /v1/app-secrets` | Submit assertion, vend secrets |
+
+Rationale: server-side cost of two extra routes is zero; client-side and log-side clarity ("which flow is failing?") is high. A single `/v1/challenge?purpose=…` would muddle rate-limit rules and access-log filters.
+
+### 8.2 Challenge wire encoding — base64-std
+
+Standard base64 (RFC 4648 §4, alphabet `[A-Za-z0-9+/]`, padding `=`). Not URL-safe.
+
+Rationale: iOS Swift `Data.base64EncodedString()` defaults to std. Challenges live in JSON bodies, never in query strings, so `+` / `/` / `=` have no escape problem. Std keeps the iOS side trivial.
+
+HTTP layer decodes before handing raw bytes to this package (§1.3).
+
+### 8.3 BoltDB path — env-overridable FHS default
+
+Default `/var/lib/yardmate-api/credentials.db` (FHS-conventional for mutable per-host state; `chmod 600`, owned by `yardmate-api` user).
+
+Override: env var `YARDMATE_API_DB_PATH`. Used for:
+
+- Local dev on macOS (`/var/lib/` not writable): `YARDMATE_API_DB_PATH=./credentials.db`.
+- Tests: `YARDMATE_API_DB_PATH=$(mktemp -d)/credentials.db`.
+
+Resolved once at process start. Effective path logged at INFO (path only, never contents).
+
+### 8.4 First-attestation rate limit — per-IP, shared `ratelimit` package
+
+`/v1/attest/register` cannot use per-keyID rate limiting (no credential exists yet). Per-IP fills this role.
+
+Two buckets evaluated together; whichever trips first → `429 Too Many Requests` + `Retry-After`:
+
+- **Per-IP** ≈ 100 req/h — forgiving. Protects against NAT'd corp networks where many real users share an egress IP.
+- **Per-keyID** ≈ 10 req/day — tight. Primary quota defense; only meaningful once a keyID is registered.
+
+| Endpoint | Per-IP | Per-keyID |
+|---|---|---|
+| `/v1/attest/challenge` | ✅ | — |
+| `/v1/attest/register` | ✅ | — |
+| `/v1/secrets/challenge` | ✅ | — (keyID not in request body) |
+| `/v1/app-secrets` | ✅ | ✅ (post-verify) |
+
+Per-keyID is checked AFTER `VerifyAssertion` succeeds (see `ratelimit/SPEC §4`). A pre-verify check would let any caller who knows a keyID (e.g. from leaked logs) burn through that keyID's daily budget and lock out the real owner. Post-verify means only the holder of the private key can move the counter.
+
+`ratelimit` is an in-memory fixed-window counter (`ratelimit/SPEC §2`). No persistence — restarts reset all buckets (acceptable: an attacker who triggers a restart also loses all replay material).
 
 ---
 

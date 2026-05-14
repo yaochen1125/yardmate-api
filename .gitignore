@@ -6,6 +6,9 @@ yardmate-api.linux
 # Secrets (production env file lives only on the server, never committed)
 secrets.env
 *.env.local
+*.env.prod
+*.env.staging
+*.env.dev
 
 # BoltDB store (created at runtime, per-deployment data)
 *.db

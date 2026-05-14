@@ -1,0 +1,50 @@
+[Unit]
+Description=YardMate API (App-Attest secret vendor)
+Documentation=https://github.com/yaochen1125/yardmate-api/blob/main/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yardmate-api
+Group=yardmate-api
+
+# yardmate-api reads /etc/yardmate-api/secrets.env directly via secrets.Load.
+# The file is owned by yardmate-api:yardmate-api with mode 0600 — readable only
+# by this service. Server-side config env vars are baked into Environment=
+# below; bin path is fixed.
+Environment=YARDMATE_API_ADDR=127.0.0.1:8080
+Environment=YARDMATE_API_DB_PATH=/var/lib/yardmate-api/credentials.db
+Environment=YARDMATE_API_SECRETS_PATH=/etc/yardmate-api/secrets.env
+Environment=YARDMATE_API_APP_ID=PMX32RG52M.com.chenyao.plantapp
+
+ExecStart=/usr/local/bin/yardmate-api
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/yardmate-api
+
+# Resource caps. yardmate-api is a small Go server; these are room-with-spare.
+LimitNOFILE=4096
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
