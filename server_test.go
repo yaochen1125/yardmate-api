@@ -10,16 +10,25 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yaochen1125/yardmate-api/attest"
+	"github.com/yaochen1125/yardmate-api/ratelimit"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
 
-// buildTestServer wires a Server to a fresh temp Store + synthetic Vault.
-// Verifier uses the Apple production root pool by default — fine for surface
-// tests that exercise error paths before cert validation runs. End-to-end
-// happy-path tests using a test root pool live in c6 (integration test).
+// buildTestServer wires a Server to a fresh temp Store + synthetic Vault +
+// permissive rate limits. Verifier uses the Apple production root pool by
+// default — fine for surface tests that exercise error paths before cert
+// validation runs. End-to-end happy-path tests using a test root pool live
+// in c6 (integration test).
 func buildTestServer(t *testing.T) *Server {
+	return buildTestServerWithLimits(t, 1000, 1000)
+}
+
+// buildTestServerWithLimits builds a server with explicit rate-limit budgets,
+// for tests that want to trip the limiter.
+func buildTestServerWithLimits(t *testing.T, ipLimit, keyIDLimit int) *Server {
 	t.Helper()
 	dir := t.TempDir()
 	store, err := attest.OpenStore(filepath.Join(dir, "test.db"))
@@ -43,7 +52,8 @@ func buildTestServer(t *testing.T) *Server {
 		t.Fatal(err)
 	}
 
-	return newServer(verifier, vault)
+	lim := ratelimit.New(ipLimit, time.Hour, keyIDLimit, 24*time.Hour)
+	return newServer(verifier, vault, lim)
 }
 
 func do(t *testing.T, s *Server, method, path string, body any) *httptest.ResponseRecorder {
@@ -203,6 +213,71 @@ func TestMapAttestError_EveryAttestSentinel(t *testing.T) {
 	}
 	if c, _ := mapAttestError(nil); c != http.StatusOK {
 		t.Errorf("nil → %d, want 200", c)
+	}
+}
+
+func TestPerIPRateLimit_Triggers429(t *testing.T) {
+	s := buildTestServerWithLimits(t, 2, 1000) // 2 req per IP per hour
+	fire := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/v1/attest/challenge", strings.NewReader("{}"))
+		req.RemoteAddr = "10.1.2.3:9999"
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		s.ServeHTTP(rr, req)
+		return rr
+	}
+	for i := 0; i < 2; i++ {
+		rr := fire()
+		if rr.Code != http.StatusOK {
+			t.Errorf("req %d code %d, want 200", i, rr.Code)
+		}
+	}
+	rr := fire()
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("3rd req code %d, want 429 body=%s", rr.Code, rr.Body)
+	}
+	if rr.Header().Get("Retry-After") == "" {
+		t.Error("Retry-After missing")
+	}
+	var resp errorResponse
+	json.NewDecoder(rr.Body).Decode(&resp)
+	if resp.Error != "rate_limit_ip" {
+		t.Errorf("error = %q, want rate_limit_ip", resp.Error)
+	}
+}
+
+func TestPerIPRateLimit_IsolatesByIP(t *testing.T) {
+	s := buildTestServerWithLimits(t, 1, 1000)
+	hit := func(ip string) int {
+		req := httptest.NewRequest("POST", "/v1/attest/challenge", strings.NewReader("{}"))
+		req.RemoteAddr = ip
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		s.ServeHTTP(rr, req)
+		return rr.Code
+	}
+	if c := hit("10.0.0.1:1"); c != 200 {
+		t.Errorf("10.0.0.1 first = %d", c)
+	}
+	if c := hit("10.0.0.1:2"); c != 429 {
+		t.Errorf("10.0.0.1 second = %d", c)
+	}
+	if c := hit("10.0.0.2:1"); c != 200 {
+		t.Errorf("10.0.0.2 first = %d", c)
+	}
+}
+
+func TestHealthzNotRateLimited(t *testing.T) {
+	s := buildTestServerWithLimits(t, 1, 1000)
+	// /healthz is outside /v1 — no rate limit. Fire 5x from same IP.
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest("GET", "/healthz", nil)
+		req.RemoteAddr = "10.0.0.1:1234"
+		rr := httptest.NewRecorder()
+		s.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("req %d code %d", i, rr.Code)
+		}
 	}
 }
 

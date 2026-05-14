@@ -382,10 +382,12 @@ Two buckets evaluated together; whichever trips first → `429 Too Many Requests
 |---|---|---|
 | `/v1/attest/challenge` | ✅ | — |
 | `/v1/attest/register` | ✅ | — |
-| `/v1/secrets/challenge` | ✅ | ✅ |
-| `/v1/app-secrets` | ✅ | ✅ |
+| `/v1/secrets/challenge` | ✅ | — (keyID not in request body) |
+| `/v1/app-secrets` | ✅ | ✅ (post-verify) |
 
-Final bucket numbers + algorithm choice (`golang.org/x/time/rate` vs in-memory ring vs Redis) finalized in commit 4. No persistence — restarts reset all buckets (acceptable: an attacker who triggers a restart also loses all replay material).
+Per-keyID is checked AFTER `VerifyAssertion` succeeds (see `ratelimit/SPEC §4`). A pre-verify check would let any caller who knows a keyID (e.g. from leaked logs) burn through that keyID's daily budget and lock out the real owner. Post-verify means only the holder of the private key can move the counter.
+
+`ratelimit` is an in-memory fixed-window counter (`ratelimit/SPEC §2`). No persistence — restarts reset all buckets (acceptable: an attacker who triggers a restart also loses all replay material).
 
 ---
 

@@ -6,8 +6,10 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/yaochen1125/yardmate-api/attest"
+	"github.com/yaochen1125/yardmate-api/ratelimit"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
 
@@ -93,7 +95,7 @@ func handleSecretsChallenge(v *attest.Verifier) http.HandlerFunc {
 	}
 }
 
-func handleAppSecrets(v *attest.Verifier, vault *secrets.Vault) http.HandlerFunc {
+func handleAppSecrets(v *attest.Verifier, vault *secrets.Vault, perKeyID *ratelimit.Bucket) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req appSecretsRequest
 		if !decodeJSON(w, r, &req) {
@@ -113,6 +115,13 @@ func handleAppSecrets(v *attest.Verifier, vault *secrets.Vault) http.HandlerFunc
 		}
 		if err := v.VerifyAssertion(keyID, ass, ch); err != nil {
 			writeAttestError(w, err)
+			return
+		}
+		// Per-keyID rate limit (post-verify: keyID is now cryptographically
+		// authenticated, so a caller can't lock out someone else's quota by
+		// spamming a known keyID). See ratelimit/SPEC §4.
+		if allowed, retry := perKeyID.Allow(string(keyID), time.Now()); !allowed {
+			ratelimit.Write429(w, retry, "rate_limit_keyid")
 			return
 		}
 		writeJSON(w, http.StatusOK, vault.Snapshot(vendedKeys))
