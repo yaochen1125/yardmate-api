@@ -281,6 +281,25 @@ func TestHealthzNotRateLimited(t *testing.T) {
 	}
 }
 
+func TestRequestBodySizeCap_Returns413(t *testing.T) {
+	s := buildTestServer(t)
+	// Valid JSON > 64 KB cap. We need a syntactically valid body so the
+	// JSON decoder doesn't bail with bad_json before MaxBytesReader fires.
+	big := `{"keyID":"AAAA","attestation":"AAAA","challenge":"` + strings.Repeat("A", 128*1024) + `"}`
+	req := httptest.NewRequest("POST", "/v1/attest/register", strings.NewReader(big))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code %d, want 413 body=%s", rr.Code, rr.Body)
+	}
+	var resp errorResponse
+	json.NewDecoder(rr.Body).Decode(&resp)
+	if resp.Error != "body_too_large" {
+		t.Errorf("error = %q, want body_too_large", resp.Error)
+	}
+}
+
 func TestVendedKeysAllPresent(t *testing.T) {
 	// Sanity: every vended key resolves on a Vault populated with values.
 	v, _ := secrets.Parse(strings.NewReader(

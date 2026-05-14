@@ -296,17 +296,17 @@ Sweeping consumed-and-expired entries is the background goroutine's job, not the
 
 ### 6.8 CBOR decoding tolerance
 
-Apple's attestation/assertion are *valid* CBOR but not always canonical (e.g. integer encoding choices). Configure `fxamacker/cbor` with:
+Apple's attestation/assertion are *valid* CBOR but not always canonical (e.g. integer encoding choices). Configure `fxamacker/cbor` (v2.9.2) with:
 
 ```
 cbor.DecOptions{
-    DupMapKey: cbor.DupMapKeyEnforcedAPIError,
+    DupMapKey:   cbor.DupMapKeyEnforcedAPF,
     IndefLength: cbor.IndefLengthAllowed,
-    TagsMd: cbor.TagsForbidden,
+    TagsMd:      cbor.TagsForbidden,
 }
 ```
 
-(Final values to confirm during implementation review — these are the conservative defaults.)
+`DupMapKeyEnforcedAPF` is the v2 enum name (the original SPEC said `DupMapKeyEnforcedAPIError`, which does not exist in the library — corrected in commit 7).
 
 ### 6.9 Public key storage format
 

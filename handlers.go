@@ -130,11 +130,22 @@ func handleAppSecrets(v *attest.Verifier, vault *secrets.Vault, perKeyID *rateli
 
 // --- helpers ---
 
+// maxRequestBody caps every /v1 JSON body. Real attestation CBOR is ~3-5 KB
+// (cert chain + receipt); 64 KB gives ~10× headroom while bounding the memory
+// any single request can claim before validation runs.
+const maxRequestBody = 64 << 10
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_json")
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeError(w, http.StatusRequestEntityTooLarge, "body_too_large")
+		} else {
+			writeError(w, http.StatusBadRequest, "bad_json")
+		}
 		return false
 	}
 	return true
