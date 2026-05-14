@@ -199,6 +199,7 @@ When V1.1+ adds adaptive risk scoring or per-user identity (sign-in), these beco
 - HEIC support (iOS native format) — requires server-side conversion.
 - Disease identification (`/v1/identify-disease` via Plant.id `/api/v3/health_assessment`) — separate feature PR.
 - AI care advice / chat (originally drafted as `/v1/ai-chat` with OpenAI gpt-4o-mini; removed in commit after `f4e4f35` because V1 has no chat feature in scope). Re-add as its own feature PR if/when product needs it; the OpenAI proxy pattern is recoverable from git history.
+- AI Vision enhancement on identification results (OpenAI gpt-4o-mini vision **or** Claude vision over the uploaded image + Plant.id top suggestion → richer description / disease note). When this is added, it must be a **new** server-side vision proxy module (e.g. `proxy/openai_vision.go` or `proxy/claude_vision.go`) backing a **new** endpoint such as `/v1/identify-enhanced`. **Do NOT restore the deleted `proxy/openai.go` (Chat Completions text-only) as-is** — the Vision API uses a different message shape (`content` is an array of typed parts mixing `image_url` + `text`, not a plain string). API keys (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) stay server-only — never returned to iOS. See memory `feature_ai_vision_enhancement.md` for the full reminder.
 - Adaptive risk scoring using App Attest + behavior signals.
 - Image preview / thumbnail caching for client (would require image storage on our side, decided against for V1).
 - Short-TTL token vending (D-Server revival, replaces `/v1/app-secrets`).
