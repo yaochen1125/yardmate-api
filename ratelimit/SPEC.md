@@ -62,33 +62,44 @@ Chose fixed-window over token-bucket / sliding-window because:
 |---|---|---|---|
 | Per-IP | 100 | 1 hour | NAT-friendly. Corporate networks where many real users share one egress IP must not lock out. 100/h ≈ 1 every 36 s — well above a normal user's needs. |
 | Per-keyID | 50 | 24 hours | iOS clients cache vended secrets in memory; a typical user issues 1–10 fetches/day. 50 leaves headroom for cold starts, app reinstalls, and the occasional client bug, while still rate-limiting abuse from a leaked private key. |
+| Per-device | 100 | 1 hour | Applied on the proxy endpoint group (`/v1/identify`, `/v1/diagnose`). 100/h matches the per-IP budget — a single install hitting it is already abusive. Combined with per-IP, this defends against IP-rotation-but-reused-install attacks. |
 
-Both numbers are env-overridable for staging vs production:
+All three numbers are env-overridable for staging vs production:
 
 ```
 YARDMATE_API_RL_IP_LIMIT          (default 100)
 YARDMATE_API_RL_IP_WINDOW         (default 1h)
 YARDMATE_API_RL_KEYID_LIMIT       (default 50)
 YARDMATE_API_RL_KEYID_WINDOW      (default 24h)
+YARDMATE_API_RL_DEVICE_LIMIT      (default 100)
+YARDMATE_API_RL_DEVICE_WINDOW     (default 1h)
 ```
 
 Restart required to pick up changes.
 
 ## 4. Application points
 
-| Endpoint | Per-IP middleware | Per-keyID inside handler |
-|---|---|---|
-| `/healthz` | — (excluded; uptime probes) | — |
-| `/v1/attest/challenge` | ✅ | — (no keyID yet) |
-| `/v1/attest/register` | ✅ | — |
-| `/v1/secrets/challenge` | ✅ | — (keyID not in request body) |
-| `/v1/app-secrets` | ✅ | ✅ (after assertion verify) |
+| Endpoint | Per-IP middleware | Per-device middleware | Per-keyID inside handler |
+|---|---|---|---|
+| `/healthz` | — (excluded; uptime probes) | — | — |
+| `/v1/attest/challenge` | ✅ | — | — (no keyID yet) |
+| `/v1/attest/register` | ✅ | — | — |
+| `/v1/secrets/challenge` | ✅ | — | — (keyID not in request body) |
+| `/v1/app-secrets` | ✅ | — | ✅ (after assertion verify) |
+| `/v1/identify` | ✅ | ✅ | — |
+| `/v1/diagnose` | ✅ | ✅ | — |
 
 ### Per-keyID is post-verify
 
 `/v1/app-secrets` checks the keyID rate limit AFTER `VerifyAssertion` succeeds. This trades a tiny amount of wasted CPU on rate-limited requests against a much bigger downside: a pre-verify check would let any caller with knowledge of a keyID (from leaked logs etc) burn through that keyID's daily budget and lock out the real owner. The post-verify position means only the holder of the private key can move the counter.
 
 Side effect: when the limit denies, the assertion verification has already updated the stored counter. That is intentional — the next legitimate assertion from the same key carries a fresh higher counter from the iOS framework, so nothing breaks.
+
+### Per-device passes through on missing / malformed header
+
+`PerDeviceMiddleware` reads `X-Device-Install-Id`. If the header is absent or is not a valid UUID, the middleware **passes the request through** rather than 400-ing or recording the empty key. Rationale: the handlers already 400 on `missing_device_id`, and we don't want every malformed-header request from every IP to share one global empty-string bucket (which would let an attacker drain it by hammering with no device id).
+
+This makes the empty/malformed case un-rate-limited at the device layer. The per-IP layer still applies, and the handler short-circuits with `missing_device_id` before any upstream cost is incurred.
 
 ## 5. Sweeper
 
