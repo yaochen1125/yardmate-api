@@ -80,6 +80,75 @@ type openAIChatResponse struct {
 	} `json:"choices"`
 }
 
+// RerankIdentify takes the uploaded image bytes plus the Plant.id top-N
+// candidate suggestions and asks the model to choose the most likely one.
+// Reply is constrained to a single name verbatim; we return the matching
+// candidate's Name. On any error / ambiguous reply, returns ("", err) and
+// the handler leaves the suggestions ordered as Plant.id ranked them.
+//
+// SPEC §2.1 ai_enhance — only used when the request sets ai_enhance=true.
+// AIEnhancedAt on the response is set by the handler iff this call returns
+// successfully (RerankIdentify err == nil).
+func (c *VisionClient) RerankIdentify(ctx context.Context, image []byte, mime string, candidates []Suggestion) (string, error) {
+	if c == nil {
+		return "", fmt.Errorf("vision: nil client")
+	}
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("vision: no candidates")
+	}
+
+	var b strings.Builder
+	for i, s := range candidates {
+		b.WriteString(fmt.Sprintf("%d. %s (scientific: %s)\n", i+1, s.Name, s.ScientificName))
+	}
+
+	sys := "You are a botanical identification assistant. Given a plant photo and a list of candidate names from a vision model, reply with ONLY the exact name of the candidate you judge most likely. Reply with one of the candidate names verbatim (the part before the parenthesis) — no commentary, no explanation, no rank prefix."
+	user := "Candidates:\n" + b.String() + "\nReply with the exact name of the most likely match."
+
+	body := openAIChatRequest{
+		Model:     c.Model,
+		MaxTokens: 80,
+		Messages: []openAIChatRequestMsg{
+			{Role: "system", Content: sys},
+			{
+				Role: "user",
+				Content: []any{
+					map[string]any{"type": "text", "text": user},
+					map[string]any{"type": "image_url", "image_url": map[string]any{"url": dataURL(mime, image)}},
+				},
+			},
+		},
+	}
+
+	pick, err := c.post(ctx, body)
+	if err != nil {
+		return "", err
+	}
+	pick = strings.TrimSpace(pick)
+	// Strip any leading "1. " / "Top: " style prefix the model occasionally
+	// adds despite the system prompt.
+	if i := strings.Index(pick, ". "); i >= 0 && i <= 3 {
+		pick = pick[i+2:]
+	}
+	pick = strings.Trim(pick, "\"' ")
+
+	// Match exact-name first, then case-insensitive contains.
+	for _, s := range candidates {
+		if pick == s.Name {
+			return s.Name, nil
+		}
+	}
+	lowPick := strings.ToLower(pick)
+	for _, s := range candidates {
+		if strings.EqualFold(pick, s.Name) ||
+			strings.Contains(lowPick, strings.ToLower(s.Name)) ||
+			strings.Contains(strings.ToLower(s.Name), lowPick) {
+			return s.Name, nil
+		}
+	}
+	return "", fmt.Errorf("vision rerank: pick %q not in candidate list", pick)
+}
+
 // DisambiguateDiseaseName asks the model (text-only) to pick the catalog id
 // whose name best matches plantIDName from refs. Reply is constrained to a
 // single id token like "L20", "P05", or "NONE" when nothing is close. Returns

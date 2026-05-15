@@ -37,13 +37,20 @@ func buildMultipart(t *testing.T, fieldName string, body []byte) (*bytes.Buffer,
 
 func newIdentifyHandler(t *testing.T, upstream http.HandlerFunc) (http.Handler, *httptest.Server) {
 	t.Helper()
+	return newIdentifyHandlerWithVision(t, upstream, nil)
+}
+
+// newIdentifyHandlerWithVision wires HandleIdentify with an optional vision
+// client (so ai_enhance tests can inject a mocked OpenAI server).
+func newIdentifyHandlerWithVision(t *testing.T, upstream http.HandlerFunc, vision *VisionClient) (http.Handler, *httptest.Server) {
+	t.Helper()
 	srv := httptest.NewServer(upstream)
 	c := &PlantIDClient{
 		APIKey:   "test-key",
 		Endpoint: srv.URL,
 		HTTP:     srv.Client(),
 	}
-	return HandleIdentify(c), srv
+	return HandleIdentify(c, vision), srv
 }
 
 func TestHandleIdentify_Success(t *testing.T) {
@@ -275,6 +282,175 @@ func TestHandleIdentify_PlantIDImageRejected_MapsToClient400(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"bad_image"`) {
 		t.Errorf("body = %s, want bad_image", rec.Body.String())
+	}
+}
+
+// --- HandleIdentify ai_enhance ---
+
+// buildMultipartWithFlag builds a multipart body containing both an image
+// file part and a free-form ai_enhance text part, in that order.
+func buildMultipartWithFlag(t *testing.T, image []byte, flag string) (*bytes.Buffer, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	fw, err := w.CreateFormFile("image", "test.jpg")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := fw.Write(image); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if flag != "" {
+		if err := w.WriteField("ai_enhance", flag); err != nil {
+			t.Fatalf("WriteField: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	return &buf, w.FormDataContentType()
+}
+
+func TestHandleIdentify_AIEnhance_False_NoRerank(t *testing.T) {
+	h, srv := newIdentifyHandlerWithVision(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, cannedPlantIDOK)
+	}, nil)
+	defer srv.Close()
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	var result IdentifyResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &result)
+	if result.AIEnhancedAt != nil {
+		t.Errorf("AIEnhancedAt = %v, want nil (ai_enhance not requested)", *result.AIEnhancedAt)
+	}
+}
+
+func TestHandleIdentify_AIEnhance_True_NoVisionClient(t *testing.T) {
+	// ai_enhance=true but vision client is nil — server gracefully skips
+	// the rerank and ships the Plant.id ordering unchanged.
+	h, srv := newIdentifyHandlerWithVision(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, cannedPlantIDOK)
+	}, nil)
+	defer srv.Close()
+	body, ct := buildMultipartWithFlag(t, jpegMagic, "true")
+	req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	var result IdentifyResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &result)
+	if result.AIEnhancedAt != nil {
+		t.Errorf("AIEnhancedAt = %v, want nil (vision client absent)", *result.AIEnhancedAt)
+	}
+	if result.Suggestions[0].Name != "Monstera deliciosa" {
+		t.Errorf("top-1 should be unchanged Plant.id top: %s", result.Suggestions[0].Name)
+	}
+}
+
+func TestHandleIdentify_AIEnhance_True_RerankPromotesTopN(t *testing.T) {
+	// Vision returns the 2nd candidate ("Other plant"); handler must swap
+	// it into position 0 and set AIEnhancedAt.
+	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Other plant"}}]}`)
+	}))
+	defer llm.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: llm.URL, Model: "t", HTTP: llm.Client()}
+
+	h, srv := newIdentifyHandlerWithVision(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, cannedPlantIDOK)
+	}, vision)
+	defer srv.Close()
+	body, ct := buildMultipartWithFlag(t, jpegMagic, "true")
+	req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body=%s", rec.Code, rec.Body)
+	}
+	var result IdentifyResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &result)
+	if result.AIEnhancedAt == nil {
+		t.Fatal("AIEnhancedAt = nil, want timestamp")
+	}
+	if result.Suggestions[0].Name != "Other plant" {
+		t.Errorf("top-1 = %q, want \"Other plant\" (after rerank)", result.Suggestions[0].Name)
+	}
+}
+
+func TestHandleIdentify_AIEnhance_True_VisionError_KeepsOriginal(t *testing.T) {
+	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer llm.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: llm.URL, Model: "t", HTTP: llm.Client()}
+
+	h, srv := newIdentifyHandlerWithVision(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, cannedPlantIDOK)
+	}, vision)
+	defer srv.Close()
+	body, ct := buildMultipartWithFlag(t, jpegMagic, "true")
+	req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	var result IdentifyResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &result)
+	if result.AIEnhancedAt != nil {
+		t.Errorf("AIEnhancedAt = %v, want nil on LLM failure", *result.AIEnhancedAt)
+	}
+	// Plant.id order preserved.
+	if result.Suggestions[0].Name != "Monstera deliciosa" {
+		t.Errorf("top-1 = %q, want \"Monstera deliciosa\" (Plant.id top-1)", result.Suggestions[0].Name)
+	}
+}
+
+func TestHandleIdentify_AIEnhance_FlagAcceptsTrueAndOne(t *testing.T) {
+	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Monstera deliciosa"}}]}`)
+	}))
+	defer llm.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: llm.URL, Model: "t", HTTP: llm.Client()}
+
+	for _, flag := range []string{"true", "1", "yes"} {
+		t.Run("flag="+flag, func(t *testing.T) {
+			h, srv := newIdentifyHandlerWithVision(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, cannedPlantIDOK)
+			}, vision)
+			defer srv.Close()
+			body, ct := buildMultipartWithFlag(t, jpegMagic, flag)
+			req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
+			req.Header.Set("Content-Type", ct)
+			req.Header.Set("X-Device-Install-Id", testUUID)
+			req.Header.Set("X-App-Version", "1.1.1")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			var result IdentifyResult
+			_ = json.Unmarshal(rec.Body.Bytes(), &result)
+			if result.AIEnhancedAt == nil {
+				t.Errorf("flag=%q: AIEnhancedAt should be non-nil", flag)
+			}
+		})
 	}
 }
 

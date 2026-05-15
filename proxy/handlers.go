@@ -27,12 +27,18 @@ const identifyUpstreamTimeout = 30 * time.Second
 //
 // V1 NOTES (per SPEC):
 //   - per-IP rate limit is applied by ratelimit.PerIPMiddleware at the /v1
-//     scope (server.go); this handler does not call it directly.
-//   - per-deviceInstallId rate limit is a TODO V1.1 (SPEC §4.1) — we log
-//     the device ID + assertion presence today; no enforcement yet.
+//     scope, and per-deviceInstallId by ratelimit.PerDeviceMiddleware on the
+//     proxy endpoint group (both in server.go); this handler does not call
+//     either directly.
 //   - App Attest assertion headers are read + logged for forensics. V1 does
 //     NOT call attest.VerifyAssertion (iOS 26 issue, memory option_d_progress.md).
-func HandleIdentify(client *PlantIDClient) http.HandlerFunc {
+//
+// vision is optional. When non-nil AND the request sets ai_enhance=true, the
+// handler asks OpenAI to rerank the Plant.id top-N candidates against the
+// uploaded image and re-orders Suggestions so the LLM pick is first. On any
+// LLM error / timeout the original Plant.id ranking is preserved and
+// AIEnhancedAt stays null in the response.
+func HandleIdentify(client *PlantIDClient, vision *VisionClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 1. Body cap (drops the connection on overflow, returning *MaxBytesError
 		//    on the next Read so we can map to image_too_large).
@@ -66,9 +72,13 @@ func HandleIdentify(client *PlantIDClient) http.HandlerFunc {
 			return
 		}
 
-		// 5. Locate the "image" form field.
+		// 5. Scan all multipart parts. We need the image bytes plus the
+		//    optional ai_enhance flag; either can appear first depending on
+		//    client encoding order. multipart.Part doesn't support skip-then-
+		//    rewind, so each part is fully consumed when found.
 		var (
-			imagePart *multipart.Part
+			imgBytes  []byte
+			aiEnhance bool
 		)
 		for {
 			part, perr := mr.NextPart()
@@ -83,46 +93,56 @@ func HandleIdentify(client *PlantIDClient) http.HandlerFunc {
 				writeError(w, http.StatusBadRequest, "bad_multipart")
 				return
 			}
-			if part.FormName() == "image" {
-				imagePart = part
-				break
+			switch part.FormName() {
+			case "image":
+				if imgBytes != nil {
+					_ = part.Close()
+					continue
+				}
+				b, err := io.ReadAll(part)
+				if err != nil {
+					_ = part.Close()
+					if isMaxBytesErr(err) {
+						writeError(w, http.StatusRequestEntityTooLarge, "image_too_large")
+						return
+					}
+					writeError(w, http.StatusBadRequest, "bad_image")
+					return
+				}
+				imgBytes = b
+			case "ai_enhance":
+				b, err := io.ReadAll(io.LimitReader(part, 16))
+				if err == nil {
+					switch strings.TrimSpace(string(b)) {
+					case "true", "1", "yes":
+						aiEnhance = true
+					}
+				}
 			}
 			_ = part.Close()
 		}
-		if imagePart == nil {
+		if len(imgBytes) == 0 {
 			writeError(w, http.StatusBadRequest, "missing_image")
 			return
 		}
-		defer imagePart.Close()
 
-		// 6. MIME byte-sniff first 512 bytes (SPEC §6 pitfall 8). The
+		// 6. MIME byte-sniff first 512 bytes (SPEC §6 pitfall 6). The
 		//    multipart Content-Type header from the client is untrusted.
-		first := make([]byte, 512)
-		n, rerr := io.ReadFull(imagePart, first)
-		if rerr != nil && !errors.Is(rerr, io.EOF) && !errors.Is(rerr, io.ErrUnexpectedEOF) {
-			if isMaxBytesErr(rerr) {
-				writeError(w, http.StatusRequestEntityTooLarge, "image_too_large")
-				return
-			}
-			writeError(w, http.StatusBadRequest, "bad_image")
-			return
+		head := imgBytes
+		if len(head) > 512 {
+			head = head[:512]
 		}
-		first = first[:n]
-		mime := http.DetectContentType(first)
+		mime := http.DetectContentType(head)
 		if mime != "image/jpeg" && mime != "image/png" {
 			writeError(w, http.StatusBadRequest, "bad_image")
 			return
 		}
 
-		// 7. Stream-and-call Plant.id. The 512-byte sniff prefix is concatenated
-		//    back via io.MultiReader so we don't lose data.
-		body := io.MultiReader(bytes.NewReader(first), imagePart)
 		ctx, cancel := context.WithTimeout(r.Context(), identifyUpstreamTimeout)
 		defer cancel()
 
-		result, err := client.Identify(ctx, body, mime)
+		result, err := client.Identify(ctx, bytes.NewReader(imgBytes), mime)
 		if err != nil {
-			// Detect over-cap error during streaming to upstream.
 			if isMaxBytesErr(err) {
 				writeError(w, http.StatusRequestEntityTooLarge, "image_too_large")
 				return
@@ -142,9 +162,32 @@ func HandleIdentify(client *PlantIDClient) http.HandlerFunc {
 			return
 		}
 
+		// 7. Optional AI rerank. Failures here do not affect the 200 response
+		//    contract — AIEnhancedAt simply stays null. The vision call uses
+		//    the same ctx but its client has an inner 8 s timeout (see SPEC §2.1).
+		if aiEnhance && vision != nil && len(result.Suggestions) > 0 {
+			pick, verr := vision.RerankIdentify(ctx, imgBytes, mime, result.Suggestions)
+			if verr != nil {
+				log.Printf("identify ai_enhance failed: deviceID=%s err=%v", deviceID, verr)
+			} else {
+				// Move the picked candidate to index 0 if it isn't already.
+				for i, s := range result.Suggestions {
+					if s.Name == pick {
+						if i != 0 {
+							result.Suggestions[0], result.Suggestions[i] =
+								result.Suggestions[i], result.Suggestions[0]
+						}
+						break
+					}
+				}
+				ts := time.Now().UTC().Format(time.RFC3339)
+				result.AIEnhancedAt = &ts
+			}
+		}
+
 		// 8. Success — single-line structured log (SPEC §5.2 forensics).
-		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v mime=%s isPlant=%v suggestions=%d",
-			deviceID, appVer, attKeyID, attAssertPresent, mime, result.IsPlant, len(result.Suggestions))
+		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v mime=%s isPlant=%v suggestions=%d aiEnhanced=%v",
+			deviceID, appVer, attKeyID, attAssertPresent, mime, result.IsPlant, len(result.Suggestions), result.AIEnhancedAt != nil)
 		writeJSON(w, http.StatusOK, result)
 	}
 }

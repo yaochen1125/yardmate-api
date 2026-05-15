@@ -72,7 +72,7 @@ func newServer(
 		if plantID != nil {
 			r.Group(func(r chi.Router) {
 				r.Use(ratelimit.PerDeviceMiddleware(lim.PerDevice, "rate_limit_device"))
-				r.Post("/identify", proxy.HandleIdentify(plantID))
+				r.Post("/identify", proxy.HandleIdentify(plantID, vision))
 				r.Post("/diagnose", proxy.HandleDiagnose(plantID, content, vision))
 			})
 		}
