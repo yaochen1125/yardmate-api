@@ -26,7 +26,7 @@
 - **Plant.id account management.** API key + billing are operator concerns; this package only consumes the key from `secrets.Vault`.
 - **Caching.** No response cache. Identification results are user-content-specific and idempotency isn't valuable enough for V1.
 - **Multi-tenancy.** All requests use the same upstream Plant.id account.
-- **Chat / care advice / generative description enrichment.** The vision client today only does (a) candidate reranking and (b) catalog-name disambiguation. Generating descriptions, watering tips, or other detail-page content is a future enrichment path that will live in a separate module and be invoked from the plant-detail flow, not from `/v1/identify` or `/v1/diagnose`.
+- **Chat / care advice / generative description enrichment.** The vision client in this package only does (a) candidate reranking and (b) catalog-name disambiguation. Plant-detail enrichment (descriptions, watering tips, full detail-page data for plants outside the 1522 catalog) is the sibling `proxy/enrichment` package, invoked from the iOS plant-detail flow on detail-page mount, not from `/v1/identify` or `/v1/diagnose`. The two packages share the OpenAI HTTP transport (`VisionClient.post`) but have separate prompt paths. See `proxy/enrichment/SPEC.md`.
 
 ### 1.3 Inputs
 
@@ -331,7 +331,6 @@ When V1.1+ adds adaptive risk scoring or per-user identity (sign-in), these beco
 
 - HEIC support (iOS native format) — requires server-side conversion.
 - AI care advice / chat (originally drafted as `/v1/ai-chat` with OpenAI gpt-4o-mini; removed in commit after `f4e4f35` because V1 has no chat feature in scope). Re-add as its own feature PR if/when product needs it; the OpenAI proxy pattern is recoverable from git history (current `proxy/openai_vision.go` provides the `post` helper that can be reused).
-- Plant-detail enrichment LLM pass (generative description / care tips per plant id). Separate from the identify/diagnose path, invoked from the plant-detail flow. Shared OpenAI client allowed but a separate prompt path; the AIEnhancedAt timestamp on identify does NOT cover this.
 - Adaptive risk scoring using App Attest + behavior signals.
 - Image preview / thumbnail caching for client (would require image storage on our side, decided against for V1).
 - Short-TTL token vending (D-Server revival, replaces `/v1/app-secrets`).
