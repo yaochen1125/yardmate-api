@@ -52,8 +52,8 @@ func buildTestServerWithLimits(t *testing.T, ipLimit, keyIDLimit int) *Server {
 		t.Fatal(err)
 	}
 
-	lim := ratelimit.New(ipLimit, time.Hour, keyIDLimit, 24*time.Hour)
-	return newServer(verifier, vault, lim, nil)
+	lim := ratelimit.New(ipLimit, time.Hour, keyIDLimit, 24*time.Hour, 1000, time.Hour)
+	return newServer(verifier, vault, lim, nil, nil, nil)
 }
 
 func do(t *testing.T, s *Server, method, path string, body any) *httptest.ResponseRecorder {

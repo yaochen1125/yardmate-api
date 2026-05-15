@@ -14,24 +14,30 @@ import (
 )
 
 // Server bundles the chi router with the verifier, vault, rate limiter,
-// and (optional) upstream proxy clients it serves. Tests construct it via
-// newServer with a test root pool + synthetic vault; main constructs it
-// from real production values.
+// and (optional) upstream proxy clients + embedded content index it
+// serves. Tests construct it via newServer with a test root pool +
+// synthetic vault; main constructs it from real production values.
 type Server struct {
 	verifier *attest.Verifier
 	vault    *secrets.Vault
 	limiter  *ratelimit.Limiter
-	plantID  *proxy.PlantIDClient // optional; nil disables /v1/identify
+	plantID  *proxy.PlantIDClient // optional; nil disables /v1/identify + /v1/diagnose
+	vision   *proxy.VisionClient  // optional; nil disables ai_enhance + LLM catalog disambiguation
+	content  *proxy.ContentIndex  // optional; nil disables plantId/catalogId lookups in /v1/diagnose
 	router   chi.Router
 }
 
 // newServer wires routes. plantID may be nil (tests / setups that don't
-// exercise the proxy endpoints); when nil, /v1/identify is not registered.
+// exercise the proxy endpoints); when nil, /v1/identify + /v1/diagnose are
+// not registered. content + vision may be nil — gracefully degraded
+// (no YardMate cross-reference / no LLM enhancement).
 func newServer(
 	verifier *attest.Verifier,
 	vault *secrets.Vault,
 	lim *ratelimit.Limiter,
 	plantID *proxy.PlantIDClient,
+	vision *proxy.VisionClient,
+	content *proxy.ContentIndex,
 ) *Server {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -58,16 +64,23 @@ func newServer(
 		// Slow proxy endpoints — upstream call (Plant.id) can take up to 30 s
 		// (proxy/SPEC §5.2). No chi-level Timeout middleware here; the handler
 		// manages its own context deadline.
+		//
+		// Per-device rate limit (in addition to per-IP at /v1 scope) applies
+		// here only: these endpoints carry a device install id, and the
+		// double-bucket defends against IP-rotation attackers reusing the
+		// same client install (proxy/SPEC §4.1, ratelimit/SPEC §4).
 		if plantID != nil {
 			r.Group(func(r chi.Router) {
-				r.Post("/identify", proxy.HandleIdentify(plantID))
+				r.Use(ratelimit.PerDeviceMiddleware(lim.PerDevice, "rate_limit_device"))
+				r.Post("/identify", proxy.HandleIdentify(plantID, vision))
+				r.Post("/diagnose", proxy.HandleDiagnose(plantID, content, vision))
 			})
 		}
 	})
 
 	return &Server{
 		verifier: verifier, vault: vault, limiter: lim,
-		plantID: plantID, router: r,
+		plantID: plantID, vision: vision, content: content, router: r,
 	}
 }
 

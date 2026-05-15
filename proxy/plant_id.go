@@ -7,6 +7,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,15 +21,23 @@ import (
 // query params V1 needs (common_names + scientific_name in English).
 const defaultPlantIDEndpoint = "https://plant.id/api/v3/identification?details=common_names,scientific_name&language=en"
 
+// defaultPlantIDDiagnoseEndpoint is the Plant.id v3 identification URL used
+// for diagnose calls — same endpoint with health-assessment details and the
+// `health=all` flag passed in the JSON body (SPEC §2.2).
+const defaultPlantIDDiagnoseEndpoint = "https://plant.id/api/v3/identification?details=local_name,description,treatment,cause&language=en"
+
 // defaultPlantIDTimeout caps the upstream Plant.id call. 30 s matches SPEC §5.2.
 const defaultPlantIDTimeout = 30 * time.Second
 
-// PlantIDClient calls Plant.id v3 to identify plants. Construct with
-// NewPlantIDClient. Endpoint and HTTP client are exported for tests.
+// PlantIDClient calls Plant.id v3 for identification (Identify) and combined
+// identification + health assessment (Diagnose). Construct with
+// NewPlantIDClient. Endpoint, DiagnoseEndpoint and HTTP client are exported
+// for tests.
 type PlantIDClient struct {
-	APIKey   string
-	Endpoint string
-	HTTP     *http.Client
+	APIKey           string
+	Endpoint         string
+	DiagnoseEndpoint string
+	HTTP             *http.Client
 }
 
 // NewPlantIDClient returns a PlantIDClient with production defaults.
@@ -36,9 +45,10 @@ type PlantIDClient struct {
 // never exposed to clients.
 func NewPlantIDClient(apiKey string) *PlantIDClient {
 	return &PlantIDClient{
-		APIKey:   apiKey,
-		Endpoint: defaultPlantIDEndpoint,
-		HTTP:     &http.Client{Timeout: defaultPlantIDTimeout},
+		APIKey:           apiKey,
+		Endpoint:         defaultPlantIDEndpoint,
+		DiagnoseEndpoint: defaultPlantIDDiagnoseEndpoint,
+		HTTP:             &http.Client{Timeout: defaultPlantIDTimeout},
 	}
 }
 
@@ -98,6 +108,64 @@ func (c *PlantIDClient) Identify(ctx context.Context, image io.Reader, mime stri
 		return nil, ErrPlantIDRateLimit
 	case resp.StatusCode == http.StatusBadRequest:
 		// Plant.id 400 typically: "Unsupported file format" / "Not an image".
+		return nil, ErrPlantIDImageRejected
+	case resp.StatusCode >= 500:
+		return nil, ErrPlantIDUnavailable
+	default:
+		return nil, fmt.Errorf("%w: status %d", ErrPlantIDBadResponse, resp.StatusCode)
+	}
+}
+
+// Diagnose calls Plant.id v3 with `health=all`, returning both the plant
+// identification (classification.suggestions) and the health assessment
+// (disease.suggestions). image is the raw bytes (≤8 MB cap enforced by the
+// handler); mime must be "image/jpeg" or "image/png" (caller validates).
+//
+// Plant.id v3 accepts both multipart and JSON-body uploads. We use JSON +
+// base64 here (instead of multipart like Identify) because the contract
+// requires `images: [...]` as a JSON array plus the sibling `health: "all"`
+// flag — multipart can't express the named flag cleanly. The trade-off is
+// ~33% extra payload size from base64 encoding.
+func (c *PlantIDClient) Diagnose(ctx context.Context, image []byte, mime string) (*plantIDDiagnoseResponse, error) {
+	endpoint := c.DiagnoseEndpoint
+	if endpoint == "" {
+		endpoint = defaultPlantIDDiagnoseEndpoint
+	}
+
+	body := map[string]any{
+		"images": []string{"data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)},
+		"health": "all",
+	}
+	bs, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("plant_id diagnose: marshal: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bs))
+	if err != nil {
+		return nil, fmt.Errorf("plant_id diagnose: build request: %w", err)
+	}
+	req.Header.Set("Api-Key", c.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrPlantIDUnavailable, err)
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
+		var apiResp plantIDDiagnoseResponse
+		if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+			return nil, fmt.Errorf("%w: decode: %v", ErrPlantIDBadResponse, err)
+		}
+		return &apiResp, nil
+	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden:
+		return nil, ErrPlantIDUnauthorized
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return nil, ErrPlantIDRateLimit
+	case resp.StatusCode == http.StatusBadRequest:
 		return nil, ErrPlantIDImageRejected
 	case resp.StatusCode >= 500:
 		return nil, ErrPlantIDUnavailable

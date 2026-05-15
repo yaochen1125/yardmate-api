@@ -27,6 +27,8 @@ const (
 	defaultIPWindow      = time.Hour
 	defaultKeyIDLimit    = 50
 	defaultKeyIDWindow   = 24 * time.Hour
+	defaultDeviceLimit   = 100
+	defaultDeviceWindow  = time.Hour
 	defaultSweepInterval = time.Minute
 )
 
@@ -64,21 +66,41 @@ func main() {
 		envDurationOr("YARDMATE_API_RL_IP_WINDOW", defaultIPWindow),
 		envIntOr("YARDMATE_API_RL_KEYID_LIMIT", defaultKeyIDLimit),
 		envDurationOr("YARDMATE_API_RL_KEYID_WINDOW", defaultKeyIDWindow),
+		envIntOr("YARDMATE_API_RL_DEVICE_LIMIT", defaultDeviceLimit),
+		envDurationOr("YARDMATE_API_RL_DEVICE_WINDOW", defaultDeviceWindow),
 	)
 	sweepStop := lim.StartSweeper(defaultSweepInterval)
 	defer close(sweepStop)
 
-	// Plant.id proxy client (V1 — server-side image identification).
+	// Plant.id proxy client (V1 — server-side image identification + diagnose).
 	// Key never leaves server. Disabled if PLANT_ID_API_KEY is missing
 	// (deploy.sh enforces presence in production secrets.env).
 	var plantID *proxy.PlantIDClient
 	if v := vault.Get("PLANT_ID_API_KEY"); v != "" {
 		plantID = proxy.NewPlantIDClient(v)
 	} else {
-		log.Printf("WARN: PLANT_ID_API_KEY missing; /v1/identify will not be registered")
+		log.Printf("WARN: PLANT_ID_API_KEY missing; /v1/identify + /v1/diagnose will not be registered")
 	}
 
-	srv := newServer(verifier, vault, lim, plantID)
+	// OpenAI vision client — drives the ai_enhance rerank on /v1/identify and
+	// catalog-id disambiguation on /v1/diagnose. Optional: a missing key
+	// leaves both as no-ops (Plant.id-only behavior).
+	var vision *proxy.VisionClient
+	if v := vault.Get("OPENAI_API_KEY"); v != "" {
+		vision = proxy.NewVisionClient(v)
+	} else {
+		log.Printf("WARN: OPENAI_API_KEY missing; ai_enhance + catalog disambiguation disabled")
+	}
+
+	// Embedded content index (plants_index, plants_detail, diseases catalog).
+	// Built once at startup; ~10 MB binary footprint.
+	content, err := proxy.LoadContent()
+	if err != nil {
+		log.Fatalf("load content: %v", err)
+	}
+	log.Printf("content loaded: catalog ready")
+
+	srv := newServer(verifier, vault, lim, plantID, vision, content)
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream). Headroom 5 s.
 	httpSrv := &http.Server{
