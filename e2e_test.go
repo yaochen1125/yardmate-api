@@ -47,7 +47,7 @@ func buildE2EServer(t *testing.T, ipLimit int) (*Server, *testkit.Issuer) {
 		t.Fatal(err)
 	}
 
-	lim := ratelimit.New(ipLimit, time.Hour, 1000, 24*time.Hour)
+	lim := ratelimit.New(ipLimit, time.Hour, 1000, 24*time.Hour, 1000, time.Hour)
 	return newServer(verifier, vault, lim, nil), issuer
 }
 
@@ -234,8 +234,8 @@ func TestE2E_PerKeyIDLimit(t *testing.T) {
 		RootPool: issuer.RootPool,
 	})
 	vault, _ := secrets.Parse(strings.NewReader("OPENAI_API_KEY=k\nPLANT_ID_API_KEY=p\n"))
-	// Generous per-IP, tight per-keyID (2 per 24h).
-	lim := ratelimit.New(1000, time.Hour, 2, 24*time.Hour)
+	// Generous per-IP, tight per-keyID (2 per 24h), generous per-device.
+	lim := ratelimit.New(1000, time.Hour, 2, 24*time.Hour, 1000, time.Hour)
 	s := newServer(verifier, vault, lim, nil)
 
 	// Register.

@@ -27,6 +27,8 @@ const (
 	defaultIPWindow      = time.Hour
 	defaultKeyIDLimit    = 50
 	defaultKeyIDWindow   = 24 * time.Hour
+	defaultDeviceLimit   = 100
+	defaultDeviceWindow  = time.Hour
 	defaultSweepInterval = time.Minute
 )
 
@@ -64,6 +66,8 @@ func main() {
 		envDurationOr("YARDMATE_API_RL_IP_WINDOW", defaultIPWindow),
 		envIntOr("YARDMATE_API_RL_KEYID_LIMIT", defaultKeyIDLimit),
 		envDurationOr("YARDMATE_API_RL_KEYID_WINDOW", defaultKeyIDWindow),
+		envIntOr("YARDMATE_API_RL_DEVICE_LIMIT", defaultDeviceLimit),
+		envDurationOr("YARDMATE_API_RL_DEVICE_WINDOW", defaultDeviceWindow),
 	)
 	sweepStop := lim.StartSweeper(defaultSweepInterval)
 	defer close(sweepStop)

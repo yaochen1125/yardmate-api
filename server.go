@@ -58,8 +58,14 @@ func newServer(
 		// Slow proxy endpoints — upstream call (Plant.id) can take up to 30 s
 		// (proxy/SPEC §5.2). No chi-level Timeout middleware here; the handler
 		// manages its own context deadline.
+		//
+		// Per-device rate limit (in addition to per-IP at /v1 scope) applies
+		// here only: these endpoints carry a device install id, and the
+		// double-bucket defends against IP-rotation attackers reusing the
+		// same client install (proxy/SPEC §4.1, ratelimit/SPEC §4).
 		if plantID != nil {
 			r.Group(func(r chi.Router) {
+				r.Use(ratelimit.PerDeviceMiddleware(lim.PerDevice, "rate_limit_device"))
 				r.Post("/identify", proxy.HandleIdentify(plantID))
 			})
 		}
