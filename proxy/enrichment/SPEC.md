@@ -61,7 +61,7 @@ The 200 response shape is **identical regardless of which lookup path produced i
 - **OpenAI chat-completions** — `gpt-4o-mini-2024-07-18` with `response_format: { type: "json_schema", strict: true }`. Existing `proxy.VisionClient.post(...)` reused for transport; prompt + schema live in `enrichment/prompt.go`.
 - **`proxy.ContentIndex`** — already built at startup by `proxy/content.go`. The enrichment package consumes it via existing `LookupPlantID(...)` AND a new `LookupFullDetail(plantId) -> (*PlantDetail, bool)` method (pitfall §9 #8 — the existing `LoadContent` parses only `id`+`common_diseases_list` from plants_detail.json; full parse must be added).
 - **`ratelimit.PerIPMiddleware`** (already mounted on `/v1`) + **`ratelimit.PerDeviceMiddleware`** (already mounted on the proxy group in `server.go`; enrichment joins that group).
-- **In-process LRU cache** — `github.com/hashicorp/golang-lru/v2` (or std `sync.Map` + manual eviction; final pick at implementation time). Bounds ~10k entries, 30 min TTL, holds path-1 / path-2 lookup results to absorb investment-scale traffic bursts (see §7 + §9 #13). Allocated ~20 MB.
+- **In-process LRU cache** — `github.com/hashicorp/golang-lru/v2` (or std `sync.Map` + manual eviction; final pick at implementation time). Bounds ~10k entries, 30 min TTL. Written on all three lookup paths (catalog hit, Supabase hit, fresh LLM generation) so 30 s after user A triggers generation, user B hits the cache and skips both Supabase and OpenAI. Sized for 5000+ req/min bursts (see §7 + §9 #13). Allocated ~20 MB.
 - Standard library only for HTTP / JSON / context / time (third-party SDKs limited to pgx + an LRU lib).
 
 ---
@@ -283,7 +283,7 @@ Column notes:
 - **`scientific_name_normalized` is the single unique key.** Inputs that normalize to the same string (e.g. `Abelia × grandiflora` ↔ `Abelia x grandiflora`) intentionally share one row. The first-stored un-normalized form is preserved for audit but does not affect lookup.
 - **The embedded catalog is the path-1 source** (not a jsDelivr fetch). Adding a CDN dependency to the request path would couple us to jsDelivr availability for every catalog-hit lookup.
 - **pgx direct TCP connection, not Supabase PostgREST.** Investment-scale traffic (10k+ DAU at launch peaks) can burst 5000+ req/min; PostgREST is rate-limited at the Supabase Cloudflare layer with opaque thresholds, while pgx hits Postgres directly (bounded only by our pool size × DB capacity). Direct TCP also avoids the HTTPS handshake + JSON serialization overhead per request.
-- **In-process LRU cache included in V1 (not deferred).** Bounded ~10k entries, 30 min TTL on path-1 catalog hits AND path-2 Supabase hits. Hot plants (top ~100 in any given period) absorb the majority of traffic without touching DB. Sized to absorb investment-scale bursts; cache invalidation on `status` changes via the Dashboard is handled per pitfall §9 #13.
+- **In-process LRU cache included in V1 (not deferred).** Bounded ~10k entries, 30 min TTL. Written after EVERY successful 200 response: path-1 catalog hit, path-2 Supabase hit, AND path-3 fresh LLM generation (fresh row enters cache atomically after the Supabase write returns). Hot plants (top ~100 in any given period) absorb the majority of traffic without touching DB. Sized for 10k+ DAU bursts of 5000+ req/min; cache invalidation on `status` changes via the Dashboard is handled per pitfall §9 #13.
 - **All LLM string output is English only**, per the `app_language` memory. The system prompt + per-field json_schema descriptions force English regardless of input language (Chinese / Spanish / etc. scientific names still resolve via the same Latin name; the generated `description` / `history_text_*` / `symbolism_story` / etc. stay English).
 
 ---
@@ -316,7 +316,8 @@ Column notes:
 11. **The LLM call uses the OpenAI client's HTTP transport but a separate prompt path** — do NOT reuse `RerankIdentify` / `DisambiguateDiseaseName`. Add a new method on `VisionClient` or a sibling client in `enrichment/prompt.go`. Parent SPEC §1.2 boundary.
 12. **Path-1 catalog-hit and path-2/3 Supabase/LLM both return the same shape**, but the `id` field is `string` in path 1 and `null` in paths 2/3. iOS Codable must declare `id: String?`. If we ever assign YardMate ids to Supabase-stored plants (V1.x), this becomes non-null again for those rows.
 13. **Cache invalidation on status changes.** When Yao approves / rejects a row in the Supabase Dashboard, the server's in-process LRU does NOT auto-refresh. V1 acceptable: cache TTL (30 min) bounds staleness; the LLM-generated `pending` data and the Yao-approved data are usually compatible (no schema break, just edited text). If immediate invalidation matters in V1.x, add a Supabase Realtime subscription or a privileged admin endpoint `POST /v1/plants/enrichment/cache/invalidate` keyed by scientific name.
-14. **DSN secrecy.** `SUPABASE_DB_URL` contains the Postgres password in cleartext (e.g. `postgresql://postgres:abc123@db.xxx.supabase.co:5432/postgres`). Treat the whole DSN as a secret — never log it, never echo it in error messages, never include it in test fixtures or commits.
+14. **DSN secrecy.** `SUPABASE_DB_URL` contains the Postgres password in cleartext (e.g. `postgresql://postgres.abc:examplepw@aws-0-eu-central-1.pooler.supabase.com:5432/postgres`). Treat the whole DSN as a secret — never log it, never echo it in error messages, never include it in test fixtures or commits.
+15. **Use Session Pooler, not Direct connection.** Supabase's "Direct connection" DSN (`db.<ref>.supabase.co:5432`, user `postgres`) resolves to **IPv6-only** addresses; outbound IPv6 from the Hetzner box is not always reliable and the failure mode is silent (TCP timeout, no DNS error). The "Session Pooler" DSN (`aws-0-<region>.pooler.supabase.com:5432`, user `postgres.<ref>`) is IPv4-routable and runs the same Postgres wire protocol — pgx connects identically and prepared statements work. The "Transaction Pooler" (port 6543) is also IPv4 but disables session-scoped features (prepared statements, LISTEN/NOTIFY); pgx's auto-prepared-statement caching will break against it, so avoid for this package.
 
 ---
 
@@ -332,8 +333,8 @@ proxy/enrichment/
 ├── supabase_test.go                  hermetic tests
 ├── prompt.go                         OpenAI request body + json_schema definition + whitelist
 ├── prompt_test.go                    fixture-based schema + nullable + whitelist tests
-├── cache.go                          LRU wrapper (key=normalized scientific name, value=*PlantDetail, ~10k entries, 30 min TTL)
-├── cache_test.go                     eviction + TTL + concurrent access tests
+├── cache.go                          LRU wrapper (key=normalized scientific name, value=*PlantDetail, ~10k entries, 30 min TTL). Service writes after every 200 response — catalog hit, Supabase hit, AND path-3 fresh generation
+├── cache_test.go                     eviction + TTL + concurrent access tests (run with -race)
 ├── handlers.go                       HTTP handler: body parse / validate / call Service / error mapping
 ├── handlers_test.go                  HTTP-level tests + integration with mocks
 └── migrations/
@@ -353,10 +354,10 @@ r.Route("/v1/plants", func(r chi.Router) {
 `secrets.Vault` additions (`/etc/yardmate-api/secrets.env` on prod):
 
 ```
-SUPABASE_DB_URL=postgresql://postgres:<password>@db.<project>.supabase.co:5432/postgres
+SUPABASE_DB_URL=postgresql://postgres.<project_ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
 ```
 
-`OPENAI_API_KEY` is already present. The DSN is the full Postgres connection string from Supabase Dashboard → Project Settings → Database → Connection string (Direct connection); replace `<password>` with the DB password (resettable in the same dashboard page). Treat the entire DSN as a secret (§9 #14).
+`OPENAI_API_KEY` is already present. **Use the Supabase "Session Pooler" DSN, NOT "Direct connection"** — see pitfall §9 #15 for the Hetzner-IPv6 reason. Copy the value from Supabase Dashboard → Project Settings → Database → Connection string → "Session Pooler". The user is `postgres.<project_ref>` (note the dot — Pooler form), not bare `postgres`. Replace `<password>` with the DB password (resettable in the same dashboard page). Treat the entire DSN as a secret (§9 #14).
 
 `ContentIndex` additions in `proxy/content.go`:
 
@@ -368,4 +369,4 @@ fullPlantByID map[string]*PlantDetail   // built from plants_detail.json
 func (c *ContentIndex) LookupFullDetail(plantID string) (*PlantDetail, bool)
 ```
 
-Estimated effort: ~1.5 day implementation + 0.5 day tests + 0.5 day deploy + smoke = ~2.5 days total.
+Estimated effort: ~2 day implementation (incl. cache.go) + 0.5 day tests (race detector for cache concurrency) + 0.5 day deploy + smoke = ~3 days total.
