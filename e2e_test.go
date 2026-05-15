@@ -48,7 +48,7 @@ func buildE2EServer(t *testing.T, ipLimit int) (*Server, *testkit.Issuer) {
 	}
 
 	lim := ratelimit.New(ipLimit, time.Hour, 1000, 24*time.Hour, 1000, time.Hour)
-	return newServer(verifier, vault, lim, nil, nil, nil), issuer
+	return newServer(verifier, vault, lim, nil, nil, nil, nil), issuer
 }
 
 func postJSON(t *testing.T, s *Server, path string, body any) *httptest.ResponseRecorder {
@@ -236,7 +236,7 @@ func TestE2E_PerKeyIDLimit(t *testing.T) {
 	vault, _ := secrets.Parse(strings.NewReader("OPENAI_API_KEY=k\nPLANT_ID_API_KEY=p\n"))
 	// Generous per-IP, tight per-keyID (2 per 24h), generous per-device.
 	lim := ratelimit.New(1000, time.Hour, 2, 24*time.Hour, 1000, time.Hour)
-	s := newServer(verifier, vault, lim, nil, nil, nil)
+	s := newServer(verifier, vault, lim, nil, nil, nil, nil)
 
 	// Register.
 	rr := postJSON(t, s, "/v1/attest/challenge", map[string]string{})

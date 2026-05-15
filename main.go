@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/yaochen1125/yardmate-api/attest"
 	"github.com/yaochen1125/yardmate-api/proxy"
+	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
@@ -100,7 +102,13 @@ func main() {
 	}
 	log.Printf("content loaded: catalog ready")
 
-	srv := newServer(verifier, vault, lim, plantID, vision, content)
+	// Enrichment service — V1 plant-detail enrichment endpoint
+	// (proxy/enrichment/SPEC.md). Requires SUPABASE_DB_URL (Session Pooler
+	// DSN per SPEC §9 #15) + OPENAI_API_KEY. Gracefully disabled with a
+	// WARN log if either is missing or the DB ping fails.
+	enrichSvc := buildEnrichmentService(vault, content)
+
+	srv := newServer(verifier, vault, lim, plantID, vision, content, enrichSvc)
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream). Headroom 5 s.
 	httpSrv := &http.Server{
@@ -115,6 +123,39 @@ func main() {
 	if err := httpSrv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// buildEnrichmentService wires the /v1/plants/enrichment dependencies:
+// pgx pool against Supabase, OpenAI LLM client, and the in-process LRU cache.
+// Returns nil (with a WARN log) if required secrets are missing or the
+// initial DB ping fails — in that case the route stays unregistered.
+//
+// The DB pool's lifetime is the process lifetime; no graceful Close() on
+// shutdown in V1 (systemd SIGTERM kills the process; Postgres reclaims
+// connections via idle timeout).
+func buildEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex) *enrichment.Service {
+	dsn := vault.Get("SUPABASE_DB_URL")
+	openaiKey := vault.Get("OPENAI_API_KEY")
+	if dsn == "" || openaiKey == "" {
+		log.Printf("WARN: SUPABASE_DB_URL or OPENAI_API_KEY missing; /v1/plants/enrichment disabled")
+		return nil
+	}
+	initCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	db, err := enrichment.NewDB(initCtx, dsn)
+	if err != nil {
+		log.Printf("WARN: enrichment DB init failed: %v; /v1/plants/enrichment disabled", err)
+		return nil
+	}
+	if err := db.Ping(initCtx); err != nil {
+		log.Printf("WARN: enrichment DB ping failed: %v; /v1/plants/enrichment disabled", err)
+		db.Close()
+		return nil
+	}
+	llm := enrichment.NewLLMClient(openaiKey)
+	cache := enrichment.NewCache(0, 0) // defaults: 10k entries, 30 min TTL
+	log.Printf("enrichment service ready: db pool + LRU cache + LLM %s", enrichment.SourceTag)
+	return enrichment.NewService(content, db, llm, cache)
 }
 
 func envOr(key, def string) string {
