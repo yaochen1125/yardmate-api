@@ -209,3 +209,126 @@ func TestPlantIDClient_Identify_BadResponseJSON(t *testing.T) {
 		t.Errorf("err = %v, want ErrPlantIDBadResponse", err)
 	}
 }
+
+// --- Diagnose ---
+
+// cannedPlantIDDiagnoseOK is a canned Plant.id health_assessment response.
+const cannedPlantIDDiagnoseOK = `{
+  "result": {
+    "is_plant": {"probability": 0.99, "binary": true},
+    "is_healthy": {"probability": 0.12, "binary": false},
+    "classification": {
+      "suggestions": [
+        {"name": "Monstera deliciosa", "probability": 0.96,
+         "details": {"common_names": ["Swiss cheese plant"], "scientific_name": "Monstera deliciosa"}}
+      ]
+    },
+    "disease": {
+      "suggestions": [
+        {"name": "Powdery mildew", "probability": 0.78,
+         "details": {
+           "local_name": "Powdery mildew",
+           "description": "white fungal coating",
+           "cause": "humid + poor airflow",
+           "treatment": {
+             "biological": ["neem oil"],
+             "chemical": ["copper fungicide"],
+             "prevention": ["increase airflow"]
+           }
+         }
+        }
+      ]
+    }
+  }
+}`
+
+func newTestDiagnoseClient(t *testing.T, handler http.HandlerFunc) (*PlantIDClient, *httptest.Server) {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	c := &PlantIDClient{
+		APIKey:           "test-key",
+		Endpoint:         srv.URL,
+		DiagnoseEndpoint: srv.URL,
+		HTTP:             srv.Client(),
+	}
+	return c, srv
+}
+
+func TestPlantIDClient_Diagnose_Success(t *testing.T) {
+	var (
+		gotAPIKey, gotCT string
+		gotBody          []byte
+	)
+	c, srv := newTestDiagnoseClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotAPIKey = r.Header.Get("Api-Key")
+		gotCT = r.Header.Get("Content-Type")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, cannedPlantIDDiagnoseOK)
+	})
+	defer srv.Close()
+
+	api, err := c.Diagnose(context.Background(), []byte("\xFF\xD8\xFF\xE0FAKE"), "image/jpeg")
+	if err != nil {
+		t.Fatalf("Diagnose: %v", err)
+	}
+	if gotAPIKey != "test-key" {
+		t.Errorf("Api-Key = %q", gotAPIKey)
+	}
+	if gotCT != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", gotCT)
+	}
+	if !strings.Contains(string(gotBody), `"images"`) || !strings.Contains(string(gotBody), `"health":"all"`) {
+		t.Errorf("body = %s, want images[] + health:all", gotBody)
+	}
+	if api.Result.IsHealthy.Binary {
+		t.Error("IsHealthy=true, want false (canned response is unhealthy)")
+	}
+	if got, want := len(api.Result.Disease.Suggestions), 1; got != want {
+		t.Errorf("disease suggestions len = %d, want %d", got, want)
+	}
+}
+
+func TestPlantIDClient_Diagnose_Accepts201Created(t *testing.T) {
+	c, srv := newTestDiagnoseClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, cannedPlantIDDiagnoseOK)
+	})
+	defer srv.Close()
+	if _, err := c.Diagnose(context.Background(), []byte("img"), "image/jpeg"); err != nil {
+		t.Fatalf("Diagnose on 201: %v", err)
+	}
+}
+
+func TestPlantIDClient_Diagnose_Unauthorized(t *testing.T) {
+	c, srv := newTestDiagnoseClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	defer srv.Close()
+	_, err := c.Diagnose(context.Background(), []byte("x"), "image/jpeg")
+	if !errors.Is(err, ErrPlantIDUnauthorized) {
+		t.Errorf("err = %v, want ErrPlantIDUnauthorized", err)
+	}
+}
+
+func TestPlantIDClient_Diagnose_ImageRejected_400(t *testing.T) {
+	c, srv := newTestDiagnoseClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	})
+	defer srv.Close()
+	_, err := c.Diagnose(context.Background(), []byte("x"), "image/jpeg")
+	if !errors.Is(err, ErrPlantIDImageRejected) {
+		t.Errorf("err = %v, want ErrPlantIDImageRejected", err)
+	}
+}
+
+func TestPlantIDClient_Diagnose_5xx_Unavailable(t *testing.T) {
+	c, srv := newTestDiagnoseClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	defer srv.Close()
+	_, err := c.Diagnose(context.Background(), []byte("x"), "image/jpeg")
+	if !errors.Is(err, ErrPlantIDUnavailable) {
+		t.Errorf("err = %v, want ErrPlantIDUnavailable", err)
+	}
+}

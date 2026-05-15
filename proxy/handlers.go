@@ -192,3 +192,283 @@ func isUUID(s string) bool {
 	}
 	return true
 }
+
+// --- diagnose (POST /v1/diagnose, SPEC §2.2) ---
+
+// diagnoseMaxBody = identifyMaxBody (same 8 MB image cap + multipart overhead).
+const diagnoseMaxBody = identifyMaxBody
+
+// diagnoseUpstreamTimeout caps the Plant.id call. The handler context is
+// further bounded by the chi RequestID + Logger middleware; vision
+// disambiguation runs inside the same context but has its own client
+// timeout (≤8 s) inside VisionClient.
+const diagnoseUpstreamTimeout = 30 * time.Second
+
+// HandleDiagnose returns the http.HandlerFunc for POST /v1/diagnose.
+// Combines Plant.id v3 health_assessment with YardMate catalog lookups
+// (content) and an optional LLM disambiguation pass (vision). See SPEC §2.2.
+//
+// content / vision may be nil — both are graceful no-ops (plantId stays
+// null, catalogId falls back to name-match only, generic Leaf-spot tail).
+func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *VisionClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, diagnoseMaxBody)
+
+		// X-Device-Install-Id is validated by ratelimit.PerDeviceMiddleware
+		// in server.go; we re-read it here for logging only.
+		deviceID := r.Header.Get("X-Device-Install-Id")
+		appVer := r.Header.Get("X-App-Version")
+		if appVer == "" {
+			writeError(w, http.StatusBadRequest, "missing_app_version")
+			return
+		}
+		// Also accept the legacy device-id check at the handler boundary so
+		// that direct-call tests (without the middleware) still get the
+		// expected 400.
+		if !isUUID(deviceID) {
+			writeError(w, http.StatusBadRequest, "missing_device_id")
+			return
+		}
+		attKeyID := r.Header.Get("X-AppAttest-KeyID")
+		attAssertPresent := r.Header.Get("X-AppAttest-Assertion") != ""
+
+		if !strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+			writeError(w, http.StatusBadRequest, "bad_multipart")
+			return
+		}
+		mr, err := r.MultipartReader()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_multipart")
+			return
+		}
+
+		var imagePart *multipart.Part
+		for {
+			part, perr := mr.NextPart()
+			if perr == io.EOF {
+				break
+			}
+			if perr != nil {
+				if isMaxBytesErr(perr) {
+					writeError(w, http.StatusRequestEntityTooLarge, "image_too_large")
+					return
+				}
+				writeError(w, http.StatusBadRequest, "bad_multipart")
+				return
+			}
+			if part.FormName() == "image" {
+				imagePart = part
+				break
+			}
+			_ = part.Close()
+		}
+		if imagePart == nil {
+			writeError(w, http.StatusBadRequest, "missing_image")
+			return
+		}
+		defer imagePart.Close()
+
+		// Read full image bytes — Diagnose has to base64-encode the body
+		// upstream, so we buffer once here (bounded by the 9 MB cap above).
+		imgBytes, rerr := io.ReadAll(imagePart)
+		if rerr != nil {
+			if isMaxBytesErr(rerr) {
+				writeError(w, http.StatusRequestEntityTooLarge, "image_too_large")
+				return
+			}
+			writeError(w, http.StatusBadRequest, "bad_image")
+			return
+		}
+		if len(imgBytes) < 12 {
+			writeError(w, http.StatusBadRequest, "bad_image")
+			return
+		}
+		// MIME sniff on actual bytes (SPEC §6 pitfall 6) — multipart Content-Type
+		// from the client is untrusted.
+		head := imgBytes
+		if len(head) > 512 {
+			head = head[:512]
+		}
+		mime := http.DetectContentType(head)
+		if mime != "image/jpeg" && mime != "image/png" {
+			writeError(w, http.StatusBadRequest, "bad_image")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), diagnoseUpstreamTimeout)
+		defer cancel()
+
+		api, err := client.Diagnose(ctx, imgBytes, mime)
+		if err != nil {
+			log.Printf("diagnose upstream err: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v err=%v",
+				deviceID, appVer, attKeyID, attAssertPresent, err)
+			switch {
+			case errors.Is(err, ErrPlantIDImageRejected):
+				writeError(w, http.StatusBadRequest, "bad_image")
+			case errors.Is(err, ErrPlantIDUnauthorized):
+				writeError(w, http.StatusBadGateway, "plant_id_unauthorized")
+			case errors.Is(err, ErrPlantIDRateLimit), errors.Is(err, ErrPlantIDUnavailable):
+				writeError(w, http.StatusBadGateway, "plant_id_unavailable")
+			default:
+				writeError(w, http.StatusBadGateway, "plant_id_unavailable")
+			}
+			return
+		}
+
+		result := buildDiagnoseResult(ctx, api, content, vision)
+		log.Printf("diagnose ok: deviceID=%s appVer=%s isHealthy=%v issues=%d plantIdResolved=%v",
+			deviceID, appVer, result.IsHealthy, len(result.Issues), result.PlantID != nil)
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+// buildDiagnoseResult maps a Plant.id /identification health_assessment
+// response into the YardMate-facing DiagnoseResult.
+//
+// Healthy path: issues=[] + Top + plantId populated.
+// Unhealthy path: top-3 disease suggestions from Plant.id; on each, attempt
+// catalog id lookup (name-match, then LLM disambiguation). If Plant.id says
+// unhealthy but returns zero suggestions, fall back to the plant's
+// common_diseases_list[0]; ultimately to generic Leaf-spot (L06).
+func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, content *ContentIndex, vision *VisionClient) *DiagnoseResult {
+	res := &DiagnoseResult{Issues: []HealthIssue{}}
+
+	if len(api.Result.Classification.Suggestions) > 0 {
+		top := api.Result.Classification.Suggestions[0]
+		cn := top.Details.CommonNames
+		if cn == nil {
+			cn = []string{}
+		}
+		res.Top = &PlantSuggestion{
+			Name:           top.Name,
+			ScientificName: top.Details.ScientificName,
+			CommonNames:    cn,
+			Confidence:     top.Probability,
+		}
+		res.IdentifiedName = top.Name
+	}
+
+	if res.IdentifiedName != "" {
+		if id, ok := content.LookupPlantID(res.IdentifiedName); ok {
+			pid := id
+			res.PlantID = &pid
+		}
+	}
+
+	res.HealthProbability = api.Result.IsHealthy.Probability
+	res.IsHealthy = api.Result.IsHealthy.Binary
+
+	if res.IsHealthy {
+		// Healthy path — iOS shows the plant detail with a "this plant is
+		// healthy" toast; no disease card. F-option-2 (诚实 fallback).
+		return res
+	}
+
+	for _, s := range api.Result.Disease.Suggestions {
+		issue := HealthIssue{
+			Name:        s.Name,
+			Probability: s.Probability,
+			Description: diagnoseDescriptionString(s.Details.Description),
+			Cause:       s.Details.Cause,
+			IsFallback:  false,
+			Treatment: Treatment{
+				Biological: nonNil(s.Details.Treatment.Biological),
+				Chemical:   nonNil(s.Details.Treatment.Chemical),
+				Prevention: nonNil(s.Details.Treatment.Prevention),
+			},
+		}
+		issue.CatalogID = mapCatalogID(ctx, s.Name, content, vision)
+		res.Issues = append(res.Issues, issue)
+		if len(res.Issues) >= 3 {
+			break
+		}
+	}
+	if len(res.Issues) > 0 {
+		return res
+	}
+
+	// Plant.id says unhealthy but returned zero disease suggestions —
+	// construct a fallback issue rather than ship an empty Issues array.
+	res.Issues = []HealthIssue{buildFallbackIssue(res.PlantID, content)}
+	return res
+}
+
+// mapCatalogID resolves a Plant.id disease name to a YardMate catalog id.
+// Order: exact/fuzzy name match → LLM disambiguation → nil.
+func mapCatalogID(ctx context.Context, name string, content *ContentIndex, vision *VisionClient) *string {
+	if id, ok := content.LookupCatalogID(name); ok {
+		s := id
+		return &s
+	}
+	if vision == nil || content == nil {
+		return nil
+	}
+	refs := content.AllDiseaseNames()
+	if len(refs) == 0 {
+		return nil
+	}
+	id, err := vision.DisambiguateDiseaseName(ctx, name, refs)
+	if err != nil {
+		log.Printf("diagnose disambiguate err: name=%q err=%v", name, err)
+		return nil
+	}
+	if id == "" {
+		return nil
+	}
+	return &id
+}
+
+// buildFallbackIssue is the unhealthy-but-empty-suggestions tail. Uses the
+// plant's common_diseases_list[0] when known; otherwise the generic L06
+// "Leaf spot" entry; if neither is available, returns a minimal hard-coded
+// shape so the contract (Issues non-empty) is honored.
+func buildFallbackIssue(plantID *string, content *ContentIndex) HealthIssue {
+	emptyTreatment := Treatment{Biological: []string{}, Chemical: []string{}, Prevention: []string{}}
+
+	if content != nil && plantID != nil {
+		if list := content.CommonDiseasesFor(*plantID); len(list) > 0 {
+			if d, ok := content.DiseaseByID(list[0]); ok && d != nil {
+				id := d.ID
+				return HealthIssue{
+					Name:        d.Name,
+					CatalogID:   &id,
+					Probability: 0,
+					Description: d.ShortDescription,
+					Cause:       "",
+					IsFallback:  true,
+					Treatment:   emptyTreatment,
+				}
+			}
+		}
+	}
+	if content != nil {
+		if d, ok := content.DiseaseByID("L06"); ok && d != nil {
+			id := d.ID
+			return HealthIssue{
+				Name:        d.Name,
+				CatalogID:   &id,
+				Probability: 0,
+				Description: d.ShortDescription,
+				Cause:       "",
+				IsFallback:  true,
+				Treatment:   emptyTreatment,
+			}
+		}
+	}
+	return HealthIssue{
+		Name:        "Leaf spot",
+		CatalogID:   nil,
+		Probability: 0,
+		IsFallback:  true,
+		Treatment:   emptyTreatment,
+	}
+}
+
+// nonNil swaps a nil []string for an empty slice so the JSON wire form is
+// `[]` rather than `null`.
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
