@@ -73,7 +73,7 @@ func loadTestContent(t *testing.T) *proxy.ContentIndex {
 func TestService_InvalidScientificName(t *testing.T) {
 	svc := NewService(nil, nil, nil, NewCache(10, time.Hour))
 	for _, name := range []string{"", "   ", "\t\n", "12345", "!!!"} {
-		_, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: name})
+		_, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: name})
 		if !errors.Is(err, ErrInvalidScientificName) {
 			t.Errorf("name=%q: expected ErrInvalidScientificName, got %v", name, err)
 		}
@@ -83,7 +83,7 @@ func TestService_InvalidScientificName(t *testing.T) {
 func TestService_ScientificNameTooLong(t *testing.T) {
 	svc := NewService(nil, nil, nil, NewCache(10, time.Hour))
 	longName := strings.Repeat("a", 201)
-	_, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: longName})
+	_, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: longName})
 	if !errors.Is(err, ErrScientificNameTooLong) {
 		t.Errorf("expected ErrScientificNameTooLong, got %v", err)
 	}
@@ -99,12 +99,15 @@ func TestService_Path0_CacheHit_ShortCircuitsEverything(t *testing.T) {
 	llm := &stubLLM{}
 	svc := NewService(loadTestContent(t), db, llm, cache)
 
-	got, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Cached species"})
+	got, source, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Cached species"})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	if got != cached {
 		t.Error("expected same pointer from cache")
+	}
+	if source != SourceCache {
+		t.Errorf("expected SourceCache, got %q", source)
 	}
 	if len(db.lookupCalls) != 0 {
 		t.Error("DB.Lookup should not run on cache hit")
@@ -119,18 +122,21 @@ func TestService_Path1_CatalogHit_PopulatesCache(t *testing.T) {
 	content := loadTestContent(t)
 	// "Abelia chinensis" is the first row of the curated 1522 catalog (id AAA0001).
 	svc := NewService(content, nil, nil, cache)
-	got, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Abelia chinensis"})
+	got, source, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Abelia chinensis"})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	if got == nil || got.PlantDetailID() != "AAA0001" {
 		t.Errorf("expected id AAA0001, got %v", got)
 	}
+	if source != SourceCatalog {
+		t.Errorf("expected SourceCatalog, got %q", source)
+	}
 	if cache.Len() != 1 {
 		t.Errorf("expected cache len 1, got %d", cache.Len())
 	}
 	// Second call must hit cache (no DB needed because content is still set).
-	if _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Abelia chinensis"}); err != nil {
+	if _, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Abelia chinensis"}); err != nil {
 		t.Fatalf("second call err: %v", err)
 	}
 }
@@ -146,12 +152,15 @@ func TestService_Path2_SupabaseHit_ReturnsRowAndCaches(t *testing.T) {
 	llm := &stubLLM{}
 	svc := NewService(loadTestContent(t), db, llm, cache)
 
-	got, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup nonexistent"})
+	got, source, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup nonexistent"})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	if got != pendingPD {
 		t.Errorf("expected pendingPD pointer, got %v", got)
+	}
+	if source != SourceSupabaseHit {
+		t.Errorf("expected SourceSupabaseHit, got %q", source)
 	}
 	if len(db.lookupCalls) != 1 {
 		t.Errorf("expected 1 lookup, got %d", len(db.lookupCalls))
@@ -175,7 +184,7 @@ func TestService_Path3_FreshGeneration_WhitelistsDiseaseIDs(t *testing.T) {
 	llm := &stubLLM{ret: llmOut}
 	svc := NewService(loadTestContent(t), db, llm, cache)
 
-	got, err := svc.GetOrGenerate(context.Background(), Request{
+	got, source, err := svc.GetOrGenerate(context.Background(), Request{
 		ScientificName: "Madeup another",
 		CommonName:     "lmm test",
 	})
@@ -184,6 +193,9 @@ func TestService_Path3_FreshGeneration_WhitelistsDiseaseIDs(t *testing.T) {
 	}
 	if got != llmOut {
 		t.Errorf("expected llmOut pointer, got %v", got)
+	}
+	if source != SourceSupabaseMissGenerate {
+		t.Errorf("expected SourceSupabaseMissGenerate, got %q", source)
 	}
 
 	// Whitelist: ZZ99 + BADID dropped, L01 + P05 kept (assuming they exist in catalog).
@@ -224,12 +236,15 @@ func TestService_Path3_ConflictRetriesAndReturnsRaceWinner(t *testing.T) {
 	llm := &stubLLM{ret: llmOut}
 	svc := NewService(loadTestContent(t), db, llm, cache)
 
-	got, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup race"})
+	got, source, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup race"})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	if got != raceWinner {
 		t.Errorf("expected raceWinner pointer (from re-lookup), got %v", got)
+	}
+	if source != SourceSupabaseMissGenerateRaceWinner {
+		t.Errorf("expected SourceSupabaseMissGenerateRaceWinner, got %q", source)
 	}
 	if len(db.lookupCalls) != 2 {
 		t.Errorf("expected 2 lookups (path-2 miss + race re-lookup), got %d", len(db.lookupCalls))
@@ -239,7 +254,7 @@ func TestService_Path3_ConflictRetriesAndReturnsRaceWinner(t *testing.T) {
 func TestService_DBLookupError_Propagates(t *testing.T) {
 	db := &stubDB{lookupQ: []dbLookupResult{{err: ErrDBUnavailable}}}
 	svc := NewService(loadTestContent(t), db, nil, NewCache(10, time.Hour))
-	_, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup err"})
+	_, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup err"})
 	if !errors.Is(err, ErrDBUnavailable) {
 		t.Errorf("expected ErrDBUnavailable, got %v", err)
 	}
@@ -249,7 +264,7 @@ func TestService_LLMError_Propagates(t *testing.T) {
 	db := &stubDB{}
 	llm := &stubLLM{err: ErrEnrichmentUnavailable}
 	svc := NewService(loadTestContent(t), db, llm, NewCache(10, time.Hour))
-	_, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup llmerr"})
+	_, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup llmerr"})
 	if !errors.Is(err, ErrEnrichmentUnavailable) {
 		t.Errorf("expected ErrEnrichmentUnavailable, got %v", err)
 	}
@@ -257,7 +272,7 @@ func TestService_LLMError_Propagates(t *testing.T) {
 
 func TestService_NoDB_NoCatalog_ReturnsEnrichmentUnavailable(t *testing.T) {
 	svc := NewService(loadTestContent(t), nil, nil, NewCache(10, time.Hour))
-	_, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup nothing"})
+	_, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup nothing"})
 	if !errors.Is(err, ErrEnrichmentUnavailable) {
 		t.Errorf("expected ErrEnrichmentUnavailable, got %v", err)
 	}

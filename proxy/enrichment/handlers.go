@@ -62,9 +62,10 @@ func HandleEnrichment(svc *Service) http.HandlerFunc {
 		}
 
 		// 5. Delegate to Service.
+		start := time.Now()
 		ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 		defer cancel()
-		result, err := svc.GetOrGenerate(ctx, Request{
+		result, source, err := svc.GetOrGenerate(ctx, Request{
 			ScientificName: req.ScientificName,
 			CommonName:     req.CommonName,
 			PlantIDHint:    req.PlantID,
@@ -75,12 +76,12 @@ func HandleEnrichment(svc *Service) http.HandlerFunc {
 		}
 
 		// 6. Success — single-line structured log (parent SPEC §5.2 forensics).
-		// Log only the scientific name + outcome, NOT the response body
-		// (SPEC §9 #10).
-		log.Printf("enrichment ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v sciName=%q hadCommonName=%v cacheLen=%d",
+		// Log scientific name + source path + latency for forensics; never the
+		// response body (SPEC §9 #10).
+		log.Printf("enrichment ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v sciName=%q source=%s latencyMs=%d hadCommonName=%v cacheLen=%d",
 			deviceID, appVer, attKeyID, attAssertPresent,
-			req.ScientificName, req.CommonName != "",
-			svc.CacheLen(),
+			req.ScientificName, source, time.Since(start).Milliseconds(),
+			req.CommonName != "", svc.CacheLen(),
 		)
 		writeJSON(w, http.StatusOK, result)
 	}

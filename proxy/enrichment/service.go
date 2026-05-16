@@ -23,6 +23,17 @@ var (
 // Maximum trimmed length for scientificName (SPEC §2.1).
 const maxScientificNameLen = 200
 
+// Source identifies which tier of GetOrGenerate's lookup produced the result.
+// Returned alongside the *PlantDetail so handlers can log the path taken
+// (SPEC §9 #10 forensic logging).
+const (
+	SourceCache                          = "cache"
+	SourceCatalog                        = "catalog"
+	SourceSupabaseHit                    = "supabase_hit"
+	SourceSupabaseMissGenerate           = "supabase_miss_generate"
+	SourceSupabaseMissGenerateRaceWinner = "supabase_miss_generate_race_winner"
+)
+
 // Request bundles the validated handler-layer inputs.
 type Request struct {
 	ScientificName string // required; trimmed length 1..200; contains at least one letter
@@ -83,22 +94,25 @@ func NewService(content *proxy.ContentIndex, db ServiceDB, llm ServiceLLM, cache
 // Order: cache -> embedded catalog -> Supabase plants_pending -> OpenAI LLM
 // (with INSERT ON CONFLICT DO NOTHING + re-Lookup on race). The cache is
 // written on every successful path so subsequent calls skip lower tiers.
-func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantDetail, error) {
+//
+// Returns the result plus a Source* string identifying which lookup tier
+// produced it (SPEC §9 #10 forensic logging). On error the source is "".
+func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantDetail, string, error) {
 	name := strings.TrimSpace(req.ScientificName)
 	if name == "" || !hasLetter(name) {
-		return nil, ErrInvalidScientificName
+		return nil, "", ErrInvalidScientificName
 	}
 	if len(name) > maxScientificNameLen {
-		return nil, ErrScientificNameTooLong
+		return nil, "", ErrScientificNameTooLong
 	}
 	normalized := proxy.NormalizeScientificName(name)
 	if normalized == "" {
-		return nil, ErrInvalidScientificName
+		return nil, "", ErrInvalidScientificName
 	}
 
 	// Step 0: in-process LRU cache.
 	if cached, ok := s.cache.Get(normalized); ok {
-		return cached, nil
+		return cached, SourceCache, nil
 	}
 
 	// Step 1: embedded 1522 catalog. ContentIndex.LookupPlantID re-normalizes
@@ -107,7 +121,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		if plantID, ok := s.content.LookupPlantID(name); ok {
 			if full, ok := s.content.LookupFullDetail(plantID); ok {
 				s.cache.Set(normalized, full)
-				return full, nil
+				return full, SourceCatalog, nil
 			}
 			// Index inconsistency (LookupPlantID hit but LookupFullDetail miss).
 			// Fall through; treat as miss rather than crash.
@@ -117,24 +131,24 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	// Step 2: Supabase plants_pending.
 	if s.db == nil {
 		// No DB configured AND not in the catalog -> enrichment unavailable.
-		return nil, ErrEnrichmentUnavailable
+		return nil, "", ErrEnrichmentUnavailable
 	}
 	row, err := s.db.Lookup(ctx, normalized)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if row != nil {
 		s.cache.Set(normalized, row)
-		return row, nil
+		return row, SourceSupabaseHit, nil
 	}
 
 	// Step 3: LLM generation.
 	if s.llm == nil {
-		return nil, ErrEnrichmentUnavailable
+		return nil, "", ErrEnrichmentUnavailable
 	}
 	generated, requestID, err := s.llm.Generate(ctx, name, req.CommonName)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// Whitelist common_diseases_list against the catalog (SPEC §1.1 + §7).
@@ -152,7 +166,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		GenerationReqID: requestID,
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	if !inserted {
@@ -160,16 +174,16 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		// row is now available — return that to keep all callers consistent.
 		if row, lookupErr := s.db.Lookup(ctx, normalized); lookupErr == nil && row != nil {
 			s.cache.Set(normalized, row)
-			return row, nil
+			return row, SourceSupabaseMissGenerateRaceWinner, nil
 		}
 		// Race re-Lookup also failed — return our generated copy. Same shape,
 		// just a different LLM sample.
 		s.cache.Set(normalized, generated)
-		return generated, nil
+		return generated, SourceSupabaseMissGenerate, nil
 	}
 
 	s.cache.Set(normalized, generated)
-	return generated, nil
+	return generated, SourceSupabaseMissGenerate, nil
 }
 
 // filterCatalogDiseaseIDs preserves order, drops entries not in the catalog

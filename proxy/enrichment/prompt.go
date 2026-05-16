@@ -113,7 +113,13 @@ func (c *LLMClient) postChat(ctx context.Context, body any) (string, string, err
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
-		return "", "", fmt.Errorf("status %d body=%s", resp.StatusCode, string(raw))
+		// Truncate the OpenAI error body to keep log lines bounded (SPEC §9 #10:
+		// no full LLM bodies at INFO; error path keeps the same posture).
+		body := string(raw)
+		if len(body) > 256 {
+			body = body[:256] + "...(truncated)"
+		}
+		return "", "", fmt.Errorf("status %d body=%s", resp.StatusCode, body)
 	}
 	var apiResp struct {
 		ID      string `json:"id"`
