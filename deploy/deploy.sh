@@ -41,7 +41,7 @@ if [[ "$mode" != "600" ]]; then
 fi
 
 # Required keys must all be present and non-empty.
-for key in ATTEST_ALLOW_DEV OPENAI_API_KEY PLANT_ID_API_KEY; do
+for key in ATTEST_ALLOW_DEV OPENAI_API_KEY PLANT_ID_API_KEY SUPABASE_DB_URL; do
     val=$(grep -E "^${key}=" "$SECRETS" | head -1 | cut -d= -f2-)
     [[ -n "$val" ]] || die "missing or empty key '$key' in $SECRETS"
 done
