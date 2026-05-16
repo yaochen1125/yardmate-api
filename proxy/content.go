@@ -49,6 +49,11 @@ type ContentIndex struct {
 
 	// diseaseByID gives the full catalog entry by id.
 	diseaseByID map[string]*DiseaseCatalog
+
+	// fullPlantByID gives the full PlantDetail catalog entry by plantId.
+	// Used by the enrichment path-1 lookup (proxy/enrichment/SPEC §2.1
+	// step 2) to short-circuit Supabase + LLM for plants in the 1522 catalog.
+	fullPlantByID map[string]*PlantDetail
 }
 
 // DiseaseCatalog is the subset of diseases.json[*] fields the server consumes
@@ -94,19 +99,23 @@ func LoadContent() (*ContentIndex, error) {
 		sci[key] = p.ID
 	}
 
-	var details []struct {
-		ID                 string   `json:"id"`
-		CommonDiseasesList []string `json:"common_diseases_list"`
-	}
+	// Parse the full plants_detail.json into typed PlantDetail entries.
+	// One parse drives two derived maps: plantId -> common_diseases_list
+	// (for /v1/diagnose F-option-2 fallback) and plantId -> *PlantDetail
+	// (for the enrichment path-1 lookup).
+	var details []PlantDetail
 	if err := json.Unmarshal(plantsDetailRaw, &details); err != nil {
 		return nil, fmt.Errorf("content: plants_detail: %w", err)
 	}
 	pdis := make(map[string][]string, len(details))
-	for _, d := range details {
-		if d.ID == "" {
+	fpd := make(map[string]*PlantDetail, len(details))
+	for i := range details {
+		p := &details[i]
+		if p.ID == nil || *p.ID == "" {
 			continue
 		}
-		pdis[d.ID] = d.CommonDiseasesList
+		pdis[*p.ID] = p.CommonDiseasesList
+		fpd[*p.ID] = p
 	}
 
 	var diseaseFile struct {
@@ -131,6 +140,7 @@ func LoadContent() (*ContentIndex, error) {
 		plantToCommonDiseases: pdis,
 		diseaseNameToID:       dnam,
 		diseaseByID:           diseaseFile.Diseases,
+		fullPlantByID:         fpd,
 	}, nil
 }
 
@@ -208,6 +218,26 @@ func (c *ContentIndex) AllDiseaseNames() []DiseaseNameRef {
 		out = append(out, DiseaseNameRef{ID: id, Name: d.Name})
 	}
 	return out
+}
+
+// NormalizeScientificName is the exported form of the package-private
+// normalizeScientificName helper. The enrichment package uses it to compute
+// the Supabase plants_pending PK in lockstep with catalog lookups — the two
+// MUST share the exact same normalization rules (proxy/enrichment/SPEC §9 #1).
+func NormalizeScientificName(s string) string {
+	return normalizeScientificName(s)
+}
+
+// LookupFullDetail returns the full PlantDetail entry for a catalog plantId
+// (e.g. "AAA0001"), or (nil, false) on miss. Used by the enrichment path-1
+// lookup (proxy/enrichment/SPEC §2.1 step 2) to short-circuit Supabase + LLM
+// for plants already in the curated 1522 catalog.
+func (c *ContentIndex) LookupFullDetail(plantID string) (*PlantDetail, bool) {
+	if c == nil || plantID == "" {
+		return nil, false
+	}
+	p, ok := c.fullPlantByID[plantID]
+	return p, ok
 }
 
 // --- normalization helpers ---

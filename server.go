@@ -9,6 +9,7 @@ import (
 
 	"github.com/yaochen1125/yardmate-api/attest"
 	"github.com/yaochen1125/yardmate-api/proxy"
+	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
@@ -24,6 +25,7 @@ type Server struct {
 	plantID  *proxy.PlantIDClient // optional; nil disables /v1/identify + /v1/diagnose
 	vision   *proxy.VisionClient  // optional; nil disables ai_enhance + LLM catalog disambiguation
 	content  *proxy.ContentIndex  // optional; nil disables plantId/catalogId lookups in /v1/diagnose
+	enrich   *enrichment.Service  // optional; nil disables /v1/plants/enrichment
 	router   chi.Router
 }
 
@@ -38,6 +40,7 @@ func newServer(
 	plantID *proxy.PlantIDClient,
 	vision *proxy.VisionClient,
 	content *proxy.ContentIndex,
+	enrich *enrichment.Service,
 ) *Server {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -69,18 +72,27 @@ func newServer(
 		// here only: these endpoints carry a device install id, and the
 		// double-bucket defends against IP-rotation attackers reusing the
 		// same client install (proxy/SPEC §4.1, ratelimit/SPEC §4).
-		if plantID != nil {
+		// All per-device endpoints share the per-device rate-limit middleware.
+		// /v1/plants/enrichment joins the same group as identify/diagnose so
+		// an attacker rotating IPs is still bounded per-device (SPEC §4.1).
+		if plantID != nil || enrich != nil {
 			r.Group(func(r chi.Router) {
 				r.Use(ratelimit.PerDeviceMiddleware(lim.PerDevice, "rate_limit_device"))
-				r.Post("/identify", proxy.HandleIdentify(plantID, vision))
-				r.Post("/diagnose", proxy.HandleDiagnose(plantID, content, vision))
+				if plantID != nil {
+					r.Post("/identify", proxy.HandleIdentify(plantID, vision))
+					r.Post("/diagnose", proxy.HandleDiagnose(plantID, content, vision))
+				}
+				if enrich != nil {
+					r.Post("/plants/enrichment", enrichment.HandleEnrichment(enrich))
+				}
 			})
 		}
 	})
 
 	return &Server{
 		verifier: verifier, vault: vault, limiter: lim,
-		plantID: plantID, vision: vision, content: content, router: r,
+		plantID: plantID, vision: vision, content: content,
+		enrich: enrich, router: r,
 	}
 }
 
