@@ -530,6 +530,23 @@ const cannedDiagnoseUnhealthyEmpty = `{
   }
 }`
 
+// cannedDiagnoseUnhealthyEmptyUnknownPlant — unhealthy + zero disease
+// suggestions, and a scientific name absent from plants_index.json so
+// plantId resolves to null (exercises the AI full-catalog fallback branch).
+const cannedDiagnoseUnhealthyEmptyUnknownPlant = `{
+  "result": {
+    "is_plant": {"probability": 0.97, "binary": true},
+    "is_healthy": {"probability": 0.18, "binary": false},
+    "classification": {
+      "suggestions": [
+        {"name": "Notaplant fakeium", "probability": 0.80,
+         "details": {"common_names": [], "scientific_name": "Notaplant fakeium"}}
+      ]
+    },
+    "disease": {"suggestions": []}
+  }
+}`
+
 func TestHandleDiagnose_Healthy_EmptyIssues(t *testing.T) {
 	h, srv := newDiagnoseHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, cannedDiagnoseHealthy)
@@ -642,6 +659,160 @@ func TestHandleDiagnose_Unhealthy_EmptySuggestions_FallbackFromPlant(t *testing.
 	}
 	if issue.Name != "Root rot" {
 		t.Errorf("Fallback Name = %q, want Root rot", issue.Name)
+	}
+}
+
+// runDiagnoseFallback drives a full /v1/diagnose request through the handler
+// with the given canned Plant.id upstream + vision client, and returns the
+// decoded result. Shared by the AI-fallback branch/degrade tests below.
+func runDiagnoseFallback(t *testing.T, upstream string, vision *VisionClient) DiagnoseResult {
+	t.Helper()
+	h, srv := newDiagnoseHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, upstream)
+	}, vision)
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/diagnose", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body=%s", rec.Code, rec.Body)
+	}
+	var result DiagnoseResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, rec.Body)
+	}
+	return result
+}
+
+// AI layer engaged: plantId resolves (AAA0001), so the candidate set is the
+// plant's curated common_diseases_list. The model picks P05 (index 1, NOT
+// [0]=R01) — proves the AI pick supersedes the old mechanical [0], and the
+// wire shape stays byte-identical to the static fallback (isFallback=true,
+// Probability 0, empty Cause/Treatment).
+func TestHandleDiagnose_EmptySuggestions_AIPicksFromCommonDiseasesList(t *testing.T) {
+	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"P05"}}]}`)
+	})
+	defer vsrv.Close()
+
+	result := runDiagnoseFallback(t, cannedDiagnoseUnhealthyEmpty, vision)
+	if len(result.Issues) != 1 {
+		t.Fatalf("Issues len = %d, want 1", len(result.Issues))
+	}
+	issue := result.Issues[0]
+	if !issue.IsFallback {
+		t.Error("IsFallback = false, want true")
+	}
+	if issue.CatalogID == nil || *issue.CatalogID != "P05" {
+		t.Errorf("CatalogID = %v, want P05 (AI pick from plant common list, overrides [0]=R01)", issue.CatalogID)
+	}
+	if issue.Name != "Spider mites" {
+		t.Errorf("Name = %q, want Spider mites", issue.Name)
+	}
+	// Contract invariants — identical to the static safety-net shape.
+	if issue.Probability != 0 || issue.Cause != "" {
+		t.Errorf("Probability/Cause = %v/%q, want 0/empty", issue.Probability, issue.Cause)
+	}
+	if issue.Treatment.Biological == nil || len(issue.Treatment.Biological) != 0 ||
+		issue.Treatment.Chemical == nil || issue.Treatment.Prevention == nil {
+		t.Errorf("Treatment = %+v, want empty (non-nil) slices", issue.Treatment)
+	}
+}
+
+// AI returns a valid catalog id (L20) that is NOT in AAA0001's
+// common_diseases_list. With plantId resolved the candidate set is the
+// plant's own list, so L20 is a non-candidate → miss → degrade to the
+// static [0] = R01. Proves the candidate set is constrained per-plant.
+func TestHandleDiagnose_EmptySuggestions_AIOutsideCommonList_Degrades(t *testing.T) {
+	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"L20"}}]}`)
+	})
+	defer vsrv.Close()
+
+	result := runDiagnoseFallback(t, cannedDiagnoseUnhealthyEmpty, vision)
+	issue := result.Issues[0]
+	if !issue.IsFallback {
+		t.Error("IsFallback = false, want true")
+	}
+	if issue.CatalogID == nil || *issue.CatalogID != "R01" {
+		t.Errorf("CatalogID = %v, want R01 (L20 not in plant common list → degrade)", issue.CatalogID)
+	}
+	if issue.Name != "Root rot" {
+		t.Errorf("Name = %q, want Root rot", issue.Name)
+	}
+}
+
+// AI transport error → degrade to the static safety net. Zero regression:
+// identical to the pre-AI result for this input (R01 "Root rot").
+func TestHandleDiagnose_EmptySuggestions_AIError_Degrades(t *testing.T) {
+	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	defer vsrv.Close()
+
+	result := runDiagnoseFallback(t, cannedDiagnoseUnhealthyEmpty, vision)
+	issue := result.Issues[0]
+	if !issue.IsFallback || issue.CatalogID == nil || *issue.CatalogID != "R01" || issue.Name != "Root rot" {
+		t.Errorf("issue = %+v, want R01 Root rot isFallback=true (AI error → safety net)", issue)
+	}
+}
+
+// AI replies NONE → degrade to the static safety net (R01 "Root rot").
+func TestHandleDiagnose_EmptySuggestions_AINone_Degrades(t *testing.T) {
+	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"NONE"}}]}`)
+	})
+	defer vsrv.Close()
+
+	result := runDiagnoseFallback(t, cannedDiagnoseUnhealthyEmpty, vision)
+	issue := result.Issues[0]
+	if !issue.IsFallback || issue.CatalogID == nil || *issue.CatalogID != "R01" || issue.Name != "Root rot" {
+		t.Errorf("issue = %+v, want R01 Root rot isFallback=true (NONE → safety net)", issue)
+	}
+}
+
+// plantId miss → candidate set is the full ~70-entry catalog. The model
+// picks L20 ("Powdery mildew"), which is a valid catalog id but not any
+// plant's [0] — proves the miss branch uses the full catalog, not an empty
+// per-plant list.
+func TestHandleDiagnose_EmptySuggestions_PlantIdMiss_AIFullCatalog(t *testing.T) {
+	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"L20"}}]}`)
+	})
+	defer vsrv.Close()
+
+	result := runDiagnoseFallback(t, cannedDiagnoseUnhealthyEmptyUnknownPlant, vision)
+	if result.PlantID != nil {
+		t.Errorf("PlantID = %v, want nil (unknown plant)", result.PlantID)
+	}
+	issue := result.Issues[0]
+	if !issue.IsFallback || issue.CatalogID == nil || *issue.CatalogID != "L20" || issue.Name != "Powdery mildew" {
+		t.Errorf("issue = %+v, want L20 Powdery mildew isFallback=true (AI full-catalog pick)", issue)
+	}
+}
+
+// plantId miss + AI error → degrade. plantId is nil so the [0] branch is
+// skipped; safety net lands on generic L06 "Leaf spot" (unchanged pre-AI
+// behavior for the unknown-plant case).
+func TestHandleDiagnose_EmptySuggestions_PlantIdMiss_AIError_DegradesToL06(t *testing.T) {
+	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	defer vsrv.Close()
+
+	result := runDiagnoseFallback(t, cannedDiagnoseUnhealthyEmptyUnknownPlant, vision)
+	if result.PlantID != nil {
+		t.Errorf("PlantID = %v, want nil", result.PlantID)
+	}
+	issue := result.Issues[0]
+	if !issue.IsFallback || issue.CatalogID == nil || *issue.CatalogID != "L06" || issue.Name != "Leaf spot" {
+		t.Errorf("issue = %+v, want L06 Leaf spot isFallback=true (miss + AI error → L06)", issue)
 	}
 }
 

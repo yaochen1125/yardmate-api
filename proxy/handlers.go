@@ -371,8 +371,9 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 // Healthy path: issues=[] + Top + plantId populated.
 // Unhealthy path: top-3 disease suggestions from Plant.id; on each, attempt
 // catalog id lookup (name-match, then LLM disambiguation). If Plant.id says
-// unhealthy but returns zero suggestions, fall back to the plant's
-// common_diseases_list[0]; ultimately to generic Leaf-spot (L06).
+// unhealthy but returns zero suggestions, an AI layer picks the single most
+// likely disease (candidate set narrows when plantId resolves), with the
+// static common_diseases_list[0] → L06 chain as the graceful safety net.
 func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, content *ContentIndex, vision *VisionClient) *DiagnoseResult {
 	res := &DiagnoseResult{Issues: []HealthIssue{}}
 
@@ -432,7 +433,7 @@ func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, cont
 
 	// Plant.id says unhealthy but returned zero disease suggestions —
 	// construct a fallback issue rather than ship an empty Issues array.
-	res.Issues = []HealthIssue{buildFallbackIssue(res.PlantID, content)}
+	res.Issues = []HealthIssue{buildFallbackIssue(ctx, res.PlantID, res.IdentifiedName, res.HealthProbability, content, vision)}
 	return res
 }
 
@@ -461,41 +462,72 @@ func mapCatalogID(ctx context.Context, name string, content *ContentIndex, visio
 	return &id
 }
 
-// buildFallbackIssue is the unhealthy-but-empty-suggestions tail. Uses the
-// plant's common_diseases_list[0] when known; otherwise the generic L06
-// "Leaf spot" entry; if neither is available, returns a minimal hard-coded
-// shape so the contract (Issues non-empty) is honored.
-func buildFallbackIssue(plantID *string, content *ContentIndex) HealthIssue {
-	emptyTreatment := Treatment{Biological: []string{}, Chemical: []string{}, Prevention: []string{}}
+// fallbackIssueFrom builds the canonical isFallback=true HealthIssue from a
+// catalog entry. The AI-suggested pick and the static [0]/L06 safety net
+// both go through this, so the wire shape is byte-identical regardless of
+// how the disease was chosen — the iOS client cannot tell them apart and
+// the /v1/diagnose response contract is unchanged (SPEC §2.2).
+func fallbackIssueFrom(d *DiseaseCatalog) HealthIssue {
+	id := d.ID
+	return HealthIssue{
+		Name:        d.Name,
+		CatalogID:   &id,
+		Probability: 0,
+		Description: d.ShortDescription,
+		Cause:       "",
+		IsFallback:  true,
+		Treatment:   Treatment{Biological: []string{}, Chemical: []string{}, Prevention: []string{}},
+	}
+}
 
+// buildFallbackIssue is the unhealthy-but-empty-suggestions tail (SPEC §2.2).
+//
+// An AI layer picks the single most likely disease, constrained to a
+// candidate set that narrows when plantId resolves:
+//   - plantId resolved → that plant's curated common_diseases_list
+//     (plant-grounded; replaces the old mechanical [0] pick);
+//   - plantId miss      → the full ~70-entry catalog, chosen by plant name.
+//
+// The static common_diseases_list[0] → L06 → hard-coded chain is the safety
+// net below the AI layer: every case that worked before still works if
+// vision is nil (no OPENAI key) / errors / times out / replies NONE /
+// hallucinates an id. Output shape is identical either way
+// (fallbackIssueFrom), so the client + contract never see the difference.
+func buildFallbackIssue(ctx context.Context, plantID *string, plantName string, healthProb float64, content *ContentIndex, vision *VisionClient) HealthIssue {
+	if content != nil && vision != nil && plantName != "" {
+		var refs []DiseaseNameRef
+		if plantID != nil {
+			for _, id := range content.CommonDiseasesFor(*plantID) {
+				if d, ok := content.DiseaseByID(id); ok && d != nil {
+					refs = append(refs, DiseaseNameRef{ID: d.ID, Name: d.Name})
+				}
+			}
+		} else {
+			refs = content.AllDiseaseNames()
+		}
+		if len(refs) > 0 {
+			id, err := vision.SuggestCommonDisease(ctx, plantName, healthProb, refs)
+			if err != nil {
+				log.Printf("diagnose fallback ai err: plant=%q plantIdResolved=%v err=%v", plantName, plantID != nil, err)
+			} else if id != "" {
+				if d, ok := content.DiseaseByID(id); ok && d != nil {
+					return fallbackIssueFrom(d)
+				}
+			}
+		}
+	}
+
+	// Safety net — unchanged from pre-AI behavior.
 	if content != nil && plantID != nil {
 		if list := content.CommonDiseasesFor(*plantID); len(list) > 0 {
 			if d, ok := content.DiseaseByID(list[0]); ok && d != nil {
-				id := d.ID
-				return HealthIssue{
-					Name:        d.Name,
-					CatalogID:   &id,
-					Probability: 0,
-					Description: d.ShortDescription,
-					Cause:       "",
-					IsFallback:  true,
-					Treatment:   emptyTreatment,
-				}
+				return fallbackIssueFrom(d)
 			}
 		}
 	}
 	if content != nil {
 		if d, ok := content.DiseaseByID("L06"); ok && d != nil {
-			id := d.ID
-			return HealthIssue{
-				Name:        d.Name,
-				CatalogID:   &id,
-				Probability: 0,
-				Description: d.ShortDescription,
-				Cause:       "",
-				IsFallback:  true,
-				Treatment:   emptyTreatment,
-			}
+			return fallbackIssueFrom(d)
 		}
 	}
 	return HealthIssue{
@@ -503,7 +535,7 @@ func buildFallbackIssue(plantID *string, content *ContentIndex) HealthIssue {
 		CatalogID:   nil,
 		Probability: 0,
 		IsFallback:  true,
-		Treatment:   emptyTreatment,
+		Treatment:   Treatment{Biological: []string{}, Chemical: []string{}, Prevention: []string{}},
 	}
 }
 

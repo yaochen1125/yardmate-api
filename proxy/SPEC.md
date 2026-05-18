@@ -189,9 +189,14 @@ Top-3 issues max. Issues are guaranteed non-empty when `isHealthy=false`.
 
 - `isHealthy=true` → `issues=[]`. iOS shows the healthy toast on the detail page.
 - `isHealthy=false` AND Plant.id returned at least one suggestion → top-3 suggestions are mapped through the catalogId logic above and shipped. `isFallback=false`.
-- `isHealthy=false` AND Plant.id returned **zero** disease suggestions → server constructs one `isFallback=true` issue. Source order: (a) the plant's `common_diseases_list[0]` from `plants_detail.json` if `plantId` is known; (b) generic L06 "Leaf spot"; (c) a minimal hard-coded leaf-spot shape if even L06 is unavailable (defensive — should not happen with the embedded catalog).
+- `isHealthy=false` AND Plant.id returned **zero** disease suggestions → server synthesizes one `isFallback=true` issue. An **AI layer** (text-only `VisionClient.SuggestCommonDisease`, same OpenAI client + key-stays-server model as the catalogId disambiguation above) picks the single most likely disease, hard-constrained to a candidate catalog that narrows by `plantId` resolution:
+  - `plantId` resolved → candidates = that plant's curated `common_diseases_list` from `plants_detail.json` (plant-grounded; **supersedes the old mechanical `[0]` pick**);
+  - `plantId` miss → candidates = the full ~70-entry `diseases.json` catalog, inferred from `identifiedName` + `healthProbability` context.
+- That AI layer **degrades to the unchanged static safety net** on any of: `NONE` / malformed / hallucinated (non-candidate) reply, transport error / timeout, or a nil vision client (no `OPENAI_API_KEY`). Safety-net source order (pre-AI behavior, unchanged): (a) the plant's `common_diseases_list[0]` if `plantId` is known; (b) generic L06 "Leaf spot"; (c) a minimal hard-coded leaf-spot shape if even L06 is unavailable (defensive — should not happen with the embedded catalog). **Every case that resolved before the AI layer resolves identically when the AI layer is unavailable — zero regression.**
 
 The server **never** ships `isHealthy=false` with an empty `issues` array.
+
+The synthesized issue's wire shape is **byte-identical** whether the disease was chosen by the AI layer or the static safety net (`isFallback: true`, same fields, only *which* catalog entry differs). The iOS client cannot distinguish the two and the `/v1/diagnose` response contract is unchanged — the AI never leaks into the response (no extra fields, no flag, API key stays server-side).
 
 ---
 
