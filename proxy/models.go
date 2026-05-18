@@ -16,11 +16,19 @@ type IdentifyResult struct {
 }
 
 // Suggestion is one plant-identification suggestion. Top-3 only per SPEC §2.1.
+//
+// PlantID is the YardMate catalog plantId resolved from ScientificName by the
+// HTTP handler (NOT PlantIDClient) via ContentIndex.LookupPlantID — the same
+// resolver /v1/diagnose uses. Per-suggestion (not top-level) because the three
+// candidates are distinct plants and the client navigates by the selected one
+// (SPEC §2.1 "plant_id mapping" + §7). nil → JSON null on a catalog miss; the
+// iOS client must tolerate null and must not render an empty detail page.
 type Suggestion struct {
 	Name           string   `json:"name"`
 	ScientificName string   `json:"scientific_name"`
 	CommonNames    []string `json:"common_names"`
 	Confidence     float64  `json:"confidence"`
+	PlantID        *string  `json:"plant_id"`
 }
 
 // --- diagnose (POST /v1/diagnose, SPEC §2.2) ---
@@ -143,8 +151,9 @@ type plantIDAPIResponse struct {
 
 // toIdentifyResult sanitizes Plant.id's raw response into the V1 client shape.
 // Top-3 suggestions max (SPEC §2.1). common_names is normalized to non-nil
-// (empty slice instead of null on the wire). AIEnhancedAt is left nil here;
-// the handler sets it after the optional rerank.
+// (empty slice instead of null on the wire). AIEnhancedAt and per-suggestion
+// PlantID are left nil here; the handler fills them (PlantID via ContentIndex
+// after the optional rerank, AIEnhancedAt after the rerank itself).
 func (r *plantIDAPIResponse) toIdentifyResult() *IdentifyResult {
 	const maxSuggestions = 3
 

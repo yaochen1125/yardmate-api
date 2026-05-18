@@ -33,12 +33,18 @@ const identifyUpstreamTimeout = 30 * time.Second
 //   - App Attest assertion headers are read + logged for forensics. V1 does
 //     NOT call attest.VerifyAssertion (iOS 26 issue, memory option_d_progress.md).
 //
+// content is optional. When non-nil, each suggestion's scientific_name is
+// resolved to a YardMate plantId via ContentIndex.LookupPlantID — the same
+// resolver /v1/diagnose uses (SPEC §2.1 "plant_id mapping"). A catalog miss
+// (or nil content) leaves that suggestion's plant_id null; it never changes
+// the 200 contract. LookupPlantID is nil-safe so no guard is needed here.
+//
 // vision is optional. When non-nil AND the request sets ai_enhance=true, the
 // handler asks OpenAI to rerank the Plant.id top-N candidates against the
 // uploaded image and re-orders Suggestions so the LLM pick is first. On any
 // LLM error / timeout the original Plant.id ranking is preserved and
 // AIEnhancedAt stays null in the response.
-func HandleIdentify(client *PlantIDClient, vision *VisionClient) http.HandlerFunc {
+func HandleIdentify(client *PlantIDClient, content *ContentIndex, vision *VisionClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 1. Body cap (drops the connection on overflow, returning *MaxBytesError
 		//    on the next Read so we can map to image_too_large).
@@ -185,9 +191,22 @@ func HandleIdentify(client *PlantIDClient, vision *VisionClient) http.HandlerFun
 			}
 		}
 
+		// 7b. Resolve YardMate plantId per suggestion from scientific_name
+		//     (SPEC §2.1 "plant_id mapping"). Same resolver /v1/diagnose uses
+		//     at the handler layer; content/LookupPlantID are nil-safe. Done
+		//     after the optional rerank but order-independent (per-suggestion).
+		plantIDsResolved := 0
+		for i := range result.Suggestions {
+			if id, ok := content.LookupPlantID(result.Suggestions[i].ScientificName); ok {
+				pid := id
+				result.Suggestions[i].PlantID = &pid
+				plantIDsResolved++
+			}
+		}
+
 		// 8. Success — single-line structured log (SPEC §5.2 forensics).
-		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v mime=%s isPlant=%v suggestions=%d aiEnhanced=%v",
-			deviceID, appVer, attKeyID, attAssertPresent, mime, result.IsPlant, len(result.Suggestions), result.AIEnhancedAt != nil)
+		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v mime=%s isPlant=%v suggestions=%d plantIdsResolved=%d aiEnhanced=%v",
+			deviceID, appVer, attKeyID, attAssertPresent, mime, result.IsPlant, len(result.Suggestions), plantIDsResolved, result.AIEnhancedAt != nil)
 		writeJSON(w, http.StatusOK, result)
 	}
 }
