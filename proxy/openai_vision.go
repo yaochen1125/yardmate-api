@@ -13,17 +13,21 @@ import (
 )
 
 // VisionClient wraps OpenAI's chat/completions endpoint for vision-capable
-// model calls. Two use cases today:
+// model calls. Three use cases today:
 //
 //  1. RerankIdentify (commit-3 path) — given the uploaded image + Plant.id top-N
 //     candidates, return the one the model judges most likely.
 //  2. DisambiguateDiseaseName — text-only call mapping a Plant.id disease name
 //     to one of the 70 YardMate catalog ids when normalization missed.
+//  3. SuggestCommonDisease — text-only call picking the single most likely
+//     disease for a plant from a candidate catalog, when Plant.id flags the
+//     plant unhealthy but returns zero specific suggestions (SPEC §2.2).
 //
 // The API key never leaves the server. All errors are returned to callers
 // for them to decide whether to fall back gracefully (RerankIdentify →
 // AIEnhancedAt=null + Plant.id raw result; DisambiguateDiseaseName →
-// CatalogID=null + generic Leaf-spot fallback).
+// CatalogID=null + generic Leaf-spot fallback; SuggestCommonDisease →
+// static common_diseases_list[0] → L06 safety net).
 type VisionClient struct {
 	APIKey   string
 	Endpoint string
@@ -204,6 +208,71 @@ func (c *VisionClient) DisambiguateDiseaseName(ctx context.Context, plantIDName 
 		}
 	}
 	// LLM hallucinated an id outside the catalog — treat as miss.
+	return "", nil
+}
+
+// SuggestCommonDisease asks the model (text-only) to infer the single most
+// likely disease for a plant species, constrained to a candidate catalog.
+// Drives the unhealthy-but-zero-Plant.id-suggestions fallback (SPEC §2.2):
+// callers pass the plant's curated common_diseases_list as refs when the
+// plantId resolved, or the full ~70-entry catalog on a plantId miss.
+//
+// Reply is constrained to a single catalog id token (like "L20" / "P05"),
+// or "NONE" when nothing fits. Returns ("", nil) on a NONE / malformed /
+// hallucinated-id reply so the caller degrades to the static
+// common_diseases_list[0] → L06 safety net. All transport errors are
+// returned to the caller for the same graceful degrade (the diagnose
+// handler never ships isHealthy=false with an empty issues array).
+func (c *VisionClient) SuggestCommonDisease(ctx context.Context, plantName string, healthProb float64, refs []DiseaseNameRef) (string, error) {
+	if c == nil {
+		return "", fmt.Errorf("vision: nil client")
+	}
+	if strings.TrimSpace(plantName) == "" {
+		return "", fmt.Errorf("vision: empty plant name")
+	}
+	if len(refs) == 0 {
+		return "", fmt.Errorf("vision: empty refs")
+	}
+
+	var b strings.Builder
+	for _, r := range refs {
+		b.WriteString(r.ID)
+		b.WriteString(": ")
+		b.WriteString(r.Name)
+		b.WriteByte('\n')
+	}
+
+	sys := "You are a plant pathology assistant. A diagnosis found the plant unhealthy but returned no specific disease. From the fixed candidate catalog only, pick the SINGLE most likely disease for this plant species. Reply ONLY with the catalog id (like 'L20' or 'P05'). If nothing in the catalog is a plausible fit, reply 'NONE'. No commentary."
+	user := fmt.Sprintf("Plant: %s\nHealth probability: %.2f (lower = more likely diseased)\n\nCandidate catalog:\n%s\nReply with the single best-matching catalog id, or NONE.", plantName, healthProb, b.String())
+
+	body := openAIChatRequest{
+		Model:     c.Model,
+		MaxTokens: 10,
+		Messages: []openAIChatRequestMsg{
+			{Role: "system", Content: sys},
+			{Role: "user", Content: user},
+		},
+	}
+
+	pick, err := c.post(ctx, body)
+	if err != nil {
+		return "", err
+	}
+	pick = strings.TrimSpace(strings.ToUpper(pick))
+	// First whitespace/punct-delimited token (model occasionally trails prose
+	// like "L20 — Powdery mildew").
+	if i := strings.IndexAny(pick, " \t\n,.;"); i > 0 {
+		pick = pick[:i]
+	}
+	if pick == "" || pick == "NONE" {
+		return "", nil
+	}
+	for _, r := range refs {
+		if r.ID == pick {
+			return pick, nil
+		}
+	}
+	// LLM hallucinated an id outside the candidate set — treat as miss.
 	return "", nil
 }
 
