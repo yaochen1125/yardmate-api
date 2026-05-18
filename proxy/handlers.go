@@ -511,6 +511,10 @@ func buildFallbackIssue(ctx context.Context, plantID *string, plantName string, 
 				log.Printf("diagnose fallback ai err: plant=%q plantIdResolved=%v err=%v", plantName, plantID != nil, err)
 			} else if id != "" {
 				if d, ok := content.DiseaseByID(id); ok && d != nil {
+					// Success log mirrors the "ai err" line so prod can measure
+					// AI-fallback trigger rate + pick distribution (resolved vs
+					// miss) on this rare path without a metrics backend.
+					log.Printf("diagnose fallback ai ok: plant=%q plantIdResolved=%v catalogId=%s", plantName, plantID != nil, d.ID)
 					return fallbackIssueFrom(d)
 				}
 			}
