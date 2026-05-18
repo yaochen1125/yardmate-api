@@ -1,6 +1,6 @@
 # `proxy` package — server-side proxy for Plant.id + OpenAI vision (V1)
 
-> Status: **shipped** (initial proxy `f4e4f35` 2026-05-14, deployed to `api.yardmate.ai`; diagnose + ai_enhance + per-device rate limit added 2026-05-15).
+> Status: **shipped** (initial proxy `f4e4f35` 2026-05-14, deployed to `api.yardmate.ai`; diagnose + ai_enhance + per-device rate limit added 2026-05-15; per-suggestion `plant_id` on `/v1/identify` added 2026-05-18, redeploy required).
 > Companion (client): `yardmate-swiftui/app/YardMate/YardMate/Identify/SPEC.md` and the camera / recognition / disease-detail Feature docs under `docs/releases/v1/main-navigation/snap/`.
 > Background: this package replaces the D-Server "key vending" flow (`/v1/app-secrets`) for V1, because the iOS 26 App Attest assertion verification path is blocked by an upstream issue (see memory `option_d_progress.md`). The `secrets` package + `/v1/app-secrets` endpoint stay compiled in and tested but are marked **deprecated for V1**. Revival when Apple addresses the iOS 26 assertion behavior.
 
@@ -10,7 +10,7 @@
 
 ### 1.1 What this package is responsible for
 
-- Accept image upload from the iOS client, forward to Plant.id v3 for plant identification, sanitize the response, return to client (`POST /v1/identify`).
+- Accept image upload from the iOS client, forward to Plant.id v3 for plant identification, sanitize the response, resolve each suggestion's `scientific_name` to a YardMate `plantId` (same catalog resolver as `/v1/diagnose`, §2.1), return to client (`POST /v1/identify`).
 - Accept image upload from the iOS client, forward to Plant.id v3 with `health=all`, cross-reference Plant.id's disease names against the YardMate catalog (1522 plants × 70 disease entries embedded at build time), and return a normalized `DiagnoseResult` with `plantId` / `catalogId` mapping (`POST /v1/diagnose`).
 - Apply optional LLM post-processing when the operator-configured OpenAI key is present: rerank Plant.id top-N candidates on `/v1/identify?ai_enhance=true`, and disambiguate Plant.id disease names that don't match the YardMate catalog on `/v1/diagnose`.
 - Enforce two-layer rate limit (per-IP and per-device, both at the /v1 router scope; see §4.1) and a hard 8 MB image size cap on every endpoint.
@@ -45,7 +45,7 @@ All HTTP body parsing and header extraction happens in `handlers.go` (HTTP layer
 
 | Function | Output | Error cases |
 |---|---|---|
-| `Identify(...)` | `*IdentifyResult` (suggestions list + is_plant flag + `ai_enhanced_at`) | `ErrPlantIDImageRejected`, `ErrPlantIDUnauthorized`, `ErrPlantIDUnavailable`, `ErrPlantIDRateLimit`, `ErrPlantIDBadResponse` |
+| `Identify(...)` | `*IdentifyResult` (suggestions list + is_plant flag + `ai_enhanced_at`); per-suggestion `plant_id` is left nil here and filled by the HTTP handler from `ContentIndex` (like `ai_enhanced_at`), not by `PlantIDClient` | `ErrPlantIDImageRejected`, `ErrPlantIDUnauthorized`, `ErrPlantIDUnavailable`, `ErrPlantIDRateLimit`, `ErrPlantIDBadResponse` |
 | `Diagnose(...)` | `*plantIDDiagnoseResponse` (raw upstream shape, sanitized in handler into `DiagnoseResult`) | same set as `Identify` |
 | `VisionClient.RerankIdentify(...)` | picked candidate name or `error` (handler keeps Plant.id ordering on error) | network / non-200 / decode / hallucinated pick |
 | HTTP `/v1/identify` | 200 JSON (see §2.1) | 4xx/5xx per §3 |
@@ -57,7 +57,7 @@ All HTTP body parsing and header extraction happens in `handlers.go` (HTTP layer
 - **OpenAI chat-completions (vision)** — `POST https://api.openai.com/v1/chat/completions` with `gpt-4o-2024-08-06`. Used for `ai_enhance` rerank (multimodal) and `/v1/diagnose` catalog-id disambiguation (text-only). 8 s client timeout.
 - `github.com/yaochen1125/yardmate-api/secrets` — for `PLANT_ID_API_KEY` and `OPENAI_API_KEY` at startup (keys never returned to clients).
 - `github.com/yaochen1125/yardmate-api/ratelimit` — per-IP middleware on the `/v1` scope plus per-device middleware on the proxy endpoint group (`/v1/identify`, `/v1/diagnose`).
-- **Embedded catalog JSON** (`proxy/data/{plants_index,plants_detail,diseases}.json`) — built into the binary via `//go:embed`. ~10 MB binary footprint, lookup map built once at startup.
+- **Embedded catalog JSON** (`proxy/data/{plants_index,plants_detail,diseases}.json`) — built into the binary via `//go:embed`. ~10 MB binary footprint, lookup map built once at startup. `plants_index.json` now backs the `plant_id` resolution on **both** `/v1/identify` (per-suggestion) and `/v1/diagnose`.
 - Standard library only for HTTP / JSON / multipart / context (no third-party SDK).
 
 ---
@@ -91,7 +91,8 @@ All HTTP body parsing and header extraction happens in `handlers.go` (HTTP layer
       "name": "Monstera deliciosa",
       "scientific_name": "Monstera deliciosa",
       "common_names": ["Swiss cheese plant", "Split-leaf philodendron"],
-      "confidence": 0.94
+      "confidence": 0.94,
+      "plant_id": "AAA0234"
     }
   ],
   "ai_enhanced_at": "2026-05-15T12:34:56Z"
@@ -112,6 +113,16 @@ If `is_plant_confidence < 0.5` server still returns the top suggestions (UI deci
 **Rerank behavior:**
 
 The handler passes the same image bytes plus the Plant.id top-3 names + scientific names to `gpt-4o-2024-08-06` (vision). The model is constrained to reply with one of the candidate names verbatim. If the model picks a name that matches a candidate (exact-name or case-insensitive contains), that candidate is moved to index 0 of `suggestions` — its `confidence` is **not** rewritten (it remains the Plant.id-assigned probability).
+
+**`plant_id` mapping** (per-suggestion `scientific_name` → YardMate `plantId`):
+
+Each suggestion carries its own `plant_id` because the three candidates are distinct plants — the iOS client navigates to plant-detail by the *selected* suggestion's id, so a single top-level id would be wrong when the user picks candidate #2 or #3.
+
+1. Resolved in the HTTP handler (not in `PlantIDClient`) from `suggestion.scientific_name` via `ContentIndex.LookupPlantID` — the **same resolver `/v1/diagnose` uses** (§2.2). Match against the embedded `plants_index.json` (1522 entries) is case-insensitive.
+2. Fuzzy match with the shared `normalizeScientificName`: lowercased, trimmed, hybrid markers (`×` / stand-alone `x`) dropped, variety / cultivar / subspecies suffixes stripped (`var. X`, `cv. X`, `subsp. X`, `ssp. X`, `f. X`, `forma X`). Identify and diagnose MUST stay on the one normalizer so a name resolves identically on both endpoints.
+3. `plant_id: null` on miss (plant outside the 1522 catalog) — the iOS client must tolerate this and fall back to the enrichment path / a not-found state; it must **not** render an empty detail page.
+
+`plant_id` resolution failures never change the 200 contract: a miss is `null`, the same as the rerank soft-degrade leaving `ai_enhanced_at: null`.
 
 ### 2.2 `POST /v1/diagnose`
 
@@ -329,6 +340,7 @@ When V1.1+ adds adaptive risk scoring or per-user identity (sign-in), these beco
 - **Embedded catalog over CDN fetch at runtime.** `proxy/data/*.json` ships in the binary (~10 MB). Runtime CDN dependency would make `/v1/diagnose` unable to serve when jsDelivr is degraded; we'd rather redeploy when the catalog grows.
 - **F-option-2 (honest fallback).** Healthy plants get `issues: []`; iOS handles the "this plant is healthy" UX. Server never manufactures a fake disease for a healthy plant. Only the unhealthy-but-empty-suggestions case synthesizes a fallback (and marks `isFallback: true`).
 - **No LLM rerank `confidence` rewrite.** When the rerank promotes a candidate, its Plant.id-assigned `confidence` stays. We trust Plant.id's probability calibration more than the LLM's.
+- **`plant_id` is per-suggestion on `/v1/identify`, not a top-level field.** The three candidates are distinct plants; the iOS client navigates by the *selected* suggestion's id. A top-level id would be correct only for `suggestions[0]` and break candidate #2/#3 selection. `/v1/diagnose` keeps its single top-level `plantId` because it identifies exactly one plant. Both endpoints share `ContentIndex.LookupPlantID` / `normalizeScientificName` — one resolver, one normalization, so a name maps identically on both.
 
 ---
 

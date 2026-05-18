@@ -79,7 +79,7 @@ func newServer(
 			r.Group(func(r chi.Router) {
 				r.Use(ratelimit.PerDeviceMiddleware(lim.PerDevice, "rate_limit_device"))
 				if plantID != nil {
-					r.Post("/identify", proxy.HandleIdentify(plantID, vision))
+					r.Post("/identify", proxy.HandleIdentify(plantID, content, vision))
 					r.Post("/diagnose", proxy.HandleDiagnose(plantID, content, vision))
 				}
 				if enrich != nil {

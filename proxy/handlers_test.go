@@ -50,7 +50,11 @@ func newIdentifyHandlerWithVision(t *testing.T, upstream http.HandlerFunc, visio
 		Endpoint: srv.URL,
 		HTTP:     srv.Client(),
 	}
-	return HandleIdentify(c, vision), srv
+	content, err := LoadContent()
+	if err != nil {
+		t.Fatalf("LoadContent: %v", err)
+	}
+	return HandleIdentify(c, content, vision), srv
 }
 
 func TestHandleIdentify_Success(t *testing.T) {
@@ -77,6 +81,60 @@ func TestHandleIdentify_Success(t *testing.T) {
 	}
 	if !result.IsPlant || len(result.Suggestions) != 3 {
 		t.Errorf("result = %+v, want IsPlant=true + 3 suggestions", result)
+	}
+}
+
+// TestHandleIdentify_ResolvesPlantID covers SPEC §2.1 "plant_id mapping":
+// a catalog scientific_name resolves to its YardMate plantId (same resolver
+// /v1/diagnose uses), a name outside the 1522 catalog stays null, and the
+// wire key is snake_case `plant_id`. "Abelia chinensis" → "AAA0001" is the
+// same fixture content_test.go + the diagnose plantId test rely on.
+func TestHandleIdentify_ResolvesPlantID(t *testing.T) {
+	const canned = `{
+  "result": {
+    "is_plant": {"probability": 0.98, "binary": true},
+    "classification": {
+      "suggestions": [
+        {"name": "Abelia chinensis", "probability": 0.91,
+         "details": {"common_names": ["Chinese Abelia"], "scientific_name": "Abelia chinensis"}},
+        {"name": "Zzzz nonexistent", "probability": 0.04,
+         "details": {"common_names": [], "scientific_name": "Zzzz nonexistent plantii"}}
+      ]
+    }
+  }
+}`
+	h, srv := newIdentifyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, canned)
+	})
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(result.Suggestions) != 2 {
+		t.Fatalf("suggestions = %d, want 2", len(result.Suggestions))
+	}
+	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0001" {
+		t.Errorf("suggestions[0].PlantID = %v, want AAA0001 (Abelia chinensis)", result.Suggestions[0].PlantID)
+	}
+	if result.Suggestions[1].PlantID != nil {
+		t.Errorf("suggestions[1].PlantID = %q, want nil (catalog miss)", *result.Suggestions[1].PlantID)
+	}
+	if !strings.Contains(rec.Body.String(), `"plant_id":"AAA0001"`) {
+		t.Errorf("wire body missing \"plant_id\":\"AAA0001\"; body=%s", rec.Body.String())
 	}
 }
 
