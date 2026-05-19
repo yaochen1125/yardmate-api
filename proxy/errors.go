@@ -60,3 +60,14 @@ var (
 	// Plant.id fallback (opaque to client; maps to `plant_id_unavailable`).
 	ErrPlantNetBadResponse = errors.New("plantnet: bad response")
 )
+
+// Sentinel error returned by the OpenAI vision tier-3 identify fallback
+// (SPEC §1.1 / §2.1 / §7). VisionClient.IdentifyPlant wraps every failure
+// mode (network, non-200, decode, model refusal, empty result) in this
+// single sentinel; HandleIdentify treats it as "vision unavailable → keep
+// the empty cascade result" (graceful, never crashes, never surfaced to
+// the client — consistent with the §3 rule that OpenAI failures are never
+// client-visible). The rerank / disambiguation methods deliberately keep
+// their bare fmt.Errorf returns (callers there only need err != nil); this
+// sentinel exists so the identify-fallback branch can errors.Is-match.
+var ErrVisionIdentifyUnavailable = errors.New("vision: identify unavailable")
