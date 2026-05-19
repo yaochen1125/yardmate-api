@@ -267,8 +267,16 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		}
 
 		// 8. Success — single-line structured log (SPEC §5.2 forensics).
-		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v engine=%s mime=%s isPlant=%v suggestions=%d plantIdsResolved=%d aiEnhanced=%v",
-			deviceID, appVer, attKeyID, attAssertPresent, engine, mime, result.IsPlant, len(result.Suggestions), plantIDsResolved, result.AIEnhancedAt != nil)
+		//    suggestionsWithImage counts how many carry a Pl@ntNet reference
+		//    image_url (always 0 on the Plant.id fallback path).
+		suggestionsWithImage := 0
+		for i := range result.Suggestions {
+			if result.Suggestions[i].ImageURL != nil {
+				suggestionsWithImage++
+			}
+		}
+		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v engine=%s mime=%s isPlant=%v suggestions=%d plantIdsResolved=%d suggestionsWithImage=%d aiEnhanced=%v",
+			deviceID, appVer, attKeyID, attAssertPresent, engine, mime, result.IsPlant, len(result.Suggestions), plantIDsResolved, suggestionsWithImage, result.AIEnhancedAt != nil)
 		writeJSON(w, http.StatusOK, result)
 	}
 }

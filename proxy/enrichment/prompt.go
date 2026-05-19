@@ -32,7 +32,16 @@ const (
 	// PromptVersion tags the prompt + schema revision. Bump on incompatible
 	// changes; persisted in plants_pending.source_version so a future batch
 	// re-generation can target old rows.
-	PromptVersion = "v1"
+	//
+	// v2 = the slimmed schema: 8 fields removed from LLM generation
+	// (fragrance / toxicity / history_text_short / history_text_long /
+	// uses_list / symbolism_list / symbolism_story / flower_meaning) and
+	// `description` shortened (80-120w → 15-40w). This is an INCOMPATIBLE
+	// revision vs the old full-schema "v1": rows in plants_pending tagged
+	// source_version="v1" carry the old full field set, "v2" rows the slim
+	// set — a future backfill / regeneration can distinguish and target the
+	// stale full-schema rows by this tag.
+	PromptVersion = "v2"
 
 	// SourceTag is recorded in plants_pending.source for forensics.
 	SourceTag = "openai-" + defaultLLMModel

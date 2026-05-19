@@ -96,7 +96,8 @@ All HTTP body parsing and header extraction happens in `handlers.go` (HTTP layer
       "scientific_name": "Monstera deliciosa",
       "common_names": ["Swiss cheese plant", "Split-leaf philodendron"],
       "confidence": 0.94,
-      "plant_id": "AAA0234"
+      "plant_id": "AAA0234",
+      "image_url": "https://bs.plantnet.org/image/m/abc123.jpg"
     }
   ],
   "ai_enhanced_at": "2026-05-15T12:34:56Z"
@@ -104,6 +105,8 @@ All HTTP body parsing and header extraction happens in `handlers.go` (HTTP layer
 ```
 
 Server returns **top 3 suggestions max** to keep payload bounded.
+
+**`image_url`** (per-suggestion species reference image): Pl@ntNet (the primary engine) returns reference images when the upstream call sets `include-related-images=true`; the server takes the first image's medium URL (`o` original / `s` small as fallbacks) for each suggestion. The Plant.id fallback path has no equivalent and leaves `image_url: null` (its `similar_images` are intentionally not wired in V1). `image_url` is also `null` when Pl@ntNet returned no related image for that suggestion. iOS uses it for the detail hero / gallery of out-of-catalog plants (`plant_id: null`), which otherwise have no image. Like `plant_id`, a `null` here never changes the 200 contract.
 
 If `is_plant_confidence < 0.5` server still returns the top suggestions (UI decides what to show); it does not 4xx on "not a plant".
 
