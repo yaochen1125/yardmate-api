@@ -54,6 +54,9 @@ func TestBuildResponseSchema_KeyFieldsPresent(t *testing.T) {
 		"common_diseases_list",
 		"indoor_temp_f",
 		"hardiness_zones",
+		"name_origin", // single-batch (NOT deferred)
+		"description",
+		"genus",
 		"anyOf",   // the two nullable-object fields must use anyOf
 		"\"llm\"", // common_name_source enum
 	}
@@ -62,8 +65,61 @@ func TestBuildResponseSchema_KeyFieldsPresent(t *testing.T) {
 			t.Errorf("schema missing %q", want)
 		}
 	}
-	if len(bs) < 4000 {
-		t.Errorf("schema looks suspiciously small (%d bytes); should be ~5-8KB", len(bs))
+}
+
+// TestBuildResponseSchema_SlimmedFieldsAbsent guards the latency-driven slim:
+// these keys were DELIBERATELY dropped from LLM generation (toxicity for
+// safety/liability, the rest for latency). A regression that re-adds any of
+// them — to properties OR required — must fail here. See SPEC §7.
+func TestBuildResponseSchema_SlimmedFieldsAbsent(t *testing.T) {
+	s := buildResponseSchema()
+	props, ok := s["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties should be map, got %T", s["properties"])
+	}
+	req, ok := s["required"].([]string)
+	if !ok {
+		t.Fatalf("required should be []string, got %T", s["required"])
+	}
+	reqSet := make(map[string]struct{}, len(req))
+	for _, k := range req {
+		reqSet[k] = struct{}{}
+	}
+	dropped := []string{
+		"fragrance",
+		"toxicity",
+		"history_text_short",
+		"history_text_long",
+		"uses_list",
+		"symbolism_list",
+		"symbolism_story",
+		"flower_meaning",
+	}
+	for _, k := range dropped {
+		if _, ok := props[k]; ok {
+			t.Errorf("dropped field %q must NOT be in properties (slimmed schema regression)", k)
+		}
+		if _, ok := reqSet[k]; ok {
+			t.Errorf("dropped field %q must NOT be in required (slimmed schema regression)", k)
+		}
+	}
+}
+
+// TestBuildResponseSchema_DescriptionShortened pins the 15-40 word concise
+// description (was 80-120w; shortened for latency — SPEC §7).
+func TestBuildResponseSchema_DescriptionShortened(t *testing.T) {
+	s := buildResponseSchema()
+	props := s["properties"].(map[string]any)
+	desc, ok := props["description"].(map[string]any)
+	if !ok {
+		t.Fatalf("description property missing or wrong type: %T", props["description"])
+	}
+	d, _ := desc["description"].(string)
+	if !strings.Contains(d, "15-40 words") {
+		t.Errorf("description should target 15-40 words, got %q", d)
+	}
+	if strings.Contains(d, "80-120") {
+		t.Errorf("description still references the old 80-120 word target: %q", d)
 	}
 }
 
@@ -81,6 +137,18 @@ func TestSystemPrompt_HasEnglishOnlyAndInjectionGuard(t *testing.T) {
 	for _, want := range wants {
 		if !strings.Contains(p, want) {
 			t.Errorf("system prompt missing %q", want)
+		}
+	}
+	// The toxicity guidance was removed with the toxicity field (SPEC §7).
+	// Re-introducing a toxicity rule line would mean the field is back.
+	notWants := []string{
+		"toxicity",
+		"Toxicity level",
+		"Not reported toxic",
+	}
+	for _, nw := range notWants {
+		if strings.Contains(p, nw) {
+			t.Errorf("system prompt should no longer reference %q (toxicity dropped)", nw)
 		}
 	}
 }
