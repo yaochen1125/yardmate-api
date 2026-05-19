@@ -29,6 +29,12 @@ type Suggestion struct {
 	CommonNames    []string `json:"common_names"`
 	Confidence     float64  `json:"confidence"`
 	PlantID        *string  `json:"plant_id"`
+	// ImageURL is a per-suggestion species reference image URL supplied by
+	// Pl@ntNet (the primary engine, via include-related-images=true). It is
+	// null for the Plant.id fallback path and whenever Pl@ntNet returns no
+	// related image. iOS uses it for the detail hero / gallery of
+	// out-of-catalog plants (PlantID == null), which otherwise have no image.
+	ImageURL *string `json:"image_url"`
 }
 
 // --- diagnose (POST /v1/diagnose, SPEC §2.2) ---

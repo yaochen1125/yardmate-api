@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -61,6 +62,18 @@ type plantNetAPIResponse struct {
 			ScientificName              string   `json:"scientificName"`
 			CommonNames                 []string `json:"commonNames"`
 		} `json:"species"`
+		// Images is the related-images array Pl@ntNet returns when the
+		// request carries include-related-images=true. May be absent/empty.
+		// Each element exposes the same url in three sizes (o=original,
+		// m=medium, s=small); we prefer m. Other per-image fields
+		// (organ, author, license, citation, date) are ignored.
+		Images []struct {
+			URL struct {
+				O string `json:"o"`
+				M string `json:"m"`
+				S string `json:"s"`
+			} `json:"url"`
+		} `json:"images"`
 	} `json:"results"`
 	RemainingIdentificationRequests int `json:"remainingIdentificationRequests"`
 }
@@ -102,9 +115,41 @@ func (r *plantNetAPIResponse) toIdentifyResult() *IdentifyResult {
 			ScientificName: s.Species.ScientificNameWithoutAuthor,
 			CommonNames:    common,
 			Confidence:     s.Score,
+			// First related image, medium preferred (o > m > s fallback);
+			// nil when Pl@ntNet returned no related image for this result.
+			ImageURL: firstPlantNetImageURL(s.Images),
 		})
 	}
 	return out
+}
+
+// firstPlantNetImageURL picks the first usable reference image URL from a
+// Pl@ntNet result's images array. Preference: medium (m) → original (o) →
+// small (s). Returns nil when there is no image or no candidate is a valid
+// non-empty http(s) URL. The pointer (vs "") makes the JSON field null on
+// the wire when absent — matching the Plant.id-fallback contract.
+func firstPlantNetImageURL(images []struct {
+	URL struct {
+		O string `json:"o"`
+		M string `json:"m"`
+		S string `json:"s"`
+	} `json:"url"`
+}) *string {
+	if len(images) == 0 {
+		return nil
+	}
+	u := images[0].URL
+	for _, cand := range []string{u.M, u.O, u.S} {
+		cand = strings.TrimSpace(cand)
+		if cand == "" {
+			continue
+		}
+		if !strings.HasPrefix(cand, "http://") && !strings.HasPrefix(cand, "https://") {
+			continue
+		}
+		return &cand
+	}
+	return nil
 }
 
 // Identify uploads the image to Pl@ntNet v2 and returns the sanitized
@@ -169,6 +214,10 @@ func (c *PlantNetClient) Identify(ctx context.Context, image io.Reader, mime, or
 	q.Set("api-key", c.APIKey)
 	q.Set("lang", lang)
 	q.Set("nb-results", fmt.Sprintf("%d", nbResults))
+	// Ask Pl@ntNet to attach species reference images so each suggestion can
+	// carry an image_url for out-of-catalog plants (SPEC §2.1). Without this
+	// flag results[].images is omitted entirely.
+	q.Set("include-related-images", "true")
 	reqURL.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL.String(), &body)
