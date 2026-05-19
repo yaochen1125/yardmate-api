@@ -494,3 +494,62 @@ func TestIdentifyPlant_EmptyImage_SentinelError(t *testing.T) {
 		t.Errorf("err = %v, want ErrVisionIdentifyUnavailable (empty image)", err)
 	}
 }
+
+// TestVisionClient_IdentifyUsesLongerClient locks the timeout-bug fix
+// (Codex #18 P2) structurally: the tier-3 identify path must run on a
+// SEPARATE http.Client whose Timeout is longer than the 15 s IdentifyPlant
+// context deadline (so the context — not the client's hard Timeout cap — is
+// the effective deadline), while rerank / disambiguation stay on the
+// unchanged shared 8 s client. (A real >8 s sleep is impractical in a unit
+// test, so this asserts the wiring instead.)
+func TestVisionClient_IdentifyUsesLongerClient(t *testing.T) {
+	c := NewVisionClient("test-key")
+
+	if c.HTTP == nil || c.identifyHTTP == nil {
+		t.Fatalf("both HTTP and identifyHTTP must be set: HTTP=%v identifyHTTP=%v", c.HTTP, c.identifyHTTP)
+	}
+	// Shared client: unchanged 8 s (rerank / disambiguation depend on this).
+	if c.HTTP.Timeout != defaultVisionTimeout {
+		t.Errorf("HTTP.Timeout = %v, want %v (shared rerank/disambiguation client must stay 8 s)", c.HTTP.Timeout, defaultVisionTimeout)
+	}
+	// Identify client: the dedicated longer client.
+	if c.identifyHTTP.Timeout != visionIdentifyClientTimeout {
+		t.Errorf("identifyHTTP.Timeout = %v, want %v", c.identifyHTTP.Timeout, visionIdentifyClientTimeout)
+	}
+	// The identify client MUST be a distinct instance, not aliased to HTTP
+	// (aliasing would re-clamp identify to 8 s).
+	if c.identifyHTTP == c.HTTP {
+		t.Error("identifyHTTP must be a separate *http.Client, not the shared 8 s HTTP client")
+	}
+	// The client cap must sit ABOVE the 15 s IdentifyPlant context deadline
+	// so the context is the real deadline (not silently clamped), and still
+	// under the 30 s handler identifyUpstreamTimeout.
+	if !(c.identifyHTTP.Timeout > c.HTTP.Timeout) {
+		t.Errorf("identifyHTTP.Timeout (%v) must exceed HTTP.Timeout (%v)", c.identifyHTTP.Timeout, c.HTTP.Timeout)
+	}
+	if !(visionIdentifyClientTimeout > visionIdentifyTimeout) {
+		t.Errorf("visionIdentifyClientTimeout (%v) must exceed the 15 s IdentifyPlant context deadline visionIdentifyTimeout (%v) so the context is the effective deadline", visionIdentifyClientTimeout, visionIdentifyTimeout)
+	}
+}
+
+// TestIdentifyPlant_NilIdentifyHTTP_FallsBackToHTTP guards the nil path:
+// a VisionClient built as a struct literal with only HTTP set (as the test
+// helpers and any external callers do) must still work — IdentifyPlant
+// falls back to HTTP when identifyHTTP is nil. The httptest server answers
+// instantly so the shorter cap is harmless here.
+func TestIdentifyPlant_NilIdentifyHTTP_FallsBackToHTTP(t *testing.T) {
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Ficus lyrata\",\"common_names\":[],\"confidence\":0.7}"}}]}`)
+	})
+	defer srv.Close()
+	if c.identifyHTTP != nil {
+		t.Fatalf("test helper unexpectedly set identifyHTTP; this test asserts the nil-guard path")
+	}
+	sug, err := c.IdentifyPlant(context.Background(), []byte("img"), "image/jpeg")
+	if err != nil {
+		t.Fatalf("err: %v (nil identifyHTTP must fall back to HTTP)", err)
+	}
+	if sug.ScientificName != "Ficus lyrata" {
+		t.Errorf("ScientificName = %q, want Ficus lyrata", sug.ScientificName)
+	}
+}
