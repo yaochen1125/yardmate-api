@@ -845,6 +845,240 @@ func TestHandleIdentify_Cascade_UnknownOrganDefaultsAuto(t *testing.T) {
 	}
 }
 
+// --- HandleIdentify tier-3 AI-vision fallback (SPEC §1.1 / §2.1 / §7) ---
+
+// newCascadeHandlerWithVision is newCascadeHandler plus an injected vision
+// client (the base helper hard-codes nil). Either upstream may be nil.
+func newCascadeHandlerWithVision(t *testing.T, plantNetUp, plantIDUp http.HandlerFunc, vision *VisionClient) (http.Handler, func()) {
+	t.Helper()
+	var (
+		pnClient *PlantNetClient
+		piClient *PlantIDClient
+		closers  []func()
+	)
+	if plantNetUp != nil {
+		pnSrv := httptest.NewServer(plantNetUp)
+		closers = append(closers, pnSrv.Close)
+		pnClient = &PlantNetClient{
+			APIKey: "test-key", Endpoint: pnSrv.URL,
+			Lang: "en", NbResults: 5, HTTP: pnSrv.Client(),
+		}
+	}
+	if plantIDUp != nil {
+		piSrv := httptest.NewServer(plantIDUp)
+		closers = append(closers, piSrv.Close)
+		piClient = &PlantIDClient{
+			APIKey: "test-key", Endpoint: piSrv.URL, HTTP: piSrv.Client(),
+		}
+	}
+	content, err := LoadContent()
+	if err != nil {
+		t.Fatalf("LoadContent: %v", err)
+	}
+	cleanup := func() {
+		for _, c := range closers {
+			c()
+		}
+	}
+	return HandleIdentify(pnClient, piClient, content, vision), cleanup
+}
+
+// cannedPlantNetNoMatch — Pl@ntNet 404 "no match" canned upstream (a VALID
+// empty result, NOT an engine failure → no Plant.id fallback → tier-3 AI
+// vision fires).
+const cannedPlantNetNoMatch = `{"error":"Not Found","message":"Species not found"}`
+
+// (g) Pl@ntNet no-match (200/empty) + no Plant.id + vision present →
+// 200 with the AI-vision suggestion; engine path is ai-vision-fallback;
+// the in-catalog AI species resolves to its YardMate plant_id (AAA0001).
+func TestHandleIdentify_Tier3_PlantNetEmpty_VisionFills(t *testing.T) {
+	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[\"Chinese Abelia\"],\"confidence\":0.71}"}}]}`)
+	}))
+	defer vsrv.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
+
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, cannedPlantNetNoMatch)
+		},
+		nil, // no Plant.id (unfunded) — cascade yields zero suggestions
+		vision)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !result.IsPlant {
+		t.Errorf("IsPlant = false, want true (AI fallback always is_plant)")
+	}
+	if len(result.Suggestions) != 1 {
+		t.Fatalf("Suggestions len = %d, want 1 (AI fallback)", len(result.Suggestions))
+	}
+	s := result.Suggestions[0]
+	if s.Name != "Abelia chinensis" || s.ScientificName != "Abelia chinensis" {
+		t.Errorf("Suggestion name/scientific = %q/%q, want Abelia chinensis", s.Name, s.ScientificName)
+	}
+	if s.Confidence != 0.71 {
+		t.Errorf("Confidence = %v, want 0.71 (AI's own confidence, not rewritten)", s.Confidence)
+	}
+	if result.IsPlantConfidence != 0.71 {
+		t.Errorf("IsPlantConfidence = %v, want 0.71 (from AI suggestion)", result.IsPlantConfidence)
+	}
+	// Existing downstream resolver still runs on the AI path.
+	if s.PlantID == nil || *s.PlantID != "AAA0001" {
+		t.Errorf("PlantID = %v, want AAA0001 (in-catalog AI species resolved)", s.PlantID)
+	}
+	if s.ImageURL != nil {
+		t.Errorf("ImageURL = %v, want nil (AI path has no reference image)", s.ImageURL)
+	}
+	// AI fallback is NOT an ai_enhance rerank — AIEnhancedAt stays null.
+	if result.AIEnhancedAt != nil {
+		t.Errorf("AIEnhancedAt = %v, want nil (tier-3 is not a rerank)", *result.AIEnhancedAt)
+	}
+}
+
+// (h) Pl@ntNet 5xx → Plant.id fallback returns a valid no-match (empty
+// suggestions) → tier-3 AI vision fires (cascade succeeded but zero
+// suggestions). Out-of-catalog AI species → plant_id stays null.
+func TestHandleIdentify_Tier3_PlantIDFallbackEmpty_VisionFills(t *testing.T) {
+	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Notaplant fakeium\",\"common_names\":[],\"confidence\":0.42}"}}]}`)
+	}))
+	defer vsrv.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
+
+	// Plant.id 200 with zero classification suggestions = valid no-match.
+	const plantIDEmpty = `{"result":{"is_plant":{"probability":0.3,"binary":false},"classification":{"suggestions":[]}}}`
+
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError) // Pl@ntNet 5xx → fall back
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, plantIDEmpty)
+		},
+		vision)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(result.Suggestions) != 1 || result.Suggestions[0].Name != "Notaplant fakeium" {
+		t.Fatalf("Suggestions = %+v, want 1 AI suggestion 'Notaplant fakeium'", result.Suggestions)
+	}
+	if result.Suggestions[0].PlantID != nil {
+		t.Errorf("PlantID = %v, want nil (out-of-catalog AI species)", result.Suggestions[0].PlantID)
+	}
+}
+
+// (i) Pl@ntNet no-match + vision present but vision ERRORS → 200 with empty
+// suggestions (UNCHANGED "can't identify" behavior; no crash, wire code
+// unchanged).
+func TestHandleIdentify_Tier3_VisionError_KeepsEmptyResult(t *testing.T) {
+	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError) // vision down
+	}))
+	defer vsrv.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
+
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, cannedPlantNetNoMatch)
+		},
+		nil,
+		vision)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (unchanged can't-identify), body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !result.IsPlant {
+		t.Errorf("IsPlant = false, want true (Pl@ntNet empty result still is_plant)")
+	}
+	if len(result.Suggestions) != 0 {
+		t.Errorf("Suggestions len = %d, want 0 (vision error → unchanged empty result)", len(result.Suggestions))
+	}
+}
+
+// (j) Pl@ntNet no-match + vision==nil (no OPENAI key) → 200 empty
+// suggestions, exactly as before tier-3 existed (graceful degrade).
+func TestHandleIdentify_Tier3_VisionNil_UnchangedBehavior(t *testing.T) {
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, cannedPlantNetNoMatch)
+		},
+		nil,
+		nil) // vision == nil
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !result.IsPlant || len(result.Suggestions) != 0 {
+		t.Errorf("result = %+v, want IsPlant=true + 0 suggestions (vision nil → unchanged)", result)
+	}
+}
+
+// (k) Both engines DOWN (Pl@ntNet 5xx + Plant.id 5xx) + vision present →
+// STILL 502 plant_id_unavailable. Tier-3 must NOT mask an upstream error
+// (it only fires when the cascade SUCCEEDED with zero suggestions); wire
+// code unchanged.
+func TestHandleIdentify_Tier3_BothEnginesDown_StillReturns502(t *testing.T) {
+	visionCalled := false
+	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		visionCalled = true
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"X\",\"common_names\":[],\"confidence\":0.9}"}}]}`)
+	}))
+	defer vsrv.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
+
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		},
+		vision)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (both engines down, tier-3 must not mask)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"plant_id_unavailable"`) {
+		t.Errorf("body = %s, want plant_id_unavailable (wire code unchanged)", rec.Body.String())
+	}
+	if visionCalled {
+		t.Error("vision was called on a both-engines-down error; tier-3 must only fire on a SUCCESSFUL empty cascade")
+	}
+}
+
 // --- HandleDiagnose ---
 
 func newDiagnoseHandler(t *testing.T, upstream http.HandlerFunc, vision *VisionClient) (http.Handler, *httptest.Server) {

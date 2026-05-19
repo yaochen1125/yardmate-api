@@ -55,11 +55,20 @@ const identifyUpstreamTimeout = 30 * time.Second
 // (or nil content) leaves that suggestion's plant_id null; it never changes
 // the 200 contract. LookupPlantID is nil-safe so no guard is needed here.
 //
-// vision is optional. When non-nil AND the request sets ai_enhance=true, the
-// handler asks OpenAI to rerank the top-N candidates against the uploaded
-// image and re-orders Suggestions so the LLM pick is first. On any LLM
-// error / timeout the original engine ranking is preserved and AIEnhancedAt
-// stays null in the response.
+// vision is optional and drives TWO independent OpenAI paths here:
+//   - ai_enhance rerank: when non-nil AND the request sets ai_enhance=true,
+//     the handler asks OpenAI to rerank the top-N candidates against the
+//     uploaded image and re-orders Suggestions so the LLM pick is first. On
+//     any LLM error / timeout the original engine ranking is preserved and
+//     AIEnhancedAt stays null in the response.
+//   - tier-3 identify fallback (SPEC §1.1 / §2.1 / §7): when non-nil AND the
+//     Pl@ntNet→Plant.id cascade SUCCEEDED but yielded ZERO suggestions, the
+//     handler asks OpenAI (vision, json_schema strict) for a single
+//     best-guess species so /v1/identify ALWAYS returns a result. The AI
+//     suggestion carries its own confidence and is NOT flagged (product
+//     decision: AI provenance not surfaced). On any vision error the empty
+//     result is kept (unchanged "can't identify" behavior). vision==nil →
+//     both paths are skipped (graceful, behaves exactly as before).
 func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 1. Body cap (drops the connection on overflow, returning *MaxBytesError
@@ -210,6 +219,45 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				engine = "plantid"
 			}
 			result, err = plantID.Identify(ctx, bytes.NewReader(imgBytes), mime)
+		}
+
+		// --- Tier-3: OpenAI vision fallback (SPEC §1.1 / §2.1 / §7).
+		//     Goal: /v1/identify ALWAYS returns a result. Fires ONLY when
+		//     the cascade above SUCCEEDED (err == nil) but produced ZERO
+		//     suggestions — i.e. Pl@ntNet returned a valid "no match" (or
+		//     Plant.id fell back and also matched nothing). It does NOT
+		//     fire when an engine errored: a both-engines-down case keeps
+		//     err != nil and falls through to the unchanged error mapping
+		//     below (502 plant_id_unavailable etc.), so wire codes +
+		//     image_too_large handling are untouched. vision==nil (no
+		//     OPENAI key) → this block is skipped → behaves exactly as
+		//     before (200 with empty suggestions). The AI suggestion
+		//     carries its own confidence and is NOT flagged in any special
+		//     way (product decision: AI provenance not surfaced — same
+		//     stance as the diagnose AI fallback). iOS sees a normal
+		//     IdentifyResult; no client change. ---
+		if err == nil && vision != nil && len(imgBytes) > 0 &&
+			(result == nil || len(result.Suggestions) == 0) {
+			sug, verr := vision.IdentifyPlant(ctx, imgBytes, mime)
+			if verr != nil {
+				// Vision unavailable → keep the empty result as-is.
+				// Existing behavior: 200 with empty suggestions → iOS
+				// "We couldn't identify this plant". No crash. Log mirrors
+				// the "identify plantnet fallback" structured line style.
+				log.Printf("identify ai-vision fallback failed: deviceID=%s err=%v", deviceID, verr)
+			} else {
+				engine = "ai-vision-fallback"
+				result = &IdentifyResult{
+					IsPlant:           true,
+					IsPlantConfidence: sug.Confidence,
+					Suggestions:       []Suggestion{*sug},
+				}
+				// Falls through to the EXISTING downstream unchanged: the
+				// per-suggestion ContentIndex.LookupPlantID resolution loop
+				// (resolves an AAA id iff the AI species is in catalog, else
+				// stays nil → iOS enrichment path), the success log, and
+				// writeJSON(200, result).
+			}
 		}
 
 		if err != nil {

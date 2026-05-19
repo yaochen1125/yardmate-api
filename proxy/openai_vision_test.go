@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -353,5 +354,143 @@ func TestRerankIdentify_Non200_Error(t *testing.T) {
 		[]Suggestion{{Name: "X"}})
 	if err == nil || !strings.Contains(err.Error(), "status 502") {
 		t.Errorf("err = %v, want status 502", err)
+	}
+}
+
+// --- IdentifyPlant (tier-3 identify fallback, SPEC §1.1 / §2.1 / §7) ---
+
+func TestIdentifyPlant_Success(t *testing.T) {
+	var gotBody, gotAuth string
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		// json_schema strict reply: the message content is the JSON string.
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Monstera deliciosa\",\"common_names\":[\"Swiss cheese plant\"],\"confidence\":0.83}"}}]}`)
+	})
+	defer srv.Close()
+
+	sug, err := c.IdentifyPlant(context.Background(), []byte("\xff\xd8img"), "image/jpeg")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if sug.Name != "Monstera deliciosa" || sug.ScientificName != "Monstera deliciosa" {
+		t.Errorf("name/scientific = %q/%q, want Monstera deliciosa", sug.Name, sug.ScientificName)
+	}
+	if len(sug.CommonNames) != 1 || sug.CommonNames[0] != "Swiss cheese plant" {
+		t.Errorf("CommonNames = %v, want [Swiss cheese plant]", sug.CommonNames)
+	}
+	if sug.Confidence != 0.83 {
+		t.Errorf("Confidence = %v, want 0.83", sug.Confidence)
+	}
+	if sug.PlantID != nil {
+		t.Errorf("PlantID = %v, want nil (handler fills it)", sug.PlantID)
+	}
+	if sug.ImageURL != nil {
+		t.Errorf("ImageURL = %v, want nil (no reference image on AI path)", sug.ImageURL)
+	}
+	if gotAuth != "Bearer test-key" {
+		t.Errorf("auth = %q", gotAuth)
+	}
+	// Request must carry the image data URL + the json_schema response_format.
+	if !strings.Contains(gotBody, "data:image/jpeg;base64,") {
+		t.Errorf("request body missing image data URL: %s", gotBody)
+	}
+	if !strings.Contains(gotBody, `"response_format"`) || !strings.Contains(gotBody, `"json_schema"`) {
+		t.Errorf("request body missing json_schema response_format: %s", gotBody)
+	}
+	if !strings.Contains(gotBody, `"strict":true`) {
+		t.Errorf("request body json_schema not strict: %s", gotBody)
+	}
+}
+
+func TestIdentifyPlant_NilCommonNamesBecomesEmptySlice(t *testing.T) {
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Ficus lyrata\",\"common_names\":null,\"confidence\":0.6}"}}]}`)
+	})
+	defer srv.Close()
+	sug, err := c.IdentifyPlant(context.Background(), []byte("img"), "image/jpeg")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if sug.CommonNames == nil || len(sug.CommonNames) != 0 {
+		t.Errorf("CommonNames = %v, want non-nil empty slice (wire []  not null)", sug.CommonNames)
+	}
+}
+
+func TestIdentifyPlant_ConfidenceClamped(t *testing.T) {
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Aloe vera\",\"common_names\":[],\"confidence\":1.7}"}}]}`)
+	})
+	defer srv.Close()
+	sug, err := c.IdentifyPlant(context.Background(), []byte("img"), "image/jpeg")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if sug.Confidence != 1 {
+		t.Errorf("Confidence = %v, want clamped to 1", sug.Confidence)
+	}
+}
+
+func TestIdentifyPlant_Non200_SentinelError(t *testing.T) {
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":"server"}`)
+	})
+	defer srv.Close()
+	_, err := c.IdentifyPlant(context.Background(), []byte("img"), "image/jpeg")
+	if err == nil || !errors.Is(err, ErrVisionIdentifyUnavailable) {
+		t.Errorf("err = %v, want ErrVisionIdentifyUnavailable", err)
+	}
+}
+
+func TestIdentifyPlant_MalformedJSON_SentinelError(t *testing.T) {
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		// 200 OK but the message content is not valid JSON.
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"not json at all"}}]}`)
+	})
+	defer srv.Close()
+	_, err := c.IdentifyPlant(context.Background(), []byte("img"), "image/jpeg")
+	if err == nil || !errors.Is(err, ErrVisionIdentifyUnavailable) {
+		t.Errorf("err = %v, want ErrVisionIdentifyUnavailable (decode failure)", err)
+	}
+}
+
+func TestIdentifyPlant_Refusal_EmptyContent_SentinelError(t *testing.T) {
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		// Model refusal / safety stop → empty message content.
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":""}}]}`)
+	})
+	defer srv.Close()
+	_, err := c.IdentifyPlant(context.Background(), []byte("img"), "image/jpeg")
+	if err == nil || !errors.Is(err, ErrVisionIdentifyUnavailable) {
+		t.Errorf("err = %v, want ErrVisionIdentifyUnavailable (refusal)", err)
+	}
+}
+
+func TestIdentifyPlant_EmptyScientificName_SentinelError(t *testing.T) {
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"   \",\"common_names\":[],\"confidence\":0.4}"}}]}`)
+	})
+	defer srv.Close()
+	_, err := c.IdentifyPlant(context.Background(), []byte("img"), "image/jpeg")
+	if err == nil || !errors.Is(err, ErrVisionIdentifyUnavailable) {
+		t.Errorf("err = %v, want ErrVisionIdentifyUnavailable (blank scientific_name)", err)
+	}
+}
+
+func TestIdentifyPlant_NilReceiver_SentinelError(t *testing.T) {
+	var c *VisionClient
+	_, err := c.IdentifyPlant(context.Background(), []byte("img"), "image/jpeg")
+	if err == nil || !errors.Is(err, ErrVisionIdentifyUnavailable) {
+		t.Errorf("err = %v, want ErrVisionIdentifyUnavailable (nil receiver)", err)
+	}
+}
+
+func TestIdentifyPlant_EmptyImage_SentinelError(t *testing.T) {
+	c := &VisionClient{}
+	_, err := c.IdentifyPlant(context.Background(), nil, "image/jpeg")
+	if err == nil || !errors.Is(err, ErrVisionIdentifyUnavailable) {
+		t.Errorf("err = %v, want ErrVisionIdentifyUnavailable (empty image)", err)
 	}
 }
