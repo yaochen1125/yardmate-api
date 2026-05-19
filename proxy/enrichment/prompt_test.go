@@ -123,6 +123,62 @@ func TestBuildResponseSchema_DescriptionShortened(t *testing.T) {
 	}
 }
 
+// TestBuildResponseSchema_CareScaleAligned pins the YardMate care-scale
+// alignment (SPEC §7): the LLM `sunlight` / `watering_note` schema entries
+// must match the authoritative scale owned by the shipped iOS
+// CareQuickStatsCard. `watering_note` is now LLM-generated (int 0..5), was
+// previously forced null; `sunlight` description was corrected from the
+// inverted "0=deep shade … 5=desert sun" to "0=Full sun … 5=Low light".
+// A regression that reverts either (back to type:null watering_note, or the
+// old desert-sun wording) must fail here.
+func TestBuildResponseSchema_CareScaleAligned(t *testing.T) {
+	s := buildResponseSchema()
+	props, ok := s["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties should be map, got %T", s["properties"])
+	}
+
+	wn, ok := props["watering_note"].(map[string]any)
+	if !ok {
+		t.Fatalf("watering_note property missing or wrong type: %T", props["watering_note"])
+	}
+	if got := wn["type"]; got != "integer" {
+		t.Errorf("watering_note type must be \"integer\" (LLM-generated on YardMate scale, no longer forced null), got %v", got)
+	}
+	wnDesc, _ := wn["description"].(string)
+	if !strings.Contains(wnDesc, "Aquatic") {
+		t.Errorf("watering_note description must describe the YardMate 0..5 scale (expected to contain \"Aquatic\"), got %q", wnDesc)
+	}
+	if !strings.Contains(wnDesc, "0..5") {
+		t.Errorf("watering_note description should state the integer 0..5 range, got %q", wnDesc)
+	}
+
+	sl, ok := props["sunlight"].(map[string]any)
+	if !ok {
+		t.Fatalf("sunlight property missing or wrong type: %T", props["sunlight"])
+	}
+	if got := sl["type"]; got != "integer" {
+		t.Errorf("sunlight type must remain \"integer\", got %v", got)
+	}
+	slDesc, _ := sl["description"].(string)
+	if !strings.Contains(slDesc, "Full sun") {
+		t.Errorf("sunlight description must use the authoritative YardMate scale (expected to contain \"Full sun\"), got %q", slDesc)
+	}
+	if strings.Contains(slDesc, "desert sun") || strings.Contains(slDesc, "deep shade") {
+		t.Errorf("sunlight description still uses the old inverted scale (deep shade / desert sun); must be the YardMate 0=Full sun..5=Low light scale: %q", slDesc)
+	}
+
+	// fertilize_formula must remain forced-null (no authoritative scale; still
+	// an opaque internal template — SPEC §7).
+	ff, ok := props["fertilize_formula"].(map[string]any)
+	if !ok {
+		t.Fatalf("fertilize_formula property missing or wrong type: %T", props["fertilize_formula"])
+	}
+	if got := ff["type"]; got != "null" {
+		t.Errorf("fertilize_formula type must stay \"null\" (no standard; opaque internal template), got %v", got)
+	}
+}
+
 func TestSystemPrompt_HasEnglishOnlyAndInjectionGuard(t *testing.T) {
 	p := systemPrompt()
 	wants := []string{
@@ -150,6 +206,20 @@ func TestSystemPrompt_HasEnglishOnlyAndInjectionGuard(t *testing.T) {
 		if strings.Contains(p, nw) {
 			t.Errorf("system prompt should no longer reference %q (toxicity dropped)", nw)
 		}
+	}
+
+	// Care-scale alignment (SPEC §7): watering_note is now LLM-generated, so
+	// the null-rule must apply ONLY to fertilize_formula — the prompt must NOT
+	// instruct the model that watering_note MUST be null.
+	if strings.Contains(p, `"watering_note" and "fertilize_formula" MUST be null`) {
+		t.Error("system prompt still forces watering_note null; the null-rule must now apply to fertilize_formula only (watering_note is LLM-generated)")
+	}
+	if !strings.Contains(p, `"fertilize_formula" MUST be null`) {
+		t.Error("system prompt must still force fertilize_formula null (no authoritative scale; opaque internal template)")
+	}
+	// watering_note must be listed among the 0..5 integer fields.
+	if !strings.Contains(p, "difficulty / sunlight / watering_note / weed_level are integers 0..5") {
+		t.Errorf("system prompt Numbers line must list watering_note among the integer 0..5 fields, got prompt: %q", p)
 	}
 }
 
