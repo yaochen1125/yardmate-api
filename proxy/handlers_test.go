@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -533,7 +534,7 @@ func newCascadeHandler(t *testing.T, plantNetUp, plantIDUp http.HandlerFunc) (ht
 		closers = append(closers, pnSrv.Close)
 		pnClient = &PlantNetClient{
 			APIKey: "test-key", Endpoint: pnSrv.URL,
-			Lang: "en", NbResults: 5, HTTP: pnSrv.Client(),
+			Lang: "en", NbResults: 10, HTTP: pnSrv.Client(),
 		}
 	}
 	if plantIDUp != nil {
@@ -765,7 +766,7 @@ func TestHandleIdentify_Cascade_OrganForwardedToPlantNet(t *testing.T) {
 	}))
 	defer pnSrv.Close()
 	pn := &PlantNetClient{
-		APIKey: "k", Endpoint: pnSrv.URL, Lang: "en", NbResults: 5, HTTP: pnSrv.Client(),
+		APIKey: "k", Endpoint: pnSrv.URL, Lang: "en", NbResults: 10, HTTP: pnSrv.Client(),
 	}
 	content, err := LoadContent()
 	if err != nil {
@@ -815,7 +816,7 @@ func TestHandleIdentify_Cascade_UnknownOrganDefaultsAuto(t *testing.T) {
 	}))
 	defer pnSrv.Close()
 	pn := &PlantNetClient{
-		APIKey: "k", Endpoint: pnSrv.URL, Lang: "en", NbResults: 5, HTTP: pnSrv.Client(),
+		APIKey: "k", Endpoint: pnSrv.URL, Lang: "en", NbResults: 10, HTTP: pnSrv.Client(),
 	}
 	content, err := LoadContent()
 	if err != nil {
@@ -861,7 +862,7 @@ func newCascadeHandlerWithVision(t *testing.T, plantNetUp, plantIDUp http.Handle
 		closers = append(closers, pnSrv.Close)
 		pnClient = &PlantNetClient{
 			APIKey: "test-key", Endpoint: pnSrv.URL,
-			Lang: "en", NbResults: 5, HTTP: pnSrv.Client(),
+			Lang: "en", NbResults: 10, HTTP: pnSrv.Client(),
 		}
 	}
 	if plantIDUp != nil {
@@ -1076,6 +1077,354 @@ func TestHandleIdentify_Tier3_BothEnginesDown_StillReturns502(t *testing.T) {
 	}
 	if visionCalled {
 		t.Error("vision was called on a both-engines-down error; tier-3 must only fire on a SUCCESSFUL empty cascade")
+	}
+}
+
+// --- HandleIdentify catalog-preference selection cascade (SPEC §1.1/§2.1/§7) ---
+//
+// One test per decision-table row. The selection runs across the FULL
+// PlantNet/Plant.id candidate set (up to 10), prefers an in-catalog match
+// (rule B = highest engine confidence among in-catalog), then AI catalog-
+// recovery (conf ≥ 0.55), then raw out-of-catalog fallbacks. Response is
+// trimmed to top-3 with the chosen candidate at [0]. iOS contract unchanged.
+
+// catalogScientificName is a name guaranteed in the embedded 1522 catalog
+// (Abelia chinensis → AAA0001, the same fixture the other identify tests use).
+// Abelia floribunda → AAA0002 is a SECOND in-catalog name for the
+// multiple-in-catalog rule-B test.
+
+// (a) A LOWER-ranked PlantNet candidate is in the catalog → it is promoted to
+// Suggestions[0] with its plant_id; the higher-ranked out-of-catalog top is
+// demoted. engine=plantnet-catalog.
+func TestHandleIdentify_CatalogPref_LowerRankedInCatalogBecomesTop(t *testing.T) {
+	// results[0] out-of-catalog (highest score 0.90), results[1] IN catalog
+	// (Abelia chinensis, lower score 0.40), results[2] out-of-catalog.
+	const pn = `{
+  "bestMatch": "Fakeplant nonexistus",
+  "results": [
+    {"score": 0.90, "species": {"scientificNameWithoutAuthor": "Fakeplant nonexistus",
+      "scientificName": "Fakeplant nonexistus Auth.", "commonNames": []}},
+    {"score": 0.40, "species": {"scientificNameWithoutAuthor": "Abelia chinensis",
+      "scientificName": "Abelia chinensis R.Br.", "commonNames": ["Chinese Abelia"]}},
+    {"score": 0.20, "species": {"scientificNameWithoutAuthor": "Otherfake speciesum",
+      "scientificName": "Otherfake speciesum Auth.", "commonNames": []}}
+  ],
+  "remainingIdentificationRequests": 480
+}`
+	h, cleanup := newCascadeHandler(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, pn)
+		}, nil)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// Selected [0] must be the in-catalog candidate (not the higher-score
+	// out-of-catalog one) with its plant_id resolved (rule B accepted
+	// tradeoff: low-score in-catalog overrides higher-score out-of-catalog).
+	if result.Suggestions[0].ScientificName != "Abelia chinensis" {
+		t.Errorf("Suggestions[0] = %q, want Abelia chinensis (in-catalog promoted)", result.Suggestions[0].ScientificName)
+	}
+	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0001" {
+		t.Errorf("Suggestions[0].PlantID = %v, want AAA0001", result.Suggestions[0].PlantID)
+	}
+	// Response trimmed to ≤3, the demoted out-of-catalog ones survive after [0].
+	if len(result.Suggestions) != 3 {
+		t.Errorf("len(Suggestions) = %d, want 3 (trimmed)", len(result.Suggestions))
+	}
+}
+
+// (b) MULTIPLE candidates in catalog → the one with the HIGHEST engine
+// confidence wins (rule B). engine=plantnet-catalog.
+func TestHandleIdentify_CatalogPref_MultipleInCatalog_HighestConfidenceWins(t *testing.T) {
+	// Two in-catalog: Abelia floribunda (AAA0002, score 0.55) and Abelia
+	// chinensis (AAA0001, score 0.30). Highest-confidence in-catalog =
+	// floribunda even though chinensis appears first.
+	const pn = `{
+  "bestMatch": "Abelia chinensis",
+  "results": [
+    {"score": 0.30, "species": {"scientificNameWithoutAuthor": "Abelia chinensis",
+      "scientificName": "Abelia chinensis R.Br.", "commonNames": ["Chinese Abelia"]}},
+    {"score": 0.80, "species": {"scientificNameWithoutAuthor": "Outofcatalog fakeum",
+      "scientificName": "Outofcatalog fakeum Auth.", "commonNames": []}},
+    {"score": 0.55, "species": {"scientificNameWithoutAuthor": "Abelia floribunda",
+      "scientificName": "Abelia floribunda M.Martens", "commonNames": ["Mexican Abelia"]}}
+  ],
+  "remainingIdentificationRequests": 470
+}`
+	h, cleanup := newCascadeHandler(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, pn)
+		}, nil)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if result.Suggestions[0].ScientificName != "Abelia floribunda" {
+		t.Errorf("Suggestions[0] = %q, want Abelia floribunda (highest-confidence in-catalog, rule B)", result.Suggestions[0].ScientificName)
+	}
+	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0002" {
+		t.Errorf("Suggestions[0].PlantID = %v, want AAA0002 (Abelia floribunda)", result.Suggestions[0].PlantID)
+	}
+}
+
+// (c) NO candidate in catalog + AI returns a catalog hit with conf ≥ 0.55 →
+// ai-catalog-recovery; the AI suggestion becomes the sole in-catalog result.
+func TestHandleIdentify_CatalogPref_NoneInCatalog_AICatalogRecovery(t *testing.T) {
+	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[\"Chinese Abelia\"],\"confidence\":0.62}"}}]}`)
+	}))
+	defer vsrv.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
+
+	// Both PlantNet candidates out-of-catalog → triggers AI catalog-recovery.
+	const pn = `{
+  "bestMatch": "Fakeone speciesum",
+  "results": [
+    {"score": 0.70, "species": {"scientificNameWithoutAuthor": "Fakeone speciesum",
+      "scientificName": "Fakeone speciesum Auth.", "commonNames": []}},
+    {"score": 0.20, "species": {"scientificNameWithoutAuthor": "Faketwo speciesum",
+      "scientificName": "Faketwo speciesum Auth.", "commonNames": []}}
+  ],
+  "remainingIdentificationRequests": 460
+}`
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, pn)
+		}, nil, vision)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(result.Suggestions) != 1 {
+		t.Fatalf("len(Suggestions) = %d, want 1 (AI catalog-recovery replaces set)", len(result.Suggestions))
+	}
+	s := result.Suggestions[0]
+	if s.ScientificName != "Abelia chinensis" {
+		t.Errorf("Suggestions[0] = %q, want Abelia chinensis (AI catalog-recovery)", s.ScientificName)
+	}
+	if s.PlantID == nil || *s.PlantID != "AAA0001" {
+		t.Errorf("Suggestions[0].PlantID = %v, want AAA0001", s.PlantID)
+	}
+	if s.Confidence != 0.62 {
+		t.Errorf("Confidence = %v, want 0.62 (AI's own, not rewritten)", s.Confidence)
+	}
+	if result.IsPlantConfidence != 0.62 {
+		t.Errorf("IsPlantConfidence = %v, want 0.62", result.IsPlantConfidence)
+	}
+	if result.AIEnhancedAt != nil {
+		t.Errorf("AIEnhancedAt = %v, want nil (catalog-recovery is not a rerank)", *result.AIEnhancedAt)
+	}
+}
+
+// (d) NO candidate in catalog + AI catalog hit BUT conf < 0.55 + engine
+// candidates non-empty → keep the engine's ORIGINAL top (NOT the AI guess);
+// plant_id null (out-of-catalog → iOS enrichment). engine=plantnet-raw-oob.
+func TestHandleIdentify_CatalogPref_AILowConfidence_KeepsEngineTop(t *testing.T) {
+	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// In-catalog name but LOW confidence (0.40 < 0.55) → must be rejected.
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.40}"}}]}`)
+	}))
+	defer vsrv.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
+
+	const pn = `{
+  "bestMatch": "Engineschoice fakeum",
+  "results": [
+    {"score": 0.88, "species": {"scientificNameWithoutAuthor": "Engineschoice fakeum",
+      "scientificName": "Engineschoice fakeum Auth.", "commonNames": ["Engine Top"]}},
+    {"score": 0.12, "species": {"scientificNameWithoutAuthor": "Secondfake speciesum",
+      "scientificName": "Secondfake speciesum Auth.", "commonNames": []}}
+  ],
+  "remainingIdentificationRequests": 450
+}`
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, pn)
+		}, nil, vision)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// Engine's ORIGINAL top kept (AI low-conf guess discarded entirely).
+	if result.Suggestions[0].ScientificName != "Engineschoice fakeum" {
+		t.Errorf("Suggestions[0] = %q, want Engineschoice fakeum (engine top kept, AI rejected)", result.Suggestions[0].ScientificName)
+	}
+	if result.Suggestions[0].PlantID != nil {
+		t.Errorf("Suggestions[0].PlantID = %v, want nil (out-of-catalog → enrichment)", result.Suggestions[0].PlantID)
+	}
+	// AI's "Abelia chinensis" must NOT have leaked in anywhere.
+	for i, s := range result.Suggestions {
+		if s.ScientificName == "Abelia chinensis" {
+			t.Errorf("Suggestions[%d] = Abelia chinensis; AI low-conf guess must not be used", i)
+		}
+	}
+}
+
+// (e) PlantNet returns ZERO suggestions + AI returns a NON-catalog guess →
+// ai-raw-oob: the AI guess is the single out-of-catalog suggestion (preserves
+// the "always a result" guarantee #18). plant_id null.
+func TestHandleIdentify_CatalogPref_EngineZero_AINonCatalog_AIRawOOB(t *testing.T) {
+	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Notincatalog fakeium\",\"common_names\":[],\"confidence\":0.33}"}}]}`)
+	}))
+	defer vsrv.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
+
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound) // PlantNet valid no-match (zero)
+			_, _ = io.WriteString(w, cannedPlantNetNoMatch)
+		}, nil, vision)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(result.Suggestions) != 1 || result.Suggestions[0].ScientificName != "Notincatalog fakeium" {
+		t.Fatalf("Suggestions = %+v, want 1 AI suggestion 'Notincatalog fakeium' (ai-raw-oob)", result.Suggestions)
+	}
+	if result.Suggestions[0].PlantID != nil {
+		t.Errorf("PlantID = %v, want nil (out-of-catalog AI guess)", result.Suggestions[0].PlantID)
+	}
+	if result.Suggestions[0].Confidence != 0.33 {
+		t.Errorf("Confidence = %v, want 0.33 (low conf still used because engine returned zero)", result.Suggestions[0].Confidence)
+	}
+}
+
+// (f) PlantNet ZERO + vision == nil → empty suggestions, iOS "can't
+// identify" (unchanged behavior; graceful degrade).
+func TestHandleIdentify_CatalogPref_EngineZero_VisionNil_Empty(t *testing.T) {
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, cannedPlantNetNoMatch)
+		}, nil, nil) // vision nil
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !result.IsPlant || len(result.Suggestions) != 0 {
+		t.Errorf("result = %+v, want IsPlant=true + 0 suggestions (vision nil → unchanged)", result)
+	}
+}
+
+// (g) BOTH engines unavailable → still 502 plant_id_unavailable; vision is
+// NOT called (AI must not substitute for engine-unavailable, locked #18).
+func TestHandleIdentify_CatalogPref_BothEnginesDown_502_VisionNotCalled(t *testing.T) {
+	visionCalled := false
+	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		visionCalled = true
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.99}"}}]}`)
+	}))
+	defer vsrv.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
+
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		},
+		vision)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (both engines down)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"plant_id_unavailable"`) {
+		t.Errorf("body = %s, want plant_id_unavailable (wire code unchanged)", rec.Body.String())
+	}
+	if visionCalled {
+		t.Error("vision called on both-engines-down; AI must NOT substitute for engine-unavailable")
+	}
+}
+
+// Response is trimmed to top-3 even when selection ran across 10 candidates,
+// and the chosen in-catalog candidate stays at [0] (kept + next 2 by conf).
+func TestHandleIdentify_CatalogPref_TrimsTo3_ChosenStaysFirst(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString(`{"bestMatch":"Oo0","results":[`)
+	// 9 out-of-catalog (descending score 0.95..0.55) then the in-catalog
+	// Abelia chinensis LAST at the lowest score 0.10.
+	for i := 0; i < 9; i++ {
+		fmt.Fprintf(&sb, `{"score":%f,"species":{"scientificNameWithoutAuthor":"Oo%d fakeum","scientificName":"Oo%d Auth.","commonNames":[]}},`,
+			0.95-float64(i)*0.05, i, i)
+	}
+	sb.WriteString(`{"score":0.10,"species":{"scientificNameWithoutAuthor":"Abelia chinensis","scientificName":"Abelia chinensis R.Br.","commonNames":["Chinese Abelia"]}}`)
+	sb.WriteString(`],"remainingIdentificationRequests":40}`)
+
+	h, cleanup := newCascadeHandler(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, sb.String())
+		}, nil)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(result.Suggestions) != 3 {
+		t.Fatalf("len(Suggestions) = %d, want 3 (selected across 10, trimmed to 3)", len(result.Suggestions))
+	}
+	// The lowest-score in-catalog candidate is the chosen [0] (rule B).
+	if result.Suggestions[0].ScientificName != "Abelia chinensis" {
+		t.Errorf("Suggestions[0] = %q, want Abelia chinensis (in-catalog stays first after trim)", result.Suggestions[0].ScientificName)
+	}
+	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0001" {
+		t.Errorf("Suggestions[0].PlantID = %v, want AAA0001", result.Suggestions[0].PlantID)
+	}
+	// The other 2 are the highest-confidence of the remaining out-of-catalog
+	// (Oo0 = 0.95, Oo1 = 0.90); plant_id null.
+	if result.Suggestions[1].ScientificName != "Oo0 fakeum" || result.Suggestions[2].ScientificName != "Oo1 fakeum" {
+		t.Errorf("trimmed tail = %q,%q, want Oo0 fakeum,Oo1 fakeum (top-2 by confidence of remainder)",
+			result.Suggestions[1].ScientificName, result.Suggestions[2].ScientificName)
 	}
 }
 
