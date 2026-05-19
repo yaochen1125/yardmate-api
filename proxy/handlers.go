@@ -23,7 +23,23 @@ const identifyMaxBody = 9 << 20 // 9 MiB
 const identifyUpstreamTimeout = 30 * time.Second
 
 // HandleIdentify returns the http.HandlerFunc for POST /v1/identify.
-// See SPEC §2.1, §3 for the contract.
+// See SPEC §2.1, §3, §7 for the contract.
+//
+// TWO-ENGINE CASCADE (SPEC §1.1 / §7): Pl@ntNet is the PRIMARY engine,
+// Plant.id is the FALLBACK. Pl@ntNet is tried once (no per-engine retry).
+// The Plant.id fallback fires iff plantNet is nil, OR the Pl@ntNet call
+// returned one of ErrPlantNetUnavailable / ErrPlantNetRateLimit /
+// ErrPlantNetUnauthorized / ErrPlantNetBadResponse. A successful Pl@ntNet
+// answer — INCLUDING a "no match" empty result (upstream 404) — is
+// authoritative and does NOT fall back (Plant.id credit must not be spent).
+// ErrPlantNetImageRejected also does NOT fall back (Plant.id would reject
+// the same bytes) → mapped to bad_image. Plant.id is then tried once; if it
+// also fails the wire codes stay plant_id_unavailable / plant_id_unauthorized
+// (NOT renamed — iOS error mapping is unchanged; SPEC §3 note).
+//
+// plantNet (primary) and plantID (fallback) may each be nil; server.go only
+// registers the route when at least one is non-nil. Both nil is defended
+// against here anyway (502 plant_id_unavailable).
 //
 // V1 NOTES (per SPEC):
 //   - per-IP rate limit is applied by ratelimit.PerIPMiddleware at the /v1
@@ -40,11 +56,11 @@ const identifyUpstreamTimeout = 30 * time.Second
 // the 200 contract. LookupPlantID is nil-safe so no guard is needed here.
 //
 // vision is optional. When non-nil AND the request sets ai_enhance=true, the
-// handler asks OpenAI to rerank the Plant.id top-N candidates against the
-// uploaded image and re-orders Suggestions so the LLM pick is first. On any
-// LLM error / timeout the original Plant.id ranking is preserved and
-// AIEnhancedAt stays null in the response.
-func HandleIdentify(client *PlantIDClient, content *ContentIndex, vision *VisionClient) http.HandlerFunc {
+// handler asks OpenAI to rerank the top-N candidates against the uploaded
+// image and re-orders Suggestions so the LLM pick is first. On any LLM
+// error / timeout the original engine ranking is preserved and AIEnhancedAt
+// stays null in the response.
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 1. Body cap (drops the connection on overflow, returning *MaxBytesError
 		//    on the next Read so we can map to image_too_large).
@@ -85,6 +101,7 @@ func HandleIdentify(client *PlantIDClient, content *ContentIndex, vision *Vision
 		var (
 			imgBytes  []byte
 			aiEnhance bool
+			organ     = "auto"
 		)
 		for {
 			part, perr := mr.NextPart()
@@ -124,6 +141,18 @@ func HandleIdentify(client *PlantIDClient, content *ContentIndex, vision *Vision
 						aiEnhance = true
 					}
 				}
+			case "organ":
+				// Pl@ntNet organ hint (SPEC §2.1). Accept only the known
+				// set case-insensitively; anything else / absent → "auto"
+				// (already the default). Forwarded to Pl@ntNet only; the
+				// Plant.id fallback ignores it.
+				b, err := io.ReadAll(io.LimitReader(part, 16))
+				if err == nil {
+					switch strings.ToLower(strings.TrimSpace(string(b))) {
+					case "leaf", "flower", "fruit", "bark", "auto":
+						organ = strings.ToLower(strings.TrimSpace(string(b)))
+					}
+				}
 			}
 			_ = part.Close()
 		}
@@ -147,24 +176,57 @@ func HandleIdentify(client *PlantIDClient, content *ContentIndex, vision *Vision
 		ctx, cancel := context.WithTimeout(r.Context(), identifyUpstreamTimeout)
 		defer cancel()
 
-		result, err := client.Identify(ctx, bytes.NewReader(imgBytes), mime)
+		// --- Two-engine cascade (SPEC §1.1 / §7). Single attempt per engine,
+		//     no per-engine retry. Pl@ntNet primary → Plant.id fallback. ---
+		// `err` is already declared in this scope (from r.MultipartReader);
+		// reuse it via plain assignment so it's not redeclared.
+		var (
+			result *IdentifyResult
+			engine string
+		)
+		err = nil
+
+		if plantNet != nil {
+			engine = "plantnet"
+			result, err = plantNet.Identify(ctx, bytes.NewReader(imgBytes), mime, organ)
+		}
+
+		// Decide whether to fall back to Plant.id. Fall back iff Pl@ntNet was
+		// not available at all, OR the Pl@ntNet call failed with one of the
+		// transient/auth/bad-body sentinels. A successful Pl@ntNet answer
+		// (including the 404 empty result) and ErrPlantNetImageRejected do
+		// NOT fall back.
+		plantNetFellBack := plantNet != nil &&
+			(errors.Is(err, ErrPlantNetUnavailable) ||
+				errors.Is(err, ErrPlantNetRateLimit) ||
+				errors.Is(err, ErrPlantNetUnauthorized) ||
+				errors.Is(err, ErrPlantNetBadResponse))
+
+		if (plantNet == nil || plantNetFellBack) && plantID != nil {
+			if plantNetFellBack {
+				log.Printf("identify plantnet fallback: deviceID=%s err=%v", deviceID, err)
+				engine = "plantid-fallback"
+			} else {
+				engine = "plantid"
+			}
+			result, err = plantID.Identify(ctx, bytes.NewReader(imgBytes), mime)
+		}
+
 		if err != nil {
 			if isMaxBytesErr(err) {
 				writeError(w, http.StatusRequestEntityTooLarge, "image_too_large")
 				return
 			}
-			log.Printf("identify upstream err: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v err=%v",
-				deviceID, appVer, attKeyID, attAssertPresent, err)
-			switch {
-			case errors.Is(err, ErrPlantIDImageRejected):
-				writeError(w, http.StatusBadRequest, "bad_image")
-			case errors.Is(err, ErrPlantIDUnauthorized):
-				writeError(w, http.StatusBadGateway, "plant_id_unauthorized")
-			case errors.Is(err, ErrPlantIDRateLimit), errors.Is(err, ErrPlantIDUnavailable):
-				writeError(w, http.StatusBadGateway, "plant_id_unavailable")
-			default:
-				writeError(w, http.StatusBadGateway, "plant_id_unavailable")
-			}
+			log.Printf("identify upstream err: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v engine=%s err=%v",
+				deviceID, appVer, attKeyID, attAssertPresent, engine, err)
+			writeError(w, identifyErrStatus(err), identifyErrCode(err))
+			return
+		}
+		if result == nil {
+			// Defensive: both plantNet == nil and plantID == nil (route would
+			// not be registered by server.go, but guard anyway). SPEC §3.
+			log.Printf("identify no engine: deviceID=%s appVer=%s", deviceID, appVer)
+			writeError(w, http.StatusBadGateway, "plant_id_unavailable")
 			return
 		}
 
@@ -205,9 +267,39 @@ func HandleIdentify(client *PlantIDClient, content *ContentIndex, vision *Vision
 		}
 
 		// 8. Success — single-line structured log (SPEC §5.2 forensics).
-		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v mime=%s isPlant=%v suggestions=%d plantIdsResolved=%d aiEnhanced=%v",
-			deviceID, appVer, attKeyID, attAssertPresent, mime, result.IsPlant, len(result.Suggestions), plantIDsResolved, result.AIEnhancedAt != nil)
+		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v engine=%s mime=%s isPlant=%v suggestions=%d plantIdsResolved=%d aiEnhanced=%v",
+			deviceID, appVer, attKeyID, attAssertPresent, engine, mime, result.IsPlant, len(result.Suggestions), plantIDsResolved, result.AIEnhancedAt != nil)
 		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+// identifyErrCode maps the final cascade error to the stable wire code
+// (SPEC §3). The codes are NOT renamed — `plant_id_unavailable` /
+// `plant_id_unauthorized` now denote "all identification engines down", not
+// literally Plant.id, so the iOS error mapping is unchanged. Both the
+// Pl@ntNet sentinels (when no Plant.id fallback was available) and the
+// Plant.id sentinels (after fallback) funnel through here.
+func identifyErrCode(err error) string {
+	switch {
+	case errors.Is(err, ErrPlantNetImageRejected), errors.Is(err, ErrPlantIDImageRejected):
+		return "bad_image"
+	case errors.Is(err, ErrPlantNetUnauthorized), errors.Is(err, ErrPlantIDUnauthorized):
+		return "plant_id_unauthorized"
+	default:
+		// ErrPlantNetRateLimit / ErrPlantNetUnavailable / ErrPlantNetBadResponse
+		// / ErrPlantIDRateLimit / ErrPlantIDUnavailable / ErrPlantIDBadResponse
+		// and any unmapped error → identification unavailable.
+		return "plant_id_unavailable"
+	}
+}
+
+// identifyErrStatus is the HTTP status paired with identifyErrCode.
+func identifyErrStatus(err error) int {
+	switch {
+	case errors.Is(err, ErrPlantNetImageRejected), errors.Is(err, ErrPlantIDImageRejected):
+		return http.StatusBadRequest // 400
+	default:
+		return http.StatusBadGateway // 502
 	}
 }
 

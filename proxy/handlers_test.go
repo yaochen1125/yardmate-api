@@ -41,7 +41,10 @@ func newIdentifyHandler(t *testing.T, upstream http.HandlerFunc) (http.Handler, 
 }
 
 // newIdentifyHandlerWithVision wires HandleIdentify with an optional vision
-// client (so ai_enhance tests can inject a mocked OpenAI server).
+// client (so ai_enhance tests can inject a mocked OpenAI server). plantNet is
+// nil here so the cascade runs Plant.id-only (the existing test corpus
+// asserts Plant.id behavior unchanged). Pl@ntNet-primary + cascade behavior
+// is covered by the dedicated tests further down.
 func newIdentifyHandlerWithVision(t *testing.T, upstream http.HandlerFunc, vision *VisionClient) (http.Handler, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewServer(upstream)
@@ -54,7 +57,7 @@ func newIdentifyHandlerWithVision(t *testing.T, upstream http.HandlerFunc, visio
 	if err != nil {
 		t.Fatalf("LoadContent: %v", err)
 	}
-	return HandleIdentify(c, content, vision), srv
+	return HandleIdentify(nil, c, content, vision), srv
 }
 
 func TestHandleIdentify_Success(t *testing.T) {
@@ -509,6 +512,336 @@ func TestHandleIdentify_AIEnhance_FlagAcceptsTrueAndOne(t *testing.T) {
 				t.Errorf("flag=%q: AIEnhancedAt should be non-nil", flag)
 			}
 		})
+	}
+}
+
+// --- HandleIdentify two-engine cascade (SPEC §1.1 / §7) ---
+
+// newCascadeHandler wires HandleIdentify with BOTH a Pl@ntNet fake (primary)
+// and a Plant.id fake (fallback). Either upstream may be nil → that engine's
+// client is nil (Plant.id-only / Pl@ntNet-only). Returns both httptest
+// servers so the caller can assert call counts via closures.
+func newCascadeHandler(t *testing.T, plantNetUp, plantIDUp http.HandlerFunc) (http.Handler, func()) {
+	t.Helper()
+	var (
+		pnClient *PlantNetClient
+		piClient *PlantIDClient
+		closers  []func()
+	)
+	if plantNetUp != nil {
+		pnSrv := httptest.NewServer(plantNetUp)
+		closers = append(closers, pnSrv.Close)
+		pnClient = &PlantNetClient{
+			APIKey: "test-key", Endpoint: pnSrv.URL,
+			Lang: "en", NbResults: 5, HTTP: pnSrv.Client(),
+		}
+	}
+	if plantIDUp != nil {
+		piSrv := httptest.NewServer(plantIDUp)
+		closers = append(closers, piSrv.Close)
+		piClient = &PlantIDClient{
+			APIKey: "test-key", Endpoint: piSrv.URL, HTTP: piSrv.Client(),
+		}
+	}
+	content, err := LoadContent()
+	if err != nil {
+		t.Fatalf("LoadContent: %v", err)
+	}
+	cleanup := func() {
+		for _, c := range closers {
+			c()
+		}
+	}
+	return HandleIdentify(pnClient, piClient, content, nil), cleanup
+}
+
+func doCascadeReq(t *testing.T, h http.Handler) *httptest.ResponseRecorder {
+	t.Helper()
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// cannedPlantNetIdentifyOK — minimal Pl@ntNet success used by cascade tests
+// (a catalog scientific name so the handler's plantId resolver also runs).
+const cannedPlantNetIdentifyOK = `{
+  "bestMatch": "Abelia chinensis",
+  "results": [
+    {"score": 0.91, "species": {
+      "scientificNameWithoutAuthor": "Abelia chinensis",
+      "scientificName": "Abelia chinensis R.Br.",
+      "commonNames": ["Chinese Abelia"]}}
+  ],
+  "remainingIdentificationRequests": 480
+}`
+
+// (a) Pl@ntNet primary success → Plant.id is NOT called.
+func TestHandleIdentify_Cascade_PlantNetPrimarySuccess(t *testing.T) {
+	plantIDCalled := false
+	h, cleanup := newCascadeHandler(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, cannedPlantNetIdentifyOK)
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			plantIDCalled = true
+			t.Error("Plant.id fallback must NOT be called on Pl@ntNet success")
+		})
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if plantIDCalled {
+		t.Error("Plant.id was called; want Pl@ntNet-only")
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !result.IsPlant || len(result.Suggestions) != 1 {
+		t.Fatalf("result = %+v, want IsPlant=true + 1 suggestion", result)
+	}
+	if result.Suggestions[0].Name != "Abelia chinensis" {
+		t.Errorf("Suggestions[0].Name = %q, want Abelia chinensis", result.Suggestions[0].Name)
+	}
+	// Per-suggestion plantId resolver still runs on the Pl@ntNet path.
+	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0001" {
+		t.Errorf("Suggestions[0].PlantID = %v, want AAA0001", result.Suggestions[0].PlantID)
+	}
+}
+
+// (b) Pl@ntNet 5xx → Plant.id fallback success.
+func TestHandleIdentify_Cascade_PlantNet5xx_FallsBackToPlantID(t *testing.T) {
+	plantIDCalled := false
+	h, cleanup := newCascadeHandler(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			plantIDCalled = true
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, cannedPlantIDOK)
+		})
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fallback), body=%s", rec.Code, rec.Body.String())
+	}
+	if !plantIDCalled {
+		t.Error("Plant.id fallback was NOT called after Pl@ntNet 5xx")
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// cannedPlantIDOK top-1 is Monstera deliciosa — proves the Plant.id
+	// response (not Pl@ntNet) is what got served.
+	if result.Suggestions[0].Name != "Monstera deliciosa" {
+		t.Errorf("Suggestions[0].Name = %q, want Monstera deliciosa (Plant.id fallback)", result.Suggestions[0].Name)
+	}
+}
+
+// (c) Pl@ntNet 404 "no match" → NO fallback; 200 with empty suggestions.
+func TestHandleIdentify_Cascade_PlantNet404_NoFallback_EmptyResult(t *testing.T) {
+	plantIDCalled := false
+	h, cleanup := newCascadeHandler(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":"Not Found","message":"Species not found"}`)
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			plantIDCalled = true
+			t.Error("Plant.id must NOT be called on a Pl@ntNet 404 no-match")
+		})
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (valid empty), body=%s", rec.Code, rec.Body.String())
+	}
+	if plantIDCalled {
+		t.Error("Plant.id was called; a Pl@ntNet 404 is a valid empty result")
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !result.IsPlant {
+		t.Errorf("IsPlant = false, want true (SPEC §1.4 empty result still is_plant)")
+	}
+	if len(result.Suggestions) != 0 {
+		t.Errorf("Suggestions len = %d, want 0 (no match)", len(result.Suggestions))
+	}
+}
+
+// (d) Pl@ntNet image-rejected (400) → 400 bad_image, NO fallback.
+func TestHandleIdentify_Cascade_PlantNetImageRejected_NoFallback_400(t *testing.T) {
+	plantIDCalled := false
+	h, cleanup := newCascadeHandler(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			plantIDCalled = true
+			t.Error("Plant.id must NOT be called when Pl@ntNet rejects the image")
+		})
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 bad_image", rec.Code)
+	}
+	if plantIDCalled {
+		t.Error("Plant.id was called; image-rejected must not fall back")
+	}
+	if !strings.Contains(rec.Body.String(), `"bad_image"`) {
+		t.Errorf("body = %s, want bad_image", rec.Body.String())
+	}
+}
+
+// (e) Pl@ntNet down + Plant.id down → 502 plant_id_unavailable (both engines
+// failed; wire code unchanged per SPEC §3).
+func TestHandleIdentify_Cascade_BothEnginesDown_502(t *testing.T) {
+	h, cleanup := newCascadeHandler(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		})
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"plant_id_unavailable"`) {
+		t.Errorf("body = %s, want plant_id_unavailable", rec.Body.String())
+	}
+}
+
+// Pl@ntNet auth-fail + Plant.id auth-fail → plant_id_unauthorized (502).
+func TestHandleIdentify_Cascade_BothUnauthorized_502Unauthorized(t *testing.T) {
+	h, cleanup := newCascadeHandler(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		})
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"plant_id_unauthorized"`) {
+		t.Errorf("body = %s, want plant_id_unauthorized", rec.Body.String())
+	}
+}
+
+// (f) `organ` form field is forwarded to the Pl@ntNet engine.
+func TestHandleIdentify_Cascade_OrganForwardedToPlantNet(t *testing.T) {
+	gotOrgan := ""
+	pnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(2 << 20); err != nil {
+			t.Fatalf("ParseMultipartForm: %v", err)
+		}
+		if r.MultipartForm != nil {
+			if vals, ok := r.MultipartForm.Value["organs"]; ok && len(vals) > 0 {
+				gotOrgan = vals[0]
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, cannedPlantNetIdentifyOK)
+	}))
+	defer pnSrv.Close()
+	pn := &PlantNetClient{
+		APIKey: "k", Endpoint: pnSrv.URL, Lang: "en", NbResults: 5, HTTP: pnSrv.Client(),
+	}
+	content, err := LoadContent()
+	if err != nil {
+		t.Fatalf("LoadContent: %v", err)
+	}
+	h := HandleIdentify(pn, nil, content, nil)
+
+	// Build a multipart body with image + organ=flower.
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	fw, _ := w.CreateFormFile("image", "test.jpg")
+	_, _ = fw.Write(jpegMagic)
+	if err := w.WriteField("organ", "flower"); err != nil {
+		t.Fatalf("WriteField organ: %v", err)
+	}
+	_ = w.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/identify", &buf)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if gotOrgan != "flower" {
+		t.Errorf("Pl@ntNet organs part = %q, want flower (forwarded from form field)", gotOrgan)
+	}
+}
+
+// An unrecognized `organ` value falls back to "auto" (SPEC §2.1).
+func TestHandleIdentify_Cascade_UnknownOrganDefaultsAuto(t *testing.T) {
+	gotOrgan := ""
+	pnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(2 << 20); err != nil {
+			t.Fatalf("ParseMultipartForm: %v", err)
+		}
+		if r.MultipartForm != nil {
+			if vals, ok := r.MultipartForm.Value["organs"]; ok && len(vals) > 0 {
+				gotOrgan = vals[0]
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, cannedPlantNetIdentifyOK)
+	}))
+	defer pnSrv.Close()
+	pn := &PlantNetClient{
+		APIKey: "k", Endpoint: pnSrv.URL, Lang: "en", NbResults: 5, HTTP: pnSrv.Client(),
+	}
+	content, err := LoadContent()
+	if err != nil {
+		t.Fatalf("LoadContent: %v", err)
+	}
+	h := HandleIdentify(pn, nil, content, nil)
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	fw, _ := w.CreateFormFile("image", "test.jpg")
+	_, _ = fw.Write(jpegMagic)
+	_ = w.WriteField("organ", "wingding")
+	_ = w.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/identify", &buf)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if gotOrgan != "auto" {
+		t.Errorf("Pl@ntNet organs part = %q, want auto (unknown organ → auto)", gotOrgan)
 	}
 }
 

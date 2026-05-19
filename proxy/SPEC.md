@@ -10,7 +10,7 @@
 
 ### 1.1 What this package is responsible for
 
-- Accept image upload from the iOS client, forward to Plant.id v3 for plant identification, sanitize the response, resolve each suggestion's `scientific_name` to a YardMate `plantId` (same catalog resolver as `/v1/diagnose`, §2.1), return to client (`POST /v1/identify`).
+- Accept image upload from the iOS client and identify the plant via a **two-engine cascade**: **Pl@ntNet is primary, Plant.id is the fallback**. Pl@ntNet is tried first; only when Pl@ntNet is *unavailable* (5xx / timeout / network / 429 quota / auth-misconfig / malformed body) does the handler retry the same image against Plant.id. Pl@ntNet returning a valid answer — *including "no match found"* — is authoritative and does **not** trigger the fallback (it is a real result, and Plant.id credit must not be spent on it). Both engines normalize to the identical `IdentifyResult` shape; each suggestion's `scientific_name` is resolved to a YardMate `plantId` (same catalog resolver as `/v1/diagnose`, §2.1) regardless of which engine answered, then returned (`POST /v1/identify`). Cascade order + rationale in §7.
 - Accept image upload from the iOS client, forward to Plant.id v3 with `health=all`, cross-reference Plant.id's disease names against the YardMate catalog (1522 plants × 70 disease entries embedded at build time), and return a normalized `DiagnoseResult` with `plantId` / `catalogId` mapping (`POST /v1/diagnose`).
 - Apply optional LLM post-processing when the operator-configured OpenAI key is present: rerank Plant.id top-N candidates on `/v1/identify?ai_enhance=true`, and disambiguate Plant.id disease names that don't match the YardMate catalog on `/v1/diagnose`.
 - Enforce two-layer rate limit (per-IP and per-device, both at the /v1 router scope; see §4.1) and a hard 8 MB image size cap on every endpoint.
@@ -32,11 +32,12 @@
 
 | Function | Input |
 |---|---|
-| `PlantIDClient.Identify(ctx, image io.Reader, mime)` | image stream + MIME (`image/jpeg` or `image/png`); ≤8 MB |
+| `PlantNetClient.Identify(ctx, image io.Reader, mime, organ)` | image stream + MIME + organ (`leaf`/`flower`/`fruit`/`bark`/`auto`); ≤8 MB. **Primary engine.** |
+| `PlantIDClient.Identify(ctx, image io.Reader, mime)` | image stream + MIME (`image/jpeg` or `image/png`); ≤8 MB. **Fallback engine.** |
 | `PlantIDClient.Diagnose(ctx, image []byte, mime)` | image bytes + MIME; bytes because the upstream needs a base64 JSON body |
 | `VisionClient.RerankIdentify(ctx, image, mime, candidates)` | image bytes + Plant.id top-N |
 | `VisionClient.DisambiguateDiseaseName(ctx, name, refs)` | text-only |
-| HTTP `POST /v1/identify` | multipart/form-data: `image` (file, required) + `ai_enhance` (text "true"/"1"/"yes", optional, default false). Required headers `X-Device-Install-Id` + `X-App-Version`, optional `X-AppAttest-*` |
+| HTTP `POST /v1/identify` | multipart/form-data: `image` (file, required) + `ai_enhance` (text "true"/"1"/"yes", optional, default false) + `organ` (text, optional, default `auto`; one of `leaf`/`flower`/`fruit`/`bark`/`auto` — Pl@ntNet organ hint, ignored by the Plant.id fallback). Required headers `X-Device-Install-Id` + `X-App-Version`, optional `X-AppAttest-*` |
 | HTTP `POST /v1/diagnose` | multipart/form-data: `image` (file, required). Same header set as `/v1/identify` |
 
 All HTTP body parsing and header extraction happens in `handlers.go` (HTTP layer); the typed package functions take already-validated arguments.
@@ -45,7 +46,8 @@ All HTTP body parsing and header extraction happens in `handlers.go` (HTTP layer
 
 | Function | Output | Error cases |
 |---|---|---|
-| `Identify(...)` | `*IdentifyResult` (suggestions list + is_plant flag + `ai_enhanced_at`); per-suggestion `plant_id` is left nil here and filled by the HTTP handler from `ContentIndex` (like `ai_enhanced_at`), not by `PlantIDClient` | `ErrPlantIDImageRejected`, `ErrPlantIDUnauthorized`, `ErrPlantIDUnavailable`, `ErrPlantIDRateLimit`, `ErrPlantIDBadResponse` |
+| `PlantNetClient.Identify(...)` | `*IdentifyResult` (same shape as Plant.id; `is_plant`=true when matches exist, empty `suggestions` on a Pl@ntNet "no match"); per-suggestion `plant_id` filled by the handler | `ErrPlantNetImageRejected`, `ErrPlantNetUnauthorized`, `ErrPlantNetUnavailable`, `ErrPlantNetRateLimit`, `ErrPlantNetBadResponse` (the *Unavailable/RateLimit/Unauthorized/BadResponse* set triggers the Plant.id fallback; *ImageRejected* does not — both engines would reject it) |
+| `PlantIDClient.Identify(...)` | `*IdentifyResult` (suggestions list + is_plant flag + `ai_enhanced_at`); per-suggestion `plant_id` is left nil here and filled by the HTTP handler from `ContentIndex` (like `ai_enhanced_at`), not by `PlantIDClient` | `ErrPlantIDImageRejected`, `ErrPlantIDUnauthorized`, `ErrPlantIDUnavailable`, `ErrPlantIDRateLimit`, `ErrPlantIDBadResponse` |
 | `Diagnose(...)` | `*plantIDDiagnoseResponse` (raw upstream shape, sanitized in handler into `DiagnoseResult`) | same set as `Identify` |
 | `VisionClient.RerankIdentify(...)` | picked candidate name or `error` (handler keeps Plant.id ordering on error) | network / non-200 / decode / hallucinated pick |
 | HTTP `/v1/identify` | 200 JSON (see §2.1) | 4xx/5xx per §3 |
@@ -53,9 +55,10 @@ All HTTP body parsing and header extraction happens in `handlers.go` (HTTP layer
 
 ### 1.5 External dependencies
 
-- **Plant.id v3** — `POST https://plant.id/api/v3/identification` (multipart with `images` field for Identify; JSON body with base64 data URLs + `health=all` for Diagnose; header `Api-Key`). [Docs](https://github.com/flowerchecker/Plant-id-API)
+- **Pl@ntNet API v2 (primary identify engine)** — `POST https://my-api.plantnet.org/v2/identify/all?api-key=<KEY>&lang=en&nb-results=5` (multipart with parallel `images` file part + `organs` text part; key is a query param, not a header). Free tier ≈ 500 req/day; quota exhaustion returns 429 → triggers the Plant.id fallback. A no-match returns HTTP 404 `{"error":"Not Found","message":"Species not found"}` — treated as a *valid empty result*, not an engine failure.
+- **Plant.id v3 (fallback identify engine + sole `/v1/diagnose` engine)** — `POST https://plant.id/api/v3/identification` (multipart with `images` field for Identify; JSON body with base64 data URLs + `health=all` for Diagnose; header `Api-Key`). [Docs](https://github.com/flowerchecker/Plant-id-API). `/v1/diagnose` does **not** cascade to Pl@ntNet — Pl@ntNet does species ID only, no health assessment.
 - **OpenAI chat-completions (vision)** — `POST https://api.openai.com/v1/chat/completions` with `gpt-4o-2024-08-06`. Used for `ai_enhance` rerank (multimodal) and `/v1/diagnose` catalog-id disambiguation (text-only). 8 s client timeout.
-- `github.com/yaochen1125/yardmate-api/secrets` — for `PLANT_ID_API_KEY` and `OPENAI_API_KEY` at startup (keys never returned to clients).
+- `github.com/yaochen1125/yardmate-api/secrets` — for `PLANTNET_API_KEY`, `PLANT_ID_API_KEY` and `OPENAI_API_KEY` at startup (keys never returned to clients). A missing `PLANTNET_API_KEY` disables the primary engine and the handler runs Plant.id-only (graceful degrade, warn-logged); a missing `PLANT_ID_API_KEY` disables the fallback.
 - `github.com/yaochen1125/yardmate-api/ratelimit` — per-IP middleware on the `/v1` scope plus per-device middleware on the proxy endpoint group (`/v1/identify`, `/v1/diagnose`).
 - **Embedded catalog JSON** (`proxy/data/{plants_index,plants_detail,diseases}.json`) — built into the binary via `//go:embed`. ~10 MB binary footprint, lookup map built once at startup. `plants_index.json` now backs the `plant_id` resolution on **both** `/v1/identify` (per-suggestion) and `/v1/diagnose`.
 - Standard library only for HTTP / JSON / multipart / context (no third-party SDK).
@@ -72,6 +75,7 @@ All HTTP body parsing and header extraction happens in `handlers.go` (HTTP layer
 - Form fields:
   - `image` (file, required) — JPEG or PNG, ≤8 MB
   - `ai_enhance` (text, optional) — `true` / `1` / `yes` opts into the LLM rerank pass. Any other value (or the field's absence) is treated as false.
+  - `organ` (text, optional) — Pl@ntNet organ hint: one of `leaf` / `flower` / `fruit` / `bark` / `auto`. Absent / empty / unrecognized → `auto`. Forwarded to the primary Pl@ntNet engine only; the Plant.id fallback ignores it (Plant.id has no organ parameter). iOS already captures this on `CapturedPhoto.organ`.
 - Required headers:
   - `X-Device-Install-Id: <RFC4122 UUID>`
   - `X-App-Version: <semver>` (e.g. `1.1.1`)
@@ -233,11 +237,11 @@ All codes apply to both `/v1/identify` and `/v1/diagnose`.
 | `image_too_large` | 413 | >8 MB | resize + retry |
 | `rate_limit_ip` | 429 | per-IP bucket exhausted; `Retry-After` header set | back off; user UX message |
 | `rate_limit_device` | 429 | per-device bucket exhausted (`X-Device-Install-Id` key); `Retry-After` header set | back off; user UX message |
-| `plant_id_unavailable` | 502 | Plant.id 5xx / timeout / transient (including 429 from Plant.id) | retry with backoff |
-| `plant_id_unauthorized` | 502 | Plant.id 401/403 — server config issue, NOT a client problem | client shows generic "service issue" |
+| `plant_id_unavailable` | 502 | **identification unavailable** — on `/v1/identify` this means *both* engines failed (Pl@ntNet 5xx/timeout/429/network/bad-body **and then** the Plant.id fallback 5xx/timeout/429); on `/v1/diagnose` it means Plant.id 5xx/timeout/429 | retry with backoff |
+| `plant_id_unauthorized` | 502 | identification engine 401/403 — server key misconfig, NOT a client problem (on `/v1/identify`: Pl@ntNet auth failed *and* the Plant.id fallback also 401/403) | client shows generic "service issue" |
 | `internal` | 500 | unmapped upstream error | retry; alert backend |
 
-Note: OpenAI vision failures are **never** surfaced to the client. `ai_enhance` rerank failures leave `ai_enhanced_at: null` in a 200 response; `/v1/diagnose` catalog disambiguation failures leave `catalogId: null` on the issue. Both are warn-logged server-side.
+Note: the wire code stays `plant_id_unavailable` / `plant_id_unauthorized` (not renamed) so the iOS error mapping is unchanged — it now denotes "all identification engines down", not literally Plant.id. OpenAI vision failures are **never** surfaced to the client. `ai_enhance` rerank failures leave `ai_enhanced_at: null` in a 200 response; `/v1/diagnose` catalog disambiguation failures leave `catalogId: null` on the issue. Both are warn-logged server-side.
 
 ---
 
@@ -330,8 +334,9 @@ When V1.1+ adds adaptive risk scoring or per-user identity (sign-in), these beco
 
 ## 7. Resolved decisions (don't re-debate)
 
+- **Pl@ntNet primary, Plant.id fallback on `/v1/identify` (V1.0).** Decided 2026-05-18 when the operator's Plant.id account ran out of credit and `/v1/identify` hard-failed `plant_id_unavailable` for every request (identify is a core feature → production-blocking). Pl@ntNet's free tier (~500 req/day) keeps identify alive at zero marginal cost; Plant.id (when funded) is generally the stronger engine so it stays as the fallback rather than being dropped. Cascade is **single-attempt, no retry within an engine**: Pl@ntNet once → on *unavailable* (not on a valid no-match) → Plant.id once → else 502. `/v1/diagnose` is unaffected (Pl@ntNet has no health assessment) and stays Plant.id-only. Operator must keep `PLANTNET_API_KEY` funded/rotated; quota/credit alarms remain an operator concern (§8). If Pl@ntNet daily volume routinely exceeds the free tier, either upgrade the Pl@ntNet plan or re-fund Plant.id — the cascade already degrades correctly either way.
 - **Plant.id v3, not v2.** Better quality + maintained.
-- **No retry of upstream calls in V1.** Plant.id 5xx → return 502 immediately. Client retries with user-driven backoff. Server-side retry adds complexity for marginal value at V1 scale.
+- **No retry of upstream calls in V1.** An engine 5xx is a single attempt; on `/v1/identify` it advances to the next engine in the cascade, on `/v1/diagnose` it returns 502 immediately. Client retries with user-driven backoff. Server-side per-engine retry adds complexity for marginal value at V1 scale.
 - **App Attest stays in V1 binary but unused in proxy code path.** Removing it would conflict with V1.1 revival plan + memory `option_d_progress.md` deprecation note. Keep `/v1/attest/challenge` + `/v1/attest/register` + `/v1/secrets/challenge` + `/v1/app-secrets` registered (existing tests stay green). V1 iOS client doesn't call them.
 - **Headers `X-AppAttest-*` (optional) accepted for forward compat.** Server logs them; doesn't act on them. V1.1 + revival of App Attest can wire `attest.SoftVerifyAssertion()` here without changing the wire contract.
 - **Image MIME accepted: jpeg, png only.** No HEIC (iOS auto-converts on share-sheet; iOS app should ensure jpeg/png at upload time).

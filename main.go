@@ -74,14 +74,25 @@ func main() {
 	sweepStop := lim.StartSweeper(defaultSweepInterval)
 	defer close(sweepStop)
 
-	// Plant.id proxy client (V1 — server-side image identification + diagnose).
-	// Key never leaves server. Disabled if PLANT_ID_API_KEY is missing
-	// (deploy.sh enforces presence in production secrets.env).
+	// Pl@ntNet proxy client — PRIMARY /v1/identify engine (SPEC §7).
+	// Key never leaves server. Disabled if PLANTNET_API_KEY is missing;
+	// then /v1/identify degrades to Plant.id-only (graceful, warn-logged).
+	var plantNet *proxy.PlantNetClient
+	if v := vault.Get("PLANTNET_API_KEY"); v != "" {
+		plantNet = proxy.NewPlantNetClient(v)
+	} else {
+		log.Printf("WARN: PLANTNET_API_KEY missing; /v1/identify primary engine disabled (Plant.id-only fallback)")
+	}
+
+	// Plant.id proxy client — /v1/identify FALLBACK + sole /v1/diagnose
+	// engine (SPEC §7). Key never leaves server. Disabled if
+	// PLANT_ID_API_KEY is missing; then /v1/diagnose is not registered and
+	// /v1/identify runs Pl@ntNet-only.
 	var plantID *proxy.PlantIDClient
 	if v := vault.Get("PLANT_ID_API_KEY"); v != "" {
 		plantID = proxy.NewPlantIDClient(v)
 	} else {
-		log.Printf("WARN: PLANT_ID_API_KEY missing; /v1/identify + /v1/diagnose will not be registered")
+		log.Printf("WARN: PLANT_ID_API_KEY missing; /v1/diagnose will not be registered (identify falls back to Pl@ntNet-only)")
 	}
 
 	// OpenAI vision client — drives the ai_enhance rerank on /v1/identify and
@@ -108,7 +119,7 @@ func main() {
 	// WARN log if either is missing or the DB ping fails.
 	enrichSvc := buildEnrichmentService(vault, content)
 
-	srv := newServer(verifier, vault, lim, plantID, vision, content, enrichSvc)
+	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, content, enrichSvc)
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream). Headroom 5 s.
 	httpSrv := &http.Server{
