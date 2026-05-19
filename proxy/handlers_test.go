@@ -1238,12 +1238,19 @@ func TestHandleIdentify_CatalogPref_NoneInCatalog_AICatalogRecovery(t *testing.T
 	}
 }
 
-// (d) NO candidate in catalog + AI catalog hit BUT conf < 0.55 + engine
-// candidates non-empty → keep the engine's ORIGINAL top (NOT the AI guess);
-// plant_id null (out-of-catalog → iOS enrichment). engine=plantnet-raw-oob.
-func TestHandleIdentify_CatalogPref_AILowConfidence_KeepsEngineTop(t *testing.T) {
+// (d) NO candidate in catalog + engine's ORIGINAL TOP is highly confident
+// (score 0.88 ≥ plantnetConfidentSkipAIConfidence 0.80) → the AI catalog-
+// recovery probe is SKIPPED entirely; the engine's original top is kept
+// (out-of-catalog, plant_id null → iOS enrichment). engine=plantnet-
+// confident-oob. (Change 1: this fixture used to exercise the AI-low-conf
+// rejection path; under the new ordering a confident engine top short-
+// circuits before vision is ever called — vision must NOT be hit.)
+func TestHandleIdentify_CatalogPref_ConfidentTop_SkipsAI_EngineTopUsed(t *testing.T) {
+	visionCalled := false
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// In-catalog name but LOW confidence (0.40 < 0.55) → must be rejected.
+		// If reached this would (under the new 0.10 floor) be ACCEPTED as a
+		// catalog recovery — so reaching it at all is the bug we guard against.
+		visionCalled = true
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.40}"}}]}`)
 	}))
 	defer vsrv.Close()
@@ -1274,17 +1281,22 @@ func TestHandleIdentify_CatalogPref_AILowConfidence_KeepsEngineTop(t *testing.T)
 	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	// Engine's ORIGINAL top kept (AI low-conf guess discarded entirely).
+	// AI must have been SKIPPED — a confident engine top (0.88 ≥ 0.80) +
+	// none-in-catalog short-circuits before the vision probe.
+	if visionCalled {
+		t.Error("vision was called; a confident engine top (≥0.80) + none-in-catalog must SKIP the AI catalog-recovery probe")
+	}
+	// Engine's ORIGINAL top kept as-is (out-of-catalog → iOS enrichment).
 	if result.Suggestions[0].ScientificName != "Engineschoice fakeum" {
-		t.Errorf("Suggestions[0] = %q, want Engineschoice fakeum (engine top kept, AI rejected)", result.Suggestions[0].ScientificName)
+		t.Errorf("Suggestions[0] = %q, want Engineschoice fakeum (confident engine top kept)", result.Suggestions[0].ScientificName)
 	}
 	if result.Suggestions[0].PlantID != nil {
 		t.Errorf("Suggestions[0].PlantID = %v, want nil (out-of-catalog → enrichment)", result.Suggestions[0].PlantID)
 	}
-	// AI's "Abelia chinensis" must NOT have leaked in anywhere.
+	// AI's "Abelia chinensis" must NOT have leaked in anywhere (probe skipped).
 	for i, s := range result.Suggestions {
 		if s.ScientificName == "Abelia chinensis" {
-			t.Errorf("Suggestions[%d] = Abelia chinensis; AI low-conf guess must not be used", i)
+			t.Errorf("Suggestions[%d] = Abelia chinensis; AI probe was skipped, its guess must not appear", i)
 		}
 	}
 }
@@ -1425,6 +1437,179 @@ func TestHandleIdentify_CatalogPref_TrimsTo3_ChosenStaysFirst(t *testing.T) {
 	if result.Suggestions[1].ScientificName != "Oo0 fakeum" || result.Suggestions[2].ScientificName != "Oo1 fakeum" {
 		t.Errorf("trimmed tail = %q,%q, want Oo0 fakeum,Oo1 fakeum (top-2 by confidence of remainder)",
 			result.Suggestions[1].ScientificName, result.Suggestions[2].ScientificName)
+	}
+}
+
+// --- Change 1 + Change 2 (cascade tune, 2026-05-19) ---
+//
+// Change 1: when 0 candidates resolve to the 1522 catalog AND the engine's
+// ORIGINAL top candidate is highly confident (Confidence ≥
+// plantnetConfidentSkipAIConfidence = 0.80), the AI catalog-recovery probe is
+// SKIPPED — engine top is used as-is (out-of-catalog), vision NOT called.
+// Change 2: aiCatalogRecoveryMinConfidence lowered 0.55 → 0.10 (maximize
+// curated-library hits; user accepts occasional wrong-but-curated).
+// Rule-B precedence (≥1 in catalog wins, even over a higher-conf OOB top) is
+// UNCHANGED. The 502/both-down + iOS shape are UNCHANGED.
+
+// (i) NONE in catalog + engine TOP Confidence 0.85 (≥ 0.80) → the engine top
+// is used as-is (out-of-catalog, plant_id null) and the AI catalog-recovery
+// probe is SKIPPED entirely (vision must NOT be called — asserted via a
+// vision fake that fails the test if hit). engine=plantnet-confident-oob.
+func TestHandleIdentify_CatalogPref_ConfidentTop085_SkipsAIProbe(t *testing.T) {
+	visionCalled := false
+	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		visionCalled = true
+		// Would resolve to catalog at conf 0.99 (≥ new 0.10 floor) → if the
+		// probe were NOT skipped this would wrongly become the answer.
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.99}"}}]}`)
+	}))
+	defer vsrv.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
+
+	// Both candidates out-of-catalog; original top score 0.85 ≥ 0.80.
+	const pn = `{
+  "bestMatch": "Confident fakeum",
+  "results": [
+    {"score": 0.85, "species": {"scientificNameWithoutAuthor": "Confident fakeum",
+      "scientificName": "Confident fakeum Auth.", "commonNames": ["Conf Top"]}},
+    {"score": 0.30, "species": {"scientificNameWithoutAuthor": "Lesser fakeum",
+      "scientificName": "Lesser fakeum Auth.", "commonNames": []}}
+  ],
+  "remainingIdentificationRequests": 440
+}`
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, pn)
+		}, nil, vision)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if visionCalled {
+		t.Error("vision was called; engine top 0.85 ≥ 0.80 + none-in-catalog must SKIP the AI probe (Change 1)")
+	}
+	if result.Suggestions[0].ScientificName != "Confident fakeum" {
+		t.Errorf("Suggestions[0] = %q, want Confident fakeum (confident engine top used as-is)", result.Suggestions[0].ScientificName)
+	}
+	if result.Suggestions[0].PlantID != nil {
+		t.Errorf("Suggestions[0].PlantID = %v, want nil (out-of-catalog → iOS enrichment)", result.Suggestions[0].PlantID)
+	}
+	for i, s := range result.Suggestions {
+		if s.ScientificName == "Abelia chinensis" {
+			t.Errorf("Suggestions[%d] = Abelia chinensis; AI probe was skipped, its guess must not appear", i)
+		}
+	}
+}
+
+// (ii) NONE in catalog + engine top 0.50 (< 0.80, AI path NOT skipped) + AI
+// returns a CATALOG plant at conf 0.12 → adopted as ai-catalog-recovery.
+// 0.12 ≥ new floor 0.10 but < old 0.55 → this proves Change 2 (would have
+// been rejected under the old 0.55 bar and kept the engine OOB top).
+func TestHandleIdentify_CatalogPref_AIConf012_RecoveredUnderNew010Floor(t *testing.T) {
+	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[\"Chinese Abelia\"],\"confidence\":0.12}"}}]}`)
+	}))
+	defer vsrv.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
+
+	// Engine top score 0.50 < 0.80 → AI catalog-recovery path runs.
+	const pn = `{
+  "bestMatch": "Notcatalog oneum",
+  "results": [
+    {"score": 0.50, "species": {"scientificNameWithoutAuthor": "Notcatalog oneum",
+      "scientificName": "Notcatalog oneum Auth.", "commonNames": []}},
+    {"score": 0.20, "species": {"scientificNameWithoutAuthor": "Notcatalog twoum",
+      "scientificName": "Notcatalog twoum Auth.", "commonNames": []}}
+  ],
+  "remainingIdentificationRequests": 430
+}`
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, pn)
+		}, nil, vision)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(result.Suggestions) != 1 {
+		t.Fatalf("len(Suggestions) = %d, want 1 (AI catalog-recovery replaces set)", len(result.Suggestions))
+	}
+	s := result.Suggestions[0]
+	if s.ScientificName != "Abelia chinensis" {
+		t.Errorf("Suggestions[0] = %q, want Abelia chinensis (recovered at conf 0.12 ≥ 0.10 floor)", s.ScientificName)
+	}
+	if s.PlantID == nil || *s.PlantID != "AAA0001" {
+		t.Errorf("Suggestions[0].PlantID = %v, want AAA0001", s.PlantID)
+	}
+	if s.Confidence != 0.12 {
+		t.Errorf("Confidence = %v, want 0.12 (AI's own; proves 0.10 floor — old 0.55 would reject)", s.Confidence)
+	}
+	if result.IsPlantConfidence != 0.12 {
+		t.Errorf("IsPlantConfidence = %v, want 0.12", result.IsPlantConfidence)
+	}
+}
+
+// (iii) NONE in catalog + engine top 0.50 (< 0.80) + AI returns a CATALOG
+// plant but at conf 0.05 (< new floor 0.10) → NOT recovered; the engine's
+// ORIGINAL top is kept as out-of-catalog. engine=plantnet-raw-oob. Proves the
+// 0.10 floor still rejects below it (the floor is lowered, not removed).
+func TestHandleIdentify_CatalogPref_AIConf005_BelowFloor_KeepsEngineTop(t *testing.T) {
+	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.05}"}}]}`)
+	}))
+	defer vsrv.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
+
+	const pn = `{
+  "bestMatch": "Keptengine topum",
+  "results": [
+    {"score": 0.50, "species": {"scientificNameWithoutAuthor": "Keptengine topum",
+      "scientificName": "Keptengine topum Auth.", "commonNames": ["Kept Top"]}},
+    {"score": 0.10, "species": {"scientificNameWithoutAuthor": "Other lowum",
+      "scientificName": "Other lowum Auth.", "commonNames": []}}
+  ],
+  "remainingIdentificationRequests": 420
+}`
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, pn)
+		}, nil, vision)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// AI guess (conf 0.05 < 0.10 floor) rejected → engine's ORIGINAL top kept.
+	if result.Suggestions[0].ScientificName != "Keptengine topum" {
+		t.Errorf("Suggestions[0] = %q, want Keptengine topum (AI 0.05 < 0.10 floor → engine top kept)", result.Suggestions[0].ScientificName)
+	}
+	if result.Suggestions[0].PlantID != nil {
+		t.Errorf("Suggestions[0].PlantID = %v, want nil (out-of-catalog → iOS enrichment)", result.Suggestions[0].PlantID)
+	}
+	for i, s := range result.Suggestions {
+		if s.ScientificName == "Abelia chinensis" {
+			t.Errorf("Suggestions[%d] = Abelia chinensis; AI guess below 0.10 floor must not be used", i)
+		}
 	}
 }
 

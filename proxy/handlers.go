@@ -25,14 +25,34 @@ const identifyUpstreamTimeout = 30 * time.Second
 
 // aiCatalogRecoveryMinConfidence is the floor the AI vision guess must clear
 // to be ACCEPTED as a curated-catalog recovery (SPEC §2.1 catalog-preference
-// cascade). When NO engine candidate resolves to the 1522 catalog, the handler
-// asks AI vision for a species and only adopts it (as the in-catalog answer)
-// if it (a) resolves to a catalog plantId AND (b) self-reports confidence ≥
-// this threshold. Below it, the engine's own top candidate is kept as the
-// out-of-catalog answer (the engine is the trusted identifier; AI is only a
-// catalog-recovery probe here, NOT a re-identification). 0.55 is a deliberate
-// "more-likely-than-not + margin" bar; see SPEC §7 resolved decisions.
-const aiCatalogRecoveryMinConfidence = 0.55
+// cascade). When NO engine candidate resolves to the 1522 catalog AND the
+// engine was NOT confident (its top candidate < plantnetConfidentSkipAIConfidence),
+// the handler asks AI vision for a species and only adopts it (as the
+// in-catalog answer) if it (a) resolves to a catalog plantId AND (b)
+// self-reports confidence ≥ this threshold. Below it, the engine's own top
+// candidate is kept as the out-of-catalog answer (the engine is the trusted
+// identifier; AI is only a catalog-recovery probe here, NOT a
+// re-identification). 0.10 is a deliberately VERY LOW bar: the user wants to
+// MAXIMIZE curated-library (1522) hits and accepts the tradeoff that, once the
+// engine was NOT confident (<0.80) and AI's free identification resolves to a
+// curated 1522 plant, a curated match — even at low AI confidence — is
+// preferred over a likely-worse out-of-catalog enrichment. The user explicitly
+// accepts occasional wrong-but-curated answers in exchange for the "rich
+// library" feel; see SPEC §7 resolved decisions (do NOT re-debate).
+const aiCatalogRecoveryMinConfidence = 0.10
+
+// plantnetConfidentSkipAIConfidence is the engine-confidence gate above which
+// the AI catalog-recovery probe is SKIPPED entirely (SPEC §2.1 catalog-
+// preference cascade). When NO engine candidate resolves to the 1522 catalog
+// but the engine's OWN top candidate (the original top, before any reorder)
+// self-reports confidence ≥ this value, the engine is treated as sure of a
+// specific out-of-catalog plant: a curated match is unlikely and the AI
+// catalog-recovery probe is not worth the GPT-4o latency/cost, so the engine
+// top is used as-is (out-of-catalog → iOS enrichment) and `vision` is NOT
+// called. Below it (including the no-candidates case where there is no top),
+// the AI catalog-recovery path runs as before. 0.80 is a deliberate
+// "engine is very sure" bar; see SPEC §7 resolved decisions.
+const plantnetConfidentSkipAIConfidence = 0.80
 
 // HandleIdentify returns the http.HandlerFunc for POST /v1/identify.
 // See SPEC §2.1, §3, §7 for the contract.
@@ -79,14 +99,19 @@ const aiCatalogRecoveryMinConfidence = 0.55
 //     the curated 1522 catalog, the handler asks OpenAI (vision, json_schema
 //     strict) for a species and adopts it as the in-catalog answer iff it
 //     resolves to a catalog plantId AND its self-reported confidence ≥
-//     aiCatalogRecoveryMinConfidence. Otherwise the engine's own top
-//     candidate is kept as the out-of-catalog answer (engine is the trusted
-//     identifier); the zero-engine case still gets the AI guess so a result
-//     is always returned (#18). The AI suggestion carries its own confidence
-//     and is NOT flagged (product decision: AI provenance not surfaced).
-//     vision==nil → no probe; behaves gracefully (engine top or, when the
-//     engine also returned nothing, the unchanged "can't identify" empty
-//     result). This subsumes the old tier-3 "zero suggestions → AI" block.
+//     aiCatalogRecoveryMinConfidence. EXCEPTION: if the engine's OWN top
+//     candidate self-reports confidence ≥ plantnetConfidentSkipAIConfidence
+//     the engine is treated as sure of a specific out-of-catalog plant — the
+//     AI probe is SKIPPED (not worth the latency/cost) and the engine top is
+//     used as-is. Otherwise (no catalog hit / low AI conf / vision err) the
+//     engine's own top candidate is kept as the out-of-catalog answer (engine
+//     is the trusted identifier); the zero-engine case still gets the AI
+//     guess so a result is always returned (#18). The AI suggestion carries
+//     its own confidence and is NOT flagged (product decision: AI provenance
+//     not surfaced). vision==nil → no probe; behaves gracefully (engine top
+//     or, when the engine also returned nothing, the unchanged "can't
+//     identify" empty result). This subsumes the old tier-3 "zero suggestions
+//     → AI" block.
 func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 1. Body cap (drops the connection on overflow, returning *MaxBytesError
@@ -255,12 +280,23 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//          ACCEPTED tradeoff (SPEC §7): a low-score in-catalog
 		//          candidate can override a higher-score out-of-catalog one
 		//          — chosen knowingly to prefer reviewed data.
-		//       2. Else if vision != nil → ask AI vision to recover a catalog
-		//          match. If the AI species resolves to the catalog AND its
-		//          self-reported confidence ≥ aiCatalogRecoveryMinConfidence
-		//          → adopt it as the sole in-catalog suggestion
-		//          (engine=ai-catalog-recovery).
-		//       3. Else (AI no catalog hit / low conf / vision err / nil):
+		//          This takes precedence even over a high-confidence
+		//          out-of-catalog top (no threshold here — unchanged #20).
+		//       2. Else (0 in catalog) if the engine's ORIGINAL TOP candidate
+		//          (cands[0], before any reorder) has Confidence ≥
+		//          plantnetConfidentSkipAIConfidence → the engine is sure of a
+		//          specific out-of-catalog plant; use the engine top as-is
+		//          (out-of-catalog → iOS enrichment) and DO NOT call vision —
+		//          a curated match is unlikely and the AI probe is not worth
+		//          the latency/cost (engine=<base>-confident-oob). Edge: zero
+		//          candidates ⇒ no top ⇒ treated as < the gate ⇒ fall to
+		//          step 3 (do NOT skip AI on an empty set).
+		//       3. Else (0 in catalog, engine NOT confident) if vision != nil
+		//          → ask AI vision to recover a catalog match. If the AI
+		//          species resolves to the catalog AND its self-reported
+		//          confidence ≥ aiCatalogRecoveryMinConfidence → adopt it as
+		//          the sole in-catalog suggestion (engine=ai-catalog-recovery).
+		//       4. Else (AI no catalog hit / low conf / vision err / nil):
 		//          - cands non-empty → keep the engine's ORIGINAL top
 		//            candidate (out-of-catalog, PlantID nil → iOS
 		//            enrichment); the engine is the trusted identifier, the
@@ -277,7 +313,8 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     not surfaced — same stance as the diagnose AI fallback). iOS
 		//     sees a normal IdentifyResult; no client change. This subsumes
 		//     the old tier-3 "zero suggestions → AI" block (the zero-engine
-		//     case is covered by branch 2/3 above). ---
+		//     case is covered by branch 3/4 above; the confident-oob skip in
+		//     branch 2 never applies to an empty set). ---
 		if err == nil {
 			base := engine // "plantnet" or "plantid-fallback"/"plantid"
 			if base == "plantid" {
@@ -305,12 +342,22 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				}
 			}
 
+			// Engine's ORIGINAL top confidence (cands[0], BEFORE any reorder).
+			// Empty set ⇒ no top ⇒ -1 (always < the skip gate), so the AI
+			// path is NOT skipped on an empty engine result (Change 1 edge).
+			engineTopConf := -1.0
+			if len(cands) > 0 {
+				engineTopConf = cands[0].Confidence
+			}
+
 			switch {
 			case bestIdx >= 0:
 				// ≥1 candidate in catalog → promote the highest-confidence
 				// in-catalog one to [0] and stamp its resolved PlantID. The
 				// per-suggestion resolver below re-runs LookupPlantID on the
 				// whole slice (idempotent) so [0] keeps a correct PlantID.
+				// This wins even over a higher-confidence out-of-catalog top
+				// (no threshold here — rule B precedence, unchanged from #20).
 				if bestIdx != 0 {
 					result.Suggestions[0], result.Suggestions[bestIdx] =
 						result.Suggestions[bestIdx], result.Suggestions[0]
@@ -319,8 +366,21 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				result.Suggestions[0].PlantID = &pid
 				engine = base + "-catalog"
 
+			case engineTopConf >= plantnetConfidentSkipAIConfidence:
+				// 0 candidates in catalog BUT the engine's own top candidate
+				// is highly confident (≥ plantnetConfidentSkipAIConfidence) →
+				// the engine is sure of a specific out-of-catalog plant; a
+				// curated match is unlikely and the AI catalog-recovery probe
+				// is not worth the GPT-4o latency/cost. Keep the engine's
+				// ORIGINAL top as-is (out-of-catalog, PlantID resolved nil by
+				// the loop below → iOS enrichment) and DO NOT call vision.
+				// (len(cands) > 0 is implied — empty set ⇒ engineTopConf = -1.)
+				engine = base + "-confident-oob"
+
 			case vision != nil:
-				// 0 candidates in catalog → AI vision catalog-recovery probe.
+				// 0 candidates in catalog AND engine NOT confident (top <
+				// plantnetConfidentSkipAIConfidence, or no top) → AI vision
+				// catalog-recovery probe.
 				aiSug, verr := vision.IdentifyPlant(ctx, imgBytes, mime)
 				var aiPID string
 				aiHasPID := false
