@@ -117,7 +117,7 @@ Full PlantDetail entry mirroring one entry of `yardmate-content/plants_detail.js
 | `difficulty` | `int` (0..5) | catalog | LLM |
 | `sunlight` | `int` (0..5) | catalog | LLM |
 | `hardiness_zones` | `{min:int, max:int}` | catalog | LLM |
-| `indoor_temp_f` | `number\|null` | catalog | LLM |
+| `indoor_temp_f` | `{min:int, max:int}\|null` | catalog | LLM |
 | `watering_days` | `{spring:int, summer:int, fall:int, winter:int}` | catalog | LLM |
 | **`watering_note`** | **`int\|null`** | catalog (0..6 int) | **always `null`** (LLM does not generate — §7) |
 | `fertilizing_days` | `{spring:int, summer:int, fall:int, winter:int}` | catalog | LLM |
