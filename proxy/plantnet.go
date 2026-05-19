@@ -17,7 +17,8 @@ import (
 // defaultPlantNetEndpoint is the Pl@ntNet API v2 identify URL (all organs).
 // The api-key is a QUERY param appended at call time (SPEC §1.5) — NOT a
 // header — so this base URL stays key-free and is overridable for tests.
-// lang=en + nb-results=5 match the SPEC contract.
+// lang=en + nb-results=10 match the SPEC contract (10 candidates so the
+// handler can evaluate the FULL set for a curated-catalog match, SPEC §2.1).
 const defaultPlantNetEndpoint = "https://my-api.plantnet.org/v2/identify/all"
 
 // defaultPlantNetTimeout caps the upstream Pl@ntNet call. 30 s matches the
@@ -32,7 +33,7 @@ type PlantNetClient struct {
 	APIKey    string
 	Endpoint  string // base URL; api-key is appended as a query param at call time
 	Lang      string // language for common names (default "en")
-	NbResults int    // max results requested from Pl@ntNet (default 5)
+	NbResults int    // max results requested from Pl@ntNet (default 10)
 	HTTP      *http.Client
 }
 
@@ -45,7 +46,7 @@ func NewPlantNetClient(apiKey string) *PlantNetClient {
 		APIKey:    apiKey,
 		Endpoint:  defaultPlantNetEndpoint,
 		Lang:      "en",
-		NbResults: 5,
+		NbResults: 10,
 		HTTP:      &http.Client{Timeout: defaultPlantNetTimeout},
 	}
 }
@@ -79,15 +80,19 @@ type plantNetAPIResponse struct {
 }
 
 // toIdentifyResult maps Pl@ntNet's raw response into the V1 client shape
-// (same IdentifyResult as the Plant.id path). Top-3 suggestions max
-// (SPEC §2.1). ScientificName uses scientificNameWithoutAuthor (NOT the
+// (same IdentifyResult as the Plant.id path). Up to 10 suggestions reach
+// the handler so it can evaluate the FULL candidate set for a curated-
+// catalog match (SPEC §2.1); the handler does the selection and trims the
+// RESPONSE to top-3 afterward. ScientificName uses scientificNameWithoutAuthor (NOT the
 // authored form) so the shared catalog resolver normalizes it identically
 // to Plant.id — parity matters (SPEC §2.1 "plant_id mapping"). commonNames
 // is normalized to non-nil (empty slice, not null, on the wire). PlantID and
 // AIEnhancedAt are left nil here; the handler fills them, exactly like the
 // Plant.id path.
 func (r *plantNetAPIResponse) toIdentifyResult() *IdentifyResult {
-	const maxSuggestions = 3
+	// 10, not 3: the handler selects across the FULL set (catalog-preference
+	// cascade, SPEC §2.1) and trims the RESPONSE to top-3 after choosing [0].
+	const maxSuggestions = 10
 
 	out := &IdentifyResult{
 		// Pl@ntNet only ever returns plant matches; presence of any result
@@ -204,7 +209,7 @@ func (c *PlantNetClient) Identify(ctx context.Context, image io.Reader, mime, or
 	}
 	nbResults := c.NbResults
 	if nbResults <= 0 {
-		nbResults = 5
+		nbResults = 10
 	}
 	reqURL, err := url.Parse(endpoint)
 	if err != nil {

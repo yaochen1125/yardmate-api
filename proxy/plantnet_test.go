@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,10 +13,12 @@ import (
 )
 
 // cannedPlantNetOK is a canned Pl@ntNet v2 /identify/all response (subset of
-// fields we consume). 4 results so the top-3 cap is exercised. results[0]
-// carries an `images` array (include-related-images=true shape) so ImageURL
-// mapping + the medium-preferred pick is exercised; results[1..] omit images
-// so the nil path is covered in the same fixture.
+// fields we consume). 4 results: toIdentifyResult now returns up to 10 (the
+// handler does catalog-preference selection across the full set and trims the
+// RESPONSE to top-3, SPEC §2.1), so the client layer keeps all 4 here.
+// results[0] carries an `images` array (include-related-images=true shape) so
+// ImageURL mapping + the medium-preferred pick is exercised; results[1..] omit
+// images so the nil path is covered in the same fixture.
 const cannedPlantNetOK = `{
   "query": {"project": "all", "images": ["img"], "organs": ["leaf"]},
   "language": "en",
@@ -69,7 +72,7 @@ const cannedPlantNetOK = `{
     {
       "score": 0.01,
       "species": {
-        "scientificNameWithoutAuthor": "Fourth (should be dropped, top-3 cap)",
+        "scientificNameWithoutAuthor": "Fourth (kept by client; top-3 trim is the handler's job now)",
         "scientificName": "Fourth Auth.",
         "commonNames": []
       }
@@ -85,7 +88,7 @@ func newTestPlantNetClient(t *testing.T, handler http.HandlerFunc) (*PlantNetCli
 		APIKey:    "test-key",
 		Endpoint:  srv.URL,
 		Lang:      "en",
-		NbResults: 5,
+		NbResults: 10,
 		HTTP:      srv.Client(),
 	}
 	return c, srv
@@ -133,8 +136,10 @@ func TestPlantNetClient_Identify_Success(t *testing.T) {
 	if gotLang != "en" {
 		t.Errorf("lang query = %q, want en", gotLang)
 	}
-	if gotNbResults != "5" {
-		t.Errorf("nb-results query = %q, want 5", gotNbResults)
+	// SPEC §2.1: request 10 candidates so the handler can evaluate the FULL
+	// set for a curated-catalog match (catalog-preference cascade).
+	if gotNbResults != "10" {
+		t.Errorf("nb-results query = %q, want 10 (catalog-preference cascade)", gotNbResults)
 	}
 	if gotInclRelImages != "true" {
 		t.Errorf("include-related-images query = %q, want true", gotInclRelImages)
@@ -157,8 +162,11 @@ func TestPlantNetClient_Identify_Success(t *testing.T) {
 	if got, want := result.IsPlantConfidence, 0.85; got != want {
 		t.Errorf("IsPlantConfidence = %v, want %v (results[0].score)", got, want)
 	}
-	if got, want := len(result.Suggestions), 3; got != want {
-		t.Errorf("len(Suggestions) = %d, want %d (top-3 cap)", got, want)
+	// toIdentifyResult now returns up to 10 (catalog-preference cascade,
+	// SPEC §2.1): selection across the full set + the top-3 trim are the
+	// HANDLER's job, not the client's. The 4-result fixture → 4 suggestions.
+	if got, want := len(result.Suggestions), 4; got != want {
+		t.Errorf("len(Suggestions) = %d, want %d (full set; handler trims to 3)", got, want)
 	}
 	s0 := result.Suggestions[0]
 	// Name + ScientificName both use scientificNameWithoutAuthor (SPEC §2.1
@@ -190,6 +198,53 @@ func TestPlantNetClient_Identify_Success(t *testing.T) {
 	}
 	if result.Suggestions[2].ImageURL != nil {
 		t.Errorf("Suggestions[2].ImageURL = %q, want nil (no images in fixture)", *result.Suggestions[2].ImageURL)
+	}
+}
+
+// TestPlantNetClient_NewClient_NbResults10 pins the PRODUCTION default to 10
+// (catalog-preference cascade, SPEC §2.1 — request 10 candidates so the
+// handler can evaluate the full set for a curated-catalog match).
+func TestPlantNetClient_NewClient_NbResults10(t *testing.T) {
+	c := NewPlantNetClient("k")
+	if c.NbResults != 10 {
+		t.Errorf("NewPlantNetClient().NbResults = %d, want 10", c.NbResults)
+	}
+}
+
+// TestPlantNetClient_Identify_ReturnsUpTo10 asserts toIdentifyResult passes
+// the FULL candidate set (up to 10) to the handler — it no longer caps at 3.
+// A 12-result upstream is capped to exactly 10 (the handler then does the
+// catalog-preference selection across all 10 and trims the RESPONSE to 3).
+func TestPlantNetClient_Identify_ReturnsUpTo10(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString(`{"bestMatch":"R0","results":[`)
+	for i := 0; i < 12; i++ {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, `{"score":%f,"species":{"scientificNameWithoutAuthor":"R%d","scientificName":"R%d Auth.","commonNames":[]}}`,
+			1.0-float64(i)*0.05, i, i)
+	}
+	sb.WriteString(`],"remainingIdentificationRequests":50}`)
+
+	c, srv := newTestPlantNetClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, sb.String())
+	})
+	defer srv.Close()
+
+	result, err := c.Identify(context.Background(),
+		strings.NewReader("x"), "image/jpeg", "auto")
+	if err != nil {
+		t.Fatalf("Identify: %v", err)
+	}
+	if got, want := len(result.Suggestions), 10; got != want {
+		t.Errorf("len(Suggestions) = %d, want %d (toIdentifyResult cap raised 3→10)", got, want)
+	}
+	// Order preserved (no client-side reorder; the handler selects).
+	if result.Suggestions[0].Name != "R0" || result.Suggestions[9].Name != "R9" {
+		t.Errorf("first/last = %q/%q, want R0/R9 (input order, first 10 kept)",
+			result.Suggestions[0].Name, result.Suggestions[9].Name)
 	}
 }
 
@@ -286,8 +341,9 @@ func TestPlantNetClient_Identify_Accepts201Created(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Identify on 201: %v", err)
 	}
-	if !result.IsPlant || len(result.Suggestions) != 3 {
-		t.Errorf("result = %+v, want IsPlant=true + 3 suggestions on 201", result)
+	// 4-result fixture → 4 (client returns the full set now; handler trims).
+	if !result.IsPlant || len(result.Suggestions) != 4 {
+		t.Errorf("result = %+v, want IsPlant=true + 4 suggestions on 201", result)
 	}
 }
 

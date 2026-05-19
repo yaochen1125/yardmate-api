@@ -9,6 +9,7 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -21,6 +22,17 @@ const identifyMaxBody = 9 << 20 // 9 MiB
 // middleware.Timeout (10 s) is overridden via a per-request derived context
 // so Plant.id has up to 30 s — the proxy is the slow-path tenant.
 const identifyUpstreamTimeout = 30 * time.Second
+
+// aiCatalogRecoveryMinConfidence is the floor the AI vision guess must clear
+// to be ACCEPTED as a curated-catalog recovery (SPEC §2.1 catalog-preference
+// cascade). When NO engine candidate resolves to the 1522 catalog, the handler
+// asks AI vision for a species and only adopts it (as the in-catalog answer)
+// if it (a) resolves to a catalog plantId AND (b) self-reports confidence ≥
+// this threshold. Below it, the engine's own top candidate is kept as the
+// out-of-catalog answer (the engine is the trusted identifier; AI is only a
+// catalog-recovery probe here, NOT a re-identification). 0.55 is a deliberate
+// "more-likely-than-not + margin" bar; see SPEC §7 resolved decisions.
+const aiCatalogRecoveryMinConfidence = 0.55
 
 // HandleIdentify returns the http.HandlerFunc for POST /v1/identify.
 // See SPEC §2.1, §3, §7 for the contract.
@@ -61,14 +73,20 @@ const identifyUpstreamTimeout = 30 * time.Second
 //     uploaded image and re-orders Suggestions so the LLM pick is first. On
 //     any LLM error / timeout the original engine ranking is preserved and
 //     AIEnhancedAt stays null in the response.
-//   - tier-3 identify fallback (SPEC §1.1 / §2.1 / §7): when non-nil AND the
-//     Pl@ntNet→Plant.id cascade SUCCEEDED but yielded ZERO suggestions, the
-//     handler asks OpenAI (vision, json_schema strict) for a single
-//     best-guess species so /v1/identify ALWAYS returns a result. The AI
-//     suggestion carries its own confidence and is NOT flagged (product
-//     decision: AI provenance not surfaced). On any vision error the empty
-//     result is kept (unchanged "can't identify" behavior). vision==nil →
-//     both paths are skipped (graceful, behaves exactly as before).
+//   - catalog-recovery probe (SPEC §1.1 / §2.1 / §7): part of the catalog-
+//     preference selection cascade. When the Pl@ntNet→Plant.id cascade
+//     SUCCEEDED but NO candidate (across the full up-to-10 set) resolves to
+//     the curated 1522 catalog, the handler asks OpenAI (vision, json_schema
+//     strict) for a species and adopts it as the in-catalog answer iff it
+//     resolves to a catalog plantId AND its self-reported confidence ≥
+//     aiCatalogRecoveryMinConfidence. Otherwise the engine's own top
+//     candidate is kept as the out-of-catalog answer (engine is the trusted
+//     identifier); the zero-engine case still gets the AI guess so a result
+//     is always returned (#18). The AI suggestion carries its own confidence
+//     and is NOT flagged (product decision: AI provenance not surfaced).
+//     vision==nil → no probe; behaves gracefully (engine top or, when the
+//     engine also returned nothing, the unchanged "can't identify" empty
+//     result). This subsumes the old tier-3 "zero suggestions → AI" block.
 func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 1. Body cap (drops the connection on overflow, returning *MaxBytesError
@@ -221,42 +239,145 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			result, err = plantID.Identify(ctx, bytes.NewReader(imgBytes), mime)
 		}
 
-		// --- Tier-3: OpenAI vision fallback (SPEC §1.1 / §2.1 / §7).
-		//     Goal: /v1/identify ALWAYS returns a result. Fires ONLY when
-		//     the cascade above SUCCEEDED (err == nil) but produced ZERO
-		//     suggestions — i.e. Pl@ntNet returned a valid "no match" (or
-		//     Plant.id fell back and also matched nothing). It does NOT
-		//     fire when an engine errored: a both-engines-down case keeps
-		//     err != nil and falls through to the unchanged error mapping
-		//     below (502 plant_id_unavailable etc.), so wire codes +
-		//     image_too_large handling are untouched. vision==nil (no
-		//     OPENAI key) → this block is skipped → behaves exactly as
-		//     before (200 with empty suggestions). The AI suggestion
-		//     carries its own confidence and is NOT flagged in any special
-		//     way (product decision: AI provenance not surfaced — same
-		//     stance as the diagnose AI fallback). iOS sees a normal
-		//     IdentifyResult; no client change. ---
-		if err == nil && vision != nil && len(imgBytes) > 0 &&
-			(result == nil || len(result.Suggestions) == 0) {
-			sug, verr := vision.IdentifyPlant(ctx, imgBytes, mime)
-			if verr != nil {
-				// Vision unavailable → keep the empty result as-is.
-				// Existing behavior: 200 with empty suggestions → iOS
-				// "We couldn't identify this plant". No crash. Log mirrors
-				// the "identify plantnet fallback" structured line style.
-				log.Printf("identify ai-vision fallback failed: deviceID=%s err=%v", deviceID, verr)
-			} else {
-				engine = "ai-vision-fallback"
-				result = &IdentifyResult{
-					IsPlant:           true,
-					IsPlantConfidence: sug.Confidence,
-					Suggestions:       []Suggestion{*sug},
+		// --- Catalog-preference selection cascade (SPEC §1.1 / §2.1 / §7).
+		//     Runs ONLY when the Pl@ntNet→Plant.id cascade SUCCEEDED
+		//     (err == nil). A both-engines-down case keeps err != nil and
+		//     falls through UNCHANGED to the 502 mapping below (AI never
+		//     substitutes for engine-unavailable — locked decision); wire
+		//     codes + image_too_large handling are untouched.
+		//
+		//     Goal: MAXIMIZE curated-catalog (1522) hits across the FULL
+		//     PlantNet/Plant.id candidate set (up to 10), not just [0]:
+		//
+		//       1. If ANY candidate resolves to the catalog → pick the
+		//          in-catalog one with the HIGHEST engine confidence (rule B)
+		//          and make it Suggestions[0] (engine=<base>-catalog).
+		//          ACCEPTED tradeoff (SPEC §7): a low-score in-catalog
+		//          candidate can override a higher-score out-of-catalog one
+		//          — chosen knowingly to prefer reviewed data.
+		//       2. Else if vision != nil → ask AI vision to recover a catalog
+		//          match. If the AI species resolves to the catalog AND its
+		//          self-reported confidence ≥ aiCatalogRecoveryMinConfidence
+		//          → adopt it as the sole in-catalog suggestion
+		//          (engine=ai-catalog-recovery).
+		//       3. Else (AI no catalog hit / low conf / vision err / nil):
+		//          - cands non-empty → keep the engine's ORIGINAL top
+		//            candidate (out-of-catalog, PlantID nil → iOS
+		//            enrichment); the engine is the trusted identifier, the
+		//            AI guess is NOT used here (engine=<base>-raw-oob).
+		//          - cands empty but an AI guess exists (any confidence) →
+		//            use it as the single out-of-catalog suggestion so the
+		//            "always a result" guarantee holds for the zero-engine
+		//            case (engine=ai-raw-oob).
+		//          - cands empty and vision nil/err → empty suggestions →
+		//            iOS "can't identify" (engine=<base>, unchanged).
+		//
+		//     The AI suggestion (when used) carries its OWN model-reported
+		//     confidence and is NOT flagged (product decision: AI provenance
+		//     not surfaced — same stance as the diagnose AI fallback). iOS
+		//     sees a normal IdentifyResult; no client change. This subsumes
+		//     the old tier-3 "zero suggestions → AI" block (the zero-engine
+		//     case is covered by branch 2/3 above). ---
+		if err == nil {
+			base := engine // "plantnet" or "plantid-fallback"/"plantid"
+			if base == "plantid" {
+				base = "plantid-fallback"
+			}
+
+			var cands []Suggestion
+			if result != nil {
+				cands = result.Suggestions
+			}
+
+			// Find the highest-engine-confidence candidate that resolves to
+			// the curated catalog (rule B). content may be nil → LookupPlantID
+			// is nil-safe and reports no catalog.
+			bestIdx := -1
+			var bestPID string
+			for i := range cands {
+				id, ok := content.LookupPlantID(cands[i].ScientificName)
+				if !ok {
+					continue
 				}
-				// Falls through to the EXISTING downstream unchanged: the
-				// per-suggestion ContentIndex.LookupPlantID resolution loop
-				// (resolves an AAA id iff the AI species is in catalog, else
-				// stays nil → iOS enrichment path), the success log, and
-				// writeJSON(200, result).
+				if bestIdx == -1 || cands[i].Confidence > cands[bestIdx].Confidence {
+					bestIdx = i
+					bestPID = id
+				}
+			}
+
+			switch {
+			case bestIdx >= 0:
+				// ≥1 candidate in catalog → promote the highest-confidence
+				// in-catalog one to [0] and stamp its resolved PlantID. The
+				// per-suggestion resolver below re-runs LookupPlantID on the
+				// whole slice (idempotent) so [0] keeps a correct PlantID.
+				if bestIdx != 0 {
+					result.Suggestions[0], result.Suggestions[bestIdx] =
+						result.Suggestions[bestIdx], result.Suggestions[0]
+				}
+				pid := bestPID
+				result.Suggestions[0].PlantID = &pid
+				engine = base + "-catalog"
+
+			case vision != nil:
+				// 0 candidates in catalog → AI vision catalog-recovery probe.
+				aiSug, verr := vision.IdentifyPlant(ctx, imgBytes, mime)
+				var aiPID string
+				aiHasPID := false
+				if verr == nil && aiSug != nil {
+					if id, ok := content.LookupPlantID(aiSug.ScientificName); ok {
+						aiPID = id
+						aiHasPID = true
+					}
+				}
+				switch {
+				case verr == nil && aiSug != nil && aiHasPID &&
+					aiSug.Confidence >= aiCatalogRecoveryMinConfidence:
+					// AI recovered a catalog match with enough confidence →
+					// adopt it as the sole in-catalog suggestion.
+					pid := aiPID
+					aiSug.PlantID = &pid
+					result = &IdentifyResult{
+						IsPlant:           true,
+						IsPlantConfidence: aiSug.Confidence,
+						Suggestions:       []Suggestion{*aiSug},
+					}
+					engine = "ai-catalog-recovery"
+				case len(cands) > 0:
+					// AI no catalog hit / low conf / vision err, but the
+					// engine DID return candidates → keep the engine's
+					// ORIGINAL top candidate (out-of-catalog → iOS
+					// enrichment). The AI guess is NOT used (engine is the
+					// trusted identifier; AI was only a catalog probe).
+					if verr != nil {
+						log.Printf("identify ai-catalog-recovery vision err: deviceID=%s err=%v", deviceID, verr)
+					}
+					engine = base + "-raw-oob"
+				case verr == nil && aiSug != nil:
+					// Engine returned ZERO candidates but AI produced a guess
+					// (any confidence, out-of-catalog) → use it so the
+					// "always a result" guarantee holds (#18).
+					result = &IdentifyResult{
+						IsPlant:           true,
+						IsPlantConfidence: aiSug.Confidence,
+						Suggestions:       []Suggestion{*aiSug},
+					}
+					engine = "ai-raw-oob"
+				default:
+					// Engine returned zero AND vision errored → unchanged
+					// empty result → iOS "can't identify".
+					if verr != nil {
+						log.Printf("identify ai-vision fallback failed: deviceID=%s err=%v", deviceID, verr)
+					}
+				}
+
+			default:
+				// 0 candidates in catalog AND vision == nil (no OPENAI key).
+				// cands non-empty → keep engine top as out-of-catalog
+				// (PlantID resolved nil by the loop below); cands empty →
+				// unchanged empty result → iOS "can't identify". Either way
+				// the engine tag stays <base> (no AI involved).
+				_ = cands
 			}
 		}
 
@@ -314,17 +435,41 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			}
 		}
 
+		// 7c. Trim the RESPONSE to top-3 (SPEC §2.1 "top 3 suggestions max").
+		//     Selection above happened across the FULL set (up to 10) so the
+		//     curated-catalog winner could be found at any rank; the chosen
+		//     candidate is already Suggestions[0]. Keep [0] (the decision) and
+		//     append the next 2 highest-`confidence` of the remainder so the
+		//     payload stays bounded and the chosen plant is never dropped. The
+		//     AI-recovery / ai-raw-oob paths already hold exactly 1 suggestion
+		//     → this is a no-op there. iOS contract unchanged (navigates [0]).
+		const maxResponseSuggestions = 3
+		if len(result.Suggestions) > maxResponseSuggestions {
+			head := result.Suggestions[0]
+			rest := append([]Suggestion(nil), result.Suggestions[1:]...)
+			sort.SliceStable(rest, func(i, j int) bool {
+				return rest[i].Confidence > rest[j].Confidence
+			})
+			trimmed := make([]Suggestion, 0, maxResponseSuggestions)
+			trimmed = append(trimmed, head)
+			trimmed = append(trimmed, rest[:maxResponseSuggestions-1]...)
+			result.Suggestions = trimmed
+		}
+
 		// 8. Success — single-line structured log (SPEC §5.2 forensics).
 		//    suggestionsWithImage counts how many carry a Pl@ntNet reference
-		//    image_url (always 0 on the Plant.id fallback path).
+		//    image_url (always 0 on the Plant.id fallback path). catalogHit is
+		//    true iff the chosen Suggestions[0] resolved to a curated catalog
+		//    plantId (catalog-preference cascade observability, SPEC §2.1).
 		suggestionsWithImage := 0
 		for i := range result.Suggestions {
 			if result.Suggestions[i].ImageURL != nil {
 				suggestionsWithImage++
 			}
 		}
-		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v engine=%s mime=%s isPlant=%v suggestions=%d plantIdsResolved=%d suggestionsWithImage=%d aiEnhanced=%v",
-			deviceID, appVer, attKeyID, attAssertPresent, engine, mime, result.IsPlant, len(result.Suggestions), plantIDsResolved, suggestionsWithImage, result.AIEnhancedAt != nil)
+		catalogHit := len(result.Suggestions) > 0 && result.Suggestions[0].PlantID != nil
+		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v engine=%s mime=%s isPlant=%v suggestions=%d plantIdsResolved=%d catalogHit=%v suggestionsWithImage=%d aiEnhanced=%v",
+			deviceID, appVer, attKeyID, attAssertPresent, engine, mime, result.IsPlant, len(result.Suggestions), plantIDsResolved, catalogHit, suggestionsWithImage, result.AIEnhancedAt != nil)
 		writeJSON(w, http.StatusOK, result)
 	}
 }

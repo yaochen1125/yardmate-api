@@ -156,12 +156,17 @@ type plantIDAPIResponse struct {
 }
 
 // toIdentifyResult sanitizes Plant.id's raw response into the V1 client shape.
-// Top-3 suggestions max (SPEC §2.1). common_names is normalized to non-nil
-// (empty slice instead of null on the wire). AIEnhancedAt and per-suggestion
-// PlantID are left nil here; the handler fills them (PlantID via ContentIndex
-// after the optional rerank, AIEnhancedAt after the rerank itself).
+// Up to 10 suggestions reach the handler so the catalog-preference cascade
+// (SPEC §2.1) can evaluate the FULL fallback-engine candidate set too; the
+// handler selects [0] and trims the RESPONSE to top-3 afterward. common_names
+// is normalized to non-nil (empty slice instead of null on the wire).
+// AIEnhancedAt and per-suggestion PlantID are left nil here; the handler fills
+// them (PlantID via ContentIndex after the optional rerank, AIEnhancedAt after
+// the rerank itself).
 func (r *plantIDAPIResponse) toIdentifyResult() *IdentifyResult {
-	const maxSuggestions = 3
+	// 10, not 3: parity with the Pl@ntNet path so a lower-ranked Plant.id
+	// candidate that IS in the curated catalog can still be selected.
+	const maxSuggestions = 10
 
 	out := &IdentifyResult{
 		IsPlant:           r.Result.IsPlant.Binary,

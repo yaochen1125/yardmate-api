@@ -53,7 +53,7 @@ const cannedPlantIDOK = `{
         },
         {
           "id": "jkl",
-          "name": "Fourth (should be dropped, top-3 cap)",
+          "name": "Fourth (kept by client; top-3 trim is the handler's job now)",
           "probability": 0.005,
           "details": {
             "common_names": [],
@@ -116,8 +116,12 @@ func TestPlantIDClient_Identify_Success(t *testing.T) {
 	if got, want := result.IsPlantConfidence, 0.97; got != want {
 		t.Errorf("IsPlantConfidence = %v, want %v", got, want)
 	}
-	if got, want := len(result.Suggestions), 3; got != want {
-		t.Errorf("len(Suggestions) = %d, want %d (top-3 cap)", got, want)
+	// toIdentifyResult now returns up to 10 (catalog-preference cascade,
+	// SPEC §2.1): the handler selects across the FULL set and trims the
+	// RESPONSE to top-3 — the client layer no longer caps at 3. The 4-result
+	// fixture therefore yields 4 suggestions here.
+	if got, want := len(result.Suggestions), 4; got != want {
+		t.Errorf("len(Suggestions) = %d, want %d (full set; handler trims to 3)", got, want)
 	}
 	s0 := result.Suggestions[0]
 	if s0.Name != "Monstera deliciosa" || s0.ScientificName != "Monstera deliciosa" {
