@@ -22,21 +22,26 @@ type Server struct {
 	verifier *attest.Verifier
 	vault    *secrets.Vault
 	limiter  *ratelimit.Limiter
-	plantID  *proxy.PlantIDClient // optional; nil disables /v1/identify + /v1/diagnose
-	vision   *proxy.VisionClient  // optional; nil disables ai_enhance + LLM catalog disambiguation
-	content  *proxy.ContentIndex  // optional; nil disables plantId/catalogId lookups in /v1/diagnose
-	enrich   *enrichment.Service  // optional; nil disables /v1/plants/enrichment
+	plantNet *proxy.PlantNetClient // optional; PRIMARY identify engine (SPEC §7). nil → Plant.id-only
+	plantID  *proxy.PlantIDClient  // optional; identify FALLBACK + sole /v1/diagnose engine. nil disables /v1/diagnose
+	vision   *proxy.VisionClient   // optional; nil disables ai_enhance + LLM catalog disambiguation
+	content  *proxy.ContentIndex   // optional; nil disables plantId/catalogId lookups in /v1/diagnose
+	enrich   *enrichment.Service   // optional; nil disables /v1/plants/enrichment
 	router   chi.Router
 }
 
-// newServer wires routes. plantID may be nil (tests / setups that don't
-// exercise the proxy endpoints); when nil, /v1/identify + /v1/diagnose are
-// not registered. content + vision may be nil — gracefully degraded
-// (no YardMate cross-reference / no LLM enhancement).
+// newServer wires routes. plantNet (PRIMARY identify engine, SPEC §7) and
+// plantID (identify FALLBACK + sole /v1/diagnose engine) may each be nil.
+// /v1/identify is registered when EITHER is non-nil (cascade degrades to
+// whichever is present); /v1/diagnose requires plantID (Pl@ntNet has no
+// health assessment). When both identify engines are nil and enrich is nil,
+// the per-device group is not registered. content + vision may be nil —
+// gracefully degraded (no YardMate cross-reference / no LLM enhancement).
 func newServer(
 	verifier *attest.Verifier,
 	vault *secrets.Vault,
 	lim *ratelimit.Limiter,
+	plantNet *proxy.PlantNetClient,
 	plantID *proxy.PlantIDClient,
 	vision *proxy.VisionClient,
 	content *proxy.ContentIndex,
@@ -75,11 +80,18 @@ func newServer(
 		// All per-device endpoints share the per-device rate-limit middleware.
 		// /v1/plants/enrichment joins the same group as identify/diagnose so
 		// an attacker rotating IPs is still bounded per-device (SPEC §4.1).
-		if plantID != nil || enrich != nil {
+		if plantNet != nil || plantID != nil || enrich != nil {
 			r.Group(func(r chi.Router) {
 				r.Use(ratelimit.PerDeviceMiddleware(lim.PerDevice, "rate_limit_device"))
+				// /v1/identify cascades Pl@ntNet (primary) → Plant.id
+				// (fallback); register when EITHER engine is present
+				// (SPEC §1.1 / §7).
+				if plantNet != nil || plantID != nil {
+					r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision))
+				}
+				// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
+				// assessment, SPEC §1.5) — still requires plantID.
 				if plantID != nil {
-					r.Post("/identify", proxy.HandleIdentify(plantID, content, vision))
 					r.Post("/diagnose", proxy.HandleDiagnose(plantID, content, vision))
 				}
 				if enrich != nil {
@@ -91,7 +103,7 @@ func newServer(
 
 	return &Server{
 		verifier: verifier, vault: vault, limiter: lim,
-		plantID: plantID, vision: vision, content: content,
+		plantNet: plantNet, plantID: plantID, vision: vision, content: content,
 		enrich: enrich, router: r,
 	}
 }

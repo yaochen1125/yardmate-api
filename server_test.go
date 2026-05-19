@@ -53,7 +53,9 @@ func buildTestServerWithLimits(t *testing.T, ipLimit, keyIDLimit int) *Server {
 	}
 
 	lim := ratelimit.New(ipLimit, time.Hour, keyIDLimit, 24*time.Hour, 1000, time.Hour)
-	return newServer(verifier, vault, lim, nil, nil, nil, nil)
+	// plantNet + plantID both nil → identify/diagnose routes not registered
+	// (these tests exercise attest/secrets only).
+	return newServer(verifier, vault, lim, nil, nil, nil, nil, nil)
 }
 
 func do(t *testing.T, s *Server, method, path string, body any) *httptest.ResponseRecorder {
