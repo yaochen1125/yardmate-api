@@ -33,15 +33,27 @@ const (
 	// changes; persisted in plants_pending.source_version so a future batch
 	// re-generation can target old rows.
 	//
+	// v1 = the original full schema (description 80-120w, history_text_long
+	// 150-300w, symbolism_story, uses_list, etc.).
+	//
 	// v2 = the slimmed schema: 8 fields removed from LLM generation
 	// (fragrance / toxicity / history_text_short / history_text_long /
-	// uses_list / symbolism_list / symbolism_story / flower_meaning) and
-	// `description` shortened (80-120w → 15-40w). This is an INCOMPATIBLE
-	// revision vs the old full-schema "v1": rows in plants_pending tagged
-	// source_version="v1" carry the old full field set, "v2" rows the slim
-	// set — a future backfill / regeneration can distinguish and target the
-	// stale full-schema rows by this tag.
-	PromptVersion = "v2"
+	// uses_list / symbolism_list / symbolism_story / flower_meaning),
+	// `description` shortened (80-120w → 15-40w), `watering_note` forced
+	// `type:null`, and an OLD inverted `sunlight` description (0=deep shade
+	// … 5=desert sun).
+	//
+	// v3 = the care-scale-aligned incompatible revision: `watering_note` is
+	// now an integer 0–5 on the authoritative YardMate scale (0=Wants wet …
+	// 5=Aquatic) instead of forced null, and the `sunlight` description was
+	// corrected to the authoritative YardMate scale (0=Full sun … 5=Low
+	// light) — the v2 description was inverted relative to the curated
+	// catalog + shipped iOS CareQuickStatsCard. This is INCOMPATIBLE with
+	// v2: v2 rows in plants_pending carry watering_note=null and sunlight
+	// ints generated against the old inverted convention. A future Supabase
+	// backfill can target rows with source_version < "v3" (i.e. "v1" full /
+	// "v2" slim) for regeneration on the corrected care scale.
+	PromptVersion = "v3"
 
 	// SourceTag is recorded in plants_pending.source for forensics.
 	SourceTag = "openai-" + defaultLLMModel
