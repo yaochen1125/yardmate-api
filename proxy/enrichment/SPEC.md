@@ -105,7 +105,7 @@ Full PlantDetail entry mirroring one entry of `yardmate-content/plants_detail.js
 | `flower_color` | `string[]` | catalog | LLM |
 | `flower_color_primary` | `string\|null` | catalog | LLM |
 | `foliage_color` | `string[]` | catalog | LLM |
-| `fragrance` | `{level:string, parts:string[], notes:string}` | catalog | LLM |
+| **`fragrance`** | `{level:string, parts:string[], notes:string}` | catalog | **NOT LLM-generated** — zero value `{level:"",parts:[],notes:""}`; iOS hides the card (§7) |
 | `fruit_color` | `string[]` | catalog | LLM |
 | `fruit_color_primary` | `string\|null` | catalog | LLM |
 | `bloom_tip` | `string` | catalog | LLM |
@@ -125,21 +125,23 @@ Full PlantDetail entry mirroring one entry of `yardmate-content/plants_detail.js
 | `native_region` | `string[]` | catalog | LLM |
 | `locations` | `string[]` | catalog | LLM |
 | `weed_level` | `int` | catalog | LLM |
-| `toxicity` | nested object (`human`/`dog`/`cat`/`active_compounds`/`notes_en`) | catalog | LLM |
-| `description` | `string` (80–120 words target) | catalog | LLM |
-| `history_text_short` | `string` (50–80 words) | catalog | LLM |
-| `history_text_long` | `string` (150–300 words) | catalog | LLM |
-| `name_origin` | `string` | catalog | LLM |
+| **`toxicity`** | nested object (`human`/`dog`/`cat`/`active_compounds`/`notes_en`) | catalog | **DELIBERATELY NOT LLM-generated** (safety/liability — §7); zero value, iOS hides the toxicity card |
+| `description` | `string` (15–40 words target) | catalog | LLM |
+| **`history_text_short`** | `string` (50–80 words) | catalog | **NOT LLM-generated** — empty string; iOS hides the history section (§7) |
+| **`history_text_long`** | `string` (150–300 words) | catalog | **NOT LLM-generated** — empty string (§7) |
+| `name_origin` | `string` | catalog | LLM (single-batch, NOT deferred) |
 | `attributes` | `string[]` | catalog | LLM |
 | `height` | `{min:number, max:number, unit:string}` | catalog | LLM |
 | `spread` | `{min:number, max:number, unit:string}` | catalog | LLM |
 | `soil` | `string[]` | catalog | LLM |
-| `uses_list` | `[{icon:string, text:string}]` | catalog | LLM |
-| `symbolism_list` | `[{keyword:string, description:string}]` | catalog | LLM |
-| `symbolism_story` | `string` | catalog | LLM |
-| `flower_meaning` | `string` | catalog | LLM |
+| **`uses_list`** | `[{icon:string, text:string}]` | catalog | **NOT LLM-generated** — empty array; iOS hides the uses section (§7) |
+| **`symbolism_list`** | `[{keyword:string, description:string}]` | catalog | **NOT LLM-generated** — empty array (§7) |
+| **`symbolism_story`** | `string` | catalog | **NOT LLM-generated** — empty string (§7) |
+| **`flower_meaning`** | `string` | catalog | **NOT LLM-generated** — empty string (§7) |
 | `common_diseases_list` | `string[]` (whitelisted catalog disease IDs `L08`, `R01`, ...) | catalog | LLM picks, then server whitelists against the 70 catalog IDs (§5) |
 | `genus` | `string` | catalog | LLM |
+
+> **Slimmed LLM generation (path 2/3 only).** The OpenAI `json_schema` was drastically slimmed for latency (the full schema's long prose exceeded the LLM timeout — §7). Path-1 **catalog** rows are unaffected: the curated 1522 `plants_detail.json` still carries every field including `toxicity` / `fragrance` / `history_text_*` / `uses_list` / `symbolism_*` / `flower_meaning`. For path-2/3 (Supabase / LLM) rows these fields are absent from the LLM JSON, so the Go `proxy.PlantDetail` unmarshal leaves them zero-valued (empty string / empty slice / zero struct). iOS treats them as optional and hides the corresponding cards. The `proxy.PlantDetail` struct, the `common_diseases_list` whitelist, and Supabase persistence are **unchanged** — only what the LLM is *asked to generate* changed.
 
 **Server lookup flow (single conceptual flow, no DB transaction needed):**
 
@@ -209,7 +211,7 @@ Inherits parent SPEC §4 with these specifics:
 
 Body cap: **64 KB** (JSON-only). Path 3 (LLM) responses are bounded by the strict JSON schema to ~2 KB; the cap is for the request body.
 
-LLM call has its own inner 12 s timeout (inside `enrichment/prompt.go`), longer than the 8 s vision rerank timeout because structured-output generation is more verbose. Wraps inside the handler's 30 s outer timeout — enough headroom for one Supabase round-trip + one LLM call + one Supabase write.
+LLM call has its own inner **20 s** timeout (`defaultLLMTimeout` in `enrichment/prompt.go`). The schema is slimmed (no long prose — §7) so gpt-4o-mini returns in a few seconds; 20 s is generous headroom. Raised from the original 12 s because under the full schema the call was overrunning the 12 s window → 502 `enrichment_unavailable` → users saw "Still preparing this plant". Still wraps inside the handler's 30 s outer `requestTimeout` with room for one Supabase round-trip + one LLM call + one Supabase write.
 
 ---
 
@@ -271,6 +273,13 @@ Column notes:
 
 ## 7. Resolved decisions (don't re-debate)
 
+- **LLM generation schema is deliberately slimmed (path 2/3 only — don't re-add fields).** The original full `json_schema` (description 80-120w, `history_text_long` 150-300w, `symbolism_story`, `uses_list`, etc.) made the gpt-4o-mini call routinely exceed the inner LLM timeout → 502 `enrichment_unavailable` → users saw "Still preparing this plant". Resolved:
+  - **`toxicity` is DELIBERATELY NOT LLM-generated.** An LLM mis-stating a toxic plant as non-toxic is a safety / liability risk we will not take. The curated 1522 catalog still carries *real, reviewed* toxicity; out-of-catalog plants ship a zero `toxicity` value and iOS hides the toxicity card entirely. Better no toxicity card than a hallucinated "safe".
+  - **`fragrance` + long-form `history_text_short` / `history_text_long` + `uses_list` + `symbolism_list` + `symbolism_story` + `flower_meaning` dropped from generation for latency.** These were the slow, verbose, low-stakes fields. iOS treats them as optional and hides the corresponding cards for out-of-catalog plants.
+  - **`description` shortened 80-120w → 15-40 words.** "Concise overview: growth habit, key features, native habitat and ornamental value." Enough for the header blurb without the prose latency tax.
+  - **Single-batch generation — no batching / polling.** The slimmed schema is fast enough to generate in one OpenAI call within the timeout. `name_origin` stays in this single batch (NOT deferred to a second call).
+  - **Inner LLM timeout raised 12 s → 20 s** (`defaultLLMTimeout`). The slim schema returns in seconds; 20 s is headroom, still safely under the 30 s handler `requestTimeout`.
+  - **Scope of the slim:** ONLY the LLM `json_schema` + system prompt changed. The `proxy.PlantDetail` Go struct, path-1 catalog handling, the `common_diseases_list` whitelist, and Supabase persistence are **unchanged** — dropped fields simply unmarshal to their Go zero value for path-2/3 rows. The curated catalog (path 1) still returns every field.
 - **POST, not GET.** Scientific names contain spaces / `×` / Unicode — URL encoding is awkward. The call has a write side effect on first invocation per plant; POST is correct semantically.
 - **Server-side dispatch (B), not iOS-side catalog check (A).** iOS always calls `/v1/plants/enrichment`; server decides catalog vs Supabase vs LLM. Trade-off: catalog-hit responses pay one extra round-trip to api.yardmate.ai vs going direct to jsDelivr. Reason: single source of truth on the server, iOS has one fetch path, catalog updates need no iOS-side cache invalidation. V1.1+ may add CDN caching of catalog-hit responses.
 - **Pending rows are visible to all callers** (not just the originator). This is the whole point of the table — A generates, B/C/D reuse. Without this, the table reduces neither LLM cost nor "different users see different data".

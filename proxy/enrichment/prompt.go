@@ -22,7 +22,12 @@ var ErrEnrichmentUnavailable = errors.New("enrichment: llm unavailable")
 const (
 	defaultLLMEndpoint = "https://api.openai.com/v1/chat/completions"
 	defaultLLMModel    = "gpt-4o-mini-2024-07-18"
-	defaultLLMTimeout  = 12 * time.Second
+	// defaultLLMTimeout — the schema is slimmed (no long prose: no
+	// description 80-120w / history_text_long 150-300w / symbolism_story /
+	// uses_list / etc.), so gpt-4o-mini returns in a few seconds. 20 s gives
+	// generous headroom while staying safely under the handler's 30 s
+	// requestTimeout (one Supabase read + LLM call + Supabase write).
+	defaultLLMTimeout = 20 * time.Second
 
 	// PromptVersion tags the prompt + schema revision. Bump on incompatible
 	// changes; persisted in plants_pending.source_version so a future batch
@@ -37,7 +42,7 @@ const (
 // strict mode, generating a PlantDetail JSON.
 //
 // We hold our own HTTP client (and not proxy.VisionClient) because the
-// timeout differs — structured generation gets 12 s vs the 8 s ai_enhance
+// timeout differs — structured generation gets 20 s vs the 8 s ai_enhance
 // rerank — and the prompt path is independent (parent SPEC §1.2 boundary).
 type LLMClient struct {
 	APIKey   string
@@ -154,8 +159,7 @@ Hard rules — non-negotiable:
 - "common_name_source" MUST be the literal string "llm".
 - For "common_diseases_list", emit up to 10 catalog disease IDs in the form L01 / P05 / R12 / ST09 / FL06 (1-3 capital letters followed by 2 digits). The server whitelists your output against the actual catalog; unknown IDs are dropped silently, so prefer common ones. Empty array is acceptable.
 - All strings must be plain text. No markdown, no HTML, no URLs, no emojis.
-- Numbers: difficulty / sunlight / weed_level are integers 0..5. hardiness_zones use USDA integer zones 1..13. Toxicity level is 0..4. Watering / fertilizing values are integer days between events (use 0 for "skip this season").
-- Be conservative on toxicity: prefer level 0 with notes_en "Not reported toxic." unless you have specific knowledge of harm.
+- Numbers: difficulty / sunlight / weed_level are integers 0..5. hardiness_zones use USDA integer zones 1..13. Watering / fertilizing values are integer days between events (use 0 for "skip this season").
 
 Output a single JSON object matching the schema. No prose before or after.`)
 }
@@ -230,45 +234,19 @@ func buildResponseSchema() map[string]any {
 			},
 		}
 	}
-	toxicityRoute := map[string]any{
-		"type":                 "object",
-		"additionalProperties": false,
-		"required":             []string{"level", "routes", "parts", "symptoms"},
-		"properties": map[string]any{
-			"level": map[string]any{
-				"type":        "integer",
-				"description": "Toxicity severity 0..4: 0=non-toxic, 1=mild irritation, 2=moderate, 3=severe, 4=potentially lethal.",
-			},
-			"routes": map[string]any{
-				"type":  "array",
-				"items": map[string]any{"type": "string", "enum": []string{"ingestion", "skin-contact", "eye-contact", "inhalation"}},
-			},
-			"parts": map[string]any{
-				"type":  "array",
-				"items": map[string]any{"type": "string", "enum": []string{"all", "leaf", "stem", "flower", "fruit", "seed", "root", "sap"}},
-			},
-			"symptoms": map[string]any{
-				"type":        "array",
-				"items":       map[string]any{"type": "string"},
-				"description": "3-6 short symptom phrases when level>0; empty array when level=0.",
-			},
-		},
-	}
-
 	return map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
 		"required": []string{
 			"id", "scientific_name", "common_name", "common_name_source",
-			"flower_color", "flower_color_primary", "foliage_color", "fragrance",
+			"flower_color", "flower_color_primary", "foliage_color",
 			"fruit_color", "fruit_color_primary", "bloom_tip", "bloom_months_north",
 			"bloom_period_short", "fruit_tip", "fruit_months_north", "fruit_period_short",
 			"difficulty", "sunlight", "hardiness_zones", "indoor_temp_f",
 			"watering_days", "watering_note", "fertilizing_days", "fertilize_formula",
-			"native_region", "locations", "weed_level", "toxicity",
-			"description", "history_text_short", "history_text_long", "name_origin",
+			"native_region", "locations", "weed_level",
+			"description", "name_origin",
 			"attributes", "height", "spread", "soil",
-			"uses_list", "symbolism_list", "symbolism_story", "flower_meaning",
 			"common_diseases_list", "genus",
 		},
 		"properties": map[string]any{
@@ -292,16 +270,6 @@ func buildResponseSchema() map[string]any {
 			"flower_color":         colorArray("Lowercased English color names like \"white\", \"yellow\", \"pink\". 0-4 entries. Empty array for non-flowering plants."),
 			"flower_color_primary": map[string]any{"type": nullableString, "description": "Dominant flower color (one of the flower_color entries), or null for non-flowering plants."},
 			"foliage_color":        colorArray("Lowercased English color names for the foliage like \"green\", \"bronze\", \"variegated\". 1-3 entries."),
-			"fragrance": map[string]any{
-				"type":                 "object",
-				"additionalProperties": false,
-				"required":             []string{"level", "parts", "notes"},
-				"properties": map[string]any{
-					"level": map[string]any{"type": "string", "enum": []string{"none", "mild", "moderate", "strong"}, "description": "Fragrance intensity."},
-					"parts": map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"flower", "leaf", "bark", "fruit", "root"}}, "description": "Plant parts that emit scent. Empty array when level is \"none\"."},
-					"notes": map[string]any{"type": "string", "description": "Free-form scent description, 5-25 words. Empty string when level is \"none\"."},
-				},
-			},
 			"fruit_color":          colorArray("Lowercased English color names for prominent fruit. Empty array when there is no notable fruit."),
 			"fruit_color_primary":  map[string]any{"type": nullableString, "description": "Dominant fruit color, or null when no notable fruit."},
 			"bloom_tip":            map[string]any{"type": "string", "description": "One sentence on flowers + bloom timing, 8-25 words. Empty string for non-flowering plants."},
@@ -349,54 +317,12 @@ func buildResponseSchema() map[string]any {
 			"native_region":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Geographic regions of origin, e.g. [\"East Asia\"] or [\"Mediterranean\", \"North Africa\"]. 1-3 entries."},
 			"locations":           map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"Yard", "Patio", "Indoor", "Bedroom", "Bathroom", "Kitchen", "Office", "Greenhouse", "Balcony"}}, "description": "Where the plant is typically grown. 1-3 entries."},
 			"weed_level":          map[string]any{"type": "integer", "description": "Invasiveness risk integer 0..5: 0=none, 1=mild self-seeder, 3=naturalized, 5=aggressive invasive."},
-			"toxicity": map[string]any{
-				"type":                 "object",
-				"additionalProperties": false,
-				"required":             []string{"human", "dog", "cat", "active_compounds", "notes_en"},
-				"properties": map[string]any{
-					"human":            toxicityRoute,
-					"dog":              toxicityRoute,
-					"cat":              toxicityRoute,
-					"active_compounds": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Named toxic compounds (e.g. \"oxalic acid\", \"saponins\"). Empty array if not toxic."},
-					"notes_en":         map[string]any{"type": "string", "description": "One short sentence on toxicity / safety. Use \"Not reported toxic.\" when there is no documented harm."},
-				},
-			},
-			"description":         map[string]any{"type": "string", "description": "80-120 words describing growth habit, height, distinguishing features, native habitat, and ornamental value. Plain text only."},
-			"history_text_short":  map[string]any{"type": "string", "description": "50-80 words on discovery, naming, and historical / cultural use."},
-			"history_text_long":   map[string]any{"type": "string", "description": "150-300 words expanding on history, cultivation, hybrids/cultivars, and modern relevance. Plain text only."},
+			"description":         map[string]any{"type": "string", "description": "Concise overview: growth habit, key features, native habitat and ornamental value. 15-40 words. Plain text only."},
 			"name_origin":         map[string]any{"type": "string", "description": "Etymology of the binomial name, 15-40 words."},
 			"attributes":          map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"fragrant", "cold-hardy", "drought-tolerant", "evergreen", "deciduous", "long-blooming", "fast-growing", "slow-growing", "compact", "climbing", "spreading", "pollinator-friendly", "edible", "showy-fruit", "shade-tolerant", "container-friendly"}}, "description": "Up to 6 keyword tags from the enum."},
 			"height":              dimensionSchema,
 			"spread":              dimensionSchema,
 			"soil":                map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"loamy", "sandy", "clay", "silty", "rocky", "well-drained", "moist", "acidic", "alkaline", "neutral"}}, "description": "Soil preferences. 1-4 entries."},
-			"uses_list": map[string]any{
-				"type": "array",
-				"items": map[string]any{
-					"type":                 "object",
-					"additionalProperties": false,
-					"required":             []string{"icon", "text"},
-					"properties": map[string]any{
-						"icon": map[string]any{"type": "string", "enum": []string{"fragrant", "pollinator", "hedge", "ornamental", "edible", "shade", "screen", "groundcover", "medicinal", "container"}},
-						"text": map[string]any{"type": "string", "description": "One sentence describing this use, 8-20 words."},
-					},
-				},
-				"description": "1-5 use cases for the plant.",
-			},
-			"symbolism_list": map[string]any{
-				"type": "array",
-				"items": map[string]any{
-					"type":                 "object",
-					"additionalProperties": false,
-					"required":             []string{"keyword", "description"},
-					"properties": map[string]any{
-						"keyword":     map[string]any{"type": "string", "description": "One English word, capitalized: e.g. \"Perseverance\", \"Grace\"."},
-						"description": map[string]any{"type": "string", "description": "Why this symbolism applies, 5-15 words."},
-					},
-				},
-				"description": "1-3 entries.",
-			},
-			"symbolism_story":      map[string]any{"type": "string", "description": "60-100 words weaving symbolism_list keywords into a short reflective narrative."},
-			"flower_meaning":       map[string]any{"type": "string", "description": "Single English word, capitalized (e.g. \"Perseverance\"). Usually the first symbolism_list keyword."},
 			"common_diseases_list": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Up to 10 catalog disease IDs (1-3 letters + 2 digits, e.g. L01, P05, R12, ST09, FL06). Unknown IDs are dropped server-side."},
 			"genus":                map[string]any{"type": "string", "description": "Genus portion of the binomial (first word)."},
 		},
