@@ -60,14 +60,14 @@ Chose fixed-window over token-bucket / sliding-window because:
 
 | Bucket | Limit | Window | Rationale |
 |---|---|---|---|
-| Per-IP | 100 | 1 hour | NAT-friendly. Corporate networks where many real users share one egress IP must not lock out. 100/h ≈ 1 every 36 s — well above a normal user's needs. |
+| Per-IP | 600 | 1 hour | NAT-friendly + gates ALL /v1 incl. the cheap App-Attest/secrets handshake (one key fetch = several handshake reqs). 100 starved identify in prod: ~90 handshake reqs/hr from one device 429'd identify after ~3 photos. The expensive upstream calls stay bounded by per-device (below) regardless, so 600 doesn't widen the cost/abuse surface; it's a per-egress-IP ceiling for many-real-users-behind-NAT + handshake overhead. |
 | Per-keyID | 50 | 24 hours | iOS clients cache vended secrets in memory; a typical user issues 1–10 fetches/day. 50 leaves headroom for cold starts, app reinstalls, and the occasional client bug, while still rate-limiting abuse from a leaked private key. |
-| Per-device | 100 | 1 hour | Applied on the proxy endpoint group (`/v1/identify`, `/v1/diagnose`). 100/h matches the per-IP budget — a single install hitting it is already abusive. Combined with per-IP, this defends against IP-rotation-but-reused-install attacks. |
+| Per-device | 100 | 1 hour | Applied on the proxy endpoint group (`/v1/identify`, `/v1/diagnose`). The real cap on expensive upstream calls — a single install hitting 100/h is already abusive. Combined with per-IP, this defends against IP-rotation-but-reused-install attacks. |
 
 All three numbers are env-overridable for staging vs production:
 
 ```
-YARDMATE_API_RL_IP_LIMIT          (default 100)
+YARDMATE_API_RL_IP_LIMIT          (default 600)
 YARDMATE_API_RL_IP_WINDOW         (default 1h)
 YARDMATE_API_RL_KEYID_LIMIT       (default 50)
 YARDMATE_API_RL_KEYID_WINDOW      (default 24h)

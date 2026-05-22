@@ -25,7 +25,17 @@ const (
 	defaultAppID       = "PMX32RG52M.com.chenyao.plantapp"
 
 	// Rate-limit defaults (see ratelimit/SPEC §3).
-	defaultIPLimit       = 100
+	// per-IP gates ALL /v1 endpoints incl. the cheap App-Attest/secrets
+	// handshake (attest/challenge, attest/register, secrets/challenge,
+	// app-secrets). One client doing the handshake fires several of these per
+	// key fetch, so the per-IP ceiling must be generous or the handshake
+	// starves the expensive proxy calls — observed in prod: ~90 handshake
+	// reqs/hr from a single device exhausted the old 100 ceiling and 429'd
+	// identify after ~3 photos. The expensive upstream calls
+	// (identify/diagnose/enrichment) stay independently bounded by the per-Device
+	// bucket (100/hr) regardless of this ceiling, so raising per-IP does NOT
+	// widen the upstream-cost / abuse surface.
+	defaultIPLimit       = 600
 	defaultIPWindow      = time.Hour
 	defaultKeyIDLimit    = 50
 	defaultKeyIDWindow   = 24 * time.Hour
