@@ -144,7 +144,7 @@ func main() {
 	// Started only when the service is configured AND the interval > 0; the
 	// single-flight guard in RunBatch prevents overlapping passes.
 	if ingestSvc != nil {
-		if tick := envDurationOr("IMAGEINGEST_TICK_INTERVAL", 0); tick > 0 {
+		if tick := vaultDurationOr(vault, "IMAGEINGEST_TICK_INTERVAL", 0); tick > 0 {
 			stop := ingestSvc.Start(tick)
 			defer stop()
 			log.Printf("imageingest ticker started: interval=%v", tick)
@@ -259,18 +259,48 @@ func buildImageIngestService(vault *secrets.Vault) *imageingest.Service {
 
 	commons := imageingest.NewCommonsClient(imageingest.CommonsOptions{
 		UserAgent: vault.Get("IMAGEINGEST_USER_AGENT"), // empty → built-in default UA
-		MaxBytes:  int64(envIntOr("IMAGEINGEST_MAX_BYTES", 0)),
+		MaxBytes:  int64(vaultIntOr(vault, "IMAGEINGEST_MAX_BYTES", 0)),
 	})
 
 	cfg := imageingest.Config{
 		AllowAttributionLicenses: vault.GetBool("IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES", false),
-		MinInterval:              envDurationOr("IMAGEINGEST_MIN_INTERVAL", time.Second),
-		BatchLimit:               envIntOr("IMAGEINGEST_BATCH_LIMIT", 25),
+		MinInterval:              vaultDurationOr(vault, "IMAGEINGEST_MIN_INTERVAL", time.Second),
+		BatchLimit:               vaultIntOr(vault, "IMAGEINGEST_BATCH_LIMIT", 25),
 	}
 	ingestor := imageingest.NewIngestor(commons, r2Client, ledger, seeds, cfg)
 	log.Printf("image ingest service ready: R2 bucket=%s ledger+seed pools + commons (allowAttribution=%v batchLimit=%d)",
 		r2Cfg.Bucket, cfg.AllowAttributionLicenses, cfg.BatchLimit)
 	return imageingest.NewService(ingestor, adminToken)
+}
+
+// vaultDurationOr / vaultIntOr read tuning knobs from the secrets Vault (the
+// operator-edited /etc/yardmate-api/secrets.env), NOT os.Getenv. The systemd
+// unit does not export secrets.env into the process environment (no
+// EnvironmentFile=), so IMAGEINGEST_* knobs documented in secrets.env.example
+// are only reachable via the Vault — reading them with os.Getenv left the
+// ticker permanently off when an operator enabled it in secrets.env (Codex #23).
+func vaultDurationOr(vault *secrets.Vault, key string, def time.Duration) time.Duration {
+	v := vault.Get(key)
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return d
+	}
+	log.Printf("vault %s=%q not a duration, using default %v", key, v, def)
+	return def
+}
+
+func vaultIntOr(vault *secrets.Vault, key string, def int) int {
+	v := vault.Get(key)
+	if v == "" {
+		return def
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return n
+	}
+	log.Printf("vault %s=%q not an int, using default %d", key, v, def)
+	return def
 }
 
 func envOr(key, def string) string {
