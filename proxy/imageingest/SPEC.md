@@ -85,7 +85,7 @@ Two entry points, both wrapping the same `Ingestor` core. **No public/iOS surfac
 2. n := 0
    for each seed.scientific_name (stop when n == limit):
      slug := Slug(scientific_name)                            -- §2.3, byte-exact iOS port
-     if slug == "" { ledger upsert status=no_acceptable_image, note="empty slug"; continue }
+     if slug == "" { skip — no valid R2 key, can't ingest; NOT cached (a row keyed by raw name is never read, lookups key on slug==""); re-evaluated cheaply each pass; continue }
      if ledger says slug already ingested OR no_acceptable_image (and not stale) { skip; continue }
      out := IngestOne(ctx, slug, scientific_name)
      ledger upsert(out)

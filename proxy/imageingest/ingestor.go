@@ -286,12 +286,13 @@ func (in *Ingestor) RunBatch(ctx context.Context, limit int) (BatchSummary, erro
 
 		slug := Slug(name)
 		if slug == "" {
-			// Empty slug — record as no_acceptable_image so it isn't retried
-			// every pass (SPEC §2.1 step "empty slug").
-			_ = in.ledger.Upsert(ctx, LedgerRow{
-				Slug: name, ScientificName: name, Status: StatusNoAcceptableImg,
-				LastError: "empty slug",
-			})
+			// Name has no ASCII slug characters (e.g. "×" / a non-Latin string),
+			// so there is no valid R2 key (plant_images//hero.png) and it can
+			// never be ingested. Do NOT write a ledger row: its PK would be the
+			// raw name, but every lookup keys on slug=="" and would never find it
+			// (Codex #23) — a dead, never-read upsert each pass. Just skip;
+			// re-evaluating next pass is a cheap Slug() call with no I/O.
+			log.Printf("imageingest skip: name=%q slugs to empty (no ASCII slug chars)", name)
 			continue
 		}
 

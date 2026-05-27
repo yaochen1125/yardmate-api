@@ -368,7 +368,7 @@ func TestRunBatch_MixedOutcomes(t *testing.T) {
 	store := newMockStore()
 	ledger := newMockLedger()
 	// "×" is a non-empty name that slugs to "" (the hybrid sign is a separator);
-	// it must be recorded (not retried every pass) but not counted as attempted.
+	// it is skipped (no valid R2 key) and NOT counted as attempted.
 	seeds := &mockSeeds{names: []string{"Rosa regina", "Tulipa gesneriana", "×"}}
 	in := NewIngestor(commons, store, ledger, seeds, Config{})
 
@@ -379,8 +379,8 @@ func TestRunBatch_MixedOutcomes(t *testing.T) {
 	if summary.Seen != 3 {
 		t.Errorf("Seen = %d, want 3", summary.Seen)
 	}
-	// Two real names ingest; the slugs-to-empty name is upserted as
-	// no_acceptable_image (not counted as attempted).
+	// Two real names ingest; the slugs-to-empty name is skipped (not counted
+	// as attempted, not written to the ledger).
 	if summary.Ingested != 2 {
 		t.Errorf("Ingested = %d, want 2", summary.Ingested)
 	}
@@ -394,10 +394,14 @@ func TestRunBatch_MixedOutcomes(t *testing.T) {
 	if _, ok := ledger.rows["tulipa-gesneriana"]; !ok {
 		t.Errorf("expected ledger row for tulipa-gesneriana")
 	}
-	// The slugs-to-empty name is recorded keyed by the original name so it is
-	// not re-attempted every pass (SPEC §2.1 empty-slug step).
-	if r, ok := ledger.rows["×"]; !ok || r.Status != StatusNoAcceptableImg {
-		t.Errorf("expected no_acceptable_image row keyed by original name for '×', got ok=%v row=%+v", ok, r)
+	// The slugs-to-empty name ("×") is skipped (no valid R2 key) and NOT written
+	// to the ledger: a row keyed by the raw name is never read (lookups key on
+	// the empty slug — Codex #23), so it must not be created.
+	if _, ok := ledger.rows["×"]; ok {
+		t.Errorf("did not expect a ledger row for the slugs-to-empty name '×'")
+	}
+	if _, ok := ledger.rows[""]; ok {
+		t.Errorf("did not expect a ledger row under the empty slug key")
 	}
 }
 
