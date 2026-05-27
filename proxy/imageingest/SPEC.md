@@ -15,14 +15,15 @@
   1. compute the R2 `slug` (byte-identical to iOS `PlantImageURL.slug` — §2.3, the central invariant),
   2. skip if already done (idempotency ledger — §6.1),
   3. search Wikimedia Commons for candidate File: pages for that species,
-  4. read each candidate's `imageinfo.extmetadata` license, **keep only CC0 / Public-domain / CC-BY / CC-BY-SA** (reject NC / ND / ARR / unknown — §2.4),
+  4. read each candidate's `imageinfo.extmetadata` license, classify into CC0 / Public-domain / CC-BY / CC-BY-SA (reject NC / ND / ARR / unknown — §2.4). **CC-BY / CC-BY-SA are gated** behind `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES` (release-coordination flag, default OFF until the iOS Credits page is live — §2.4 / §7 D-attribution-gate); CC0 / PD are always eligible,
   5. pick the best candidate (license tier, then a photo-likeness/size heuristic — §2.5),
   6. download the bytes of Wikimedia's 1600px scaled rendition, stored verbatim (§7 D2),
-  7. upload to R2 `yardmate-static/plant_images/{slug}/hero.png` with the real `Content-Type` (§2.6),
+  7. upload the chosen image to R2 `yardmate-static/plant_images/{slug}/hero.png` with the real `Content-Type` (§2.6) — only for a license currently eligible per the gate,
   8. record the outcome + attribution in the ledger (§6.1).
 - **Batch orchestration:** a bounded pass that ingests up to N un-done seeds, serially, honoring Wikimedia rate-limit etiquette (UA + min interval + `maxlag` + `Retry-After` — §4).
 - **Self-driven invocation:** a background ticker (interval/N env-configurable; disable-able) AND a manual internal HTTP trigger for on-demand runs + single-slug testing (§2.1). No public surface.
-- **Attribution capture:** persist author / license / source-file-page per ingested image so a future iOS Settings → Credits page (CC §3a2 collected attribution) can be built. Capturing at ingest is mandatory — the data is needed for license compliance and is awkward to reconstruct after the fact.
+- **Attribution capture + `credits.json` export:** persist author / license / source-file-page per ingested image in the ledger, AND regenerate `plant_images/credits.json` on R2 from the ledger after each batch (§2.7) — this CDN file is the data source the iOS Settings → Credits page reads (CC §3a2 collected attribution). Capturing at ingest is mandatory; the export keeps the public credits in sync with what is currently live in R2.
+- **License-compliance gate (Codex #22 finding).** CC-BY / CC-BY-SA require visible attribution wherever the work is displayed (CC 4.0 §3(a)); storing attribution only in a private DB is NOT compliant. So a BY/SA hero may be served ONLY once the iOS Credits page (which renders `credits.json`) is live. The backend enforces this with the default-OFF `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES` gate; until the iOS page ships, V1 uploads CC0 / PD only (no attribution required → compliant). See §7 D-attribution-gate.
 
 ### 1.2 What this package is NOT responsible for
 
@@ -31,7 +32,7 @@
 - **In-catalog (1522) imagery.** Curated plants use `plant_images/{AAA-id}/{1_whole|2_closeup|3_state|4_scene}.png`, uploaded by separate offline tooling (the `scripts/` pipeline in `yardmate-swiftui`). This package only fills the **slug**-keyed `hero.png` for **out-of-catalog** plants. It never touches AAA-id keys.
 - **Image transformation.** No re-encode, no crop, no resize-by-us, no AI enhancement. Bytes are stored verbatim (§7 D2 — CC-BY-SA ShareAlike is only triggered by *adaptations*; a verbatim copy is not one). The one server-side decode is a read-only sniff for MIME/dimensions; the stored bytes are the downloaded bytes.
 - **Genus-level fallback fill.** V1 fills the **species** slug only (`PlantImageURL.slug`), because iOS PR #227 currently reads only the species slug (genus fallback is iOS P2, not yet shipped). The ingest core is **slug-parameterized**, so genus fill (`PlantImageURL.genusSlug`) reuses the same code once iOS reads it — §8.
-- **Serving / surfacing the credits to iOS.** V1 captures attribution in the ledger; building the iOS Credits page (or a `/credits` export) is iOS-side + V1.1 (§8). No regression in compliance: attribution is recorded now, just not yet displayed.
+- **The iOS Credits *page* (UI).** This package generates `credits.json` (§2.7) but does not render it. The Settings → Credits *page* that displays it is iOS-side (`yardmate-swiftui`, separate repo, documentation-first); it is IN SCOPE for this initiative (Yao option B) and is the compliance prerequisite for flipping the BY/SA gate ON (§7 D-attribution-gate, §8). (An earlier draft wrongly claimed recording attribution alone was compliant — corrected per Codex #22.)
 - **Promotion of out-of-catalog plants into the curated catalog**, or any change to `plants_detail.json`.
 - **iNaturalist / USDA / GBIF sources.** V1 is Wikimedia Commons only. Other sources are §8 candidates; the ledger's `source` column is forward-compatible.
 
@@ -90,7 +91,8 @@ Two entry points, both wrapping the same `Ingestor` core. **No public/iOS surfac
      ledger upsert(out)
      n++
      sleep(minInterval)                                       -- §4 Wikimedia etiquette
-3. return BatchSummary{...}
+3. regenerate plant_images/credits.json from the ledger (§2.7)   -- keep public credits in sync with live R2
+4. return BatchSummary{...}
 ```
 
 `IngestOne(ctx, slug, searchTerm)` flow:
@@ -98,8 +100,11 @@ Two entry points, both wrapping the same `Ingestor` core. **No public/iOS surfac
 1. if HeadObject(plant_images/{slug}/hero.png) exists → return {Status: skipped_exists}
    (defensive double-check vs the ledger; R2 is the source of truth for "image present")
 2. candidates := WikimediaSearch(searchTerm, limit=10)        -- §2.4 (UA + maxlag)
-3. acceptable := filter(candidates, licenseAllowed)           -- §2.4 (CC0/PD/BY/BY-SA only)
-   if empty → return {Status: no_acceptable_image}
+3. classified := classify(candidates)                         -- §2.4 (CC0/PD/BY/BY-SA; reject NC/ND/ARR)
+   eligible := gateFilter(classified)                         -- BY/SA dropped when the gate flag is OFF
+   if eligible empty:
+     if classified still has (gated) BY/SA → {Status: deferred_attribution} (store chosen cand)
+     else → {Status: no_acceptable_image}
 4. pick := selectBest(acceptable)                             -- §2.5 (tier → photo-likeness/size)
 5. bytes, mime := download(pick.ThumbURL)                     -- §2.6 1600px rendition (UA; size guard §4)
    if too large / wrong mime / download fail → next candidate, else {Status: source_error}
@@ -184,11 +189,12 @@ Notes:
 - Also reject when `extmetadata.Copyrighted.value == "True"` **and** no allowed CC/PD code resolved (catches "All rights reserved" stragglers — Commons is mostly free but PD-art / fair-use edge files exist).
 - `GFDL-only` (no CC dual-license) → reject in V1 (copyleft + attribution but awkward; rare for photos — most are dual CC-BY-SA which we accept). §7 D3.
 - **Conservative default:** if the license can't be positively classified into the 4 allowed families, SKIP the candidate. A placeholder is acceptable (memory: "占位是常态"); a license violation is not.
+- **Attribution gate (Codex #22 / §7 D-attribution-gate):** a candidate classified CC-BY or CC-BY-SA is *eligible for upload* only when `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES` is true. While it is false (V1 default, until the iOS Credits page is live), BY/SA are NOT uploaded; a species whose only acceptable candidates are BY/SA is recorded `deferred_attribution` — its chosen candidate (thumburl + author + license) is stored so flipping the flag uploads it WITHOUT re-searching Wikimedia (§6.1). This is NOT a permanent negative cache (pitfall §9 #13). CC0 / PD are always eligible (no attribution required).
 
 ### 2.5 Candidate selection (which photo becomes the hero)
 
 Rank acceptable candidates by:
-1. **License tier** (least restrictive first, per Q-pitfall): `CC0 = PD > CC-BY > CC-BY-SA`. Fewer downstream attribution obligations.
+1. **License tier** (least restrictive first, per Q-pitfall): `CC0 = PD > CC-BY > CC-BY-SA`. Fewer downstream attribution obligations. Licenses gated out by §2.4 (BY/SA while the flag is OFF) are excluded before ranking; a species whose only acceptable candidates are gated → `deferred_attribution` (§3).
 2. **Photo-likeness / size** (tiebreak within a tier): prefer raster photos over diagrams/maps. Heuristics (best-effort, tunable §7 D4):
    - reject `image/svg+xml`, `image/gif`, `image/tiff` outright (not photos / not web-friendly);
    - deprioritize titles containing `map|range|distribution|herbarium|illustration|diagram|chart|locator`;
@@ -201,6 +207,37 @@ Rank acceptable candidates by:
 
 `PutObject(Bucket=yardmate-static, Key=plant_images/{slug}/hero.png, Body=bytes, ContentType=<real mime>)`. Bytes are the **downloaded bytes, verbatim** (§7 D2). No `ACL` param (R2 ignores S3 ACLs; public read is configured at the bucket/custom-domain level, already serving the AAA images). Set `CacheControl` to a long max-age (e.g. `public, max-age=31536000, immutable`) since a given slug's hero is effectively immutable once chosen (re-ingest only via explicit ledger reset — §6.1).
 
+### 2.7 `credits.json` export (the iOS Credits page's data source)
+
+After every batch, rebuild the full credits manifest from the ledger and upload it to R2 — a static CDN file iOS reads (no new endpoint / no auth; same read-from-CDN pattern the app uses for catalog JSON).
+
+| | |
+|---|---|
+| R2 key | `plant_images/credits.json` |
+| Public URL | `https://images.yardmate.ai/plant_images/credits.json` |
+| Content-Type | `application/json` |
+| CacheControl | short (`public, max-age=3600`) — it changes as ingest runs, unlike the immutable heroes |
+
+Shape:
+```json
+{
+  "generated_at": "2026-05-27T12:00:00Z",
+  "entries": [
+    {
+      "slug": "rosa-regina-sueciae",
+      "scientific_name": "Rosa regina sueciae",
+      "license_short": "CC BY-SA 4.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "author": "Jane Doe",
+      "source_url": "https://commons.wikimedia.org/wiki/File:Example.jpg"
+    }
+  ]
+}
+```
+- Built from `status='ingested'` rows that are **live in R2** — credits.json always matches what users can actually see. Only BY/SA rows are attribution-*required*; CC0/PD rows MAY be listed for transparency (V1: list all ingested attribution-required rows + optionally CC0/PD).
+- **Full rebuild, never diff-append** (pitfall §9 #15) — a deleted/re-ingested slug must drop/refresh cleanly.
+- While the BY/SA gate is OFF only CC0/PD rows are `ingested`, so credits.json carries those; when the gate flips ON and BY/SA upload, the next batch's rebuild adds them automatically — the iOS page re-fetches, no code change.
+
 ---
 
 ## 3. Error / outcome matrix
@@ -212,6 +249,7 @@ Per-species outcomes are **not HTTP errors** — they are `IngestOutcome.Status`
 | `ingested` | uploaded to R2 + attribution recorded | `status=ingested` | terminal (until manual reset) |
 | `skipped_exists` | R2 already has the key (ledger/HEAD agree) | `status=ingested` (backfilled if missing) | terminal |
 | `no_acceptable_image` | search returned nothing, or nothing CC0/PD/BY/BY-SA | `status=no_acceptable_image` | negative-cached; re-attempt only after `IMAGEINGEST_NOIMAGE_TTL` (default 30d) or manual reset |
+| `deferred_attribution` | best/only acceptable candidate is CC-BY/SA but the gate is OFF | `status=deferred_attribution` + chosen candidate's thumburl/license/author stored | skipped until the gate flips ON (then upload WITHOUT re-search); NOT permanent negative cache (§9 #13) |
 | `source_error` | Wikimedia 5xx / network / all candidate downloads failed | `status=failed`, `attempts++` | retried next pass with backoff; cap `attempts` (default 5) → then treated as negative-cached |
 | `upload_error` | R2 PutObject failed | `status=failed`, `attempts++` | retried next pass |
 
@@ -262,9 +300,10 @@ Serves three jobs at once: **idempotency** (skip done slugs), **negative cache**
 CREATE TABLE plant_image_ingest (
   slug                TEXT PRIMARY KEY,            -- == Slug(scientific_name); == iOS R2 key segment
   scientific_name     TEXT NOT NULL,               -- the searched name (audit; not re-slugged on read)
-  status              TEXT NOT NULL                -- 'ingested' | 'no_acceptable_image' | 'failed'
-                        CHECK (status IN ('ingested','no_acceptable_image','failed')),
+  status              TEXT NOT NULL                -- see §3 outcome matrix
+                        CHECK (status IN ('ingested','no_acceptable_image','failed','deferred_attribution')),
   r2_key              TEXT,                         -- 'plant_images/{slug}/hero.png' when ingested
+  pending_thumburl    TEXT,                         -- chosen BY/SA rendition URL stored while deferred_attribution → upload on flag-flip without re-search (§2.4)
   source              TEXT NOT NULL DEFAULT 'wikimedia_commons',
   source_file_page    TEXT,                         -- Commons File: page URL (re-derive attribution anytime)
   license_code        TEXT,                         -- machine, e.g. 'cc-by-sa-4.0' / 'cc0' / 'pd'
@@ -302,6 +341,7 @@ CREATE INDEX idx_plant_image_ingest_status ON plant_image_ingest (status);
 - **D-genus (Q3): species slug only; genus is P2.** iOS reads only the species slug today; filling genus now = wasted Wikimedia/R2 work iOS won't read. The core is slug-parameterized so genus fill (`GenusSlug`) is a trivial future addition (feed genus slugs into the same `IngestOne`).
 - **D-format (Q2 + D2): store the fetched bytes verbatim, real Content-Type, NEVER re-encode.** We download Wikimedia's **server-side 1600px scaled rendition** (`iiurlwidth=1600` → `imageinfo.thumburl`; D2 resolved → scaled) and store those bytes *as-is*. Re-encoding **by us** (even JPEG→PNG to match the `.png` key) would be an *adaptation* → CC-BY-SA ShareAlike; we never do it. Downloading Wikimedia's own downscale is "reproduction in another size", **not** an adaptation by us, so SA does not attach, attribution is unchanged, and the "不加工" intent (no transformation *by us*) holds. The key's `.png` is a logical name; iOS decodes by content. Allowed MIMEs: `image/jpeg|png|webp`.
 - **D-license-conservative:** classify into CC0/PD/CC-BY/CC-BY-SA or SKIP. Token-based NC/ND rejection. Unknown/ARR/GFDL-only → skip. A placeholder beats a license violation.
+- **D-attribution-gate (Codex #22): BY/SA gated behind the iOS Credits page; flag default OFF.** CC-BY/CC-BY-SA require visible attribution at the point of display (CC 4.0 §3(a)) — storing attribution in a private DB is NOT compliant. V1 ships with `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES=false` → uploads CC0/PD only (compliant; ~20% coverage per the `v1_image_self_hosting` sampling). The backend ALSO generates `credits.json` (§2.7) regardless, so the iOS Credits page has its data source. Once that page is live (separate `yardmate-swiftui` doc-first PR — Yao option B: in scope for this initiative, sequenced after the backend), ops flips the flag ON → BY/SA uploads begin → ~98% coverage. The flag is a **release-coordination** knob (decouples backend deploy from iOS release timing), NOT a permanent BY/SA-off switch. Without the gate, a backend deploy would serve BY/SA heroes before any attribution UI existed — the exact compliance gap Codex flagged.
 - **D-auth (Q4): admin token + internal-only path.** New `IMAGEINGEST_ADMIN_TOKEN`; `/internal/...` excluded from public nginx + server binds localhost. Not under `/v1`, no per-IP/per-device middleware (those are for public client traffic).
 - **D-ledger:** a `plant_image_ingest` table is required (not optional) — it is the idempotency record AND the negative cache AND the attribution store (B-档 compliance needs author/license captured at ingest). HEAD-R2-only can't negative-cache "no free image exists".
 
@@ -316,7 +356,7 @@ CREATE INDEX idx_plant_image_ingest_status ON plant_image_ingest (status);
 
 - **On-demand per-species ingest** (iOS/enrichment signals "fill this slug now" when a placeholder is shown). Needs an iOS change + a public/auth'd trigger; V1 batch-from-seed covers the common case (memory: common species are ~98% covered, cold species are the placeholder-risk tail).
 - **Genus-level fallback fill** — turn on once iOS reads the genus slug (iOS P2). Core already parameterized.
-- **iOS Settings → Credits page** + a `/credits` export endpoint built from `plant_image_ingest` attribution rows.
+- **iOS Settings → Credits page** (`yardmate-swiftui`, documentation-first) — **IN SCOPE for this initiative** (Yao option B), sequenced after the backend; renders `credits.json` (§2.7) and is the prerequisite for flipping the BY/SA gate ON. The `credits.json` export itself is now in-scope HERE (§1.1 / §2.7), not deferred. A live `GET /v1/credits` endpoint instead of the static file remains a possible future variant.
 - **Additional sources** (iNaturalist CC0/CC-BY, USDA PD, GBIF) — ledger `source` column is ready; add a source-cascade.
 - **Better candidate selection** — Commons `incategory:` precision, ML photo-vs-diagram detection, multiple variants per slug (closeup/scene like the AAA layout).
 - **Scaled-rendition / WebP normalization** beyond D2-OPEN, if a perf pass wants uniform hero sizes.
@@ -339,6 +379,9 @@ CREATE INDEX idx_plant_image_ingest_status ON plant_image_ingest (status);
 10. **Don't log image bytes or full Commons JSON at INFO.** Log `slug`, `scientific_name`, `status`, `license_code`, `bytes`, latency. Never the DSN / R2 secret / admin token.
 11. **Ticker must not pile up** — if a pass outruns the interval (slow Wikimedia), guard with a single-flight mutex so two passes don't run concurrently (double Wikimedia load + ledger races).
 12. **`config.LoadDefaultConfig` for aws-sdk-go-v2 reads env/`~/.aws` by default** — pass explicit static credentials (`credentials.NewStaticCredentialsProvider`) + `BaseEndpoint` for R2 so it never accidentally picks up ambient AWS creds on the box.
+13. **`deferred_attribution` is NOT permanent negative cache.** BY/SA rows gated off must be re-processed when `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES` flips ON — don't let the `IMAGEINGEST_NOIMAGE_TTL` logic treat them like `no_acceptable_image`. Store the chosen candidate's `pending_thumburl` + attribution so the flip uploads without re-searching Wikimedia.
+14. **Do NOT flip the gate ON before the iOS Credits page is live.** R2 is a public bucket and iOS renders the hero directly — uploading BY/SA makes them user-visible immediately. Flipping early = serving BY/SA without visible attribution = license violation (the exact Codex #22 issue).
+15. **`credits.json` is a full rebuild from the ledger, never a diff-append.** Rebuild from current `status='ingested'` rows every batch so deletions / re-ingests stay consistent. A drifted credits file = wrong/missing attribution = compliance risk.
 
 ---
 
@@ -355,6 +398,8 @@ proxy/imageingest/
 ├── commons_test.go               httptest-served fixtures (search hit / 403-no-UA / 429-retry / no results)
 ├── r2.go                         S3 client wrapper: HeadObject + PutObject (R2 endpoint, static creds, region=auto)
 ├── r2_test.go                    against a stub S3 (or interface + mock)
+├── credits.go                    build credits.json from the ledger + PutObject to R2 (§2.7)
+├── credits_test.go               JSON shape + full-rebuild (no diff-append) + gate-state coverage
 ├── ledger.go                     pgx: Lookup(slug) + Upsert(outcome) against plant_image_ingest
 ├── ledger_test.go                hermetic
 ├── seed.go                       pgx: SELECT scientific_name FROM plants_pending (read-only)
@@ -383,6 +428,7 @@ R2_BUCKET=yardmate-static
 IMAGEINGEST_ADMIN_TOKEN=...        # internal manual-trigger gate; server-only, NOT vended
 # IMAGEINGEST_TICK_INTERVAL=0      # 0/unset = ticker off (manual-only); e.g. 6h to enable
 # IMAGEINGEST_BATCH_LIMIT=25
+IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES=false   # release-coordination gate (Codex #22): flip true ONLY after the iOS Credits page is live; until then CC0/PD-only
 ```
 `SUPABASE_DB_URL` already present (enrichment). **R2 creds + `IMAGEINGEST_ADMIN_TOKEN` must NOT be added to `main.vendedKeys`** (pitfall §6/§9 #6). Deploy via the standard `YARDMATE_DEPLOY_STAGE=dev ./deploy/deploy.sh` flow (App-Attest dev-gate caveat per the `yardmate_api_deploy` memory).
 
