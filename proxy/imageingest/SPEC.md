@@ -189,7 +189,7 @@ Notes:
 - Also reject when `extmetadata.Copyrighted.value == "True"` **and** no allowed CC/PD code resolved (catches "All rights reserved" stragglers — Commons is mostly free but PD-art / fair-use edge files exist).
 - `GFDL-only` (no CC dual-license) → reject in V1 (copyleft + attribution but awkward; rare for photos — most are dual CC-BY-SA which we accept). §7 D3.
 - **Conservative default:** if the license can't be positively classified into the 4 allowed families, SKIP the candidate. A placeholder is acceptable (memory: "占位是常态"); a license violation is not.
-- **Attribution gate (Codex #22 / §7 D-attribution-gate):** a candidate classified CC-BY or CC-BY-SA is *eligible for upload* only when `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES` is true. While it is false (V1 default, until the iOS Credits page is live), BY/SA are NOT uploaded; a species whose only acceptable candidates are BY/SA is recorded `deferred_attribution` — its chosen candidate (thumburl + author + license) is stored so flipping the flag uploads it WITHOUT re-searching Wikimedia (§6.1). This is NOT a permanent negative cache (pitfall §9 #13). CC0 / PD are always eligible (no attribution required).
+- **Attribution gate (Codex #22 / §7 D-attribution-gate):** a candidate classified CC-BY or CC-BY-SA is *eligible for upload* only when `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES` is true. While it is false (V1 default, until the iOS Credits page is live), BY/SA are NOT uploaded; a species whose only acceptable candidates are BY/SA is recorded `deferred_attribution` — its chosen candidate (thumburl + author + license) is stored (§6.1) for credits-readiness + a future flip-fast-path (§8). When the flag flips ON the row is re-processed (V1 re-searches; the stored thumburl is reserved for the fast-path). This is NOT a permanent negative cache (pitfall §9 #13). CC0 / PD are always eligible (no attribution required).
 
 ### 2.5 Candidate selection (which photo becomes the hero)
 
@@ -250,7 +250,7 @@ Per-species outcomes are **not HTTP errors** — they are `IngestOutcome.Status`
 | `skipped_exists` | R2 already has the key (ledger/HEAD agree) | `status=ingested` (backfilled if missing) | terminal |
 | `no_acceptable_image` | search returned nothing, or nothing CC0/PD/BY/BY-SA | `status=no_acceptable_image` | negative-cached; re-attempt only after `IMAGEINGEST_NOIMAGE_TTL` (default 30d) or manual reset |
 | `deferred_attribution` | best/only acceptable candidate is CC-BY/SA but the gate is OFF | `status=deferred_attribution` + chosen candidate's thumburl/license/author stored | skipped until the gate flips ON (then upload WITHOUT re-search); NOT permanent negative cache (§9 #13) |
-| `source_error` | Wikimedia 5xx / network / all candidate downloads failed | `status=failed`, `attempts++` | retried next pass with backoff; cap `attempts` (default 5) → then treated as negative-cached |
+| `source_error` | Wikimedia 5xx / network / all candidate downloads failed | `status=failed`, `attempts++` | retried EVERY pass (transient/infra errors self-heal); V1 does NOT permanently negative-cache failures — `attempts` is observability only, so an R2/Wikimedia outage never parks a healthy species forever (no TTL re-check needed) |
 | `upload_error` | R2 PutObject failed | `status=failed`, `attempts++` | retried next pass |
 
 The **internal HTTP trigger** maps only auth/config problems to HTTP errors `{"error":"<code>"}`:
@@ -303,7 +303,7 @@ CREATE TABLE plant_image_ingest (
   status              TEXT NOT NULL                -- see §3 outcome matrix
                         CHECK (status IN ('ingested','no_acceptable_image','failed','deferred_attribution')),
   r2_key              TEXT,                         -- 'plant_images/{slug}/hero.png' when ingested
-  pending_thumburl    TEXT,                         -- chosen BY/SA rendition URL stored while deferred_attribution → upload on flag-flip without re-search (§2.4)
+  pending_thumburl    TEXT,                         -- chosen BY/SA 1600px rendition URL stored while deferred_attribution; reserved for a future flip-fast-path (§8, write-only in V1 — flip re-searches)
   source              TEXT NOT NULL DEFAULT 'wikimedia_commons',
   source_file_page    TEXT,                         -- Commons File: page URL (re-derive attribution anytime)
   license_code        TEXT,                         -- machine, e.g. 'cc-by-sa-4.0' / 'cc0' / 'pd'
@@ -379,7 +379,7 @@ CREATE INDEX idx_plant_image_ingest_status ON plant_image_ingest (status);
 10. **Don't log image bytes or full Commons JSON at INFO.** Log `slug`, `scientific_name`, `status`, `license_code`, `bytes`, latency. Never the DSN / R2 secret / admin token.
 11. **Ticker must not pile up** — if a pass outruns the interval (slow Wikimedia), guard with a single-flight mutex so two passes don't run concurrently (double Wikimedia load + ledger races).
 12. **`config.LoadDefaultConfig` for aws-sdk-go-v2 reads env/`~/.aws` by default** — pass explicit static credentials (`credentials.NewStaticCredentialsProvider`) + `BaseEndpoint` for R2 so it never accidentally picks up ambient AWS creds on the box.
-13. **`deferred_attribution` is NOT permanent negative cache.** BY/SA rows gated off must be re-processed when `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES` flips ON — don't let the `IMAGEINGEST_NOIMAGE_TTL` logic treat them like `no_acceptable_image`. Store the chosen candidate's `pending_thumburl` + attribution so the flip uploads without re-searching Wikimedia.
+13. **`deferred_attribution` is NOT permanent negative cache.** BY/SA rows gated off are re-processed when `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES` flips ON (`shouldSkip` returns false for deferred rows once the gate is on). V1 re-processes via a normal re-search (bounded by the batch limit + pacing — not a hammer). The chosen rendition URL is stored in `pending_thumburl` for a future flip-fast-path that would upload without re-searching (§8 optimization; write-only in V1).
 14. **Do NOT flip the gate ON before the iOS Credits page is live.** R2 is a public bucket and iOS renders the hero directly — uploading BY/SA makes them user-visible immediately. Flipping early = serving BY/SA without visible attribution = license violation (the exact Codex #22 issue).
 15. **`credits.json` is a full rebuild from the ledger, never a diff-append.** Rebuild from current `status='ingested'` rows every batch so deletions / re-ingests stay consistent. A drifted credits file = wrong/missing attribution = compliance risk.
 

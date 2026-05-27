@@ -33,6 +33,7 @@ type IngestOutcome struct {
 	LicenseShort   string              `json:"license_short,omitempty"`
 	Author         string              `json:"author,omitempty"`
 	FilePage       string              `json:"file_page,omitempty"`
+	ThumbURL       string              `json:"thumb_url,omitempty"` // chosen 1600px rendition (stored on deferred rows)
 	MIME           string              `json:"mime,omitempty"`
 	Bytes          int64               `json:"bytes,omitempty"`
 	Width          int                 `json:"width,omitempty"`
@@ -169,6 +170,13 @@ func (in *Ingestor) IngestOne(ctx context.Context, slug, searchTerm string) (Ing
 		if !c.License.Allowed {
 			continue
 		}
+		if strings.TrimSpace(c.ThumbURL) == "" {
+			// Commons couldn't render a 1600px rendition for this file; we only
+			// ever store the scaled rendition (D2), so it's unusable — skip it
+			// rather than later soft-fail Download("") and risk a spurious
+			// source_error when it was the only candidate.
+			continue
+		}
 		if c.License.AttributionRequired && !in.cfg.AllowAttributionLicenses {
 			gated = append(gated, c)
 			continue
@@ -187,6 +195,7 @@ func (in *Ingestor) IngestOne(ctx context.Context, slug, searchTerm string) (Ing
 			out.LicenseShort = pick.License.ShortName
 			out.Author = pick.License.Author
 			out.FilePage = pick.PageURL
+			out.ThumbURL = pick.ThumbURL
 			out.Note = "attribution gate off"
 			return out, nil
 		}
@@ -350,8 +359,13 @@ func (in *Ingestor) shouldSkip(prior *LedgerRow) bool {
 		// Re-process when the gate is ON (so it can upload); skip while OFF.
 		return !in.cfg.AllowAttributionLicenses
 	case StatusFailed:
-		// Negative-cache once the attempt cap is hit; otherwise retry.
-		return prior.Attempts >= in.cfg.MaxAttempts
+		// Always retry in V1: `failed` means a transient / infra error (Wikimedia
+		// 5xx, R2 HEAD/PUT blip), which should self-heal — NOT a stable "no free
+		// image" (that's no_acceptable_image, cached above). Permanently
+		// negative-caching transient failures would park a healthy species
+		// forever on an outage (there is no TTL re-check in V1). `attempts` is
+		// retained as an observability counter only (SPEC §3).
+		return false
 	default:
 		return false
 	}
@@ -370,7 +384,21 @@ func (in *Ingestor) recordOutcome(ctx context.Context, slug, name string, out In
 	}
 
 	switch out.Status {
-	case OutcomeIngested, OutcomeSkippedExists:
+	case OutcomeSkippedExists:
+		// R2 already has the hero (HEAD hit). The skipped outcome carries NO
+		// license/author (we never searched), so preserve any prior attribution
+		// row UNCHANGED — re-writing would wipe a live image's credit, e.g. on a
+		// re-run of the single-slug smoke path. If there's no prior row (object
+		// in R2 but ledger missing — manual upload / ledger reset), record only a
+		// minimal ingested marker; attribution is unknown and not re-derivable
+		// here (a future reconcile job could backfill it from Commons).
+		if prior != nil {
+			return
+		}
+		row.Status = StatusIngested
+		row.R2Key = heroKey(slug)
+		row.Attempts = priorAttempts
+	case OutcomeIngested:
 		row.Status = StatusIngested
 		row.R2Key = heroKey(slug)
 		row.LicenseCode = out.License
@@ -393,7 +421,10 @@ func (in *Ingestor) recordOutcome(ctx context.Context, slug, name string, out In
 		row.Attempts = priorAttempts
 	case OutcomeDeferredAttrib:
 		row.Status = StatusDeferredAttrib
-		row.PendingThumbURL = out.FilePage // provenance; the chosen file page
+		// Store the chosen 1600px rendition URL (NOT the File: page) for a future
+		// flip-fast-path that uploads without re-searching (§8). V1 re-searches on
+		// flip, so this is currently write-only provenance.
+		row.PendingThumbURL = out.ThumbURL
 		row.LicenseCode = out.License
 		row.LicenseShort = out.LicenseShort
 		row.LicenseURL = licenseURLFor(out)

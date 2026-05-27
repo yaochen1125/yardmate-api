@@ -93,6 +93,15 @@ func HandleRun(svc *Service) http.HandlerFunc {
 			// for attempt accounting.
 			prior, _ := svc.ingestor.ledger.Lookup(ctx, slug)
 			svc.ingestor.recordOutcome(ctx, slug, name, out, prior)
+			// Keep credits.json in sync when a single-slug run actually ingested
+			// (parity with RunBatch) — otherwise a single-slug CC-BY/SA ingest is
+			// live in R2 but missing from the public credits manifest until the
+			// next batch (an attribution-compliance window).
+			if out.Status == OutcomeIngested {
+				if cerr := svc.ingestor.rebuildCredits(ctx); cerr != nil {
+					log.Printf("imageingest run single credits rebuild err: slug=%s err=%v", slug, cerr)
+				}
+			}
 			log.Printf("imageingest run single ok: slug=%s status=%s license=%s bytes=%d",
 				slug, out.Status, out.License, out.Bytes)
 			writeJSON(w, http.StatusOK, out)

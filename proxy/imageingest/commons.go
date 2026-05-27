@@ -236,41 +236,36 @@ func (c *CommonsClient) Download(ctx context.Context, rawURL string) ([]byte, st
 func (c *CommonsClient) getWithRetry(ctx context.Context, reqURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= defaultMaxRetries; attempt++ {
-		if attempt > 0 {
-			wait := backoffFor(attempt)
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(wait):
-			}
-		}
 		body, retryAfter, status, err := c.doGet(ctx, reqURL)
-		if err != nil {
-			lastErr = err
-			continue // transient network error — retry
-		}
-		if status == http.StatusOK {
+		switch {
+		case err != nil:
+			lastErr = err // transient network error — retry
+		case status == http.StatusOK:
 			return body, nil
-		}
-		if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
-			// Honor Retry-After if present (bounded), else fall through to the
-			// computed backoff on the next loop iteration.
+		case status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable:
 			lastErr = fmt.Errorf("%w: status %d", ErrCommonsUnavailable, status)
-			if retryAfter > 0 {
-				wait := retryAfter
-				if wait > defaultMaxRetryGap {
-					wait = defaultMaxRetryGap
-				}
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(wait):
-				}
-			}
-			continue
+		default:
+			// Other non-200 (4xx other than 429) → not retryable.
+			return nil, fmt.Errorf("%w: status %d", ErrCommonsUnavailable, status)
 		}
-		// Other non-200 (4xx other than 429) → not retryable.
-		return nil, fmt.Errorf("%w: status %d", ErrCommonsUnavailable, status)
+		if attempt == defaultMaxRetries {
+			break
+		}
+		// Sleep EXACTLY ONCE before the next attempt: honor a server Retry-After
+		// when present (bounded), else a computed backoff — never both (summing
+		// them would over-wait and could blow the request timeout).
+		wait := retryAfter
+		if wait <= 0 {
+			wait = backoffFor(attempt + 1)
+		}
+		if wait > defaultMaxRetryGap {
+			wait = defaultMaxRetryGap
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
 	}
 	if lastErr == nil {
 		lastErr = ErrCommonsUnavailable

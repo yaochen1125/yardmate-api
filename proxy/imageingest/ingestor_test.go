@@ -188,6 +188,17 @@ func TestIngestOne(t *testing.T) {
 			wantPut:    false,
 		},
 		{
+			name: "no_acceptable_image when the only candidate has an empty thumburl",
+			setup: func(c *mockCommons, s *mockStore) {
+				// Commons couldn't render a 1600px rendition → unusable (we only
+				// store the scaled rendition, D2); must be skipped, not soft-failed
+				// as source_error via a Download("") attempt.
+				c.searchRet = []Candidate{cand("File:nothumb.jpg", "", "image/jpeg", 4000, 3000, cc0Lic())}
+			},
+			wantStatus: OutcomeNoAcceptableImg,
+			wantPut:    false,
+		},
+		{
 			name:        "deferred_attribution when gate OFF and only BY/SA",
 			allowAttrib: false,
 			setup: func(c *mockCommons, s *mockStore) {
@@ -300,6 +311,51 @@ func TestIngestOne_DeferredCapturesProvenance(t *testing.T) {
 	}
 	if out.License != "cc-by-sa-4.0" || out.Author != "Jane" || out.FilePage == "" {
 		t.Errorf("deferred outcome missing provenance: %+v", out)
+	}
+	if out.ThumbURL != "https://thumb/bysa" {
+		t.Errorf("deferred outcome must capture the chosen 1600px thumburl, got %q", out.ThumbURL)
+	}
+}
+
+// TestRecordOutcome_SkippedExistsPreservesPriorAttribution locks the fix for the
+// code-review finding: re-running an already-live slug (HEAD hit →
+// skipped_exists, which carries NO license/author) must NOT wipe the prior
+// attribution row, or the next credits.json rebuild would drop a live CC-BY/SA
+// image's required credit (a CC §3(a) violation).
+func TestRecordOutcome_SkippedExistsPreservesPriorAttribution(t *testing.T) {
+	ledger := newMockLedger()
+	prior := &LedgerRow{
+		Slug: "rosa", ScientificName: "Rosa regina", Status: StatusIngested,
+		R2Key: heroKey("rosa"), LicenseCode: "cc-by-sa-4.0", LicenseShort: "CC BY-SA 4.0",
+		AttributionAuthor: "Jane", AttributionRequired: true,
+		SourceFilePage: "https://commons.wikimedia.org/wiki/File:rosa.jpg",
+	}
+	ledger.rows["rosa"] = prior
+	in := NewIngestor(&mockCommons{}, newMockStore(), ledger, &mockSeeds{}, Config{})
+
+	// skipped_exists carries no license/author (we never searched).
+	out := IngestOutcome{Status: OutcomeSkippedExists, Slug: "rosa", ScientificName: "Rosa regina", R2Key: heroKey("rosa")}
+	in.recordOutcome(context.Background(), "rosa", "Rosa regina", out, prior)
+
+	got := ledger.rows["rosa"]
+	if got.AttributionAuthor != "Jane" || got.LicenseCode != "cc-by-sa-4.0" || !got.AttributionRequired {
+		t.Errorf("skipped_exists wiped prior attribution: %+v", got)
+	}
+}
+
+// TestShouldSkip_FailedAlwaysRetries locks the fix: a `failed` row (transient /
+// infra error) must always retry — never a permanent negative cache, so an
+// R2 / Wikimedia outage cannot park a healthy species forever.
+func TestShouldSkip_FailedAlwaysRetries(t *testing.T) {
+	in := NewIngestor(&mockCommons{}, newMockStore(), newMockLedger(), &mockSeeds{}, Config{})
+	if in.shouldSkip(&LedgerRow{Status: StatusFailed, Attempts: 99}) {
+		t.Errorf("failed row with high attempts must still retry (no permanent negative cache)")
+	}
+	if !in.shouldSkip(&LedgerRow{Status: StatusNoAcceptableImg}) {
+		t.Errorf("no_acceptable_image should stay cached/skipped")
+	}
+	if !in.shouldSkip(&LedgerRow{Status: StatusIngested}) {
+		t.Errorf("ingested should be skipped")
 	}
 }
 
