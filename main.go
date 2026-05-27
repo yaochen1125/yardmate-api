@@ -14,6 +14,7 @@ import (
 	"github.com/yaochen1125/yardmate-api/attest"
 	"github.com/yaochen1125/yardmate-api/proxy"
 	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
+	"github.com/yaochen1125/yardmate-api/proxy/imageingest"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
@@ -129,7 +130,28 @@ func main() {
 	// WARN log if either is missing or the DB ping fails.
 	enrichSvc := buildEnrichmentService(vault, content)
 
-	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, content, enrichSvc)
+	// Image-ingest service — fills out-of-catalog plant hero images on R2 from
+	// Wikimedia Commons (proxy/imageingest/SPEC.md). Requires R2 creds +
+	// SUPABASE_DB_URL + IMAGEINGEST_ADMIN_TOKEN; gracefully disabled (nil +
+	// WARN) if any is missing, in which case the /internal route is not
+	// registered and the ticker does not start.
+	ingestSvc := buildImageIngestService(vault)
+
+	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, content, enrichSvc, ingestSvc)
+
+	// Optional background ingest ticker (proxy/imageingest/SPEC.md §2.1).
+	// Disabled by default (IMAGEINGEST_TICK_INTERVAL=0/unset → manual-only).
+	// Started only when the service is configured AND the interval > 0; the
+	// single-flight guard in RunBatch prevents overlapping passes.
+	if ingestSvc != nil {
+		if tick := envDurationOr("IMAGEINGEST_TICK_INTERVAL", 0); tick > 0 {
+			stop := ingestSvc.Start(tick)
+			defer stop()
+			log.Printf("imageingest ticker started: interval=%v", tick)
+		} else {
+			log.Printf("imageingest ticker disabled (IMAGEINGEST_TICK_INTERVAL unset/0); manual trigger only")
+		}
+	}
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream). Headroom 5 s.
 	httpSrv := &http.Server{
@@ -177,6 +199,78 @@ func buildEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex) *
 	cache := enrichment.NewCache(0, 0) // defaults: 10k entries, 30 min TTL
 	log.Printf("enrichment service ready: db pool + LRU cache + LLM %s", enrichment.SourceTag)
 	return enrichment.NewService(content, db, llm, cache)
+}
+
+// buildImageIngestService wires the proxy/imageingest dependencies: R2 client
+// (S3 SDK), the plant_image_ingest ledger + plants_pending seed reader (both
+// own small pgx pools, MaxConns=2), and the Wikimedia Commons client. Returns
+// nil (with a WARN log) if any required secret is missing or a DB ping fails —
+// in that case the /internal route stays unregistered and the ticker never
+// starts (mirrors buildEnrichmentService graceful-disable).
+//
+// Required secrets: R2_ACCESS_KEY_ID + R2_SECRET_ACCESS_KEY + R2_BUCKET +
+// (R2_ENDPOINT or R2_ACCOUNT_ID), SUPABASE_DB_URL, IMAGEINGEST_ADMIN_TOKEN.
+// The R2 creds + admin token are SERVER-ONLY and MUST NOT be in vendedKeys.
+//
+// Pool lifetime is the process lifetime (no graceful Close on shutdown in V1;
+// systemd SIGTERM kills the process, Postgres reclaims via idle timeout —
+// same stance as buildEnrichmentService).
+func buildImageIngestService(vault *secrets.Vault) *imageingest.Service {
+	dsn := vault.Get("SUPABASE_DB_URL")
+	adminToken := vault.Get("IMAGEINGEST_ADMIN_TOKEN")
+	r2Cfg := imageingest.R2Config{
+		AccountID:       vault.Get("R2_ACCOUNT_ID"),
+		AccessKeyID:     vault.Get("R2_ACCESS_KEY_ID"),
+		SecretAccessKey: vault.Get("R2_SECRET_ACCESS_KEY"),
+		Bucket:          vault.Get("R2_BUCKET"),
+		Endpoint:        vault.Get("R2_ENDPOINT"),
+	}
+	if dsn == "" || adminToken == "" || r2Cfg.AccessKeyID == "" ||
+		r2Cfg.SecretAccessKey == "" || r2Cfg.Bucket == "" ||
+		(r2Cfg.Endpoint == "" && r2Cfg.AccountID == "") {
+		log.Printf("WARN: R2 creds / SUPABASE_DB_URL / IMAGEINGEST_ADMIN_TOKEN missing; image ingest disabled")
+		return nil
+	}
+
+	r2Client, err := imageingest.NewR2Client(r2Cfg)
+	if err != nil {
+		log.Printf("WARN: image ingest R2 init failed: %v; disabled", err)
+		return nil
+	}
+
+	initCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ledger, err := imageingest.NewLedger(initCtx, dsn)
+	if err != nil {
+		log.Printf("WARN: image ingest ledger init failed: %v; disabled", err)
+		return nil
+	}
+	if err := ledger.Ping(initCtx); err != nil {
+		log.Printf("WARN: image ingest ledger ping failed: %v; disabled", err)
+		ledger.Close()
+		return nil
+	}
+	seeds, err := imageingest.NewSeedReader(initCtx, dsn)
+	if err != nil {
+		log.Printf("WARN: image ingest seed reader init failed: %v; disabled", err)
+		ledger.Close()
+		return nil
+	}
+
+	commons := imageingest.NewCommonsClient(imageingest.CommonsOptions{
+		UserAgent: vault.Get("IMAGEINGEST_USER_AGENT"), // empty → built-in default UA
+		MaxBytes:  int64(envIntOr("IMAGEINGEST_MAX_BYTES", 0)),
+	})
+
+	cfg := imageingest.Config{
+		AllowAttributionLicenses: vault.GetBool("IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES", false),
+		MinInterval:              envDurationOr("IMAGEINGEST_MIN_INTERVAL", time.Second),
+		BatchLimit:               envIntOr("IMAGEINGEST_BATCH_LIMIT", 25),
+	}
+	ingestor := imageingest.NewIngestor(commons, r2Client, ledger, seeds, cfg)
+	log.Printf("image ingest service ready: R2 bucket=%s ledger+seed pools + commons (allowAttribution=%v batchLimit=%d)",
+		r2Cfg.Bucket, cfg.AllowAttributionLicenses, cfg.BatchLimit)
+	return imageingest.NewService(ingestor, adminToken)
 }
 
 func envOr(key, def string) string {
