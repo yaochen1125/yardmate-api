@@ -109,6 +109,30 @@ func TestLookupPlantID_BrassicaVarieties(t *testing.T) {
 	}
 }
 
+// TestLookupPlantID_HybridMarkerDistinctEntries pins behavior when the catalog
+// stores two rows that differ ONLY by the hybrid marker — AAA0324 "Chrysanthemum
+// morifolium" (bare) and AAA0325 "Chrysanthemum x morifolium" (ASCII-x form).
+// Codex review on PR #25 caught a regression: an earlier rev of the precise
+// normalizer dropped stand-alone "x" the same way the species-level normalizer
+// does, so both rows folded to one precise key, first-write-wins picked AAA0324,
+// and LookupPlantID("Chrysanthemum x morifolium") silently returned AAA0324
+// (the wrong row) instead of AAA0325. The precise tier MUST keep "x" so each
+// catalog row remains addressable by its own scientific_name.
+func TestLookupPlantID_HybridMarkerDistinctEntries(t *testing.T) {
+	c := loadContentForTests(t)
+	if id, ok := c.LookupPlantID("Chrysanthemum morifolium"); !ok || id != "AAA0324" {
+		t.Errorf("bare \"Chrysanthemum morifolium\" = (%q, %v), want (AAA0324, true)", id, ok)
+	}
+	if id, ok := c.LookupPlantID("Chrysanthemum x morifolium"); !ok || id != "AAA0325" {
+		t.Errorf("\"Chrysanthemum x morifolium\" = (%q, %v), want (AAA0325, true) — precise tier dropped 'x'", id, ok)
+	}
+	// Unicode × is the conventional hybrid marker; it collapses to the bare-form
+	// row (× -> space -> strings.Fields drops the empty token).
+	if id, ok := c.LookupPlantID("Chrysanthemum × morifolium"); !ok || id != "AAA0324" {
+		t.Errorf("\"Chrysanthemum × morifolium\" = (%q, %v), want (AAA0324, true)", id, ok)
+	}
+}
+
 func TestLookupPlantID_Miss(t *testing.T) {
 	c := loadContentForTests(t)
 	if _, ok := c.LookupPlantID("Fictional plant"); ok {

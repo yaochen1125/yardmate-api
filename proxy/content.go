@@ -186,12 +186,17 @@ func LoadContent() (*ContentIndex, error) {
 }
 
 // LookupPlantID maps a Plant.id / Pl@ntNet-reported scientific name to a
-// YardMate plantId. Match is case-insensitive and tolerates the hybrid marker
-// (`×` / stand-alone `x`). It is two-tier: an exact infraspecific match wins
-// first (so "Brassica oleracea var. italica" resolves to its own cultivar id,
-// distinct from var. acephala), then a species-level fallback strips variety /
-// cultivar / subspecies suffixes (`var.`, `cv.`, `subsp.`, `f.`) so a query
-// whose variety isn't separately curated still resolves to the species entry.
+// YardMate plantId. Match is case-insensitive. It is two-tier:
+//
+//   - Tier 1 (precise) preserves variety / subspecies / cultivar suffixes AND a
+//     stand-alone ASCII "x" — so "Brassica oleracea var. italica" resolves to
+//     its own cultivar id (distinct from var. acephala), and a catalog row that
+//     uses the ASCII-x hybrid form (e.g. "Chrysanthemum x morifolium", AAA0325)
+//     stays addressable separately from its bare-form sibling.
+//   - Tier 2 (species fallback) folds the Unicode × marker, drops a stand-alone
+//     ASCII "x", and strips variety / cultivar / subspecies suffixes (`var.`,
+//     `cv.`, `subsp.`, `f.`) — so a query whose variety / hybrid marker the
+//     catalog doesn't carry separately still resolves to the species entry.
 //
 // Returns ("", false) on miss — iOS detail page must tolerate plantId=null
 // (renders Plant.id-only data without YardMate cross-reference).
@@ -364,15 +369,25 @@ func normalizeScientificName(s string) string {
 }
 
 // normalizeScientificNamePrecise is like normalizeScientificName but does NOT
-// strip the infraspecific rank markers (var./subsp./ssp./cv./f./forma). It still
-// lowercases, trims, collapses whitespace, and drops the hybrid × / stand-alone
-// "x" marker, so "Brassica oleracea var. italica" -> "brassica oleracea var.
-// italica" while "Chrysanthemum × morifolium" and "Chrysanthemum x morifolium"
-// still fold together. Examples:
+// strip the infraspecific rank markers (var./subsp./ssp./cv./f./forma) AND does
+// NOT drop a stand-alone ASCII "x" token. It still lowercases, trims, collapses
+// whitespace, and replaces the Unicode × with a space. Examples:
 //
-//	"Brassica oleracea var. italica"  -> "brassica oleracea var. italica"
-//	"Brassica oleracea var. acephala" -> "brassica oleracea var. acephala"
-//	"Abelia × grandiflora"            -> "abelia grandiflora"
+//	"Brassica oleracea var. italica"   -> "brassica oleracea var. italica"
+//	"Brassica oleracea var. acephala"  -> "brassica oleracea var. acephala"
+//	"Chrysanthemum morifolium"         -> "chrysanthemum morifolium"
+//	"Chrysanthemum x morifolium"       -> "chrysanthemum x morifolium"  (x kept)
+//	"Chrysanthemum × morifolium"       -> "chrysanthemum morifolium"
+//	"Abelia × grandiflora"             -> "abelia grandiflora"
+//
+// Why "x" is kept here but dropped in normalizeScientificName: the catalog
+// stores some pairs of rows that differ ONLY by the hybrid marker — e.g.
+// AAA0324 "Chrysanthemum morifolium" and AAA0325 "Chrysanthemum x morifolium".
+// The precise index must preserve that distinction so each row is reachable
+// via its own scientific_name. Inputs using the conventional Unicode × still
+// collapse to the bare-form row (× -> space, then strings.Fields drops the
+// empty token); the species-level fallback (normalizeScientificName) continues
+// to drop both forms so a query without any hybrid marker still resolves.
 //
 // Two consumers: the catalog's precise scientificNameToIDPrecise index, and
 // (via the exported NormalizeScientificNamePrecise wrapper) the enrichment
@@ -383,15 +398,7 @@ func normalizeScientificName(s string) string {
 func normalizeScientificNamePrecise(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = strings.ReplaceAll(s, "×", " ")
-	fields := strings.Fields(s)
-	out := fields[:0]
-	for _, f := range fields {
-		if f == "x" {
-			continue
-		}
-		out = append(out, f)
-	}
-	return strings.Join(out, " ")
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // normalizeDiseaseName lowercases, trims, and strips common boilerplate
