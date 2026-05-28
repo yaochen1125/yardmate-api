@@ -348,10 +348,21 @@ func speciesBinomial(s string) string {
 			break
 		}
 	}
-	if strings.Contains(s, "×") { // hybrid — never collapse
+	if strings.Contains(s, "×") { // hybrid (Unicode) — never collapse
 		return s
 	}
 	f := strings.Fields(s)
+	// Stand-alone ASCII "x" is the other hybrid marker (e.g. "Abelia x
+	// grandiflora", "Citrus x paradisi" — both present in plants_index.json).
+	// The catalog key builder normalizeScientificName drops the "x" token; for
+	// display + iNat we keep the full hybrid name as-is, because a bare
+	// "Abelia grandiflora" / "Citrus paradisi" is a different epithet and a
+	// collapse would corrupt the displayed scientific_name.
+	for _, t := range f {
+		if t == "x" {
+			return s
+		}
+	}
 	if len(f) < 3 || !isLowerLatin(f[1]) || !isLowerLatin(f[2]) {
 		return strings.Join(f, " ")
 	}
