@@ -20,6 +20,7 @@ func TestSpeciesBinomial(t *testing.T) {
 		{"hybrid marker unchanged", "Abelia × grandiflora", "Abelia × grandiflora"},
 		{"extra whitespace normalised", "  Rosa   chinensis  ", "Rosa chinensis"},
 		{"single token", "Rosa", "Rosa"},
+		{"rank marker without species epithet (defense)", "Eucalyptus f. xxx", "Eucalyptus f. xxx"},
 		{"empty", "", ""},
 	}
 	for _, tc := range cases {

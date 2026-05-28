@@ -331,10 +331,20 @@ func speciesBinomial(s string) string {
 		return s
 	}
 	// Strip a rank marker and everything after it, preserving original case.
+	// If stripping leaves less than a binomial (genus + species), bail out
+	// and keep the original — a marker right after a single token is a
+	// malformed input (e.g. "Eucalyptus f. xxx" with no species epithet)
+	// and engines essentially never emit it; defend rather than collapse
+	// to a bare genus.
+	original := s
 	low := strings.ToLower(s)
 	for _, m := range []string{" var.", " cv.", " subsp.", " ssp.", " f.", " forma "} {
 		if i := strings.Index(low, m); i >= 0 {
-			s = strings.TrimSpace(s[:i])
+			stripped := strings.TrimSpace(s[:i])
+			if len(strings.Fields(stripped)) < 2 {
+				return original
+			}
+			s = stripped
 			break
 		}
 	}
