@@ -10,6 +10,7 @@ import (
 	"github.com/yaochen1125/yardmate-api/attest"
 	"github.com/yaochen1125/yardmate-api/proxy"
 	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
+	"github.com/yaochen1125/yardmate-api/proxy/imageingest"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
@@ -27,6 +28,7 @@ type Server struct {
 	vision   *proxy.VisionClient   // optional; nil disables ai_enhance + LLM catalog disambiguation
 	content  *proxy.ContentIndex   // optional; nil disables plantId/catalogId lookups in /v1/diagnose
 	enrich   *enrichment.Service   // optional; nil disables /v1/plants/enrichment
+	ingest   *imageingest.Service  // optional; nil disables POST /internal/imageingest/run
 	router   chi.Router
 }
 
@@ -46,6 +48,7 @@ func newServer(
 	vision *proxy.VisionClient,
 	content *proxy.ContentIndex,
 	enrich *enrichment.Service,
+	ingest *imageingest.Service,
 ) *Server {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -54,6 +57,16 @@ func newServer(
 	r.Use(middleware.Recoverer)
 
 	r.Get("/healthz", healthz)
+
+	// Internal image-ingest trigger (proxy/imageingest/SPEC.md §2.1 / §5).
+	// TOP-LEVEL route, deliberately OUTSIDE the /v1 group: it is admin-token
+	// gated + internal-only (nginx proxies only /v1/* + /healthz publicly, and
+	// the server binds localhost), so it must NOT carry the public per-IP /
+	// per-device rate-limit middleware. Registered only when the service is
+	// configured (R2 + DB + admin token present; nil otherwise → unregistered).
+	if ingest != nil {
+		r.Post("/internal/imageingest/run", imageingest.HandleRun(ingest))
+	}
 
 	// All /v1 endpoints share the per-IP rate limit. Per-keyID is applied
 	// inside /v1/app-secrets after assertion verification (ratelimit/SPEC §4).
@@ -104,7 +117,7 @@ func newServer(
 	return &Server{
 		verifier: verifier, vault: vault, limiter: lim,
 		plantNet: plantNet, plantID: plantID, vision: vision, content: content,
-		enrich: enrich, router: r,
+		enrich: enrich, ingest: ingest, router: r,
 	}
 }
 
