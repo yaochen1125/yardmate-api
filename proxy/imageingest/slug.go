@@ -9,17 +9,86 @@ package imageingest
 
 import "strings"
 
-// Slug mirrors iOS PlantImageURL.slug byte-for-byte (shipped iOS PR #227).
-// Do NOT add unidecode / NFD / NFC / transliteration — iOS treats every
-// non-[a-z0-9] code point as a separator (it is NOT in the allowed set), so
-// "é" / "×" / spaces all collapse to a single "-". Transliterating "é"→"e"
-// here would produce a DIFFERENT slug than iOS → a permanent 404 on the hero
-// (SPEC §2.3, pitfall §9 #1). This is THE central cross-platform invariant:
-// same function, same input ⇒ same R2 key on both sides.
+// Slug computes the R2 species-level slug for a scientific name. Mirrors iOS
+// PlantImageURL.slug byte-for-byte (SPEC §2.3, pitfall §9 #1 — THE central
+// cross-platform invariant).
+//
+// The slug is computed from the SPECIES BINOMIAL (first 2 space-delimited
+// non-empty words). Every subspecies / variety / cultivar of a species
+// collapses to the same slug + one R2 hero — no per-trinomial ingest. iOS
+// PlantImageURL.slug applies the equivalent binomial-then-slugify chain;
+// both sides MUST stay in lock-step.
+//
+//	"Monstera adansonii"            → "monstera-adansonii"
+//	"Monstera adansonii blanchetii" → "monstera-adansonii"   (subspecies)
+//	"Rosa"                          → "rosa"                 (single word)
+//
+// Slugify rules (applied to the binomial):
+//   - lowercase
+//   - every non-[a-z0-9] code point is a separator (collapsed to single "-")
+//   - no leading / trailing "-"
+//   - NO unidecode / NFD / NFC / transliteration. "é" / "×" / spaces all
+//     collapse to a separator (NOT mapped to "e", "x", etc.). Diverging
+//     from iOS here = permanent 404 on the hero.
 func Slug(scientificName string) string {
-	out := make([]byte, 0, len(scientificName))
+	return slugifyByteExact(Binomial(scientificName))
+}
+
+// Binomial returns the species binomial — the first 2 non-empty space-delimited
+// tokens of the input scientific name, with standalone botanical hybrid markers
+// (`×` / ASCII `x` / `X`) filtered out so they don't occupy a binomial slot.
+// Any whitespace is normalized away via strings.Fields. Names with fewer than 2
+// remaining tokens pass through unchanged; empty / whitespace-only / marker-only
+// input yields "".
+//
+// Exposed so callers also normalize the *Wikimedia search term* (not just
+// the slug), keeping the entire pipeline canonical at species level —
+// different subspecies seeds map to the same search + same slug + same hero
+// (no last-writer-wins churn on the binomial R2 key).
+//
+//	"Monstera adansonii blanchetii" → "Monstera adansonii"
+//	"  Rosa  regina  sueciae  "     → "Rosa regina"
+//	"Rosa regina"                   → "Rosa regina"
+//	"Monstera"                      → "Monstera"
+//	""                              → ""
+//	"Abelia × grandiflora"          → "Abelia grandiflora"  (× marker dropped)
+//	"Abelia x grandiflora"          → "Abelia grandiflora"  (ASCII x — catalog form)
+//	"× Cupressocyparis leylandii"   → "Cupressocyparis leylandii"
+//
+// **Hybrid filter is EXACT single-token match only** — "Xanthium strumarium"
+// (genus starts with X) and "Pinus xanthopinus" (epithet starts with x) are
+// NOT affected. The catalog uses the ASCII form (`Abelia x grandiflora`), so
+// filtering is required for parity with curated entries (Codex #27 fix; same
+// filter ships in iOS PlantImageURL.binomial(of:) — both sides MUST agree).
+//
+// iOS PlantImageURL applies the equivalent inside slug(for:); both sides
+// extract the same first-2-non-marker-words before slugifying — the
+// cross-platform byte-exact invariant.
+func Binomial(name string) string {
+	var tokens []string
+	for _, t := range strings.Fields(name) {
+		if t == "×" || t == "x" || t == "X" {
+			continue
+		}
+		tokens = append(tokens, t)
+	}
+	switch len(tokens) {
+	case 0:
+		return ""
+	case 1:
+		return tokens[0]
+	default:
+		return tokens[0] + " " + tokens[1]
+	}
+}
+
+// slugifyByteExact is the pure byte-exact lowercase + [^a-z0-9]→"-" + collapse
+// + trim transform. Input pre-processing (binomial extraction) is the caller's
+// job. Kept private: every external caller wants the canonical Slug entry point.
+func slugifyByteExact(s string) string {
+	out := make([]byte, 0, len(s))
 	pendingDash := false
-	for _, r := range strings.ToLower(scientificName) {
+	for _, r := range strings.ToLower(s) {
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
 			if pendingDash && len(out) > 0 {
 				out = append(out, '-')
