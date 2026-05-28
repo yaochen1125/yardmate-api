@@ -35,9 +35,11 @@ func Slug(scientificName string) string {
 }
 
 // Binomial returns the species binomial — the first 2 non-empty space-delimited
-// tokens of the input scientific name (any whitespace is normalized away via
-// strings.Fields). Names with fewer than 2 words pass through unchanged;
-// empty / whitespace-only input yields "".
+// tokens of the input scientific name, with standalone botanical hybrid markers
+// (`×` / ASCII `x` / `X`) filtered out so they don't occupy a binomial slot.
+// Any whitespace is normalized away via strings.Fields. Names with fewer than 2
+// remaining tokens pass through unchanged; empty / whitespace-only / marker-only
+// input yields "".
 //
 // Exposed so callers also normalize the *Wikimedia search term* (not just
 // the slug), keeping the entire pipeline canonical at species level —
@@ -49,19 +51,34 @@ func Slug(scientificName string) string {
 //	"Rosa regina"                   → "Rosa regina"
 //	"Monstera"                      → "Monstera"
 //	""                              → ""
+//	"Abelia × grandiflora"          → "Abelia grandiflora"  (× marker dropped)
+//	"Abelia x grandiflora"          → "Abelia grandiflora"  (ASCII x — catalog form)
+//	"× Cupressocyparis leylandii"   → "Cupressocyparis leylandii"
+//
+// **Hybrid filter is EXACT single-token match only** — "Xanthium strumarium"
+// (genus starts with X) and "Pinus xanthopinus" (epithet starts with x) are
+// NOT affected. The catalog uses the ASCII form (`Abelia x grandiflora`), so
+// filtering is required for parity with curated entries (Codex #27 fix; same
+// filter ships in iOS PlantImageURL.binomial(of:) — both sides MUST agree).
 //
 // iOS PlantImageURL applies the equivalent inside slug(for:); both sides
-// extract the same first-2-words before slugifying — the cross-platform
-// byte-exact invariant.
+// extract the same first-2-non-marker-words before slugifying — the
+// cross-platform byte-exact invariant.
 func Binomial(name string) string {
-	fields := strings.Fields(name)
-	switch len(fields) {
+	var tokens []string
+	for _, t := range strings.Fields(name) {
+		if t == "×" || t == "x" || t == "X" {
+			continue
+		}
+		tokens = append(tokens, t)
+	}
+	switch len(tokens) {
 	case 0:
 		return ""
 	case 1:
-		return fields[0]
+		return tokens[0]
 	default:
-		return fields[0] + " " + fields[1]
+		return tokens[0] + " " + tokens[1]
 	}
 }
 

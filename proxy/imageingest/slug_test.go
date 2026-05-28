@@ -19,10 +19,18 @@ func TestSlug(t *testing.T) {
 		{"trailing spaces trimmed", "Rosa regina   ", "rosa-regina"},
 		{"multiple inner spaces collapse", "Rosa    regina", "rosa-regina"},
 		{"leading+trailing+multi (trinomial→binomial)", "  Rosa   regina  sueciae  ", "rosa-regina"},
-		// 杂交符 × 落在 binomial 第 2 词位置：Binomial="Abelia ×"，× 是分隔符且
-		// binomial 内后续无 alpha-numeric → slugify 收敛到 "abelia"。V1 接受这个
-		// 边界（杂交记法少见，产出仍是有效种级 slug）。
-		{"hybrid sign in 2nd word position", "Abelia × grandiflora", "abelia"},
+		// 杂交记法：Binomial filter 掉单字符 hybrid marker (× / 小写 x / 大写 X)
+		// 再取前 2，所以杂交学名的 binomial 等于"genus + epithet"，slug 跟非杂交
+		// 同种共享一张 hero。catalog 实际用 ASCII `x`（`Abelia x grandiflora`），
+		// 修过 Codex #27 后必须对齐。EXACT 单 token 匹配——"Xanthium" / "xanthopinus"
+		// 等首字 X/x 的正常学名不受影响。
+		{"hybrid Unicode × dropped", "Abelia × grandiflora", "abelia-grandiflora"},
+		{"hybrid ASCII x dropped (catalog form)", "Abelia x grandiflora", "abelia-grandiflora"},
+		{"hybrid caps X dropped", "Abelia X grandiflora", "abelia-grandiflora"},
+		{"hybrid leading × marker dropped", "× Cupressocyparis leylandii", "cupressocyparis-leylandii"},
+		{"genus starts with X (not filtered)", "Xanthium strumarium", "xanthium-strumarium"},
+		{"epithet starts with x (not filtered)", "Pinus xanthopinus", "pinus-xanthopinus"},
+		{"standalone hybrid marker only", "x", ""},
 		// Precomposed accent: "é" is a single non-[a-z0-9] code point → acts as a
 		// separator (NOT transliterated to "e"). Single-word input passes binomial
 		// extraction unchanged → slugify "ArécES" → "ar" + sep + "ces".
@@ -76,7 +84,15 @@ func TestBinomial(t *testing.T) {
 		{"binomial unchanged", "Rosa regina", "Rosa regina"},
 		{"trinomial → binomial", "Rosa regina sueciae", "Rosa regina"},
 		{"subspecies", "Monstera adansonii blanchetii", "Monstera adansonii"},
-		{"4 words → binomial", "Aster × alpinus var. dolomitica", "Aster ×"},
+		// Hybrid marker (× / x / X) 作为独立 token 时被 filter 掉再取前 2——
+		// 杂交学名的 binomial = genus + epithet（跟非杂交同种共享）。
+		{"4 words with × marker → binomial drops marker", "Aster × alpinus var. dolomitica", "Aster alpinus"},
+		{"hybrid Unicode × filtered", "Abelia × grandiflora", "Abelia grandiflora"},
+		{"hybrid ASCII x filtered (catalog form)", "Abelia x grandiflora", "Abelia grandiflora"},
+		{"hybrid caps X filtered", "Abelia X grandiflora", "Abelia grandiflora"},
+		{"hybrid leading × filtered", "× Cupressocyparis leylandii", "Cupressocyparis leylandii"},
+		{"genus starts with X (not filtered)", "Xanthium", "Xanthium"},
+		{"standalone hybrid marker only", "x", ""},
 		{"single word passes through", "Rosa", "Rosa"},
 		// strings.Fields 把任何空白（含 leading/trailing/multi-space/tab）
 		// 都规范化掉——这是 binomial 跨平台一致性的根。

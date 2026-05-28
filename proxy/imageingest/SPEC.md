@@ -129,10 +129,10 @@ The `.png` in the key is a **logical name**, not a format assertion (Q2). iOS `C
 ### 2.3 `slug` — Binomial + byte-exact slugify, cross-platform with iOS `PlantImageURL.slug` (THE central invariant)
 
 Slug is a 2-step chain — **both sides apply identically**:
-1. **Binomial extraction.** Take the first 2 non-empty space-delimited tokens of the scientific name (`strings.Fields` / Swift `split(separator:" ", omittingEmptySubsequences:true)`). Names with <2 tokens pass through. Whitespace is normalized away.
+1. **Binomial extraction.** Whitespace-tokenize the scientific name (`strings.Fields` / Swift `split(whereSeparator: { $0.isWhitespace })`); **drop standalone botanical hybrid markers** — EXACT single-token matches of `×`, ASCII `x`, or `X` (Codex #27 / #241 — catalog uses ASCII `x` like `Abelia x grandiflora`, the common case); take the first 2 surviving tokens. Names with <2 surviving tokens pass through. Whitespace is normalized away. **Only EXACT single-token matches drop** — words like `Xanthium` (genus starting with X) or `xanthopinus` (epithet starting with x) are kept untouched.
 2. **Byte-exact slugify** of the binomial: lowercase + iterate; keep `[a-z0-9]`; any run of non-`[a-z0-9]` collapses to a **single** `-`; **no leading dash**, **no trailing dash**.
 
-Every subspecies / variety / cultivar of a species collapses to one slug → one R2 hero → no per-trinomial ingest:
+Every subspecies / variety / cultivar / hybrid of a species collapses to one slug → one R2 hero → no per-trinomial ingest:
 
 | input | binomial | slug |
 |---|---|---|
@@ -140,6 +140,12 @@ Every subspecies / variety / cultivar of a species collapses to one slug → one
 | `Monstera adansonii blanchetii` | `Monstera adansonii` | `monstera-adansonii` (subspecies) |
 | `Rosa regina sueciae` | `Rosa regina` | `rosa-regina` (trinomial → binomial) |
 | `Rosa` | `Rosa` | `rosa` (single word passes through) |
+| `Abelia × grandiflora` | `Abelia grandiflora` | `abelia-grandiflora` (hybrid, Unicode ×) |
+| `Abelia x grandiflora` | `Abelia grandiflora` | `abelia-grandiflora` (hybrid, **catalog ASCII form**) |
+| `× Cupressocyparis leylandii` | `Cupressocyparis leylandii` | `cupressocyparis-leylandii` (leading marker) |
+| `Xanthium strumarium` | `Xanthium strumarium` | `xanthium-strumarium` (genus starts with X — NOT filtered) |
+| `Pinus xanthopinus` | `Pinus xanthopinus` | `pinus-xanthopinus` (epithet starts with x — NOT filtered) |
+| `x` | (empty) | (empty) (marker only — no surviving tokens) |
 
 Go (this package — **must produce the identical string for the identical input as iOS**):
 ```go
