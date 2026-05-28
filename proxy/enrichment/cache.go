@@ -2,7 +2,9 @@
 // plant-detail enrichment endpoint. See SPEC.md for the full contract.
 //
 // Architecture: a Service orchestrates a three-tier lookup
-//   (catalog embed → Supabase plants_pending → OpenAI gpt-4o-mini)
+//
+//	(catalog embed → Supabase plants_pending → OpenAI gpt-4o-mini)
+//
 // behind an in-process LRU+TTL cache. The cache absorbs hot-plant
 // traffic so investment-scale bursts don't all hit Supabase / OpenAI.
 package enrichment
@@ -22,8 +24,14 @@ const (
 )
 
 // Cache is an in-memory LRU+TTL cache for PlantDetail lookups, keyed by the
-// normalized scientific name (the same key used by Supabase plants_pending
-// + the catalog's LookupPlantID). Wraps hashicorp/golang-lru/v2/expirable.
+// PRECISE (infraspecific-preserving) normalized scientific name
+// (proxy.NormalizeScientificNamePrecise) — NOT the species-level Supabase
+// plants_pending PK (proxy.NormalizeScientificName). The two differ for
+// multi-variety species (the five Brassica oleracea cultivars): keying on the
+// species-level PK would alias one variety's catalog *PlantDetail onto its
+// siblings, since the catalog resolves a distinct plantId per variety. See
+// Service.GetOrGenerate for why the cache must be at least as fine-grained as
+// the catalog's precise index. Wraps hashicorp/golang-lru/v2/expirable.
 //
 // The Service writes to the cache on EVERY successful 200 response — catalog
 // hit, Supabase hit, AND fresh LLM generation. TTL bounds staleness when Yao

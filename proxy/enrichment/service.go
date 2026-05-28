@@ -109,9 +109,19 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	if normalized == "" {
 		return nil, "", ErrInvalidScientificName
 	}
+	// Cache key is the PRECISE (infraspecific-preserving) normalization, NOT the
+	// species-level Supabase PK `normalized`. The catalog (Step 1) resolves
+	// distinct plantIds for sibling varieties via scientificNameToIDPrecise — the
+	// five Brassica oleracea cultivars all fold to "brassica oleracea" under
+	// NormalizeScientificName but to distinct keys here — so a species-level cache
+	// key would alias one variety's *PlantDetail onto its siblings within the TTL.
+	// The cache must be at least as fine-grained as the catalog's precise index.
+	// Supabase Lookup/Insert below keep using `normalized` (SPEC §8 + §9 #1 —
+	// intentional cross-variety row sharing at the species-level PK).
+	cacheKey := proxy.NormalizeScientificNamePrecise(name)
 
 	// Step 0: in-process LRU cache.
-	if cached, ok := s.cache.Get(normalized); ok {
+	if cached, ok := s.cache.Get(cacheKey); ok {
 		return cached, SourceCache, nil
 	}
 
@@ -120,7 +130,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	if s.content != nil {
 		if plantID, ok := s.content.LookupPlantID(name); ok {
 			if full, ok := s.content.LookupFullDetail(plantID); ok {
-				s.cache.Set(normalized, full)
+				s.cache.Set(cacheKey, full)
 				return full, SourceCatalog, nil
 			}
 			// Index inconsistency (LookupPlantID hit but LookupFullDetail miss).
@@ -138,7 +148,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		return nil, "", err
 	}
 	if row != nil {
-		s.cache.Set(normalized, row)
+		s.cache.Set(cacheKey, row)
 		return row, SourceSupabaseHit, nil
 	}
 
@@ -173,16 +183,16 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		// Concurrent race resolved by ON CONFLICT. The conflicting writer's
 		// row is now available — return that to keep all callers consistent.
 		if row, lookupErr := s.db.Lookup(ctx, normalized); lookupErr == nil && row != nil {
-			s.cache.Set(normalized, row)
+			s.cache.Set(cacheKey, row)
 			return row, SourceSupabaseMissGenerateRaceWinner, nil
 		}
 		// Race re-Lookup also failed — return our generated copy. Same shape,
 		// just a different LLM sample.
-		s.cache.Set(normalized, generated)
+		s.cache.Set(cacheKey, generated)
 		return generated, SourceSupabaseMissGenerate, nil
 	}
 
-	s.cache.Set(normalized, generated)
+	s.cache.Set(cacheKey, generated)
 	return generated, SourceSupabaseMissGenerate, nil
 }
 
