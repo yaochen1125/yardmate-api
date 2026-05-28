@@ -46,6 +46,7 @@ func newServer(
 	plantNet *proxy.PlantNetClient,
 	plantID *proxy.PlantIDClient,
 	vision *proxy.VisionClient,
+	inat *proxy.INatClient,
 	content *proxy.ContentIndex,
 	enrich *enrichment.Service,
 	ingest *imageingest.Service,
@@ -100,7 +101,7 @@ func newServer(
 				// (fallback); register when EITHER engine is present
 				// (SPEC §1.1 / §7).
 				if plantNet != nil || plantID != nil {
-					r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision))
+					r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat))
 				}
 				// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
 				// assessment, SPEC §1.5) — still requires plantID.

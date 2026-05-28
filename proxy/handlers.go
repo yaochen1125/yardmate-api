@@ -112,7 +112,7 @@ const plantnetConfidentSkipAIConfidence = 0.80
 //     or, when the engine also returned nothing, the unchanged "can't
 //     identify" empty result). This subsumes the old tier-3 "zero suggestions
 //     → AI" block.
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 1. Body cap (drops the connection on overflow, returning *MaxBytesError
 		//    on the next Read so we can map to image_too_large).
@@ -488,10 +488,39 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     after the optional rerank but order-independent (per-suggestion).
 		plantIDsResolved := 0
 		for i := range result.Suggestions {
-			if id, ok := content.LookupPlantID(result.Suggestions[i].ScientificName); ok {
+			sci := result.Suggestions[i].ScientificName
+			species := speciesBinomial(sci)
+			// two-pass: original first (keeps a curated subspecies row like
+			// "Ceanothus griseus horizontalis"), then species-level fallback
+			// (lets a reported subspecies hit the curated SPECIES row). The
+			// catalog key builder is untouched; collapse is identify-side only.
+			if id, ok := content.LookupPlantID(sci); ok {
 				pid := id
 				result.Suggestions[i].PlantID = &pid
 				plantIDsResolved++
+			} else if species != sci {
+				if id, ok := content.LookupPlantID(species); ok {
+					pid := id
+					result.Suggestions[i].PlantID = &pid
+					plantIDsResolved++
+				}
+			}
+			result.Suggestions[i].ScientificName = species // display species-level (SPEC §2.1)
+		}
+
+		// 7b-2. Upgrade the PRIMARY suggestion's common name (Q2: top1 only).
+		// Priority (SPEC §2.1): curated catalog common_name > iNat preferred >
+		// upstream engine names. Best-effort — a miss/error keeps upstream.
+		if len(result.Suggestions) > 0 {
+			s0 := &result.Suggestions[0]
+			if s0.PlantID != nil {
+				if cn, ok := content.LookupCommonName(*s0.PlantID); ok {
+					s0.CommonNames = prependUnique(cn, s0.CommonNames)
+				}
+			} else if inat != nil {
+				if cn, ok := inat.PreferredCommonName(ctx, s0.ScientificName); ok {
+					s0.CommonNames = prependUnique(cn, s0.CommonNames)
+				}
 			}
 		}
 
@@ -565,6 +594,20 @@ func identifyErrStatus(err error) int {
 }
 
 // --- helpers (local to proxy package; small enough to duplicate vs export from main) ---
+
+// prependUnique returns name followed by list with any case-insensitive
+// duplicate of name removed — puts the resolved common name first without
+// duplicating it when the upstream list already contained it.
+func prependUnique(name string, list []string) []string {
+	out := make([]string, 0, len(list)+1)
+	out = append(out, name)
+	for _, n := range list {
+		if !strings.EqualFold(n, name) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
 
 type errorResponse struct {
 	Error string `json:"error"`

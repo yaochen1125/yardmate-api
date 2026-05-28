@@ -116,6 +116,10 @@ func main() {
 		log.Printf("WARN: OPENAI_API_KEY missing; ai_enhance + catalog disambiguation disabled")
 	}
 
+	// iNaturalist taxa client — upgrades out-of-catalog common names on
+	// /v1/identify (SPEC §2.1). No API key required; best-effort, never blocks.
+	inat := proxy.NewINatClient()
+
 	// Embedded content index (plants_index, plants_detail, diseases catalog).
 	// Built once at startup; ~10 MB binary footprint.
 	content, err := proxy.LoadContent()
@@ -137,7 +141,7 @@ func main() {
 	// registered and the ticker does not start.
 	ingestSvc := buildImageIngestService(vault)
 
-	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, content, enrichSvc, ingestSvc)
+	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, ingestSvc)
 
 	// Optional background ingest ticker (proxy/imageingest/SPEC.md §2.1).
 	// Disabled by default (IMAGEINGEST_TICK_INTERVAL=0/unset → manual-only).
