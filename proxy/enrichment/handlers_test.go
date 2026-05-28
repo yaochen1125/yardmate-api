@@ -19,7 +19,7 @@ func newTestHandler(db ServiceDB, llm ServiceLLM) http.HandlerFunc {
 		// surfacing the error here would be a developer bug — panic is loud.
 		panic(err)
 	}
-	svc := NewService(content, db, llm, NewCache(10, time.Hour))
+	svc := NewService(content, db, llm, NewCache(10, time.Hour), nil)
 	return HandleEnrichment(svc)
 }
 

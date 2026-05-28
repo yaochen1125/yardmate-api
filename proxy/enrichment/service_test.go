@@ -71,7 +71,7 @@ func loadTestContent(t *testing.T) *proxy.ContentIndex {
 }
 
 func TestService_InvalidScientificName(t *testing.T) {
-	svc := NewService(nil, nil, nil, NewCache(10, time.Hour))
+	svc := NewService(nil, nil, nil, NewCache(10, time.Hour), nil)
 	for _, name := range []string{"", "   ", "\t\n", "12345", "!!!"} {
 		_, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: name})
 		if !errors.Is(err, ErrInvalidScientificName) {
@@ -81,7 +81,7 @@ func TestService_InvalidScientificName(t *testing.T) {
 }
 
 func TestService_ScientificNameTooLong(t *testing.T) {
-	svc := NewService(nil, nil, nil, NewCache(10, time.Hour))
+	svc := NewService(nil, nil, nil, NewCache(10, time.Hour), nil)
 	longName := strings.Repeat("a", 201)
 	_, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: longName})
 	if !errors.Is(err, ErrScientificNameTooLong) {
@@ -97,7 +97,7 @@ func TestService_Path0_CacheHit_ShortCircuitsEverything(t *testing.T) {
 
 	db := &stubDB{}
 	llm := &stubLLM{}
-	svc := NewService(loadTestContent(t), db, llm, cache)
+	svc := NewService(loadTestContent(t), db, llm, cache, nil)
 
 	got, source, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Cached species"})
 	if err != nil {
@@ -117,11 +117,11 @@ func TestService_Path0_CacheHit_ShortCircuitsEverything(t *testing.T) {
 	}
 }
 
-func TestService_Path1_CatalogHit_PopulatesCache(t *testing.T) {
+func TestService_Path1_CatalogHit_DoesNotPopulateCache(t *testing.T) {
 	cache := NewCache(10, time.Hour)
 	content := loadTestContent(t)
 	// "Abelia chinensis" is the first row of the curated 1522 catalog (id AAA0001).
-	svc := NewService(content, nil, nil, cache)
+	svc := NewService(content, nil, nil, cache, nil)
 	got, source, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Abelia chinensis"})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
@@ -132,12 +132,19 @@ func TestService_Path1_CatalogHit_PopulatesCache(t *testing.T) {
 	if source != SourceCatalog {
 		t.Errorf("expected SourceCatalog, got %q", source)
 	}
-	if cache.Len() != 1 {
-		t.Errorf("expected cache len 1, got %d", cache.Len())
+	// PR #25 P0: catalog hits MUST NOT populate the LRU cache, otherwise they
+	// come back as SourceCache on subsequent calls and become eligible for
+	// the iNat override — silently breaking the catalog > iNat priority.
+	if cache.Len() != 0 {
+		t.Errorf("expected cache len 0 (catalog no longer writes LRU), got %d", cache.Len())
 	}
-	// Second call must hit cache (no DB needed because content is still set).
-	if _, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Abelia chinensis"}); err != nil {
+	// Second call resolves through catalog again (Step 1), NOT cache.
+	_, source2, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Abelia chinensis"})
+	if err != nil {
 		t.Fatalf("second call err: %v", err)
+	}
+	if source2 != SourceCatalog {
+		t.Errorf("second call source = %q, want %q (must re-resolve through catalog, not LRU)", source2, SourceCatalog)
 	}
 }
 
@@ -159,7 +166,7 @@ func TestService_Path1_MultiVarietyCatalog_NoCacheCollision(t *testing.T) {
 	content := loadTestContent(t)
 	// No DB / LLM: a catalog hit must be fully self-served. A collision would
 	// still return a (wrong) answer rather than erroring, so assert on the id.
-	svc := NewService(content, nil, nil, cache)
+	svc := NewService(content, nil, nil, cache, nil)
 
 	const (
 		italica  = "Brassica oleracea var. italica"  // AAA0207
@@ -199,14 +206,16 @@ func TestService_Path1_MultiVarietyCatalog_NoCacheCollision(t *testing.T) {
 		t.Fatalf("collision: both varieties returned the same id %q", got1.PlantDetailID())
 	}
 
-	// The first variety, re-queried, must still come back from cache as itself
-	// (the second variety's write must not have overwritten it).
+	// The first variety, re-queried, must still resolve to itself (the second
+	// variety's write must not have overwritten it). PR #26 P0 changed the
+	// path: catalog hits no longer populate LRU (catalog > iNat priority
+	// invariant), so re-queries go back through Step 1 catalog — not LRU.
 	got1b, src1b, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: italica})
 	if err != nil {
 		t.Fatalf("italica re-query: unexpected err: %v", err)
 	}
-	if src1b != SourceCache {
-		t.Errorf("italica re-query: expected SourceCache (warm), got %q", src1b)
+	if src1b != SourceCatalog {
+		t.Errorf("italica re-query: expected SourceCatalog (catalog re-resolves, no LRU per PR #26 P0), got %q", src1b)
 	}
 	if got1b.PlantDetailID() != "AAA0207" {
 		t.Errorf("italica re-query: expected id AAA0207, got %q", got1b.PlantDetailID())
@@ -222,7 +231,7 @@ func TestService_Path2_SupabaseHit_ReturnsRowAndCaches(t *testing.T) {
 	}
 	db := &stubDB{lookupQ: []dbLookupResult{{pd: pendingPD}}}
 	llm := &stubLLM{}
-	svc := NewService(loadTestContent(t), db, llm, cache)
+	svc := NewService(loadTestContent(t), db, llm, cache, nil)
 
 	got, source, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup nonexistent"})
 	if err != nil {
@@ -254,7 +263,7 @@ func TestService_Path3_FreshGeneration_WhitelistsDiseaseIDs(t *testing.T) {
 	}
 	db := &stubDB{} // empty queues -> Lookup miss, Insert inserted=true
 	llm := &stubLLM{ret: llmOut}
-	svc := NewService(loadTestContent(t), db, llm, cache)
+	svc := NewService(loadTestContent(t), db, llm, cache, nil)
 
 	got, source, err := svc.GetOrGenerate(context.Background(), Request{
 		ScientificName: "Madeup another",
@@ -306,7 +315,7 @@ func TestService_Path3_ConflictRetriesAndReturnsRaceWinner(t *testing.T) {
 		},
 	}
 	llm := &stubLLM{ret: llmOut}
-	svc := NewService(loadTestContent(t), db, llm, cache)
+	svc := NewService(loadTestContent(t), db, llm, cache, nil)
 
 	got, source, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup race"})
 	if err != nil {
@@ -325,7 +334,7 @@ func TestService_Path3_ConflictRetriesAndReturnsRaceWinner(t *testing.T) {
 
 func TestService_DBLookupError_Propagates(t *testing.T) {
 	db := &stubDB{lookupQ: []dbLookupResult{{err: ErrDBUnavailable}}}
-	svc := NewService(loadTestContent(t), db, nil, NewCache(10, time.Hour))
+	svc := NewService(loadTestContent(t), db, nil, NewCache(10, time.Hour), nil)
 	_, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup err"})
 	if !errors.Is(err, ErrDBUnavailable) {
 		t.Errorf("expected ErrDBUnavailable, got %v", err)
@@ -335,7 +344,7 @@ func TestService_DBLookupError_Propagates(t *testing.T) {
 func TestService_LLMError_Propagates(t *testing.T) {
 	db := &stubDB{}
 	llm := &stubLLM{err: ErrEnrichmentUnavailable}
-	svc := NewService(loadTestContent(t), db, llm, NewCache(10, time.Hour))
+	svc := NewService(loadTestContent(t), db, llm, NewCache(10, time.Hour), nil)
 	_, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup llmerr"})
 	if !errors.Is(err, ErrEnrichmentUnavailable) {
 		t.Errorf("expected ErrEnrichmentUnavailable, got %v", err)
@@ -343,7 +352,7 @@ func TestService_LLMError_Propagates(t *testing.T) {
 }
 
 func TestService_NoDB_NoCatalog_ReturnsEnrichmentUnavailable(t *testing.T) {
-	svc := NewService(loadTestContent(t), nil, nil, NewCache(10, time.Hour))
+	svc := NewService(loadTestContent(t), nil, nil, NewCache(10, time.Hour), nil)
 	_, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup nothing"})
 	if !errors.Is(err, ErrEnrichmentUnavailable) {
 		t.Errorf("expected ErrEnrichmentUnavailable, got %v", err)
@@ -351,7 +360,7 @@ func TestService_NoDB_NoCatalog_ReturnsEnrichmentUnavailable(t *testing.T) {
 }
 
 func TestService_FilterDiseaseIDs_Empty(t *testing.T) {
-	svc := NewService(loadTestContent(t), nil, nil, NewCache(10, time.Hour))
+	svc := NewService(loadTestContent(t), nil, nil, NewCache(10, time.Hour), nil)
 	out := svc.filterCatalogDiseaseIDs(nil)
 	if out == nil {
 		t.Error("expected non-nil empty slice (for JSON [] wire form)")
@@ -362,7 +371,7 @@ func TestService_FilterDiseaseIDs_Empty(t *testing.T) {
 }
 
 func TestService_FilterDiseaseIDs_PreservesOrderDropsUnknowns(t *testing.T) {
-	svc := NewService(loadTestContent(t), nil, nil, NewCache(10, time.Hour))
+	svc := NewService(loadTestContent(t), nil, nil, NewCache(10, time.Hour), nil)
 	// L01 + P05 should be in the 70-entry catalog; ZZ99 should not.
 	got := svc.filterCatalogDiseaseIDs([]string{"L01", "ZZ99", "P05"})
 	for _, id := range got {
