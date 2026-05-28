@@ -284,22 +284,15 @@ func (in *Ingestor) RunBatch(ctx context.Context, limit int) (BatchSummary, erro
 		default:
 		}
 
-		// Canonicalize to species binomial: subspecies / variety / cultivar seeds
-		// all collapse to the same species → slug, Wikimedia search term, and
-		// ledger scientific_name all share one canonical name (idempotent across
-		// seed variants; one R2 hero per species — fixes the trinomial-slug
-		// mismatch with iOS that previously needed per-subspecies manual ingest).
-		canonical := Binomial(name)
 		slug := Slug(name)
 		if slug == "" {
-			// Name has no ASCII slug characters even after binomial extraction
-			// (e.g. "×" / a non-Latin string), so there is no valid R2 key
-			// (plant_images//hero.png) and it can never be ingested. Do NOT
-			// write a ledger row: its PK would be the raw name, but every
-			// lookup keys on slug=="" and would never find it (Codex #23) —
-			// a dead, never-read upsert each pass. Just skip; re-evaluating
-			// next pass is cheap, no I/O.
-			log.Printf("imageingest skip: name=%q (canonical=%q) slugs to empty", name, canonical)
+			// Name has no ASCII slug characters (e.g. "×" / a non-Latin string),
+			// so there is no valid R2 key (plant_images//hero.png) and it can
+			// never be ingested. Do NOT write a ledger row: its PK would be the
+			// raw name, but every lookup keys on slug=="" and would never find it
+			// (Codex #23) — a dead, never-read upsert each pass. Just skip;
+			// re-evaluating next pass is a cheap Slug() call with no I/O.
+			log.Printf("imageingest skip: name=%q slugs to empty (no ASCII slug chars)", name)
 			continue
 		}
 
@@ -317,9 +310,9 @@ func (in *Ingestor) RunBatch(ctx context.Context, limit int) (BatchSummary, erro
 			continue
 		}
 
-		out, _ := in.IngestOne(ctx, slug, canonical)
+		out, _ := in.IngestOne(ctx, slug, name)
 		summary.Attempted++
-		in.recordOutcome(ctx, slug, canonical, out, prior)
+		in.recordOutcome(ctx, slug, name, out, prior)
 
 		switch out.Status {
 		case OutcomeIngested, OutcomeSkippedExists:
