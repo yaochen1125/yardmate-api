@@ -64,16 +64,21 @@ type Service struct {
 	db         ServiceDB
 	llm        ServiceLLM
 	cache      *Cache
+	inat       *proxy.INatClient   // optional iNat client; nil → skip name override (PR #24 follow-up, library-internal stays curated)
 	diseaseIDs map[string]struct{} // for common_diseases_list whitelist
 }
 
 // NewService builds a Service with the given dependencies. content may not
-// be nil in production (path-1 catalog hit relies on it); db + llm + cache
-// may legitimately be nil during partial-degradation tests.
+// be nil in production (path-1 catalog hit relies on it); db + llm + cache +
+// inat may legitimately be nil during partial-degradation tests. inat is the
+// iNaturalist taxa client used to override out-of-catalog common names with
+// iNat preferred_common_name (PR #24 follow-up; library-internal catalog
+// results stay curated, matching identify-side priority library > iNat >
+// upstream).
 //
 // Computes the catalog disease ID set once for fast whitelisting of
 // LLM-generated common_diseases_list (SPEC §1.1 + §7 whitelist decision).
-func NewService(content *proxy.ContentIndex, db ServiceDB, llm ServiceLLM, cache *Cache) *Service {
+func NewService(content *proxy.ContentIndex, db ServiceDB, llm ServiceLLM, cache *Cache, inat *proxy.INatClient) *Service {
 	diseaseIDs := make(map[string]struct{})
 	if content != nil {
 		for _, ref := range content.AllDiseaseNames() {
@@ -85,6 +90,7 @@ func NewService(content *proxy.ContentIndex, db ServiceDB, llm ServiceLLM, cache
 		db:         db,
 		llm:        llm,
 		cache:      cache,
+		inat:       inat,
 		diseaseIDs: diseaseIDs,
 	}
 }
@@ -120,9 +126,30 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	// intentional cross-variety row sharing at the species-level PK).
 	cacheKey := proxy.NormalizeScientificNamePrecise(name)
 
+	// iNat preferred_common_name lookup (best-effort; never blocks). Used
+	// BOTH as the LLM hint (so a newly-generated row writes the iNat name)
+	// AND as a post-return override of CommonName / CommonNameSource on
+	// cache / DB / LLM results — but NOT on catalog hits, which keep their
+	// curated common_name (PR #24 priority: catalog > iNat > upstream).
+	iNatName := ""
+	if s.inat != nil {
+		if n, ok := s.inat.PreferredCommonName(ctx, name); ok {
+			iNatName = n
+		}
+	}
+	overrideINat := func(d *proxy.PlantDetail, source string) *proxy.PlantDetail {
+		if iNatName == "" || source == SourceCatalog || d == nil {
+			return d
+		}
+		out := *d // copy: do NOT mutate cached / catalog-shared pointer
+		out.CommonName = iNatName
+		out.CommonNameSource = "inaturalist"
+		return &out
+	}
+
 	// Step 0: in-process LRU cache.
 	if cached, ok := s.cache.Get(cacheKey); ok {
-		return cached, SourceCache, nil
+		return overrideINat(cached, SourceCache), SourceCache, nil
 	}
 
 	// Step 1: embedded 1522 catalog. ContentIndex.LookupPlantID re-normalizes
@@ -149,14 +176,20 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	}
 	if row != nil {
 		s.cache.Set(cacheKey, row)
-		return row, SourceSupabaseHit, nil
+		return overrideINat(row, SourceSupabaseHit), SourceSupabaseHit, nil
 	}
 
 	// Step 3: LLM generation.
 	if s.llm == nil {
 		return nil, "", ErrEnrichmentUnavailable
 	}
-	generated, requestID, err := s.llm.Generate(ctx, name, req.CommonName)
+	// LLM hint: iNat name overrides the upstream hint when present so the
+	// LLM ideally returns the iNat name directly (and the persisted row has it).
+	hint := req.CommonName
+	if iNatName != "" {
+		hint = iNatName
+	}
+	generated, requestID, err := s.llm.Generate(ctx, name, hint)
 	if err != nil {
 		return nil, "", err
 	}
@@ -164,12 +197,19 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	// Whitelist common_diseases_list against the catalog (SPEC §1.1 + §7).
 	generated.CommonDiseasesList = s.filterCatalogDiseaseIDs(generated.CommonDiseasesList)
 
+	// Patch generated with iNat name too — the LLM may ignore the hint, and
+	// we want the persisted row + cache + response to all surface iNat.
+	if iNatName != "" {
+		generated.CommonName = iNatName
+		generated.CommonNameSource = "inaturalist"
+	}
+
 	// Step 4: INSERT ON CONFLICT DO NOTHING. On conflict, re-Lookup to pick
 	// up the row another concurrent caller just wrote (SPEC §2.1 step 5).
 	inserted, err := s.db.Insert(ctx, InsertParams{
 		Normalized:      normalized,
 		ScientificName:  name,
-		CommonName:      req.CommonName,
+		CommonName:      hint, // iNat-resolved hint when iNat hit, else upstream
 		Data:            generated,
 		Source:          SourceTag,
 		SourceVersion:   PromptVersion,
@@ -184,7 +224,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		// row is now available — return that to keep all callers consistent.
 		if row, lookupErr := s.db.Lookup(ctx, normalized); lookupErr == nil && row != nil {
 			s.cache.Set(cacheKey, row)
-			return row, SourceSupabaseMissGenerateRaceWinner, nil
+			return overrideINat(row, SourceSupabaseMissGenerateRaceWinner), SourceSupabaseMissGenerateRaceWinner, nil
 		}
 		// Race re-Lookup also failed — return our generated copy. Same shape,
 		// just a different LLM sample.

@@ -132,7 +132,7 @@ func main() {
 	// (proxy/enrichment/SPEC.md). Requires SUPABASE_DB_URL (Session Pooler
 	// DSN per SPEC §9 #15) + OPENAI_API_KEY. Gracefully disabled with a
 	// WARN log if either is missing or the DB ping fails.
-	enrichSvc := buildEnrichmentService(vault, content)
+	enrichSvc := buildEnrichmentService(vault, content, inat)
 
 	// Image-ingest service — fills out-of-catalog plant hero images on R2 from
 	// Wikimedia Commons (proxy/imageingest/SPEC.md). Requires R2 creds +
@@ -180,7 +180,7 @@ func main() {
 // The DB pool's lifetime is the process lifetime; no graceful Close() on
 // shutdown in V1 (systemd SIGTERM kills the process; Postgres reclaims
 // connections via idle timeout).
-func buildEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex) *enrichment.Service {
+func buildEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex, inat *proxy.INatClient) *enrichment.Service {
 	dsn := vault.Get("SUPABASE_DB_URL")
 	openaiKey := vault.Get("OPENAI_API_KEY")
 	if dsn == "" || openaiKey == "" {
@@ -202,7 +202,7 @@ func buildEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex) *
 	llm := enrichment.NewLLMClient(openaiKey)
 	cache := enrichment.NewCache(0, 0) // defaults: 10k entries, 30 min TTL
 	log.Printf("enrichment service ready: db pool + LRU cache + LLM %s", enrichment.SourceTag)
-	return enrichment.NewService(content, db, llm, cache)
+	return enrichment.NewService(content, db, llm, cache, inat)
 }
 
 // buildImageIngestService wires the proxy/imageingest dependencies: R2 client
