@@ -300,6 +300,23 @@ func NormalizeScientificName(s string) string {
 	return normalizeScientificName(s)
 }
 
+// NormalizeScientificNamePrecise is the exported, infraspecific-preserving
+// normalizer (var./subsp./cv./f. NOT stripped). The enrichment in-process LRU
+// cache keys on it instead of NormalizeScientificName so that sibling varieties
+// — the five Brassica oleracea cultivars (AAA0203-AAA0207) being the live case —
+// do not alias to a single cache entry. The cache MUST be at least as
+// fine-grained as the catalog's precise index (scientificNameToIDPrecise);
+// otherwise a Step-0 cache hit for one variety is served to the next variety
+// queried within the TTL, masking the per-variety plantId LookupPlantID resolves.
+//
+// It is deliberately NOT used for the Supabase plants_pending PK, which stays on
+// the species-level NormalizeScientificName (the PK source-of-truth — SPEC §9 #1,
+// and the intentional cross-variety row sharing of SPEC §8 / §7 "single unique
+// key"). Cache keyspace = precise; Supabase keyspace = species.
+func NormalizeScientificNamePrecise(s string) string {
+	return normalizeScientificNamePrecise(s)
+}
+
 // LookupFullDetail returns the full PlantDetail entry for a catalog plantId
 // (e.g. "AAA0001"), or (nil, false) on miss. Used by the enrichment path-1
 // lookup (proxy/enrichment/SPEC §2.1 step 2) to short-circuit Supabase + LLM
@@ -357,11 +374,12 @@ func normalizeScientificName(s string) string {
 //	"Brassica oleracea var. acephala" -> "brassica oleracea var. acephala"
 //	"Abelia × grandiflora"            -> "abelia grandiflora"
 //
-// Used ONLY for the catalog's precise scientificNameToIDPrecise index. It is
-// deliberately NOT exported and NOT used for the Supabase plants_pending PK,
-// which stays on normalizeScientificName — per enrichment SPEC §9 #1 the PK
-// normalizer is a single source of truth and changing it needs an offline
-// migration. Adding this sibling helper leaves that contract untouched.
+// Two consumers: the catalog's precise scientificNameToIDPrecise index, and
+// (via the exported NormalizeScientificNamePrecise wrapper) the enrichment
+// in-process cache key. It is deliberately NOT used for the Supabase
+// plants_pending PK, which stays on normalizeScientificName — per enrichment
+// SPEC §9 #1 the PK normalizer is a single source of truth and changing it
+// needs an offline migration. This sibling helper leaves that contract untouched.
 func normalizeScientificNamePrecise(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = strings.ReplaceAll(s, "×", " ")

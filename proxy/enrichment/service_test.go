@@ -141,6 +141,78 @@ func TestService_Path1_CatalogHit_PopulatesCache(t *testing.T) {
 	}
 }
 
+// TestService_Path1_MultiVarietyCatalog_NoCacheCollision guards against a latent
+// Step-0 cache-key collision. The five curated Brassica oleracea cultivars all
+// fold to "brassica oleracea" under the species-level NormalizeScientificName
+// (the Supabase plants_pending PK), but the catalog resolves each to a DISTINCT
+// plantId via scientificNameToIDPrecise. If the in-process cache keys on the
+// species-level normalization, the SECOND variety queried within the TTL returns
+// the FIRST variety's cached *PlantDetail instead of its own catalog entry.
+//
+// iOS reaches this in practice: Pl@ntNet emits scientificNameWithoutAuthor (e.g.
+// "Brassica oleracea var. italica") which the identify Suggestion carries to the
+// detail page, which POSTs it verbatim to /v1/plants/enrichment (plantId is not
+// trusted — SPEC §1.3). So two different cultivars identified within 30 min hit
+// this path. Regression test for the cache collapse.
+func TestService_Path1_MultiVarietyCatalog_NoCacheCollision(t *testing.T) {
+	cache := NewCache(10, time.Hour)
+	content := loadTestContent(t)
+	// No DB / LLM: a catalog hit must be fully self-served. A collision would
+	// still return a (wrong) answer rather than erroring, so assert on the id.
+	svc := NewService(content, nil, nil, cache)
+
+	const (
+		italica  = "Brassica oleracea var. italica"  // AAA0207
+		acephala = "Brassica oleracea var. acephala" // AAA0203
+	)
+
+	// Precondition: the two inputs DO collide at the species level (shared
+	// Supabase PK) — this is exactly what made the cache collapse possible.
+	if proxy.NormalizeScientificName(italica) != proxy.NormalizeScientificName(acephala) {
+		t.Fatalf("test premise broken: expected species-level normalization to collide, got %q vs %q",
+			proxy.NormalizeScientificName(italica), proxy.NormalizeScientificName(acephala))
+	}
+
+	// First variety: catalog hit, populates the cache.
+	got1, src1, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: italica})
+	if err != nil {
+		t.Fatalf("italica: unexpected err: %v", err)
+	}
+	if src1 != SourceCatalog {
+		t.Errorf("italica: expected SourceCatalog, got %q", src1)
+	}
+	if got1.PlantDetailID() != "AAA0207" {
+		t.Fatalf("italica: expected id AAA0207, got %q", got1.PlantDetailID())
+	}
+
+	// Second, DISTINCT variety queried within the TTL. Under a species-level
+	// cache key this returned got1 (AAA0207) from SourceCache — the collision.
+	// It must resolve its own catalog entry instead.
+	got2, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: acephala})
+	if err != nil {
+		t.Fatalf("acephala: unexpected err: %v", err)
+	}
+	if got2.PlantDetailID() != "AAA0203" {
+		t.Fatalf("acephala: expected id AAA0203, got %q (cache collision returned the first variety?)", got2.PlantDetailID())
+	}
+	if got1.PlantDetailID() == got2.PlantDetailID() {
+		t.Fatalf("collision: both varieties returned the same id %q", got1.PlantDetailID())
+	}
+
+	// The first variety, re-queried, must still come back from cache as itself
+	// (the second variety's write must not have overwritten it).
+	got1b, src1b, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: italica})
+	if err != nil {
+		t.Fatalf("italica re-query: unexpected err: %v", err)
+	}
+	if src1b != SourceCache {
+		t.Errorf("italica re-query: expected SourceCache (warm), got %q", src1b)
+	}
+	if got1b.PlantDetailID() != "AAA0207" {
+		t.Errorf("italica re-query: expected id AAA0207, got %q", got1b.PlantDetailID())
+	}
+}
+
 func TestService_Path2_SupabaseHit_ReturnsRowAndCaches(t *testing.T) {
 	cache := NewCache(10, time.Hour)
 	pendingPD := &proxy.PlantDetail{
