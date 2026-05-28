@@ -35,9 +35,22 @@ var diseasesRaw []byte
 // catalog. Built once at startup from embedded JSON. Read-only, safe for
 // concurrent use by multiple request handlers.
 type ContentIndex struct {
-	// scientificNameToID maps normalized scientific_name to plantId.
-	// e.g. "monstera deliciosa" -> "AAA1234".
+	// scientificNameToID maps the species-level normalized scientific_name
+	// (var./subsp./cv./f. rank markers stripped) to plantId.
+	// e.g. "monstera deliciosa" -> "AAA1234". Used as the fuzzy fallback for
+	// queries that carry no infraspecific epithet. Built first-write-wins, so
+	// when several catalog entries fold to the same species key (e.g. the five
+	// Brassica oleracea cultivars) this deterministically points at the first
+	// one in catalog order — see scientificNameToIDPrecise for the exact match.
 	scientificNameToID map[string]string
+
+	// scientificNameToIDPrecise maps an infraspecific-preserving normalized
+	// scientific_name to plantId, e.g. "brassica oleracea var. italica" ->
+	// "AAA0207". Unlike scientificNameToID it does NOT strip rank markers, so
+	// the five curated Brassica oleracea cultivars (acephala/botrytis/capitata/
+	// gongylodes/italica, AAA0203-AAA0207) each get a distinct key instead of
+	// colliding on "brassica oleracea". LookupPlantID consults this first.
+	scientificNameToIDPrecise map[string]string
 
 	// plantToCommonDiseases maps plantId to its ordered common_diseases_list
 	// (catalog ids). Used by the F-option-2 异常 fallback in /v1/diagnose.
@@ -95,14 +108,31 @@ func LoadContent() (*ContentIndex, error) {
 	if err := json.Unmarshal(plantsIndexRaw, &plants); err != nil {
 		return nil, fmt.Errorf("content: plants_index: %w", err)
 	}
+	// Two indexes over the same rows. Both are built first-write-wins so the
+	// result is deterministic regardless of how many entries fold to one key
+	// (plants_index.json order is stable). The precise index keeps the
+	// infraspecific epithet and is the primary disambiguator; the species-level
+	// index is the fuzzy fallback for queries with no variety. See
+	// LookupPlantID for the two-tier read.
 	sci := make(map[string]string, len(plants))
+	sciPrecise := make(map[string]string, len(plants))
 	common := make(map[string]string, len(plants))
 	for _, p := range plants {
-		key := normalizeScientificName(p.ScientificName)
-		if key == "" || p.ID == "" {
+		if p.ID == "" {
 			continue
 		}
-		sci[key] = p.ID
+		if pkey := normalizeScientificNamePrecise(p.ScientificName); pkey != "" {
+			if _, exists := sciPrecise[pkey]; !exists {
+				sciPrecise[pkey] = p.ID
+			}
+		}
+		key := normalizeScientificName(p.ScientificName)
+		if key == "" {
+			continue
+		}
+		if _, exists := sci[key]; !exists {
+			sci[key] = p.ID
+		}
 		if p.CommonName != "" {
 			common[p.ID] = p.CommonName
 		}
@@ -145,18 +175,23 @@ func LoadContent() (*ContentIndex, error) {
 	}
 
 	return &ContentIndex{
-		scientificNameToID:    sci,
-		plantToCommonDiseases: pdis,
-		diseaseNameToID:       dnam,
-		diseaseByID:           diseaseFile.Diseases,
-		fullPlantByID:         fpd,
-		commonByID:            common,
+		scientificNameToID:        sci,
+		scientificNameToIDPrecise: sciPrecise,
+		plantToCommonDiseases:     pdis,
+		diseaseNameToID:           dnam,
+		diseaseByID:               diseaseFile.Diseases,
+		fullPlantByID:             fpd,
+		commonByID:                common,
 	}, nil
 }
 
-// LookupPlantID maps a Plant.id-reported scientific name to a YardMate
-// plantId. Match is case-insensitive and tolerates variety / cultivar /
-// subspecies suffixes (`var.`, `cv.`, `subsp.`, `f.`, `×`).
+// LookupPlantID maps a Plant.id / Pl@ntNet-reported scientific name to a
+// YardMate plantId. Match is case-insensitive and tolerates the hybrid marker
+// (`×` / stand-alone `x`). It is two-tier: an exact infraspecific match wins
+// first (so "Brassica oleracea var. italica" resolves to its own cultivar id,
+// distinct from var. acephala), then a species-level fallback strips variety /
+// cultivar / subspecies suffixes (`var.`, `cv.`, `subsp.`, `f.`) so a query
+// whose variety isn't separately curated still resolves to the species entry.
 //
 // Returns ("", false) on miss — iOS detail page must tolerate plantId=null
 // (renders Plant.id-only data without YardMate cross-reference).
@@ -164,6 +199,19 @@ func (c *ContentIndex) LookupPlantID(scientificName string) (string, bool) {
 	if c == nil {
 		return "", false
 	}
+	// Tier 1: precise (infraspecific-preserving) match. Distinguishes the five
+	// curated Brassica oleracea cultivars and any future multi-variety species
+	// when the query carries the variety (Pl@ntNet emits e.g. "Brassica
+	// oleracea var. italica" via scientificNameWithoutAuthor).
+	if pkey := normalizeScientificNamePrecise(scientificName); pkey != "" {
+		if id, ok := c.scientificNameToIDPrecise[pkey]; ok {
+			return id, true
+		}
+	}
+	// Tier 2: species-level fuzzy fallback. Strips var./subsp./cv./f. so a query
+	// carrying a variety the catalog only stores at species level still resolves
+	// (e.g. "Abelia chinensis var. ignored" -> "Abelia chinensis"), and a bare
+	// genus+species query resolves deterministically to the first such entry.
 	key := normalizeScientificName(scientificName)
 	if key == "" {
 		return "", false
@@ -298,6 +346,36 @@ func normalizeScientificName(s string) string {
 	return strings.Join(out, " ")
 }
 
+// normalizeScientificNamePrecise is like normalizeScientificName but does NOT
+// strip the infraspecific rank markers (var./subsp./ssp./cv./f./forma). It still
+// lowercases, trims, collapses whitespace, and drops the hybrid × / stand-alone
+// "x" marker, so "Brassica oleracea var. italica" -> "brassica oleracea var.
+// italica" while "Chrysanthemum × morifolium" and "Chrysanthemum x morifolium"
+// still fold together. Examples:
+//
+//	"Brassica oleracea var. italica"  -> "brassica oleracea var. italica"
+//	"Brassica oleracea var. acephala" -> "brassica oleracea var. acephala"
+//	"Abelia × grandiflora"            -> "abelia grandiflora"
+//
+// Used ONLY for the catalog's precise scientificNameToIDPrecise index. It is
+// deliberately NOT exported and NOT used for the Supabase plants_pending PK,
+// which stays on normalizeScientificName — per enrichment SPEC §9 #1 the PK
+// normalizer is a single source of truth and changing it needs an offline
+// migration. Adding this sibling helper leaves that contract untouched.
+func normalizeScientificNamePrecise(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, "×", " ")
+	fields := strings.Fields(s)
+	out := fields[:0]
+	for _, f := range fields {
+		if f == "x" {
+			continue
+		}
+		out = append(out, f)
+	}
+	return strings.Join(out, " ")
+}
+
 // normalizeDiseaseName lowercases, trims, and strips common boilerplate
 // suffixes ("disease", "infection"). Plant.id names like "Brown spot disease"
 // fold to "brown spot", which then matches diseases.json L01 "Brown spot".
@@ -313,18 +391,23 @@ func normalizeDiseaseName(s string) string {
 // iNat lookup + display collapse on /v1/identify, WITHOUT touching the catalog
 // key builder (normalizeScientificName) — so the 1522 catalog keys are
 // untouched. It collapses only a TRUE infraspecific epithet:
+//
 //   - a single quote (cultivar, e.g. "Rosa 'Knock Out'")              -> unchanged
+//
 //   - a hybrid marker × (after rank-marker strip)                     -> unchanged
+//
 //   - a rank marker (var./subsp./ssp./cv./f./forma)        -> cut to the binomial
+//
 //   - a bare 3rd token that is an all-lowercase Latin word (anilina,
 //     horizontalis)                                        -> cut to the binomial
+//
 //   - anything else (author "Jacq.", "Graptoveria Fred Ives")         -> unchanged
 //
-//	"Triteleia ixioides anilina"      -> "Triteleia ixioides"
-//	"Rosa chinensis subsp. spontanea" -> "Rosa chinensis"
-//	"Brassica oleracea var. capitata" -> "Brassica oleracea"
-//	"Rosa 'Knock Out'"                -> "Rosa 'Knock Out'"      (unchanged)
-//	"Rosa chinensis Jacq."            -> "Rosa chinensis Jacq."  (unchanged)
+//     "Triteleia ixioides anilina"      -> "Triteleia ixioides"
+//     "Rosa chinensis subsp. spontanea" -> "Rosa chinensis"
+//     "Brassica oleracea var. capitata" -> "Brassica oleracea"
+//     "Rosa 'Knock Out'"                -> "Rosa 'Knock Out'"      (unchanged)
+//     "Rosa chinensis Jacq."            -> "Rosa chinensis Jacq."  (unchanged)
 func speciesBinomial(s string) string {
 	s = strings.TrimSpace(s)
 	if strings.Contains(s, "'") { // cultivar — never collapse

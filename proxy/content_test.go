@@ -71,6 +71,44 @@ func TestLookupPlantID_NormalizeMultiplicationSign(t *testing.T) {
 	}
 }
 
+// TestLookupPlantID_BrassicaVarieties pins the five curated Brassica oleracea
+// cultivar entries (AAA0203-AAA0207). Their scientific names differ ONLY in the
+// infraspecific epithet (var. acephala / botrytis / capitata / gongylodes /
+// italica). The species-level normalizer strips "var. *" and folds all five to
+// "brassica oleracea"; before the precise-index fix the scientificNameToID map
+// collapsed them to a single (last-written) id, so four of the five curated
+// plants were unreachable by scientific name. Each variety must now resolve to
+// its OWN plantId.
+func TestLookupPlantID_BrassicaVarieties(t *testing.T) {
+	c := loadContentForTests(t)
+	cases := []struct {
+		sci  string
+		want string
+	}{
+		{"Brassica oleracea var. acephala", "AAA0203"},
+		{"Brassica oleracea var. botrytis", "AAA0204"},
+		{"Brassica oleracea var. capitata", "AAA0205"},
+		{"Brassica oleracea var. gongylodes", "AAA0206"},
+		{"Brassica oleracea var. italica", "AAA0207"},
+	}
+	for _, tc := range cases {
+		id, ok := c.LookupPlantID(tc.sci)
+		if !ok {
+			t.Errorf("%q did not resolve", tc.sci)
+			continue
+		}
+		if id != tc.want {
+			t.Errorf("%q resolved to %q, want %q (variety key collision)", tc.sci, id, tc.want)
+		}
+	}
+	// A bare genus+species query carries no variety and is genuinely ambiguous;
+	// it must still resolve deterministically (to the first catalog entry) and
+	// must NOT error.
+	if id, ok := c.LookupPlantID("Brassica oleracea"); !ok || id != "AAA0203" {
+		t.Errorf("bare \"Brassica oleracea\" = (%q, %v), want (AAA0203, true)", id, ok)
+	}
+}
+
 func TestLookupPlantID_Miss(t *testing.T) {
 	c := loadContentForTests(t)
 	if _, ok := c.LookupPlantID("Fictional plant"); ok {
