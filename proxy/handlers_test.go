@@ -58,7 +58,7 @@ func newIdentifyHandlerWithVision(t *testing.T, upstream http.HandlerFunc, visio
 	if err != nil {
 		t.Fatalf("LoadContent: %v", err)
 	}
-	return HandleIdentify(nil, c, content, vision), srv
+	return HandleIdentify(nil, c, content, vision, nil), srv
 }
 
 func TestHandleIdentify_Success(t *testing.T) {
@@ -553,7 +553,7 @@ func newCascadeHandler(t *testing.T, plantNetUp, plantIDUp http.HandlerFunc) (ht
 			c()
 		}
 	}
-	return HandleIdentify(pnClient, piClient, content, nil), cleanup
+	return HandleIdentify(pnClient, piClient, content, nil, nil), cleanup
 }
 
 func doCascadeReq(t *testing.T, h http.Handler) *httptest.ResponseRecorder {
@@ -772,7 +772,7 @@ func TestHandleIdentify_Cascade_OrganForwardedToPlantNet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadContent: %v", err)
 	}
-	h := HandleIdentify(pn, nil, content, nil)
+	h := HandleIdentify(pn, nil, content, nil, nil)
 
 	// Build a multipart body with image + organ=flower.
 	var buf bytes.Buffer
@@ -822,7 +822,7 @@ func TestHandleIdentify_Cascade_UnknownOrganDefaultsAuto(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadContent: %v", err)
 	}
-	h := HandleIdentify(pn, nil, content, nil)
+	h := HandleIdentify(pn, nil, content, nil, nil)
 
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
@@ -881,7 +881,7 @@ func newCascadeHandlerWithVision(t *testing.T, plantNetUp, plantIDUp http.Handle
 			c()
 		}
 	}
-	return HandleIdentify(pnClient, piClient, content, vision), cleanup
+	return HandleIdentify(pnClient, piClient, content, vision, nil), cleanup
 }
 
 // cannedPlantNetNoMatch — Pl@ntNet 404 "no match" canned upstream (a VALID
