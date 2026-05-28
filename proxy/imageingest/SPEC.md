@@ -84,11 +84,12 @@ Two entry points, both wrapping the same `Ingestor` core. **No public/iOS surfac
             -- (optionally LEFT JOIN plant_image_ingest to filter done rows in SQL)
 2. n := 0
    for each seed.scientific_name (stop when n == limit):
-     slug := Slug(scientific_name)                            -- §2.3, byte-exact iOS port
+     canonical := Binomial(scientific_name)                   -- §2.3, species binomial (first 2 words)
+     slug := Slug(scientific_name)                            -- == slugify(canonical), byte-exact iOS port
      if slug == "" { skip — no valid R2 key, can't ingest; NOT cached (a row keyed by raw name is never read, lookups key on slug==""); re-evaluated cheaply each pass; continue }
      if ledger says slug already ingested OR no_acceptable_image (and not stale) { skip; continue }
-     out := IngestOne(ctx, slug, scientific_name)
-     ledger upsert(out)
+     out := IngestOne(ctx, slug, canonical)                   -- search term + ledger.scientific_name = canonical binomial
+     ledger upsert(out, scientific_name=canonical)            -- subspecies seeds all collapse to one species row
      n++
      sleep(minInterval)                                       -- §4 Wikimedia etiquette
 3. regenerate plant_images/credits.json from the ledger (§2.7)   -- keep public credits in sync with live R2
@@ -125,40 +126,38 @@ Two entry points, both wrapping the same `Ingestor` core. **No public/iOS surfac
 
 The `.png` in the key is a **logical name**, not a format assertion (Q2). iOS `CachedAsyncImage` decodes via `UIImage(data:)` by content, ignoring the extension; browsers/`URLSession` honor the stored `Content-Type`. Storing JPEG bytes under a `hero.png` key with `Content-Type: image/jpeg` is correct and avoids any re-encode (which would be an adaptation → CC-BY-SA ShareAlike — §7 D2).
 
-### 2.3 `slug` — byte-exact Go port of iOS `PlantImageURL.slug` (THE central invariant)
+### 2.3 `slug` — Binomial + byte-exact slugify, cross-platform with iOS `PlantImageURL.slug` (THE central invariant)
 
-iOS (`app/YardMate/YardMate/RemoteContent/PlantImageURL.swift`, shipped PR #227):
-- lowercase the whole string;
-- iterate characters; keep `[a-z0-9]`; any run of non-`[a-z0-9]` collapses to a **single** `-`; **no leading dash** (separators before the first kept char are dropped), **no trailing dash** (a pending separator at end is never flushed).
-- `Rosa regina sueciae` → `rosa-regina-sueciae`.
+Slug is a 2-step chain — **both sides apply identically**:
+1. **Binomial extraction.** Take the first 2 non-empty space-delimited tokens of the scientific name (`strings.Fields` / Swift `split(separator:" ", omittingEmptySubsequences:true)`). Names with <2 tokens pass through. Whitespace is normalized away.
+2. **Byte-exact slugify** of the binomial: lowercase + iterate; keep `[a-z0-9]`; any run of non-`[a-z0-9]` collapses to a **single** `-`; **no leading dash**, **no trailing dash**.
 
-Go port (single source of truth on the server side; **must produce the identical string for the identical input**):
+Every subspecies / variety / cultivar of a species collapses to one slug → one R2 hero → no per-trinomial ingest:
+
+| input | binomial | slug |
+|---|---|---|
+| `Monstera adansonii` | `Monstera adansonii` | `monstera-adansonii` |
+| `Monstera adansonii blanchetii` | `Monstera adansonii` | `monstera-adansonii` (subspecies) |
+| `Rosa regina sueciae` | `Rosa regina` | `rosa-regina` (trinomial → binomial) |
+| `Rosa` | `Rosa` | `rosa` (single word passes through) |
+
+Go (this package — **must produce the identical string for the identical input as iOS**):
 ```go
-// Slug mirrors iOS PlantImageURL.slug byte-for-byte. Do NOT add unidecode /
-// NFD / NFC / transliteration — iOS treats every non-[a-z0-9] code point as a
-// separator (it is NOT in the allowed set), so "é" / "×" / spaces all collapse
-// to a single "-". Transliterating "é"→"e" here would produce a DIFFERENT slug
-// than iOS → a permanent 404 on the hero (pitfall §9 #1).
+// Slug = byte-exact cross-platform with iOS PlantImageURL.slug.
+// Binomial + slugify; both sides apply the same chain.
 func Slug(scientificName string) string {
-    out := make([]byte, 0, len(scientificName))
-    pendingDash := false
-    for _, r := range strings.ToLower(scientificName) {
-        if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-            if pendingDash && len(out) > 0 {
-                out = append(out, '-')
-            }
-            out = append(out, byte(r))
-            pendingDash = false
-        } else if len(out) > 0 {
-            pendingDash = true // collapse separators; never flush at end
-        }
-    }
-    return string(out)
+    return slugifyByteExact(Binomial(scientificName))
 }
-```
-`GenusSlug(name)` = `Slug(firstSpaceDelimitedToken(name))` (iOS `genusSlug`: split on `" "`, omit empty leading tokens, slug the first). Implemented for completeness + future genus fill, **not invoked** by V1 batch (Q3).
 
-The invariant chain (must hold or the whole feature 404s): iOS sends scientific name `X` to `/v1/plants/enrichment` → enrichment stores `plants_pending.scientific_name = X` *verbatim* (enrichment SPEC §2.1: path-2/3 = "original un-normalized user input") → ingest reads `X`, computes `Slug(X)` → iOS renders the same plant and computes `Slug(X)`. Same function, same input ⇒ same key. **Neither side may pre-process the name before slugging** (pitfall §9 #2). Locked with a Go unit test mirroring iOS test vectors (§10).
+// Binomial returns the first 2 non-empty space-delimited tokens.
+// strings.Fields normalizes whitespace; names with <2 tokens pass through.
+func Binomial(name string) string { /* see slug.go */ }
+```
+iOS counterpart `PlantImageURL.slug(for:)` does the equivalent (extract binomial of input, then slugify with the same `[a-z0-9]` rule — see `app/YardMate/YardMate/RemoteContent/PlantImageURL.swift`).  `GenusSlug(name)` = `Slug(firstSpaceDelimitedToken(name))` (genus-only fallback; **not invoked** by V1 batch — Q3).
+
+**The invariant chain** (must hold or the whole feature 404s): iOS sends scientific name `X` to `/v1/plants/enrichment` → enrichment stores `plants_pending.scientific_name = X` *verbatim* (enrichment SPEC §2.1: path-2/3 = "original un-normalized user input") → ingest reads `X`, computes `Slug(X) = slugify(Binomial(X))` → iOS renders the same plant via `slug(for: X) = slugify(binomial(X))`. **Both sides apply the SAME 2-step chain (Binomial → slugify); no other preprocessing** (pitfall §9 #2). This is the cross-platform byte-exact contract.
+
+Before 2026-05-28 the slug was computed from the *full* name (no binomial), so any subspecies / trinomial input produced a slug that almost never had a matching R2 hero (Monstera adansonii blanchetii hero blank, manual per-trinomial ingest required). The Binomial preprocessing is the fix; **both repos shipped coordinated** (yardmate-api + yardmate-swiftui). Future changes to either step must ship to both repos together. Locked with a Go unit test mirroring iOS test vectors (§10).
 
 ### 2.4 Wikimedia search + license filter
 
@@ -367,8 +366,8 @@ CREATE INDEX idx_plant_image_ingest_status ON plant_image_ingest (status);
 
 ## 9. Pitfalls (don't re-rediscover)
 
-1. **`Slug` must be byte-exact to iOS — NO transliteration/normalization.** unidecode (`é`→`e`) or NFD/NFC would yield a different slug than iOS → permanent 404. iOS treats every non-`[a-z0-9]` code point as a separator; the Go port iterates runes and does the same. Caveat: a *decomposed* base-ASCII + combining-mark sequence (e.g. `e`+U+0301) diverges (Swift `Character` = 1 grapheme → separator; Go rune = `e` kept + mark separator) — not expected in romanized botanical Latin, but documented; do not "fix" it with normalization (that would break the common ASCII case's guarantee). Lock with a unit test mirroring iOS vectors.
-2. **Neither side may pre-process the name before slugging.** The invariant holds only because iOS slugs the same string it sent to enrichment, and enrichment stores it verbatim. If iOS ever strips author citations / trims differently before slugging, or enrichment stores a normalized form, the keys diverge. Verify against iOS `PlantDetailViewModel.composeHeroImages` (confirmed PR #227: it slugs the VM `scientificName`, which is the enrichment input).
+1. **`Slug` must be byte-exact to iOS — NO unilateral preprocessing beyond the agreed Binomial+slugify chain (§2.3).** Both sides apply the SAME 2-step chain: extract Binomial (first 2 space-tokens via `strings.Fields` / Swift `split`), then slugify (lowercase + `[^a-z0-9]+`→`-` collapse + trim). Anything else — unidecode (`é`→`e`), NFD/NFC, author-citation stripping, etc. — added unilaterally on either side ⇒ DIFFERENT slug than the other side ⇒ permanent 404. iOS treats every non-`[a-z0-9]` code point as a separator; the Go port iterates runes and does the same. Caveat: a *decomposed* base-ASCII + combining-mark sequence (e.g. `e`+U+0301) diverges (Swift `Character` = 1 grapheme → separator; Go rune = `e` kept + mark separator) — not expected in romanized botanical Latin, but documented; do not "fix" with normalization (would break the common ASCII case's guarantee). Lock with a unit test mirroring iOS vectors (Go ↔ Swift cases must match exactly).
+2. **Both sides must apply the SAME preprocessing chain — no unilateral additions.** The invariant holds because both sides run identically `Binomial → slugify` on the verbatim enrichment-stored name, and nothing else. If iOS ever adds extra normalization (e.g. strip author citations, trim differently), or backend ingest stores a pre-normalized form rather than the verbatim seed, the keys diverge. **Future changes to either step ship to both repos coordinated** (e.g. the 2026-05-28 Binomial change was a paired backend+iOS PR). Verify against iOS PR #227's `PlantDetailViewModel.composeHeroImages` (slugs the VM `scientificName`, which is the enrichment input).
 3. **`.png` key ≠ PNG bytes.** Store JPEG/WebP bytes under `hero.png` with the real `Content-Type`. Do not force-encode to PNG (D-format / D2).
 4. **`plants_pending` is enrichment-owned; read-only here.** Don't import the `enrichment` Go package and don't write the table. If enrichment renames the table/column, the seed query breaks — pin the column name in one place + a smoke check. (Sanctioned data coupling per Q1.)
 5. **Negative cache or you hammer Wikimedia.** Without the `no_acceptable_image` ledger state, every pass re-searches every species that has no free image. Always upsert the ledger, even on "no image".
