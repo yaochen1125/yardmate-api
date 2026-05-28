@@ -134,6 +134,51 @@ func TestGetOrGenerate_INatMissKeepsCachedName(t *testing.T) {
 	}
 }
 
+// TestGetOrGenerate_INatNoOverrideOnSecondCatalogCall is the regression test
+// for the PR #25 self-review P0: catalog hits were being LRU-cached, so the
+// SECOND same-name request would come back as SourceCache and be eligible for
+// the iNat override — silently breaking the catalog > iNat priority. Fix:
+// catalog hits no longer write LRU. This test does two identical catalog
+// requests under the SAME Service and asserts the second one is still curated
+// (commonName != iNat fake, commonNameSource != "inaturalist").
+func TestGetOrGenerate_INatNoOverrideOnSecondCatalogCall(t *testing.T) {
+	inat, done := inatStub(t, `{"results":[
+		{"name":"Abelia chinensis","rank":"species","preferred_common_name":"FAKE_OVERRIDE"}
+	]}`)
+	defer done()
+
+	content := loadTestContent(t)
+	cache := NewCache(10, time.Hour)
+	svc := NewService(content, nil, nil, cache, inat)
+	req := Request{ScientificName: "Abelia chinensis"}
+
+	// First call: catalog hit, NOT cached by design.
+	_, src1, err := svc.GetOrGenerate(context.Background(), req)
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if src1 != SourceCatalog {
+		t.Fatalf("first call source = %q, want %q", src1, SourceCatalog)
+	}
+
+	// Second call: MUST be catalog again (NOT cache), and MUST NOT be
+	// overridden by iNat. If catalog leaks into LRU, this comes back as
+	// SourceCache and overrideINat patches it — invariant broken.
+	got2, src2, err := svc.GetOrGenerate(context.Background(), req)
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if src2 != SourceCatalog {
+		t.Errorf("second call source = %q, want %q (catalog must NOT leak into LRU)", src2, SourceCatalog)
+	}
+	if got2.CommonName == "FAKE_OVERRIDE" {
+		t.Error("second catalog call was overridden by iNat — PR #24 priority broken")
+	}
+	if got2.CommonNameSource == "inaturalist" {
+		t.Error("second catalog call commonNameSource rewritten to inaturalist — must stay curated")
+	}
+}
+
 // TestGetOrGenerate_NilINatIsNoOp confirms that wiring inat=nil keeps the
 // service behaving exactly like before this PR (graceful disable when iNat is
 // not configured / unreachable on startup).

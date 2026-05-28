@@ -157,7 +157,12 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	if s.content != nil {
 		if plantID, ok := s.content.LookupPlantID(name); ok {
 			if full, ok := s.content.LookupFullDetail(plantID); ok {
-				s.cache.Set(cacheKey, full)
+				// NOTE: do NOT cache catalog hits. The LRU has no source tag,
+				// so a SourceCatalog write would come back as SourceCache on
+				// the next call and become eligible for the iNat override —
+				// silently violating the catalog > iNat > upstream priority
+				// (PR #26 self-review P0). Catalog is already an O(1)
+				// in-memory map lookup, the LRU saved nothing here.
 				return full, SourceCatalog, nil
 			}
 			// Index inconsistency (LookupPlantID hit but LookupFullDetail miss).
