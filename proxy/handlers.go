@@ -112,7 +112,7 @@ const plantnetConfidentSkipAIConfidence = 0.80
 //     or, when the engine also returned nothing, the unchanged "can't
 //     identify" empty result). This subsumes the old tier-3 "zero suggestions
 //     → AI" block.
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 1. Body cap (drops the connection on overflow, returning *MaxBytesError
 		//    on the next Read so we can map to image_too_large).
@@ -332,7 +332,11 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			bestIdx := -1
 			var bestPID string
 			for i := range cands {
-				id, ok := content.LookupPlantID(cands[i].ScientificName)
+				// two-pass: original then species-level (resolvePlantID), so
+				// a non-top engine candidate whose reported NAME is a
+				// subspecies of a catalog species is still picked here — not
+				// only resolved in step 7b after [0] has been chosen.
+				id, ok := resolvePlantID(content, cands[i].ScientificName)
 				if !ok {
 					continue
 				}
@@ -488,10 +492,28 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     after the optional rerank but order-independent (per-suggestion).
 		plantIDsResolved := 0
 		for i := range result.Suggestions {
-			if id, ok := content.LookupPlantID(result.Suggestions[i].ScientificName); ok {
+			sci := result.Suggestions[i].ScientificName
+			if id, ok := resolvePlantID(content, sci); ok {
 				pid := id
 				result.Suggestions[i].PlantID = &pid
 				plantIDsResolved++
+			}
+			result.Suggestions[i].ScientificName = speciesBinomial(sci) // display species-level (SPEC §2.1)
+		}
+
+		// 7b-2. Upgrade the PRIMARY suggestion's common name (Q2: top1 only).
+		// Priority (SPEC §2.1): curated catalog common_name > iNat preferred >
+		// upstream engine names. Best-effort — a miss/error keeps upstream.
+		if len(result.Suggestions) > 0 {
+			s0 := &result.Suggestions[0]
+			if s0.PlantID != nil {
+				if cn, ok := content.LookupCommonName(*s0.PlantID); ok {
+					s0.CommonNames = prependUnique(cn, s0.CommonNames)
+				}
+			} else if inat != nil {
+				if cn, ok := inat.PreferredCommonName(ctx, s0.ScientificName); ok {
+					s0.CommonNames = prependUnique(cn, s0.CommonNames)
+				}
 			}
 		}
 
@@ -565,6 +587,39 @@ func identifyErrStatus(err error) int {
 }
 
 // --- helpers (local to proxy package; small enough to duplicate vs export from main) ---
+
+// resolvePlantID is the identify-side two-pass plant_id resolver: the original
+// scientific_name first (so a curated subspecies row like "Ceanothus griseus
+// horizontalis" still hits), then — on a miss — the speciesBinomial
+// species-level form (so a reported subspecies whose SPECIES is in the catalog
+// resolves to it, SPEC §2.1). Used by BOTH the catalog-preference selection
+// (so the cascade can pick a subspecies candidate whose species is in catalog
+// — without this, finding 2 of the PR #24 review) AND the per-suggestion
+// resolver in step 7b. /v1/diagnose stays single-pass. content nil-safe.
+func resolvePlantID(content *ContentIndex, sci string) (string, bool) {
+	if id, ok := content.LookupPlantID(sci); ok {
+		return id, true
+	}
+	species := speciesBinomial(sci)
+	if species == sci {
+		return "", false
+	}
+	return content.LookupPlantID(species)
+}
+
+// prependUnique returns name followed by list with any case-insensitive
+// duplicate of name removed — puts the resolved common name first without
+// duplicating it when the upstream list already contained it.
+func prependUnique(name string, list []string) []string {
+	out := make([]string, 0, len(list)+1)
+	out = append(out, name)
+	for _, n := range list {
+		if !strings.EqualFold(n, name) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
 
 type errorResponse struct {
 	Error string `json:"error"`

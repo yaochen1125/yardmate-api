@@ -54,6 +54,11 @@ type ContentIndex struct {
 	// Used by the enrichment path-1 lookup (proxy/enrichment/SPEC §2.1
 	// step 2) to short-circuit Supabase + LLM for plants in the 1522 catalog.
 	fullPlantByID map[string]*PlantDetail
+
+	// commonByID gives the curated common_name by plantId (from plants_index).
+	// Drives the "catalog hit -> curated common name" step of /v1/identify name
+	// resolution (SPEC §2.1): a catalog hit prefers this over iNat / upstream.
+	commonByID map[string]string
 }
 
 // DiseaseCatalog is the subset of diseases.json[*] fields the server consumes
@@ -91,12 +96,16 @@ func LoadContent() (*ContentIndex, error) {
 		return nil, fmt.Errorf("content: plants_index: %w", err)
 	}
 	sci := make(map[string]string, len(plants))
+	common := make(map[string]string, len(plants))
 	for _, p := range plants {
 		key := normalizeScientificName(p.ScientificName)
 		if key == "" || p.ID == "" {
 			continue
 		}
 		sci[key] = p.ID
+		if p.CommonName != "" {
+			common[p.ID] = p.CommonName
+		}
 	}
 
 	// Parse the full plants_detail.json into typed PlantDetail entries.
@@ -141,6 +150,7 @@ func LoadContent() (*ContentIndex, error) {
 		diseaseNameToID:       dnam,
 		diseaseByID:           diseaseFile.Diseases,
 		fullPlantByID:         fpd,
+		commonByID:            common,
 	}, nil
 }
 
@@ -160,6 +170,20 @@ func (c *ContentIndex) LookupPlantID(scientificName string) (string, bool) {
 	}
 	if id, ok := c.scientificNameToID[key]; ok {
 		return id, true
+	}
+	return "", false
+}
+
+// LookupCommonName returns the curated common_name for a YardMate plantId
+// (from plants_index.json). Used by /v1/identify to prefer the reviewed
+// catalog name over iNat / upstream when a suggestion resolves to the 1522
+// catalog. Returns ("", false) on a nil index, empty id, or missing name.
+func (c *ContentIndex) LookupCommonName(plantID string) (string, bool) {
+	if c == nil || plantID == "" {
+		return "", false
+	}
+	if name, ok := c.commonByID[plantID]; ok && name != "" {
+		return name, true
 	}
 	return "", false
 }
@@ -283,4 +307,79 @@ func normalizeDiseaseName(s string) string {
 		s = strings.TrimSuffix(s, suffix)
 	}
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// speciesBinomial reduces a scientific name to its "Genus species" binomial for
+// iNat lookup + display collapse on /v1/identify, WITHOUT touching the catalog
+// key builder (normalizeScientificName) — so the 1522 catalog keys are
+// untouched. It collapses only a TRUE infraspecific epithet:
+//   - a single quote (cultivar, e.g. "Rosa 'Knock Out'")              -> unchanged
+//   - a hybrid marker × (after rank-marker strip)                     -> unchanged
+//   - a rank marker (var./subsp./ssp./cv./f./forma)        -> cut to the binomial
+//   - a bare 3rd token that is an all-lowercase Latin word (anilina,
+//     horizontalis)                                        -> cut to the binomial
+//   - anything else (author "Jacq.", "Graptoveria Fred Ives")         -> unchanged
+//
+//	"Triteleia ixioides anilina"      -> "Triteleia ixioides"
+//	"Rosa chinensis subsp. spontanea" -> "Rosa chinensis"
+//	"Brassica oleracea var. capitata" -> "Brassica oleracea"
+//	"Rosa 'Knock Out'"                -> "Rosa 'Knock Out'"      (unchanged)
+//	"Rosa chinensis Jacq."            -> "Rosa chinensis Jacq."  (unchanged)
+func speciesBinomial(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.Contains(s, "'") { // cultivar — never collapse
+		return s
+	}
+	// Strip a rank marker and everything after it, preserving original case.
+	// If stripping leaves less than a binomial (genus + species), bail out
+	// and keep the original — a marker right after a single token is a
+	// malformed input (e.g. "Eucalyptus f. xxx" with no species epithet)
+	// and engines essentially never emit it; defend rather than collapse
+	// to a bare genus.
+	original := s
+	low := strings.ToLower(s)
+	for _, m := range []string{" var.", " cv.", " subsp.", " ssp.", " f.", " forma "} {
+		if i := strings.Index(low, m); i >= 0 {
+			stripped := strings.TrimSpace(s[:i])
+			if len(strings.Fields(stripped)) < 2 {
+				return original
+			}
+			s = stripped
+			break
+		}
+	}
+	if strings.Contains(s, "×") { // hybrid (Unicode) — never collapse
+		return s
+	}
+	f := strings.Fields(s)
+	// Stand-alone ASCII "x" is the other hybrid marker (e.g. "Abelia x
+	// grandiflora", "Citrus x paradisi" — both present in plants_index.json).
+	// The catalog key builder normalizeScientificName drops the "x" token; for
+	// display + iNat we keep the full hybrid name as-is, because a bare
+	// "Abelia grandiflora" / "Citrus paradisi" is a different epithet and a
+	// collapse would corrupt the displayed scientific_name.
+	for _, t := range f {
+		if t == "x" {
+			return s
+		}
+	}
+	if len(f) < 3 || !isLowerLatin(f[1]) || !isLowerLatin(f[2]) {
+		return strings.Join(f, " ")
+	}
+	return f[0] + " " + f[1]
+}
+
+// isLowerLatin reports whether w is a non-empty all-lowercase a-z word — used
+// by speciesBinomial to tell a true infraspecific epithet (lowercase Latin)
+// from an author citation / cultivar token (capitalised or punctuated).
+func isLowerLatin(w string) bool {
+	if w == "" {
+		return false
+	}
+	for _, r := range w {
+		if r < 'a' || r > 'z' {
+			return false
+		}
+	}
+	return true
 }
