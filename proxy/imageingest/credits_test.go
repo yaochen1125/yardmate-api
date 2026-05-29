@@ -8,15 +8,17 @@ import (
 )
 
 func TestBuildCreditsManifest_Shape(t *testing.T) {
-	rows := []LedgerRow{
+	rows := []FileRow{
 		{
 			Slug:                "rosa-regina-sueciae",
+			ImageIndex:          1,
 			ScientificName:      "Rosa regina sueciae",
+			Source:              "inaturalist",
 			LicenseShort:        "CC BY-SA 4.0",
 			LicenseURL:          "https://creativecommons.org/licenses/by-sa/4.0/",
 			AttributionAuthor:   "Jane Doe",
 			AttributionRequired: true,
-			SourceFilePage:      "https://commons.wikimedia.org/wiki/File:Example.jpg",
+			SourceURL:           "https://www.inaturalist.org/photos/123",
 		},
 	}
 	fixed := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
@@ -29,10 +31,10 @@ func TestBuildCreditsManifest_Shape(t *testing.T) {
 		t.Fatalf("entries = %d, want 1", len(m.Entries))
 	}
 	e := m.Entries[0]
-	if e.Slug != "rosa-regina-sueciae" || e.ScientificName != "Rosa regina sueciae" {
-		t.Errorf("entry slug/name wrong: %+v", e)
+	if e.Slug != "rosa-regina-sueciae" || e.ImageIndex != 1 || e.ScientificName != "Rosa regina sueciae" {
+		t.Errorf("entry slug/index/name wrong: %+v", e)
 	}
-	if e.LicenseShort != "CC BY-SA 4.0" || e.LicenseURL == "" || e.Author != "Jane Doe" || e.SourceURL == "" {
+	if e.Source != "inaturalist" || e.LicenseShort != "CC BY-SA 4.0" || e.LicenseURL == "" || e.Author != "Jane Doe" || e.SourceURL == "" {
 		t.Errorf("entry missing fields: %+v", e)
 	}
 
@@ -50,7 +52,7 @@ func TestBuildCreditsManifest_Shape(t *testing.T) {
 		t.Fatalf("entries key wrong")
 	}
 	entry := entries[0].(map[string]any)
-	for _, k := range []string{"slug", "scientific_name", "license_short", "license_url", "author", "source_url"} {
+	for _, k := range []string{"slug", "image_index", "scientific_name", "source", "license_short", "license_url", "author", "source_url"} {
 		if _, ok := entry[k]; !ok {
 			t.Errorf("entry missing key %q", k)
 		}
@@ -72,11 +74,11 @@ func TestRebuildCredits_FullRebuild(t *testing.T) {
 	// rebuild reflects only the remaining row (full rebuild, not diff-append).
 	store := newMockStore()
 	ledger := newMockLedger()
-	ledger.ingested = []LedgerRow{
-		{Slug: "a", ScientificName: "A plant", LicenseShort: "CC0"},
-		{Slug: "b", ScientificName: "B plant", LicenseShort: "CC0"},
+	ledger.ingested = []FileRow{
+		{Slug: "a", ImageIndex: 1, ScientificName: "A plant", LicenseShort: "CC0"},
+		{Slug: "b", ImageIndex: 1, ScientificName: "B plant", LicenseShort: "CC0"},
 	}
-	in := NewIngestor(&mockCommons{}, store, ledger, &mockSeeds{}, Config{})
+	in := newIngestor(&mockSource{}, store, ledger, Config{})
 
 	if err := in.rebuildCredits(context.Background()); err != nil {
 		t.Fatalf("rebuild 1: %v", err)
@@ -87,8 +89,7 @@ func TestRebuildCredits_FullRebuild(t *testing.T) {
 		t.Fatalf("rebuild 1 entries = %d, want 2", len(m1.Entries))
 	}
 
-	// Drop b → rebuild should produce exactly 1 entry, not append.
-	ledger.ingested = []LedgerRow{{Slug: "a", ScientificName: "A plant", LicenseShort: "CC0"}}
+	ledger.ingested = []FileRow{{Slug: "a", ImageIndex: 1, ScientificName: "A plant", LicenseShort: "CC0"}}
 	if err := in.rebuildCredits(context.Background()); err != nil {
 		t.Fatalf("rebuild 2: %v", err)
 	}

@@ -30,35 +30,10 @@ type License struct {
 	AttributionRequired bool   // true for CC_BY + CC_BY_SA; false for CC0 / PD
 }
 
-// extMetadata is the subset of imageinfo[].extmetadata we read. Commons wraps
-// each field in {"value": "...", "source": "..."}; we only need value.
-type extMetadata struct {
-	License          extMetaField `json:"License"`
-	LicenseShortName extMetaField `json:"LicenseShortName"`
-	LicenseURL       extMetaField `json:"LicenseUrl"`
-	Artist           extMetaField `json:"Artist"`
-	Copyrighted      extMetaField `json:"Copyrighted"`
-}
-
-type extMetaField struct {
-	Value string `json:"value"`
-}
-
 var (
 	htmlTagRe = regexp.MustCompile(`<[^>]*>`)
 	wsRe      = regexp.MustCompile(`\s+`)
 )
-
-// ClassifyLicense maps a Wikimedia Commons file's extmetadata to a License
-// (SPEC §2.4). It strips the Artist HTML and delegates to ClassifyLicenseCode.
-func ClassifyLicense(meta extMetadata) License {
-	return ClassifyLicenseCode(
-		meta.License.Value,
-		meta.LicenseShortName.Value,
-		meta.LicenseURL.Value,
-		stripHTML(meta.Artist.Value),
-	)
-}
 
 // ClassifyLicenseCode is the shared token-membership classifier (SPEC §2.4.3),
 // usable by BOTH sources: Wikimedia's VERSIONED codes ("cc-by-sa-4.0") and

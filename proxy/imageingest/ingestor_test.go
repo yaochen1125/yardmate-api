@@ -3,27 +3,30 @@ package imageingest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
+
+	"github.com/yaochen1125/yardmate-api/proxy/imageingest/sources"
 )
 
 // --- mocks ---
 
-type mockCommons struct {
-	searchRet []Candidate
-	searchErr error
-	// downloadErrFor returns an error for a specific thumburl (to test
-	// fall-through). downloadOK returns these bytes+mime for any other url.
+// mockSource implements ImageSource. downloadErrFor lets a specific DownloadURL
+// fail (download fall-through tests); any other url returns downloadBytes/MIME.
+type mockSource struct {
+	searchRet      []sources.Candidate
+	searchErr      error
 	downloadErrFor map[string]error
 	downloadBytes  []byte
 	downloadMIME   string
 }
 
-func (m *mockCommons) Search(_ context.Context, _ string, _ int) ([]Candidate, error) {
+func (m *mockSource) Search(_ context.Context, _ string, _ int) ([]sources.Candidate, error) {
 	return m.searchRet, m.searchErr
 }
 
-func (m *mockCommons) Download(_ context.Context, rawURL string) ([]byte, string, error) {
+func (m *mockSource) Download(_ context.Context, rawURL string) ([]byte, string, error) {
 	if err, ok := m.downloadErrFor[rawURL]; ok {
 		return nil, "", err
 	}
@@ -69,25 +72,48 @@ func (m *mockStore) Put(_ context.Context, key string, body []byte, _, _ string)
 	return nil
 }
 
+// mockLedger implements LedgerStore over the two v2 tables in memory.
 type mockLedger struct {
-	mu        sync.Mutex
-	rows      map[string]*LedgerRow
-	ingested  []LedgerRow
-	lookupErr error
-	upsertErr error
+	mu               sync.Mutex
+	species          map[string]*SpeciesRow
+	files            map[string]*FileRow // key: fileKey(slug, index)
+	ingested         []FileRow           // returned by IngestedFiles
+	upsertSpeciesErr error
+	lookupErr        error
 }
 
 func newMockLedger() *mockLedger {
-	return &mockLedger{rows: map[string]*LedgerRow{}}
+	return &mockLedger{species: map[string]*SpeciesRow{}, files: map[string]*FileRow{}}
 }
 
-func (m *mockLedger) Lookup(_ context.Context, slug string) (*LedgerRow, error) {
+func fileKey(slug string, i int) string { return fmt.Sprintf("%s#%d", slug, i) }
+
+func (m *mockLedger) UpsertSpecies(_ context.Context, row SpeciesRow) error {
+	if m.upsertSpeciesErr != nil {
+		return m.upsertSpeciesErr
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := row
+	m.species[row.Slug] = &cp
+	return nil
+}
+
+func (m *mockLedger) UpsertFile(_ context.Context, row FileRow) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := row
+	m.files[fileKey(row.Slug, row.ImageIndex)] = &cp
+	return nil
+}
+
+func (m *mockLedger) LookupFile(_ context.Context, slug string, i int) (*FileRow, error) {
 	if m.lookupErr != nil {
 		return nil, m.lookupErr
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r, ok := m.rows[slug]
+	r, ok := m.files[fileKey(slug, i)]
 	if !ok {
 		return nil, nil
 	}
@@ -95,451 +121,356 @@ func (m *mockLedger) Lookup(_ context.Context, slug string) (*LedgerRow, error) 
 	return &cp, nil
 }
 
-func (m *mockLedger) Upsert(_ context.Context, row LedgerRow) error {
-	if m.upsertErr != nil {
-		return m.upsertErr
-	}
+// RecomputeCount mirrors the real UPDATE ... RETURNING: it errors when the
+// species row is missing (so a test can catch a recompute-before-upsert bug).
+func (m *mockLedger) RecomputeCount(_ context.Context, slug string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cp := row
-	m.rows[row.Slug] = &cp
-	return nil
+	sp, ok := m.species[slug]
+	if !ok {
+		return 0, fmt.Errorf("%w: no species row %q", ErrLedgerUnavailable, slug)
+	}
+	count := 0
+	for _, f := range m.files {
+		if f.Slug == slug && f.Status == StatusIngested {
+			count++
+		}
+	}
+	sp.ImageCountFilled = count
+	return count, nil
 }
 
-func (m *mockLedger) IngestedRows(_ context.Context) ([]LedgerRow, error) {
+func (m *mockLedger) IngestedFiles(_ context.Context) ([]FileRow, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.ingested, nil
 }
 
-type mockSeeds struct {
-	names []string
-	err   error
-}
-
-func (m *mockSeeds) Seeds(_ context.Context) ([]string, error) { return m.names, m.err }
-
 // --- candidate fixtures ---
 
-func cand(title, thumb, mime string, w, h int, lic License) Candidate {
-	return Candidate{
-		Title:    title,
-		PageURL:  "https://commons.wikimedia.org/wiki/" + title,
-		URL:      "https://upload/" + title,
-		ThumbURL: thumb,
-		MIME:     mime,
-		Width:    w,
-		Height:   h,
-		License:  lic,
+func cand(source, title, dlURL, mime, code string, w, h int) sources.Candidate {
+	return sources.Candidate{
+		Source:      source,
+		Title:       title,
+		PageURL:     "https://example.org/" + title,
+		DownloadURL: dlURL,
+		DedupKey:    title, // unique per fixture
+		MIME:        mime,
+		Width:       w,
+		Height:      h,
+		LicenseCode: code,
+		Author:      "Jane",
 	}
 }
 
-func cc0Lic() License {
-	return License{Allowed: true, Family: FamilyCC0, Code: "cc0", ShortName: "CC0", AttributionRequired: false}
+func newIngestor(src *mockSource, store *mockStore, ledger *mockLedger, cfg Config) *Ingestor {
+	return NewIngestor(src, nil, store, ledger, cfg)
 }
-func bySaLic() License {
-	return License{Allowed: true, Family: FamilyCCBYSA, Code: "cc-by-sa-4.0", ShortName: "CC BY-SA 4.0", Author: "Jane", AttributionRequired: true}
-}
-func byLic() License {
-	return License{Allowed: true, Family: FamilyCCBY, Code: "cc-by-4.0", ShortName: "CC BY 4.0", Author: "Bob", AttributionRequired: true}
-}
-func rejectLic() License { return License{Allowed: false, Family: FamilyUnknown} }
 
-// --- IngestOne table tests ---
+// pngBytes returns a tiny valid PNG header so http.DetectContentType (in the
+// real source clients) and the mocks agree the bytes are image/png.
+func pngBytes() []byte {
+	return []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0, 0, 0}
+}
 
-func TestIngestOne(t *testing.T) {
+// --- IngestSpecies single-slot table tests ---
+
+func TestIngestSpecies_PerImageStatus(t *testing.T) {
 	cases := []struct {
 		name        string
 		allowAttrib bool
-		setup       func(*mockCommons, *mockStore)
-		wantStatus  IngestOutcomeStatus
-		wantPut     bool // expect an R2 PutObject of the hero
+		setup       func(*mockSource, *mockStore)
+		wantStatus  ImageStatus
+		wantPut     bool
 	}{
 		{
 			name: "skipped_exists when R2 already has the key",
-			setup: func(c *mockCommons, s *mockStore) {
-				s.existsRet[heroKey("rosa")] = true
+			setup: func(c *mockSource, s *mockStore) {
+				s.existsRet[galleryKey("rosa-regina", 1)] = true
 			},
-			wantStatus: OutcomeSkippedExists,
-			wantPut:    false,
+			wantStatus: ImgSkippedExists, wantPut: false,
 		},
 		{
 			name: "ingested CC0",
-			setup: func(c *mockCommons, s *mockStore) {
-				c.searchRet = []Candidate{cand("File:a.jpg", "https://thumb/a", "image/jpeg", 4000, 3000, cc0Lic())}
+			setup: func(c *mockSource, s *mockStore) {
+				c.searchRet = []sources.Candidate{cand(sources.SourceINaturalist, "a", "https://dl/a", "image/jpeg", "cc0", 4000, 3000)}
 			},
-			wantStatus: OutcomeIngested,
-			wantPut:    true,
+			wantStatus: ImgIngested, wantPut: true,
 		},
 		{
-			name: "no_acceptable_image when search empty",
-			setup: func(c *mockCommons, s *mockStore) {
+			name: "no_acceptable when search empty",
+			setup: func(c *mockSource, s *mockStore) {
 				c.searchRet = nil
 			},
-			wantStatus: OutcomeNoAcceptableImg,
-			wantPut:    false,
+			wantStatus: ImgNoAcceptable, wantPut: false,
 		},
 		{
-			name: "no_acceptable_image when only rejected licenses",
-			setup: func(c *mockCommons, s *mockStore) {
-				c.searchRet = []Candidate{cand("File:x.jpg", "https://thumb/x", "image/jpeg", 100, 100, rejectLic())}
+			name: "no_acceptable when only rejected (ARR) licenses",
+			setup: func(c *mockSource, s *mockStore) {
+				c.searchRet = []sources.Candidate{cand(sources.SourceINaturalist, "x", "https://dl/x", "image/jpeg", "", 100, 100)}
 			},
-			wantStatus: OutcomeNoAcceptableImg,
-			wantPut:    false,
-		},
-		{
-			name: "no_acceptable_image when the only candidate has an empty thumburl",
-			setup: func(c *mockCommons, s *mockStore) {
-				// Commons couldn't render a 1600px rendition → unusable (we only
-				// store the scaled rendition, D2); must be skipped, not soft-failed
-				// as source_error via a Download("") attempt.
-				c.searchRet = []Candidate{cand("File:nothumb.jpg", "", "image/jpeg", 4000, 3000, cc0Lic())}
-			},
-			wantStatus: OutcomeNoAcceptableImg,
-			wantPut:    false,
+			wantStatus: ImgNoAcceptable, wantPut: false,
 		},
 		{
 			name:        "deferred_attribution when gate OFF and only BY/SA",
 			allowAttrib: false,
-			setup: func(c *mockCommons, s *mockStore) {
-				c.searchRet = []Candidate{cand("File:bysa.jpg", "https://thumb/bysa", "image/jpeg", 2000, 1500, bySaLic())}
+			setup: func(c *mockSource, s *mockStore) {
+				c.searchRet = []sources.Candidate{cand(sources.SourceWikimediaCommons, "bysa", "https://dl/bysa", "image/jpeg", "cc-by-sa-4.0", 2000, 1500)}
 			},
-			wantStatus: OutcomeDeferredAttrib,
-			wantPut:    false,
+			wantStatus: ImgDeferredAttrib, wantPut: false,
 		},
 		{
 			name:        "ingested BY/SA when gate ON",
 			allowAttrib: true,
-			setup: func(c *mockCommons, s *mockStore) {
-				c.searchRet = []Candidate{cand("File:bysa.jpg", "https://thumb/bysa", "image/jpeg", 2000, 1500, bySaLic())}
+			setup: func(c *mockSource, s *mockStore) {
+				c.searchRet = []sources.Candidate{cand(sources.SourceWikimediaCommons, "bysa", "https://dl/bysa", "image/jpeg", "cc-by-sa-4.0", 2000, 1500)}
 			},
-			wantStatus: OutcomeIngested,
-			wantPut:    true,
-		},
-		{
-			name: "source_error when search fails",
-			setup: func(c *mockCommons, s *mockStore) {
-				c.searchErr = ErrCommonsUnavailable
-			},
-			wantStatus: OutcomeSourceError,
-			wantPut:    false,
+			wantStatus: ImgIngested, wantPut: true,
 		},
 		{
 			name: "source_error when HEAD fails",
-			setup: func(c *mockCommons, s *mockStore) {
+			setup: func(c *mockSource, s *mockStore) {
 				s.existsErr = errors.New("r2 down")
 			},
-			wantStatus: OutcomeSourceError,
-			wantPut:    false,
+			wantStatus: ImgSourceError, wantPut: false,
 		},
 		{
 			name: "source_error when all downloads fail",
-			setup: func(c *mockCommons, s *mockStore) {
-				c.searchRet = []Candidate{cand("File:a.jpg", "https://thumb/a", "image/jpeg", 4000, 3000, cc0Lic())}
-				c.downloadErrFor = map[string]error{"https://thumb/a": ErrCommonsUnavailable}
+			setup: func(c *mockSource, s *mockStore) {
+				c.searchRet = []sources.Candidate{cand(sources.SourceINaturalist, "a", "https://dl/a", "image/jpeg", "cc0", 4000, 3000)}
+				c.downloadErrFor = map[string]error{"https://dl/a": sources.ErrUnavailable}
 			},
-			wantStatus: OutcomeSourceError,
-			wantPut:    false,
+			wantStatus: ImgSourceError, wantPut: false,
 		},
 		{
 			name: "upload_error when PutObject fails",
-			setup: func(c *mockCommons, s *mockStore) {
-				c.searchRet = []Candidate{cand("File:a.jpg", "https://thumb/a", "image/jpeg", 4000, 3000, cc0Lic())}
+			setup: func(c *mockSource, s *mockStore) {
+				c.searchRet = []sources.Candidate{cand(sources.SourceINaturalist, "a", "https://dl/a", "image/jpeg", "cc0", 4000, 3000)}
 				s.putErr = errors.New("put failed")
 			},
-			wantStatus: OutcomeUploadError,
-			wantPut:    false,
+			wantStatus: ImgUploadError, wantPut: false,
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			commons := &mockCommons{}
+			src := &mockSource{}
 			store := newMockStore()
 			if c.setup != nil {
-				c.setup(commons, store)
+				c.setup(src, store)
 			}
-			in := NewIngestor(commons, store, newMockLedger(), &mockSeeds{}, Config{
-				AllowAttributionLicenses: c.allowAttrib,
-			})
-			out, err := in.IngestOne(context.Background(), "rosa", "Rosa regina")
+			in := newIngestor(src, store, newMockLedger(), Config{AllowAttributionLicenses: c.allowAttrib})
+			out, err := in.IngestSpecies(context.Background(), IngestRequest{ScientificName: "Rosa regina", ImageCount: 1})
 			if err != nil {
-				t.Fatalf("IngestOne returned hard error: %v", err)
+				t.Fatalf("IngestSpecies hard error: %v", err)
 			}
-			if out.Status != c.wantStatus {
-				t.Errorf("Status = %q, want %q (note=%q)", out.Status, c.wantStatus, out.Note)
+			if out.Slug != "rosa-regina" {
+				t.Errorf("slug = %q, want rosa-regina", out.Slug)
 			}
-			_, didPut := store.puts[heroKey("rosa")]
+			if len(out.PerImage) != 1 {
+				t.Fatalf("PerImage len = %d, want 1", len(out.PerImage))
+			}
+			if got := out.PerImage[0].Status; got != c.wantStatus {
+				t.Errorf("Status = %q, want %q (note=%q)", got, c.wantStatus, out.PerImage[0].Note)
+			}
+			_, didPut := store.puts[galleryKey("rosa-regina", 1)]
 			if didPut != c.wantPut {
-				t.Errorf("put hero = %v, want %v", didPut, c.wantPut)
+				t.Errorf("put = %v, want %v", didPut, c.wantPut)
 			}
 		})
 	}
 }
 
-func TestIngestOne_DownloadFallThrough(t *testing.T) {
-	// First (best) candidate's download fails; the second succeeds.
-	commons := &mockCommons{
-		searchRet: []Candidate{
-			cand("File:big.jpg", "https://thumb/big", "image/jpeg", 5000, 4000, cc0Lic()),
-			cand("File:small.jpg", "https://thumb/small", "image/jpeg", 2000, 1500, cc0Lic()),
-		},
-		downloadErrFor: map[string]error{"https://thumb/big": ErrCommonsUnavailable},
-	}
+func TestIngestSpecies_MultiImageDistinctSlots(t *testing.T) {
+	src := &mockSource{searchRet: []sources.Candidate{
+		cand(sources.SourceINaturalist, "a", "https://dl/a", "image/jpeg", "cc0", 4000, 3000),
+		cand(sources.SourceINaturalist, "b", "https://dl/b", "image/jpeg", "cc0", 3000, 2000),
+	}}
 	store := newMockStore()
-	in := NewIngestor(commons, store, newMockLedger(), &mockSeeds{}, Config{})
-	out, err := in.IngestOne(context.Background(), "rosa", "Rosa regina")
+	ledger := newMockLedger()
+	in := newIngestor(src, store, ledger, Config{})
+	out, err := in.IngestSpecies(context.Background(), IngestRequest{ScientificName: "Rosa regina", ImageCount: 2})
 	if err != nil {
 		t.Fatalf("hard error: %v", err)
 	}
-	if out.Status != OutcomeIngested {
-		t.Fatalf("Status = %q, want ingested", out.Status)
+	if len(out.PerImage) != 2 || out.PerImage[0].Status != ImgIngested || out.PerImage[1].Status != ImgIngested {
+		t.Fatalf("want 2 ingested, got %+v", out.PerImage)
 	}
-	if _, ok := store.puts[heroKey("rosa")]; !ok {
-		t.Errorf("expected hero put after fall-through")
+	if _, ok := store.puts[galleryKey("rosa-regina", 1)]; !ok {
+		t.Errorf("missing slot 1 put")
 	}
-}
-
-func TestIngestOne_DeferredCapturesProvenance(t *testing.T) {
-	commons := &mockCommons{
-		searchRet: []Candidate{cand("File:bysa.jpg", "https://thumb/bysa", "image/jpeg", 2000, 1500, bySaLic())},
+	if _, ok := store.puts[galleryKey("rosa-regina", 2)]; !ok {
+		t.Errorf("missing slot 2 put")
 	}
-	in := NewIngestor(commons, newMockStore(), newMockLedger(), &mockSeeds{}, Config{AllowAttributionLicenses: false})
-	out, _ := in.IngestOne(context.Background(), "rosa", "Rosa regina")
-	if out.Status != OutcomeDeferredAttrib {
-		t.Fatalf("Status = %q, want deferred_attribution", out.Status)
+	// Within-gallery dedup: the two slots used distinct candidates.
+	if out.PerImage[0].SourceURL == out.PerImage[1].SourceURL {
+		t.Errorf("slots reused the same candidate: %q", out.PerImage[0].SourceURL)
 	}
-	if out.License != "cc-by-sa-4.0" || out.Author != "Jane" || out.FilePage == "" {
-		t.Errorf("deferred outcome missing provenance: %+v", out)
-	}
-	if out.ThumbURL != "https://thumb/bysa" {
-		t.Errorf("deferred outcome must capture the chosen 1600px thumburl, got %q", out.ThumbURL)
+	// Species aggregate recomputed AFTER files (review item a).
+	if sp := ledger.species["rosa-regina"]; sp == nil || sp.ImageCountFilled != 2 {
+		t.Errorf("species image_count_filled = %+v, want 2", sp)
 	}
 }
 
-// TestRecordOutcome_SkippedExistsPreservesPriorAttribution locks the fix for the
-// code-review finding: re-running an already-live slug (HEAD hit →
-// skipped_exists, which carries NO license/author) must NOT wipe the prior
-// attribution row, or the next credits.json rebuild would drop a live CC-BY/SA
-// image's required credit (a CC §3(a) violation).
-func TestRecordOutcome_SkippedExistsPreservesPriorAttribution(t *testing.T) {
+func TestIngestSpecies_DownloadFallThrough(t *testing.T) {
+	// Best candidate's download 404s; the next succeeds for the same slot.
+	src := &mockSource{
+		searchRet: []sources.Candidate{
+			cand(sources.SourceINaturalist, "big", "https://dl/big", "image/jpeg", "cc0", 5000, 4000),
+			cand(sources.SourceINaturalist, "small", "https://dl/small", "image/jpeg", "cc0", 2000, 1500),
+		},
+		downloadErrFor: map[string]error{"https://dl/big": sources.ErrUnavailable},
+	}
+	store := newMockStore()
+	in := newIngestor(src, store, newMockLedger(), Config{})
+	out, err := in.IngestSpecies(context.Background(), IngestRequest{ScientificName: "Rosa regina", ImageCount: 1})
+	if err != nil {
+		t.Fatalf("hard error: %v", err)
+	}
+	if out.PerImage[0].Status != ImgIngested {
+		t.Fatalf("Status = %q, want ingested", out.PerImage[0].Status)
+	}
+	if _, ok := store.puts[galleryKey("rosa-regina", 1)]; !ok {
+		t.Errorf("expected put after fall-through")
+	}
+}
+
+func TestIngestSpecies_DeferredCapturesProvenance(t *testing.T) {
+	src := &mockSource{searchRet: []sources.Candidate{
+		cand(sources.SourceWikimediaCommons, "bysa", "https://dl/bysa", "image/jpeg", "cc-by-sa-4.0", 2000, 1500),
+	}}
 	ledger := newMockLedger()
-	prior := &LedgerRow{
-		Slug: "rosa", ScientificName: "Rosa regina", Status: StatusIngested,
-		R2Key: heroKey("rosa"), LicenseCode: "cc-by-sa-4.0", LicenseShort: "CC BY-SA 4.0",
+	in := newIngestor(src, newMockStore(), ledger, Config{AllowAttributionLicenses: false})
+	out, _ := in.IngestSpecies(context.Background(), IngestRequest{ScientificName: "Rosa regina", ImageCount: 1})
+	if out.PerImage[0].Status != ImgDeferredAttrib {
+		t.Fatalf("Status = %q, want deferred_attribution", out.PerImage[0].Status)
+	}
+	row := ledger.files[fileKey("rosa-regina", 1)]
+	if row == nil || row.Status != StatusDeferredAttrib {
+		t.Fatalf("deferred row missing: %+v", row)
+	}
+	if row.LicenseCode != "cc-by-sa-4.0" || row.AttributionAuthor != "Jane" || !row.AttributionRequired {
+		t.Errorf("deferred row missing attribution: %+v", row)
+	}
+	if row.PendingURL != "https://dl/bysa" {
+		t.Errorf("deferred row must store pending_url, got %q", row.PendingURL)
+	}
+}
+
+// TestIngestSpecies_PriorIngestedPreservesAttribution: a slot already ingested
+// (with required CC-BY/SA credit) is skipped on the next trigger WITHOUT a
+// ledger rewrite — so the credits.json rebuild keeps the live image's credit.
+func TestIngestSpecies_PriorIngestedPreservesAttribution(t *testing.T) {
+	ledger := newMockLedger()
+	ledger.species["rosa-regina"] = &SpeciesRow{Slug: "rosa-regina"}
+	prior := &FileRow{
+		Slug: "rosa-regina", ImageIndex: 1, Status: StatusIngested,
+		R2Key: galleryKey("rosa-regina", 1), LicenseCode: "cc-by-sa-4.0",
 		AttributionAuthor: "Jane", AttributionRequired: true,
-		SourceFilePage: "https://commons.wikimedia.org/wiki/File:rosa.jpg",
 	}
-	ledger.rows["rosa"] = prior
-	in := NewIngestor(&mockCommons{}, newMockStore(), ledger, &mockSeeds{}, Config{})
-
-	// skipped_exists carries no license/author (we never searched).
-	out := IngestOutcome{Status: OutcomeSkippedExists, Slug: "rosa", ScientificName: "Rosa regina", R2Key: heroKey("rosa")}
-	in.recordOutcome(context.Background(), "rosa", "Rosa regina", out, prior)
-
-	got := ledger.rows["rosa"]
+	ledger.files[fileKey("rosa-regina", 1)] = prior
+	src := &mockSource{searchRet: []sources.Candidate{
+		cand(sources.SourceINaturalist, "a", "https://dl/a", "image/jpeg", "cc0", 100, 100),
+	}}
+	in := newIngestor(src, newMockStore(), ledger, Config{})
+	out, _ := in.IngestSpecies(context.Background(), IngestRequest{ScientificName: "Rosa regina", ImageCount: 1})
+	if out.PerImage[0].Status != ImgSkippedExists {
+		t.Fatalf("Status = %q, want skipped_exists", out.PerImage[0].Status)
+	}
+	got := ledger.files[fileKey("rosa-regina", 1)]
 	if got.AttributionAuthor != "Jane" || got.LicenseCode != "cc-by-sa-4.0" || !got.AttributionRequired {
-		t.Errorf("skipped_exists wiped prior attribution: %+v", got)
+		t.Errorf("prior attribution wiped: %+v", got)
 	}
 }
 
-// TestShouldSkip_FailedAlwaysRetries locks the fix: a `failed` row (transient /
-// infra error) must always retry — never a permanent negative cache, so an
-// R2 / Wikimedia outage cannot park a healthy species forever.
-func TestShouldSkip_FailedAlwaysRetries(t *testing.T) {
-	in := NewIngestor(&mockCommons{}, newMockStore(), newMockLedger(), &mockSeeds{}, Config{})
-	if in.shouldSkip(&LedgerRow{Status: StatusFailed, Attempts: 99}) {
-		t.Errorf("failed row with high attempts must still retry (no permanent negative cache)")
+func TestIngestSpecies_Coalesced(t *testing.T) {
+	in := newIngestor(&mockSource{}, newMockStore(), newMockLedger(), Config{})
+	if !in.acquire("rosa-regina") {
+		t.Fatal("first acquire should succeed")
 	}
-	if !in.shouldSkip(&LedgerRow{Status: StatusNoAcceptableImg}) {
-		t.Errorf("no_acceptable_image should stay cached/skipped")
-	}
-	if !in.shouldSkip(&LedgerRow{Status: StatusIngested}) {
-		t.Errorf("ingested should be skipped")
-	}
-}
-
-// --- RunBatch tests ---
-
-func TestRunBatch_MixedOutcomes(t *testing.T) {
-	commons := &mockCommons{
-		searchRet: []Candidate{cand("File:a.jpg", "https://thumb/a", "image/jpeg", 4000, 3000, cc0Lic())},
-	}
-	store := newMockStore()
-	ledger := newMockLedger()
-	// "×" is a non-empty name that slugs to "" (the hybrid sign is a separator);
-	// it is skipped (no valid R2 key) and NOT counted as attempted.
-	seeds := &mockSeeds{names: []string{"Rosa regina", "Tulipa gesneriana", "×"}}
-	in := NewIngestor(commons, store, ledger, seeds, Config{})
-
-	summary, err := in.RunBatch(context.Background(), 0)
-	if err != nil {
-		t.Fatalf("RunBatch err: %v", err)
-	}
-	if summary.Seen != 3 {
-		t.Errorf("Seen = %d, want 3", summary.Seen)
-	}
-	// Two real names ingest; the slugs-to-empty name is skipped (not counted
-	// as attempted, not written to the ledger).
-	if summary.Ingested != 2 {
-		t.Errorf("Ingested = %d, want 2", summary.Ingested)
-	}
-	if summary.Attempted != 2 {
-		t.Errorf("Attempted = %d, want 2", summary.Attempted)
-	}
-	// Ledger should hold rows for both real slugs.
-	if _, ok := ledger.rows["rosa-regina"]; !ok {
-		t.Errorf("expected ledger row for rosa-regina")
-	}
-	if _, ok := ledger.rows["tulipa-gesneriana"]; !ok {
-		t.Errorf("expected ledger row for tulipa-gesneriana")
-	}
-	// The slugs-to-empty name ("×") is skipped (no valid R2 key) and NOT written
-	// to the ledger: a row keyed by the raw name is never read (lookups key on
-	// the empty slug — Codex #23), so it must not be created.
-	if _, ok := ledger.rows["×"]; ok {
-		t.Errorf("did not expect a ledger row for the slugs-to-empty name '×'")
-	}
-	if _, ok := ledger.rows[""]; ok {
-		t.Errorf("did not expect a ledger row under the empty slug key")
-	}
-}
-
-func TestRunBatch_LimitCaps(t *testing.T) {
-	commons := &mockCommons{
-		searchRet: []Candidate{cand("File:a.jpg", "https://thumb/a", "image/jpeg", 4000, 3000, cc0Lic())},
-	}
-	seeds := &mockSeeds{names: []string{"A plant", "B plant", "C plant", "D plant"}}
-	in := NewIngestor(commons, newMockStore(), newMockLedger(), seeds, Config{})
-
-	summary, err := in.RunBatch(context.Background(), 2)
-	if err != nil {
-		t.Fatalf("RunBatch err: %v", err)
-	}
-	if summary.Attempted != 2 {
-		t.Errorf("Attempted = %d, want 2 (limit)", summary.Attempted)
-	}
-}
-
-func TestRunBatch_SkipsAlreadyIngested(t *testing.T) {
-	commons := &mockCommons{
-		searchRet: []Candidate{cand("File:a.jpg", "https://thumb/a", "image/jpeg", 4000, 3000, cc0Lic())},
-	}
-	ledger := newMockLedger()
-	ledger.rows["rosa-regina"] = &LedgerRow{Slug: "rosa-regina", Status: StatusIngested}
-	seeds := &mockSeeds{names: []string{"Rosa regina"}}
-	in := NewIngestor(commons, newMockStore(), ledger, seeds, Config{})
-
-	summary, err := in.RunBatch(context.Background(), 0)
-	if err != nil {
-		t.Fatalf("RunBatch err: %v", err)
-	}
-	if summary.Skipped != 1 {
-		t.Errorf("Skipped = %d, want 1", summary.Skipped)
-	}
-	if summary.Attempted != 0 {
-		t.Errorf("Attempted = %d, want 0", summary.Attempted)
-	}
-}
-
-func TestRunBatch_DeferredReprocessedWhenGateOn(t *testing.T) {
-	commons := &mockCommons{
-		searchRet: []Candidate{cand("File:bysa.jpg", "https://thumb/bysa", "image/jpeg", 2000, 1500, bySaLic())},
-	}
-	ledger := newMockLedger()
-	ledger.rows["rosa-regina"] = &LedgerRow{Slug: "rosa-regina", Status: StatusDeferredAttrib}
-	seeds := &mockSeeds{names: []string{"Rosa regina"}}
-
-	// Gate OFF → the deferred row is skipped.
-	off := NewIngestor(commons, newMockStore(), ledger, seeds, Config{AllowAttributionLicenses: false})
-	sOff, _ := off.RunBatch(context.Background(), 0)
-	if sOff.Skipped != 1 || sOff.Attempted != 0 {
-		t.Errorf("gate OFF: skipped=%d attempted=%d, want 1/0", sOff.Skipped, sOff.Attempted)
-	}
-
-	// Gate ON → the deferred row is re-processed (uploads now).
-	ledger2 := newMockLedger()
-	ledger2.rows["rosa-regina"] = &LedgerRow{Slug: "rosa-regina", Status: StatusDeferredAttrib}
-	on := NewIngestor(commons, newMockStore(), ledger2, seeds, Config{AllowAttributionLicenses: true})
-	sOn, _ := on.RunBatch(context.Background(), 0)
-	if sOn.Attempted != 1 || sOn.Ingested != 1 {
-		t.Errorf("gate ON: attempted=%d ingested=%d, want 1/1", sOn.Attempted, sOn.Ingested)
-	}
-}
-
-func TestRunBatch_RebuildsCredits(t *testing.T) {
-	commons := &mockCommons{searchRet: nil}
-	store := newMockStore()
-	ledger := newMockLedger()
-	ledger.ingested = []LedgerRow{{Slug: "rosa", ScientificName: "Rosa regina", LicenseShort: "CC0"}}
-	seeds := &mockSeeds{names: []string{}}
-	in := NewIngestor(commons, store, ledger, seeds, Config{})
-
-	_, err := in.RunBatch(context.Background(), 0)
-	if err != nil {
-		t.Fatalf("RunBatch err: %v", err)
-	}
-	if _, ok := store.puts[creditsKey]; !ok {
-		t.Errorf("expected credits.json put after batch")
-	}
-}
-
-func TestRunBatch_SingleFlight(t *testing.T) {
-	// Verify a concurrent second call returns an empty summary while one is
-	// running. We can't easily force overlap deterministically, so we assert
-	// the guard field directly via the running flag with a manual lock.
-	in := NewIngestor(&mockCommons{}, newMockStore(), newMockLedger(), &mockSeeds{}, Config{})
-	in.runMu.Lock()
-	in.running = true
-	in.runMu.Unlock()
-	summary, err := in.RunBatch(context.Background(), 0)
+	out, err := in.IngestSpecies(context.Background(), IngestRequest{ScientificName: "Rosa regina"})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if summary.Seen != 0 || summary.Attempted != 0 {
-		t.Errorf("expected empty summary while running, got %+v", summary)
+	if !out.Coalesced || len(out.PerImage) != 0 {
+		t.Errorf("expected coalesced empty outcome, got %+v", out)
+	}
+}
+
+func TestIngestSpecies_EmptySlugNoOp(t *testing.T) {
+	in := newIngestor(&mockSource{}, newMockStore(), newMockLedger(), Config{})
+	out, err := in.IngestSpecies(context.Background(), IngestRequest{ScientificName: "×"})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if out.Slug != "" || len(out.PerImage) != 0 {
+		t.Errorf("expected empty no-op outcome, got %+v", out)
+	}
+}
+
+func TestShouldSkip(t *testing.T) {
+	off := newIngestor(&mockSource{}, newMockStore(), newMockLedger(), Config{AllowAttributionLicenses: false})
+	on := newIngestor(&mockSource{}, newMockStore(), newMockLedger(), Config{AllowAttributionLicenses: true})
+
+	if !off.shouldSkip(&FileRow{Status: StatusIngested}) {
+		t.Error("ingested should skip")
+	}
+	if !off.shouldSkip(&FileRow{Status: StatusNoAcceptableImg}) {
+		t.Error("no_acceptable_image should skip")
+	}
+	if off.shouldSkip(&FileRow{Status: StatusFailed, Attempts: 99}) {
+		t.Error("failed must always retry (no permanent negative cache)")
+	}
+	if !off.shouldSkip(&FileRow{Status: StatusDeferredAttrib}) {
+		t.Error("deferred should skip while gate OFF")
+	}
+	if on.shouldSkip(&FileRow{Status: StatusDeferredAttrib}) {
+		t.Error("deferred should re-process while gate ON")
 	}
 }
 
 // --- ranking tests ---
 
-func TestRankCandidates_LicenseTierThenSize(t *testing.T) {
-	cands := []Candidate{
-		cand("File:bysa.jpg", "t1", "image/jpeg", 5000, 4000, bySaLic()),
-		cand("File:cc0small.jpg", "t2", "image/jpeg", 1000, 800, cc0Lic()),
-		cand("File:cc0big.jpg", "t3", "image/jpeg", 4000, 3000, cc0Lic()),
-		cand("File:by.jpg", "t4", "image/jpeg", 6000, 5000, byLic()),
+func scored(source, title, mime, code string, w, h int) scoredCandidate {
+	c := cand(source, title, "https://dl/"+title, mime, code, w, h)
+	return scoredCandidate{cand: c, lic: classifyCandidate(c)}
+}
+
+func TestRankScored_LicenseThenSourceThenSize(t *testing.T) {
+	cands := []scoredCandidate{
+		scored(sources.SourceWikimediaCommons, "bysa", "image/jpeg", "cc-by-sa-4.0", 5000, 4000),
+		scored(sources.SourceWikimediaCommons, "cc0small", "image/jpeg", "cc0", 1000, 800),
+		scored(sources.SourceINaturalist, "cc0inat", "image/jpeg", "cc0", 1200, 900),
+		scored(sources.SourceWikimediaCommons, "cc0big", "image/jpeg", "cc0", 4000, 3000),
+		scored(sources.SourceWikimediaCommons, "by", "image/jpeg", "cc-by-4.0", 6000, 5000),
 	}
-	ranked := rankCandidates(cands)
-	// CC0 first (tier 0), larger area within tier wins → cc0big before cc0small.
-	if ranked[0].Title != "File:cc0big.jpg" {
-		t.Errorf("ranked[0] = %q, want cc0big", ranked[0].Title)
+	rankScored(cands)
+	// Tier 0 (CC0) first; within tier iNat beats Wikimedia regardless of size.
+	if cands[0].cand.Title != "cc0inat" {
+		t.Errorf("ranked[0] = %q, want cc0inat (iNat source tier)", cands[0].cand.Title)
 	}
-	if ranked[1].Title != "File:cc0small.jpg" {
-		t.Errorf("ranked[1] = %q, want cc0small", ranked[1].Title)
+	// Then CC0 Wikimedia by larger area.
+	if cands[1].cand.Title != "cc0big" || cands[2].cand.Title != "cc0small" {
+		t.Errorf("ranked[1..2] = %q,%q, want cc0big,cc0small", cands[1].cand.Title, cands[2].cand.Title)
 	}
-	if ranked[2].Title != "File:by.jpg" {
-		t.Errorf("ranked[2] = %q, want by", ranked[2].Title)
-	}
-	if ranked[3].Title != "File:bysa.jpg" {
-		t.Errorf("ranked[3] = %q, want bysa", ranked[3].Title)
+	if cands[3].cand.Title != "by" || cands[4].cand.Title != "bysa" {
+		t.Errorf("ranked[3..4] = %q,%q, want by,bysa", cands[3].cand.Title, cands[4].cand.Title)
 	}
 }
 
-func TestRankCandidates_ExcludesFormatsAndDeprioritizes(t *testing.T) {
-	cands := []Candidate{
-		cand("File:svgmap.svg", "t1", "image/svg+xml", 9000, 9000, cc0Lic()),
-		cand("File:distribution map.jpg", "t2", "image/jpeg", 8000, 8000, cc0Lic()),
-		cand("File:photo.jpg", "t3", "image/jpeg", 2000, 1500, cc0Lic()),
+func TestGatherCandidates_ExcludesFormatsAndDeprioritizes(t *testing.T) {
+	src := &mockSource{searchRet: []sources.Candidate{
+		cand(sources.SourceWikimediaCommons, "svgmap.svg", "https://dl/svg", "image/svg+xml", "cc0", 9000, 9000),
+		cand(sources.SourceWikimediaCommons, "distribution map.jpg", "https://dl/map", "image/jpeg", "cc0", 8000, 8000),
+		cand(sources.SourceWikimediaCommons, "photo.jpg", "https://dl/photo", "image/jpeg", "cc0", 2000, 1500),
+	}}
+	in := newIngestor(src, newMockStore(), newMockLedger(), Config{})
+	eligible, _ := in.gatherCandidates(context.Background(), "Rosa regina", 4)
+	if len(eligible) != 2 {
+		t.Fatalf("want svg excluded → 2 eligible, got %d", len(eligible))
 	}
-	ranked := rankCandidates(cands)
-	if len(ranked) != 2 {
-		t.Fatalf("expected svg excluded → 2 candidates, got %d", len(ranked))
-	}
-	// The plain photo (not a "map") ranks above the distribution map even though
-	// the map has a larger pixel area.
-	if ranked[0].Title != "File:photo.jpg" {
-		t.Errorf("ranked[0] = %q, want photo (map deprioritized)", ranked[0].Title)
+	if eligible[0].cand.Title != "photo.jpg" {
+		t.Errorf("ranked[0] = %q, want photo.jpg (map deprioritized)", eligible[0].cand.Title)
 	}
 }
 
@@ -549,6 +480,7 @@ func TestCcDeedURL(t *testing.T) {
 		{"cc-by-4.0", "https://creativecommons.org/licenses/by/4.0/"},
 		{"cc-by-sa-4.0", "https://creativecommons.org/licenses/by-sa/4.0/"},
 		{"cc-by-sa-3.0", "https://creativecommons.org/licenses/by-sa/3.0/"},
+		{"cc-by", "https://creativecommons.org/licenses/by/4.0/"},
 		{"pd", ""},
 		{"", ""},
 	}

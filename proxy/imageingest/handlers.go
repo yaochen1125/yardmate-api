@@ -7,21 +7,23 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
 // adminTokenHeader is the header carrying the internal admin token (SPEC §2.1).
 const adminTokenHeader = "X-Ingest-Admin-Token"
 
-// batchRequestTimeout bounds a manual batch run started via the HTTP trigger.
-const batchRequestTimeout = 10 * time.Minute
+// internalRequestTimeout bounds a synchronous internal run (search + downloads
+// + uploads for one gallery, paced; generous headroom over the per-call 30s).
+const internalRequestTimeout = 5 * time.Minute
 
-// singleRequestTimeout bounds a single-slug run (one search + one download +
-// one upload, paced; generous headroom over the per-call 30s).
-const singleRequestTimeout = 2 * time.Minute
+// publicWorkTimeout bounds the detached goroutine doing the actual ingest after
+// the public endpoint returns 202 (SPEC §2.1 fire-and-forget).
+const publicWorkTimeout = 5 * time.Minute
 
 // Service is the imageingest HTTP-facing wrapper: an Ingestor plus the admin
-// token. Built by main's buildImageIngestService (nil → route not registered,
+// token. Built by main's buildImageIngestService (nil → routes not registered,
 // graceful-disable mirroring buildEnrichmentService). SPEC §10 wiring.
 type Service struct {
 	ingestor   *Ingestor
@@ -29,29 +31,101 @@ type Service struct {
 }
 
 // NewService wraps an Ingestor with the admin token. adminToken MUST be
-// non-empty in production (the route is only registered when it is set); an
-// empty token here rejects every request (defense in depth).
+// non-empty in production (the internal route is only registered when it is
+// set); an empty token rejects every internal request (defense in depth).
 func NewService(ingestor *Ingestor, adminToken string) *Service {
 	return &Service{ingestor: ingestor, adminToken: adminToken}
 }
 
-// Start launches the background ingest ticker (SPEC §2.1) — a passthrough to
-// the underlying Ingestor so main can drive it from the *Service it holds.
-// interval<=0 is a no-op. Returns a stop func. Safe on a nil service.
-func (s *Service) Start(interval time.Duration) (stop func()) {
-	if s == nil || s.ingestor == nil {
-		return func() {}
+// publicRequest is the JSON body of POST /v1/plants/imageingest (SPEC §1.3).
+type publicRequest struct {
+	ScientificName string `json:"scientific_name"`
+	ImageCount     int    `json:"image_count"`
+}
+
+// HandlePublic returns the http.HandlerFunc for POST /v1/plants/imageingest
+// (SPEC §1.1 / §2.1). The endpoint is App Attest gated in the SAME sense as
+// /v1/identify: the attest envelope is read + logged for forensics but V1 does
+// NOT call VerifyAssertion (iOS 26 issue — memory option_d_progress.md / SPEC
+// §5). Abuse is bounded by the per-IP + per-device rate-limit middleware
+// (server.go) and single-flight per slug. Returns 202 fire-and-forget.
+func HandlePublic(svc *Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if svc == nil || svc.ingestor == nil {
+			writeError(w, http.StatusServiceUnavailable, "ingest_disabled")
+			return
+		}
+
+		// Required headers (mirror /v1/identify; per-device middleware also keys
+		// on the device id).
+		if !isUUID(r.Header.Get("X-Device-Install-Id")) {
+			writeError(w, http.StatusBadRequest, "missing_device_id")
+			return
+		}
+		if r.Header.Get("X-App-Version") == "" {
+			writeError(w, http.StatusBadRequest, "missing_app_version")
+			return
+		}
+		// App Attest signals: logged only in V1 (SPEC §5 / option_d_progress).
+		attKeyID := r.Header.Get("X-AppAttest-KeyID")
+		attAssertPresent := r.Header.Get("X-AppAttest-Assertion") != ""
+
+		var body publicRequest
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10))
+		if err := dec.Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		name := strings.TrimSpace(body.ScientificName)
+		slug := Slug(name)
+		if name == "" || slug == "" {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		if body.ImageCount != 0 && (body.ImageCount < minImageCount || body.ImageCount > maxImageCount) {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+
+		n := body.ImageCount
+		if n <= 0 {
+			n = svc.ingestor.cfg.DefaultImageCount
+		}
+
+		// Fire-and-forget: the real work runs in a detached goroutine bounded by
+		// single-flight per slug (concurrent duplicates coalesce, SPEC §4.2).
+		go func(req IngestRequest) {
+			ctx, cancel := context.WithTimeout(context.Background(), publicWorkTimeout)
+			defer cancel()
+			out, err := svc.ingestor.IngestSpecies(ctx, req)
+			if err != nil {
+				log.Printf("imageingest public err: slug=%s err=%v", req.Slug, err)
+				return
+			}
+			if out.Coalesced {
+				log.Printf("imageingest public coalesced: slug=%s", out.Slug)
+				return
+			}
+			log.Printf("imageingest public ok: slug=%s images=%d attestKey=%q attestAssert=%v",
+				out.Slug, len(out.PerImage), attKeyID, attAssertPresent)
+		}(IngestRequest{ScientificName: name, ImageCount: n})
+
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"accepted":              true,
+			"slug":                  slug,
+			"image_count_requested": n,
+		})
 	}
-	return s.ingestor.Start(interval)
 }
 
 // HandleRun returns the http.HandlerFunc for POST /internal/imageingest/run
-// (SPEC §2.1 / §3). svc may be nil → 503 ingest_disabled (the route should not
-// be registered in that case, but guard anyway).
+// (SPEC §2.1 / §3). Admin-token gated, internal-only (mounted outside /v1), ops:
 //
-//	?slug=<>&name=<>  → IngestOne, returns the IngestOutcome JSON (200)
-//	(no slug)         → RunBatch(?limit), returns the BatchSummary JSON (202)
-//	?slug without ?name → 400 bad_request
+//	?slug=<>&name=<>&image_count=<>  → single, synchronous IngestOutcome (200)
+//	?names=n1,n2&image_count=<>      → batch reseed, synchronous []IngestOutcome
+//
+// svc may be nil → 503 ingest_disabled (the route should not be registered then,
+// but guard anyway).
 func HandleRun(svc *Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if svc == nil || svc.ingestor == nil {
@@ -72,71 +146,85 @@ func HandleRun(svc *Service) http.HandlerFunc {
 		}
 
 		q := r.URL.Query()
-		slug := q.Get("slug")
-		name := q.Get("name")
+		imageCount := 0
+		if cs := q.Get("image_count"); cs != "" {
+			n, err := strconv.Atoi(cs)
+			if err != nil || n < 0 {
+				writeError(w, http.StatusBadRequest, "bad_request")
+				return
+			}
+			imageCount = n
+		}
 
-		// Single-slug path (smoke-testing the slug↔R2 round-trip).
-		if slug != "" {
+		ctx, cancel := context.WithTimeout(r.Context(), internalRequestTimeout)
+		defer cancel()
+
+		// Single-slug path (smoke-testing the slug↔R2 round-trip; forces a slug).
+		if slug := q.Get("slug"); slug != "" {
+			name := q.Get("name")
 			if name == "" {
 				writeError(w, http.StatusBadRequest, "bad_request")
 				return
 			}
-			ctx, cancel := context.WithTimeout(r.Context(), singleRequestTimeout)
-			defer cancel()
-			out, err := svc.ingestor.IngestOne(ctx, slug, name)
+			out, err := svc.ingestor.IngestSpecies(ctx, IngestRequest{
+				Slug: slug, ScientificName: name, ImageCount: imageCount,
+			})
 			if err != nil {
 				log.Printf("imageingest run single err: slug=%s err=%v", slug, err)
 				writeError(w, http.StatusInternalServerError, "internal")
 				return
 			}
-			// Record the single-slug outcome too (parity with batch). Read prior
-			// for attempt accounting.
-			prior, _ := svc.ingestor.ledger.Lookup(ctx, slug)
-			svc.ingestor.recordOutcome(ctx, slug, name, out, prior)
-			// Keep credits.json in sync when a single-slug run actually ingested
-			// (parity with RunBatch) — otherwise a single-slug CC-BY/SA ingest is
-			// live in R2 but missing from the public credits manifest until the
-			// next batch (an attribution-compliance window).
-			if out.Status == OutcomeIngested {
-				if cerr := svc.ingestor.rebuildCredits(ctx); cerr != nil {
-					log.Printf("imageingest run single credits rebuild err: slug=%s err=%v", slug, cerr)
-				}
-			}
-			log.Printf("imageingest run single ok: slug=%s status=%s license=%s bytes=%d",
-				slug, out.Status, out.License, out.Bytes)
 			writeJSON(w, http.StatusOK, out)
 			return
 		}
 
-		// Batch path. Optional ?limit; malformed → 400 bad_request.
-		limit := 0
-		if ls := q.Get("limit"); ls != "" {
-			n, err := strconv.Atoi(ls)
-			if err != nil || n < 0 {
-				writeError(w, http.StatusBadRequest, "bad_request")
-				return
+		// Batch reseed path (ops, e.g. R2 bucket restore). Comma-separated
+		// scientific names; each is cascaded + slugged synchronously.
+		if namesParam := q.Get("names"); namesParam != "" {
+			var outs []IngestOutcome
+			for _, raw := range strings.Split(namesParam, ",") {
+				name := strings.TrimSpace(raw)
+				if name == "" {
+					continue
+				}
+				out, err := svc.ingestor.IngestSpecies(ctx, IngestRequest{
+					ScientificName: name, ImageCount: imageCount,
+				})
+				if err != nil {
+					log.Printf("imageingest run batch err: name=%q err=%v", name, err)
+					continue
+				}
+				outs = append(outs, out)
 			}
-			limit = n
+			writeJSON(w, http.StatusOK, outs)
+			return
 		}
 
-		// Run the batch in a detached goroutine bounded by limit (SPEC §2.1 —
-		// long batches return 202 and continue). The single-flight guard in
-		// RunBatch prevents overlap with the ticker.
-		go func(limit int) {
-			ctx, cancel := context.WithTimeout(context.Background(), batchRequestTimeout)
-			defer cancel()
-			summary, err := svc.ingestor.RunBatch(ctx, limit)
-			if err != nil {
-				log.Printf("imageingest run batch err: limit=%d err=%v", limit, err)
-				return
-			}
-			log.Printf("imageingest run batch ok: seen=%d attempted=%d ingested=%d noImage=%d deferred=%d skipped=%d errors=%d",
-				summary.Seen, summary.Attempted, summary.Ingested, summary.NoImage,
-				summary.Deferred, summary.Skipped, summary.Errors)
-		}(limit)
-
-		writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+		writeError(w, http.StatusBadRequest, "bad_request")
 	}
+}
+
+// isUUID accepts RFC 4122 canonical form (36 chars, dashes at 8/13/18/23).
+// Case-insensitive for hex. Duplicated from proxy.isUUID / ratelimit.isUUID —
+// the same 12-line check, not worth a shared package for three callers.
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // --- local HTTP helpers (mirrors proxy/enrichment/handlers.go; small + stable) ---

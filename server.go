@@ -28,7 +28,7 @@ type Server struct {
 	vision   *proxy.VisionClient   // optional; nil disables ai_enhance + LLM catalog disambiguation
 	content  *proxy.ContentIndex   // optional; nil disables plantId/catalogId lookups in /v1/diagnose
 	enrich   *enrichment.Service   // optional; nil disables /v1/plants/enrichment
-	ingest   *imageingest.Service  // optional; nil disables POST /internal/imageingest/run
+	ingest   *imageingest.Service  // optional; nil disables POST /v1/plants/imageingest + /internal/imageingest/run
 	router   chi.Router
 }
 
@@ -94,7 +94,7 @@ func newServer(
 		// All per-device endpoints share the per-device rate-limit middleware.
 		// /v1/plants/enrichment joins the same group as identify/diagnose so
 		// an attacker rotating IPs is still bounded per-device (SPEC §4.1).
-		if plantNet != nil || plantID != nil || enrich != nil {
+		if plantNet != nil || plantID != nil || enrich != nil || ingest != nil {
 			r.Group(func(r chi.Router) {
 				r.Use(ratelimit.PerDeviceMiddleware(lim.PerDevice, "rate_limit_device"))
 				// /v1/identify cascades Pl@ntNet (primary) → Plant.id
@@ -110,6 +110,11 @@ func newServer(
 				}
 				if enrich != nil {
 					r.Post("/plants/enrichment", enrichment.HandleEnrichment(enrich))
+				}
+				// On-demand out-of-catalog gallery ingest (App Attest log-only,
+				// same envelope as /v1/identify — proxy/imageingest/SPEC.md §2.1).
+				if ingest != nil {
+					r.Post("/plants/imageingest", imageingest.HandlePublic(ingest))
 				}
 			})
 		}
