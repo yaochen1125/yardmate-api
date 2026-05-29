@@ -49,32 +49,51 @@ var (
 	wsRe      = regexp.MustCompile(`\s+`)
 )
 
-// ClassifyLicense maps a candidate's extmetadata to a License (SPEC §2.4 / §6.1
-// + point B). Primary signal is the machine License code (lowercased); when
-// that is empty (older files) it falls back to LicenseShortName. The code is
-// tokenized on "-"; any "nc" or "nd" token → REJECT. Allowed families:
-//
-//	cc0                       → CC0      (no attribution)
-//	pd / shortName "public…"  → PD       (no attribution)
-//	cc-by-sa-*                → CC_BY_SA (attribution + ShareAlike)
-//	cc-by-*  (and not nc/nd)  → CC_BY    (attribution)
-//
-// Everything else (ARR / GFDL-only / unknown) → REJECT (conservative — a
-// placeholder beats a license violation). Also rejects when Copyrighted=="True"
-// and no allowed code resolved (catches All-Rights-Reserved stragglers).
+// ClassifyLicense maps a Wikimedia Commons file's extmetadata to a License
+// (SPEC §2.4). It strips the Artist HTML and delegates to ClassifyLicenseCode.
 func ClassifyLicense(meta extMetadata) License {
-	code := strings.ToLower(strings.TrimSpace(meta.License.Value))
-	short := strings.TrimSpace(meta.LicenseShortName.Value)
+	return ClassifyLicenseCode(
+		meta.License.Value,
+		meta.LicenseShortName.Value,
+		meta.LicenseURL.Value,
+		stripHTML(meta.Artist.Value),
+	)
+}
+
+// ClassifyLicenseCode is the shared token-membership classifier (SPEC §2.4.3),
+// usable by BOTH sources: Wikimedia's VERSIONED codes ("cc-by-sa-4.0") and
+// iNaturalist's UNVERSIONED codes ("cc-by", "cc0"). It is membership, NOT glob:
+// the probe is tokenized on non-alphanumeric runs and we test for the presence
+// of tokens ("cc" & "by" & "sa"). A literal "cc-by-*" glob would wrongly reject
+// a bare "cc-by" and silently filter out the iNat primary source (Codex #29-B).
+//
+//	rawCode    machine license code, lowercased internally (primary signal)
+//	rawShort   display short name; also the fallback signal when rawCode is empty
+//	rawURL     license deed URL (Commons LicenseUrl; empty for iNat)
+//	author     already HTML-stripped / plain-text author (caller's responsibility)
+//
+// The code is tokenized; any "nc" or "nd" token → REJECT. Allowed families:
+//
+//	cc0                              → CC0      (no attribution)
+//	pd / shortName "public domain"   → PD       (no attribution)
+//	cc & by & sa  (no nc/nd)         → CC_BY_SA (attribution + ShareAlike)
+//	cc & by       (no sa/nc/nd)      → CC_BY    (attribution)
+//
+// Everything else (ARR / GFDL-only / unknown / empty) → REJECT (conservative —
+// a placeholder beats a license violation).
+func ClassifyLicenseCode(rawCode, rawShort, rawURL, author string) License {
+	code := strings.ToLower(strings.TrimSpace(rawCode))
+	short := strings.TrimSpace(rawShort)
 	shortLower := strings.ToLower(short)
 
-	// Fall back to the short name as the machine signal when License is absent.
+	// Fall back to the short name as the machine signal when the code is absent.
 	probe := code
 	if probe == "" {
 		probe = shortLower
 	}
 
-	author := stripHTML(meta.Artist.Value)
-	licURL := strings.TrimSpace(meta.LicenseURL.Value)
+	author = strings.TrimSpace(author)
+	licURL := strings.TrimSpace(rawURL)
 
 	reject := License{
 		Allowed:   false,
