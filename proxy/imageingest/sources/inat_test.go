@@ -128,6 +128,25 @@ func TestINatSearch_DefaultPhotoPlusObservation(t *testing.T) {
 	}
 }
 
+// A fuzzy / misspelled query that iNat answers with a DIFFERENT-named taxon
+// must yield no candidates (we only trust an exact scientific-name match), so
+// the cascade falls through to the next source instead of attaching the wrong
+// species' photos to this slug.
+func TestINatSearch_FuzzyNonExactMatch_NoCandidates(t *testing.T) {
+	srv := httptest.NewServer(inatRouter(t, inatTaxaHitJSON, inatObsJSON, nil))
+	defer srv.Close()
+
+	c := newINatTestClient(srv)
+	// inatTaxaHitJSON's taxon Name is "Monstera adansonii"; query a misspelling.
+	cands, err := c.Search(context.Background(), "Monstera adansoni", 12)
+	if err != nil {
+		t.Fatalf("Search err: %v", err)
+	}
+	if len(cands) != 0 {
+		t.Fatalf("expected 0 candidates on non-exact match, got %d", len(cands))
+	}
+}
+
 func TestINatSearch_NoTaxonMatch(t *testing.T) {
 	srv := httptest.NewServer(inatRouter(t, inatTaxaNoneJSON, inatObsJSON, nil))
 	defer srv.Close()

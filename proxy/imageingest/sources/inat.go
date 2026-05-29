@@ -93,10 +93,24 @@ func (c *INatClient) Search(ctx context.Context, scientificName string, limit in
 	if err != nil {
 		return nil, err
 	}
-	if len(taxa) == 0 {
+	// /v1/taxa?q= is a FUZZY search: it can return reordered, misspelling-tolerant,
+	// or synonym-ish matches. Blindly trusting taxa[0] would attach another
+	// species' photos to this slug. Mirror proxy/inat.go's PreferredCommonName:
+	// only trust an exact (case-insensitive) scientific-name match; otherwise
+	// return no candidates so the cascade falls through to the next source.
+	want := strings.ToLower(strings.TrimSpace(scientificName))
+	var top inatTaxon
+	matched := false
+	for _, tx := range taxa {
+		if strings.ToLower(strings.TrimSpace(tx.Name)) == want {
+			top = tx
+			matched = true
+			break
+		}
+	}
+	if !matched {
 		return nil, nil
 	}
-	top := taxa[0]
 
 	var out []Candidate
 	seen := map[string]bool{}
