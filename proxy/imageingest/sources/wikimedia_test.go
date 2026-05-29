@@ -97,6 +97,67 @@ func TestWikimediaSearch_Hit(t *testing.T) {
 	}
 }
 
+// wmNumericExtmetaJSON mirrors a real Commons quirk: some extmetadata fields
+// carry a BARE JSON NUMBER as `value` (here Copyrighted=1 + an integer
+// AssessmentNumber) instead of a string. Before the extField.UnmarshalJSON fix
+// this aborted the whole search ("cannot unmarshal number into ... value of
+// type string"), silently killing the cascade fallback (observed live on
+// "Helianthus annuus").
+const wmNumericExtmetaJSON = `{
+  "query": {
+    "pages": {
+      "777": {
+        "title": "File:Helianthus annuus example.jpg",
+        "imageinfo": [{
+          "url": "https://upload.wikimedia.org/full.jpg",
+          "descriptionurl": "https://commons.wikimedia.org/wiki/File:Helianthus_annuus_example.jpg",
+          "thumburl": "https://upload.wikimedia.org/thumb/1600px-full.jpg",
+          "thumbmime": "image/jpeg",
+          "mime": "image/jpeg",
+          "width": 2000,
+          "height": 1500,
+          "extmetadata": {
+            "License": {"value": "cc0"},
+            "LicenseShortName": {"value": "CC0"},
+            "Copyrighted": {"value": 1},
+            "AssessmentNumber": {"value": 3}
+          }
+        }]
+      }
+    }
+  }
+}`
+
+// TestWikimediaSearch_NumericExtmetaValue locks the fix: a numeric extmetadata
+// `value` must not abort the search; the candidate parses + string fields stay
+// intact.
+func TestWikimediaSearch_NumericExtmetaValue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(wmNumericExtmetaJSON))
+	}))
+	defer srv.Close()
+
+	c := newWMTestClient(srv, "test-ua")
+	cands, err := c.Search(context.Background(), "Helianthus annuus", 10)
+	if err != nil {
+		t.Fatalf("Search err (numeric value must not abort): %v", err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(cands))
+	}
+	got := cands[0]
+	if got.LicenseCode != "cc0" {
+		t.Errorf("LicenseCode = %q, want cc0", got.LicenseCode)
+	}
+	if got.LicenseShortName != "CC0" {
+		t.Errorf("LicenseShortName = %q, want CC0", got.LicenseShortName)
+	}
+	if got.DownloadURL != "https://upload.wikimedia.org/thumb/1600px-full.jpg" {
+		t.Errorf("DownloadURL = %q", got.DownloadURL)
+	}
+}
+
 func TestWikimediaSearch_NoResults(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(wmNoResultsJSON))
