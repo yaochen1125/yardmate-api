@@ -366,7 +366,7 @@ func TestIdentifyPlant_Success(t *testing.T) {
 		b, _ := io.ReadAll(r.Body)
 		gotBody = string(b)
 		// json_schema strict reply: the message content is the JSON string.
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Monstera deliciosa\",\"common_names\":[\"Swiss cheese plant\"],\"confidence\":0.83}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Monstera deliciosa\",\"common_names\":[\"Swiss cheese plant\"],\"confidence\":0.83}"}}]}`)
 	})
 	defer srv.Close()
 
@@ -406,7 +406,7 @@ func TestIdentifyPlant_Success(t *testing.T) {
 
 func TestIdentifyPlant_NilCommonNamesBecomesEmptySlice(t *testing.T) {
 	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Ficus lyrata\",\"common_names\":null,\"confidence\":0.6}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Ficus lyrata\",\"common_names\":null,\"confidence\":0.6}"}}]}`)
 	})
 	defer srv.Close()
 	sug, err := c.IdentifyPlant(context.Background(), []byte("img"), "image/jpeg")
@@ -420,7 +420,7 @@ func TestIdentifyPlant_NilCommonNamesBecomesEmptySlice(t *testing.T) {
 
 func TestIdentifyPlant_ConfidenceClamped(t *testing.T) {
 	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Aloe vera\",\"common_names\":[],\"confidence\":1.7}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Aloe vera\",\"common_names\":[],\"confidence\":1.7}"}}]}`)
 	})
 	defer srv.Close()
 	sug, err := c.IdentifyPlant(context.Background(), []byte("img"), "image/jpeg")
@@ -470,12 +470,32 @@ func TestIdentifyPlant_Refusal_EmptyContent_SentinelError(t *testing.T) {
 
 func TestIdentifyPlant_EmptyScientificName_SentinelError(t *testing.T) {
 	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"   \",\"common_names\":[],\"confidence\":0.4}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"   \",\"common_names\":[],\"confidence\":0.4}"}}]}`)
 	})
 	defer srv.Close()
 	_, err := c.IdentifyPlant(context.Background(), []byte("img"), "image/jpeg")
 	if err == nil || !errors.Is(err, ErrVisionIdentifyUnavailable) {
 		t.Errorf("err = %v, want ErrVisionIdentifyUnavailable (blank scientific_name)", err)
+	}
+}
+
+func TestIdentifyPlant_NotAPlant_ReturnsNotAPlantSentinel(t *testing.T) {
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		// Model explicitly reports is_plant=false (image is an object/scene);
+		// it still returns a throwaway scientific_name which we must discard.
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":false,\"scientific_name\":\"Unknown\",\"common_names\":[],\"confidence\":0.1}"}}]}`)
+	})
+	defer srv.Close()
+	sug, err := c.IdentifyPlant(context.Background(), []byte("img"), "image/jpeg")
+	if sug != nil {
+		t.Errorf("sug = %+v, want nil (not-a-plant)", sug)
+	}
+	if err == nil || !errors.Is(err, ErrVisionNotAPlant) {
+		t.Errorf("err = %v, want ErrVisionNotAPlant", err)
+	}
+	// Must NOT be conflated with the generic vision-unavailable sentinel.
+	if errors.Is(err, ErrVisionIdentifyUnavailable) {
+		t.Errorf("err must be ErrVisionNotAPlant, not ErrVisionIdentifyUnavailable: %v", err)
 	}
 }
 
@@ -539,7 +559,7 @@ func TestVisionClient_IdentifyUsesLongerClient(t *testing.T) {
 // instantly so the shorter cap is harmless here.
 func TestIdentifyPlant_NilIdentifyHTTP_FallsBackToHTTP(t *testing.T) {
 	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Ficus lyrata\",\"common_names\":[],\"confidence\":0.7}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Ficus lyrata\",\"common_names\":[],\"confidence\":0.7}"}}]}`)
 	})
 	defer srv.Close()
 	if c.identifyHTTP != nil {

@@ -71,3 +71,12 @@ var (
 // their bare fmt.Errorf returns (callers there only need err != nil); this
 // sentinel exists so the identify-fallback branch can errors.Is-match.
 var ErrVisionIdentifyUnavailable = errors.New("vision: identify unavailable")
+
+// ErrVisionNotAPlant is returned by VisionClient.IdentifyPlant when the model
+// explicitly reports is_plant=false — the image is not a plant (an object,
+// animal, scene, etc.). Distinct from ErrVisionIdentifyUnavailable (a genuine
+// vision FAILURE): this is a successful, confident "not a plant" verdict.
+// HandleIdentify maps it to the Unknown sentinel result (the "Mysterious
+// plants" easter egg, plant_id=AAA0000) instead of an empty / best-guess
+// suggestion. Contract: SPEC §2.1 "Unknown sentinel".
+var ErrVisionNotAPlant = errors.New("vision: not a plant")
