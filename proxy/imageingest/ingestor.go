@@ -192,19 +192,37 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 		return out, fmt.Errorf("imageingest: upsert species %q: %w", slug, err)
 	}
 
-	// Gather + rank the candidate pool once (SPEC §2.4 cascade + §2.5 ranking).
-	eligible, gated := in.gatherCandidates(ctx, req.ScientificName, n)
-
-	// Fill each slot. Eligible candidates are consumed sequentially → distinct
-	// photo per slot (within-gallery dedup, SPEC §2.5 #4); already-deduped on
-	// DedupKey in gatherCandidates. sawDownloadFail tracks whether the eligible
-	// pool was depleted by transient download failures (vs genuinely having no
-	// acceptable image) so later empty slots are classified retryable (§3).
-	poolIdx, gatedIdx := 0, 0
-	sawDownloadFail := false
+	// Pass 1 — decide which slots need filling using ONLY the ledger + an R2
+	// HEAD (no source calls). R2 is the source of truth (SPEC §9 #8): an
+	// `ingested` ledger row is HEAD-verified here, so a deleted / restored-away
+	// object self-heals (it falls into needsFill and is re-fetched) instead of
+	// the ledger forever reporting skipped_exists for an absent object.
+	out.PerImage = make([]ImageOutcome, n)
+	var plan []int
+	priors := make(map[int]*FileRow, n)
 	for i := 1; i <= n; i++ {
-		oc := in.fillSlot(ctx, slug, i, eligible, &poolIdx, gated, &gatedIdx, &sawDownloadFail)
-		out.PerImage = append(out.PerImage, oc)
+		oc, needsFill, prior := in.planSlot(ctx, slug, i)
+		out.PerImage[i-1] = oc
+		if needsFill {
+			plan = append(plan, i)
+			priors[i] = prior
+		}
+	}
+
+	// Pass 2 — only when something needs filling do we hit the sources (SPEC
+	// §2.4 cascade + §2.5 ranking). A fully-filled gallery re-triggered on every
+	// detail-page mount thus makes zero outbound source calls. Eligible
+	// candidates are consumed sequentially → distinct photo per slot
+	// (within-gallery dedup, §2.5 #4). sawDownloadFail tracks whether the pool
+	// was depleted by transient download failures (vs genuinely no acceptable
+	// image) so later empty slots stay retryable (§3 / §9 #13).
+	if len(plan) > 0 {
+		eligible, gated := in.gatherCandidates(ctx, req.ScientificName, len(plan))
+		poolIdx, gatedIdx := 0, 0
+		sawDownloadFail := false
+		for _, i := range plan {
+			out.PerImage[i-1] = in.fillSlot(ctx, slug, i, priors[i], eligible, &poolIdx, gated, &gatedIdx, &sawDownloadFail)
+		}
 	}
 
 	// Recompute the species aggregate AFTER all file rows are written (SPEC §2.1
@@ -222,42 +240,54 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 	return out, nil
 }
 
-// fillSlot resolves one (slug, image_index). It honors the prior ledger row +
-// R2 HEAD for idempotency, then consumes eligible candidates with download
-// fall-through before declaring source_error (SPEC §2.1 / §2.5 #5). poolIdx /
-// gatedIdx advance past candidates consumed across slots.
-func (in *Ingestor) fillSlot(ctx context.Context, slug string, i int, eligible []scoredCandidate, poolIdx *int, gated []scoredCandidate, gatedIdx *int, sawDownloadFail *bool) ImageOutcome {
+// planSlot decides a (slug, image_index) using ONLY the ledger + an R2 HEAD (no
+// source calls). It returns (outcome, needsFill, prior): when needsFill is
+// false the outcome is terminal for this trigger (ledger skip / skipped_exists /
+// head error, all already recorded); when true the caller must fetch a
+// candidate (prior carried through for attempt accounting). R2 is the source of
+// truth (SPEC §9 #8) — an `ingested` row is HEAD-verified, so a lost object
+// re-fills rather than reporting a phantom skipped_exists.
+func (in *Ingestor) planSlot(ctx context.Context, slug string, i int) (ImageOutcome, bool, *FileRow) {
 	oc := ImageOutcome{Index: i}
 
-	// Prior ledger row: skip terminal / fresh-negative / gated-while-off slots.
 	prior, lerr := in.ledger.LookupFile(ctx, slug, i)
 	if lerr != nil {
 		log.Printf("imageingest lookup file err: slug=%s i=%d err=%v", slug, i, lerr)
-		// Treat as fresh; a transient lookup error shouldn't permanently block.
-		prior = nil
+		prior = nil // transient lookup error shouldn't permanently block; treat as fresh
 	}
-	if prior != nil && in.shouldSkip(prior) {
+	// Statuses representing NO R2 object short-circuit without a HEAD (it would
+	// always miss): a stable no_acceptable_image negative cache, or a gated
+	// deferred_attribution row while the flag is OFF.
+	if prior != nil && in.skipsWithoutHead(prior) {
 		oc.Status = statusToOutcome(prior.Status)
-		oc.R2Key = prior.R2Key
 		oc.Note = "ledger skip"
-		return oc
+		return oc, false, nil
 	}
 
-	// R2 is the source of truth (SPEC §9 #8). HEAD before any source work.
 	key := galleryKey(slug, i)
 	exists, err := in.store.Exists(ctx, key)
 	if err != nil {
 		oc.Status = ImgSourceError
 		oc.Note = "head check failed"
 		in.recordFailed(ctx, slug, i, oc, prior)
-		return oc
+		return oc, false, nil
 	}
 	if exists {
 		oc.Status = ImgSkippedExists
 		oc.R2Key = key
 		in.recordSkippedExists(ctx, slug, i, key, prior)
-		return oc
+		return oc, false, nil
 	}
+	return oc, true, prior
+}
+
+// fillSlot fetches a candidate for a slot that planSlot marked needsFill (the
+// ledger lookup + R2 HEAD already happened). It consumes eligible candidates
+// with download fall-through before declaring source_error (SPEC §2.1 / §2.5
+// #5). poolIdx / gatedIdx advance past candidates consumed across slots.
+func (in *Ingestor) fillSlot(ctx context.Context, slug string, i int, prior *FileRow, eligible []scoredCandidate, poolIdx *int, gated []scoredCandidate, gatedIdx *int, sawDownloadFail *bool) ImageOutcome {
+	oc := ImageOutcome{Index: i}
+	key := galleryKey(slug, i)
 
 	// Try eligible candidates in rank order; first download+upload that succeeds
 	// wins. Advance poolIdx so the next slot gets a distinct candidate.
@@ -411,21 +441,21 @@ func (in *Ingestor) release(slug string) {
 	in.flightMu.Unlock()
 }
 
-// shouldSkip reports whether a prior file row means "don't re-attempt this
-// trigger" (SPEC §3). ingested / no_acceptable_image are terminal-this-pass;
-// deferred_attribution is re-cascaded once the gate is ON (SPEC §9 #13); failed
-// always retries (transient/infra error must self-heal — never a permanent
-// negative cache, so an outage cannot park a healthy slot forever).
-func (in *Ingestor) shouldSkip(prior *FileRow) bool {
+// skipsWithoutHead reports whether a prior file row can be skipped WITHOUT a
+// HEAD because it represents no R2 object (HEAD would always miss): a stable
+// no_acceptable_image negative cache, or a deferred_attribution row while the
+// attribution gate is OFF (re-cascaded once it flips ON — SPEC §9 #13).
+//
+// `ingested` is deliberately EXCLUDED — it must be HEAD-verified (R2 = truth,
+// SPEC §9 #8), so it never short-circuits here and self-heals object loss.
+// `failed` is excluded — it always retries (transient/infra error must
+// self-heal; never a permanent negative cache that an outage could park, §3).
+func (in *Ingestor) skipsWithoutHead(prior *FileRow) bool {
 	switch prior.Status {
-	case StatusIngested:
-		return true
 	case StatusNoAcceptableImg:
 		return true
 	case StatusDeferredAttrib:
 		return !in.cfg.AllowAttributionLicenses
-	case StatusFailed:
-		return false
 	default:
 		return false
 	}

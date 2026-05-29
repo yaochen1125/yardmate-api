@@ -403,7 +403,9 @@ func TestIngestSpecies_PriorIngestedPreservesAttribution(t *testing.T) {
 	src := &mockSource{searchRet: []sources.Candidate{
 		cand(sources.SourceINaturalist, "a", "https://dl/a", "image/jpeg", "cc0", 100, 100),
 	}}
-	in := newIngestor(src, newMockStore(), ledger, Config{})
+	store := newMockStore()
+	store.existsRet[galleryKey("rosa-regina", 1)] = true // object present → HEAD hits → skip + preserve
+	in := newIngestor(src, store, ledger, Config{})
 	out, _ := in.IngestSpecies(context.Background(), IngestRequest{ScientificName: "Rosa regina", ImageCount: 1})
 	if out.PerImage[0].Status != ImgSkippedExists {
 		t.Fatalf("Status = %q, want skipped_exists", out.PerImage[0].Status)
@@ -439,24 +441,49 @@ func TestIngestSpecies_EmptySlugNoOp(t *testing.T) {
 	}
 }
 
-func TestShouldSkip(t *testing.T) {
+func TestSkipsWithoutHead(t *testing.T) {
 	off := newIngestor(&mockSource{}, newMockStore(), newMockLedger(), Config{AllowAttributionLicenses: false})
 	on := newIngestor(&mockSource{}, newMockStore(), newMockLedger(), Config{AllowAttributionLicenses: true})
 
-	if !off.shouldSkip(&FileRow{Status: StatusIngested}) {
-		t.Error("ingested should skip")
+	if off.skipsWithoutHead(&FileRow{Status: StatusIngested}) {
+		t.Error("ingested must NOT skip without a HEAD (R2 = truth, §9 #8)")
 	}
-	if !off.shouldSkip(&FileRow{Status: StatusNoAcceptableImg}) {
-		t.Error("no_acceptable_image should skip")
+	if !off.skipsWithoutHead(&FileRow{Status: StatusNoAcceptableImg}) {
+		t.Error("no_acceptable_image (no R2 object) should skip without HEAD")
 	}
-	if off.shouldSkip(&FileRow{Status: StatusFailed, Attempts: 99}) {
+	if off.skipsWithoutHead(&FileRow{Status: StatusFailed, Attempts: 99}) {
 		t.Error("failed must always retry (no permanent negative cache)")
 	}
-	if !off.shouldSkip(&FileRow{Status: StatusDeferredAttrib}) {
+	if !off.skipsWithoutHead(&FileRow{Status: StatusDeferredAttrib}) {
 		t.Error("deferred should skip while gate OFF")
 	}
-	if on.shouldSkip(&FileRow{Status: StatusDeferredAttrib}) {
+	if on.skipsWithoutHead(&FileRow{Status: StatusDeferredAttrib}) {
 		t.Error("deferred should re-process while gate ON")
+	}
+}
+
+// TestIngestSpecies_IngestedButMissingObjectRefills locks the Codex review fix:
+// an `ingested` ledger row whose R2 object is gone (deleted / restored away)
+// must NOT report skipped_exists — R2 is truth (§9 #8), so the slot re-fills.
+func TestIngestSpecies_IngestedButMissingObjectRefills(t *testing.T) {
+	ledger := newMockLedger()
+	ledger.species["rosa-regina"] = &SpeciesRow{Slug: "rosa-regina"}
+	ledger.files[fileKey("rosa-regina", 1)] = &FileRow{
+		Slug: "rosa-regina", ImageIndex: 1, Status: StatusIngested,
+		R2Key: galleryKey("rosa-regina", 1), LicenseCode: "cc-by-sa-4.0",
+	}
+	// store.existsRet is empty → HEAD misses (object gone).
+	src := &mockSource{searchRet: []sources.Candidate{
+		cand(sources.SourceINaturalist, "a", "https://dl/a", "image/jpeg", "cc0", 4000, 3000),
+	}}
+	store := newMockStore()
+	in := newIngestor(src, store, ledger, Config{})
+	out, _ := in.IngestSpecies(context.Background(), IngestRequest{ScientificName: "Rosa regina", ImageCount: 1})
+	if out.PerImage[0].Status != ImgIngested {
+		t.Fatalf("Status = %q, want ingested (re-fill on missing object)", out.PerImage[0].Status)
+	}
+	if _, ok := store.puts[galleryKey("rosa-regina", 1)]; !ok {
+		t.Errorf("expected re-fill PUT for the missing object")
 	}
 }
 

@@ -91,24 +91,28 @@ Two entry points wrapping the same `Ingestor` core:
 2. acquireSingleFlight(slug)                            -- §4.2 dedup; returns "coalesced" if another goroutine owns it
 3. upsert plant_image_species(slug, scientific_name, last_triggered_at=NOW)
 4. N := clamp(req.ImageCount, 1, 6)  [default 4]
-   alreadyUsedURLs := {}
+   -- PASS 1: decide which slots need filling using only the ledger + an R2 HEAD
+   -- (NO source calls). A fully-filled gallery makes zero outbound calls here.
+   plan := []
    for i := 1..N:
      existing := lookup plant_image_files(slug, i)
-     if existing && shouldSkip(existing) → record skip; continue       -- ingested / fresh negative / deferred
-     if HeadObject(plant_images/{slug}/{i}.png) → record skipped_exists; backfill ledger; continue
-     cands := cascadeSearch(req.ScientificName, alreadyUsedURLs)        -- §2.4 (iNat → Wikimedia; excludes already-used for within-gallery dedup)
-     eligibleBeforeGate := classify(cands)
-     eligible := gateFilter(eligibleBeforeGate)                        -- §2.4.3 BY/SA gated
-     if eligible empty:
-        record (eligibleBeforeGate has gated BY/SA ? deferred_attribution(store pending_url=best.RenditionURL) : no_acceptable_image); continue
-     candidate := selectBest(eligible)                                 -- §2.5
-     bytes, mime := download(candidate.RenditionURL)                   -- §2.6 (UA + size cap §4.1)
-     if download fails → record source_error; continue
-     PutObject(plant_images/{slug}/{i}.png, bytes, mime)
-     if upload fails → record upload_error; continue
-     upsert plant_image_files(slug, i, status=ingested, source, license, author, source_url, ...)
-     alreadyUsedURLs.add(candidate.CanonicalSourceURL)
-     sleep(minInterval)                                                -- §4.1 source etiquette
+     if existing has NO R2 object (no_acceptable_image | deferred-while-gate-off)
+        → record skip; continue                                       -- HEAD would always miss; skip it
+     if HeadObject(plant_images/{slug}/{i}.png) → record skipped_exists (PRESERVE prior attribution); continue
+        -- R2 = truth (§9 #8): an `ingested` ledger row is HEAD-verified here, so a
+        -- deleted / restored-away object falls into `plan` and re-fills (self-heal),
+        -- never reports a phantom skipped_exists for an absent object.
+     plan.add(i)                                                      -- object absent → needs fill
+   -- PASS 2: only when plan is non-empty do we touch the sources.
+   if plan not empty:
+     eligible, gated := gatherCascade(req.ScientificName, len(plan))   -- §2.4 (iNat → Wikimedia; dedup on DedupKey; over-provision to len(plan)*2)
+     for i in plan:
+       candidate := nextEligible(eligible)                            -- §2.5; download fall-through consumes failures
+       if download+upload succeeds → upsert plant_image_files(status=ingested, source, license, author, source_url, ...); continue
+       if eligible pool was depleted by download failures → record source_error (retryable, NOT terminal §9 #13)
+       else if gated BY/SA available → record deferred_attribution(store pending_url=best.RenditionURL)
+       else → record no_acceptable_image
+       sleep(minInterval) between source calls                        -- §4.1 source etiquette
 5. recompute plant_image_species.image_count_filled                   -- COUNT(status=ingested)
 6. regenerate plant_images/credits.json (§2.7)                        -- full rebuild
 7. releaseSingleFlight(slug)
