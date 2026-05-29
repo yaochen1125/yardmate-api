@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -20,30 +21,42 @@ type CreditsManifest struct {
 	Entries     []CreditsEntry `json:"entries"`
 }
 
-// CreditsEntry is one credited image (SPEC §2.7).
+// CreditsEntry is one credited image (SPEC §2.7) — one per (slug, image_index)
+// so a multi-image gallery carries row-distinct attribution.
 type CreditsEntry struct {
 	Slug           string `json:"slug"`
+	ImageIndex     int    `json:"image_index"`
 	ScientificName string `json:"scientific_name"`
+	Source         string `json:"source"`
 	LicenseShort   string `json:"license_short"`
 	LicenseURL     string `json:"license_url"`
 	Author         string `json:"author"`
 	SourceURL      string `json:"source_url"`
 }
 
-// BuildCreditsManifest assembles the manifest from ingested ledger rows. FULL
+// BuildCreditsManifest assembles the manifest from ingested file rows. FULL
 // rebuild from current status='ingested' rows (SPEC §2.7 / §9 #15 — never a
-// diff-append) so deleted / re-ingested slugs drop or refresh cleanly. now is
+// diff-append) so deleted / re-ingested slots drop or refresh cleanly. now is
 // injectable for deterministic tests.
-func BuildCreditsManifest(rows []LedgerRow, now time.Time) CreditsManifest {
+func BuildCreditsManifest(rows []FileRow, now time.Time) CreditsManifest {
 	entries := make([]CreditsEntry, 0, len(rows))
 	for _, r := range rows {
+		// Skip rows with no license info (e.g. a minimal "skipped_exists" marker
+		// for an orphan R2 object with no ledger attribution): a credits entry
+		// with blank license/author is meaningless noise, and publishing it would
+		// look like an attribution-less credit for a possibly BY/SA image.
+		if strings.TrimSpace(r.LicenseShort) == "" {
+			continue
+		}
 		entries = append(entries, CreditsEntry{
 			Slug:           r.Slug,
+			ImageIndex:     r.ImageIndex,
 			ScientificName: r.ScientificName,
+			Source:         r.Source,
 			LicenseShort:   r.LicenseShort,
 			LicenseURL:     r.LicenseURL,
 			Author:         r.AttributionAuthor,
-			SourceURL:      r.SourceFilePage,
+			SourceURL:      r.SourceURL,
 		})
 	}
 	return CreditsManifest{
@@ -53,13 +66,13 @@ func BuildCreditsManifest(rows []LedgerRow, now time.Time) CreditsManifest {
 }
 
 // rebuildCredits regenerates credits.json from the ledger and uploads it to R2
-// (SPEC §2.7). Called at the end of every batch so the public credits stay in
+// (SPEC §2.7). Called at the end of every ingest so the public credits stay in
 // sync with what is live in R2. A failure is returned (caller logs, does not
-// abort the batch).
+// abort the ingest).
 func (in *Ingestor) rebuildCredits(ctx context.Context) error {
-	rows, err := in.ledger.IngestedRows(ctx)
+	rows, err := in.ledger.IngestedFiles(ctx)
 	if err != nil {
-		return fmt.Errorf("imageingest/credits: load ingested rows: %w", err)
+		return fmt.Errorf("imageingest/credits: load ingested files: %w", err)
 	}
 	manifest := BuildCreditsManifest(rows, time.Now())
 	body, err := json.MarshalIndent(manifest, "", "  ")

@@ -15,7 +15,7 @@
 - **Multi-source candidate cascade (§2.4):** query sources in order — iNaturalist (CC0/CC-BY taxa default photo + observations) → Wikimedia Commons (license-filtered). Each candidate classified into CC0/PD/CC-BY/CC-BY-SA (reject NC/ND/ARR — §2.4); BY/SA gated behind `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES` until the iOS Credits page lives (§7 D-attribution-gate). V2 implements iNat + Wikimedia; GBIF / USDA = §8.
 - **Multi-image gallery upload:** pick top-N candidates (license tier → source tier → photo-likeness — §2.5), download each at a source-generated downscale (~1024–1600px, §7 D-format), upload to R2 keys `plant_images/{slug}/{1..N}.png` with the real Content-Type (§2.6). Within-gallery dedup prevents the same photo populating multiple slots.
 - **Idempotency + per-image ledger (§6.1):** before each candidate download, HEAD-check the target R2 key (R2 = truth) + consult the `plant_image_files` ledger row keyed `(slug, image_index)`. Skip already-uploaded slots; partial-fail (e.g. slots 1/2 succeed, 3/4 fail) is normal — fail-soft, retry failed slots on next trigger.
-- **Internal admin endpoint (ops only, retained from v1):** `POST /internal/imageingest/run?slug=&name=&image_count=` for single-slug re-ingest, or `?slugs=foo,bar` for batch reseed during incidents (e.g. R2 bucket restore). Same admin-token gate as v1; internal-only (mounted outside `/v1`, behind nginx). NOT used by iOS, NOT a public route. Background ticker removed in v2.
+- **Internal admin endpoint (ops only, retained from v1):** `POST /internal/imageingest/run?slug=&name=&image_count=` for single-slug re-ingest, or `?names=Name+one,Name+two` for batch reseed during incidents (e.g. R2 bucket restore). Batch is keyed by scientific NAME (the cascade needs a name to search; the slug is derived) — not by slug. Same admin-token gate as v1; internal-only (mounted outside `/v1`, behind nginx). NOT used by iOS, NOT a public route. Background ticker removed in v2.
 - **Attribution capture + `credits.json` export (§2.7):** persist author / license / source-file-page per ingested image in the ledger; regenerate `plant_images/credits.json` on R2 after each ingest. One entry per **(slug, image_index)** so multi-image gallery attribution is row-distinct. This CDN file is the data source the iOS Settings → Credits page reads (CC §3a2 collected attribution).
 - **License-compliance gate (Codex #22, retained verbatim from v1):** CC-BY / CC-BY-SA upload requires `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES=true`. Default OFF until the iOS Credits page is live. While OFF, only CC0 / PD pass; a (slug, image_index) whose only acceptable candidates are BY / SA records `deferred_attribution` (§3, §9 #13).
 
@@ -37,7 +37,7 @@
 | Layer | Input |
 |---|---|
 | Public HTTP `POST /v1/plants/imageingest` | App Attest envelope (header `X-App-Attest-*`, see `proxy/SPEC.md` §4 — same as `/v1/identify`). JSON body: `{"scientific_name": "Monstera adansonii", "image_count": 4?}`. `image_count` optional (default 4, clamp 1–6). Returns 202 immediately (fire-and-forget). |
-| Internal HTTP `POST /internal/imageingest/run` | header `X-Ingest-Admin-Token: <token>` (matched against secret `IMAGEINGEST_ADMIN_TOKEN`, constant-time). Query: `?slug=<slug>&name=<scientificName>&image_count=<N>` (single, synchronous) or `?slugs=foo,bar,baz` (batch reseed, ops only). NOT a public route — internal-only, behind nginx. |
+| Internal HTTP `POST /internal/imageingest/run` | header `X-Ingest-Admin-Token: <token>` (matched against secret `IMAGEINGEST_ADMIN_TOKEN`, constant-time). Query: `?slug=<slug>&name=<scientificName>&image_count=<N>` (single, synchronous) or `?names=<sciName1,sciName2>&image_count=<N>` (batch reseed by scientific name, ops only). NOT a public route — internal-only, behind nginx. |
 | `Ingestor.IngestSpecies(ctx, req)` | `req = {Slug, ScientificName, ImageCount int}`. Returns `IngestOutcome{Slug, PerImage []ImageOutcome}`. |
 | Server config (`secrets.Vault`) | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` (`yardmate-static`), optional `R2_ENDPOINT` (default `https://<account>.r2.cloudflarestorage.com`), `IMAGEINGEST_ADMIN_TOKEN`, `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES`, optional `IMAGEINGEST_USER_AGENT`, optional `INATURALIST_USER_AGENT`, optional `IMAGEINGEST_PUBLIC_RATE` (default 100). Supabase DSN `SUPABASE_DB_URL` (shared with enrichment; **only for this package's own ledger tables now, not `plants_pending`**). |
 
@@ -82,7 +82,7 @@ Two entry points wrapping the same `Ingestor` core:
    - Backend walks the §2.4 cascade (iNat → Wikimedia) to pick top-N candidates for the N slots.
    - Returns 202 `{accepted: true, slug, image_count_requested}` synchronously. Actual work continues in a background goroutine bounded by single-flight per slug (§4.2). Concurrent duplicate requests for the same slug coalesce.
 
-2. **Internal `POST /internal/imageingest/run`** (admin-token gated, internal-only, ops). For single-slug re-ingest / batch reseed during incidents (e.g. R2 bucket restore). `?slug=&name=&image_count=` for single; `?slugs=foo,bar` for batch. Synchronous response with full `IngestOutcome`. Mounted outside `/v1` (excluded from public nginx vhost).
+2. **Internal `POST /internal/imageingest/run`** (admin-token gated, internal-only, ops). For single-slug re-ingest / batch reseed during incidents (e.g. R2 bucket restore). `?slug=&name=&image_count=` for single (returns one `IngestOutcome`); `?names=sciName1,sciName2&image_count=` for batch (returns `[]IngestOutcome`; keyed by scientific name since the cascade searches by name). Synchronous. Mounted outside `/v1` (excluded from public nginx vhost).
 
 `IngestSpecies(ctx, req)` flow:
 ```
@@ -91,24 +91,28 @@ Two entry points wrapping the same `Ingestor` core:
 2. acquireSingleFlight(slug)                            -- §4.2 dedup; returns "coalesced" if another goroutine owns it
 3. upsert plant_image_species(slug, scientific_name, last_triggered_at=NOW)
 4. N := clamp(req.ImageCount, 1, 6)  [default 4]
-   alreadyUsedURLs := {}
+   -- PASS 1: decide which slots need filling using only the ledger + an R2 HEAD
+   -- (NO source calls). A fully-filled gallery makes zero outbound calls here.
+   plan := []
    for i := 1..N:
      existing := lookup plant_image_files(slug, i)
-     if existing && shouldSkip(existing) → record skip; continue       -- ingested / fresh negative / deferred
-     if HeadObject(plant_images/{slug}/{i}.png) → record skipped_exists; backfill ledger; continue
-     cands := cascadeSearch(req.ScientificName, alreadyUsedURLs)        -- §2.4 (iNat → Wikimedia; excludes already-used for within-gallery dedup)
-     eligibleBeforeGate := classify(cands)
-     eligible := gateFilter(eligibleBeforeGate)                        -- §2.4.3 BY/SA gated
-     if eligible empty:
-        record (eligibleBeforeGate has gated BY/SA ? deferred_attribution(store pending_url=best.RenditionURL) : no_acceptable_image); continue
-     candidate := selectBest(eligible)                                 -- §2.5
-     bytes, mime := download(candidate.RenditionURL)                   -- §2.6 (UA + size cap §4.1)
-     if download fails → record source_error; continue
-     PutObject(plant_images/{slug}/{i}.png, bytes, mime)
-     if upload fails → record upload_error; continue
-     upsert plant_image_files(slug, i, status=ingested, source, license, author, source_url, ...)
-     alreadyUsedURLs.add(candidate.CanonicalSourceURL)
-     sleep(minInterval)                                                -- §4.1 source etiquette
+     if existing has NO R2 object (no_acceptable_image | deferred-while-gate-off)
+        → record skip; continue                                       -- HEAD would always miss; skip it
+     if HeadObject(plant_images/{slug}/{i}.png) → record skipped_exists (PRESERVE prior attribution); continue
+        -- R2 = truth (§9 #8): an `ingested` ledger row is HEAD-verified here, so a
+        -- deleted / restored-away object falls into `plan` and re-fills (self-heal),
+        -- never reports a phantom skipped_exists for an absent object.
+     plan.add(i)                                                      -- object absent → needs fill
+   -- PASS 2: only when plan is non-empty do we touch the sources.
+   if plan not empty:
+     eligible, gated := gatherCascade(req.ScientificName, len(plan))   -- §2.4 (iNat → Wikimedia; dedup on DedupKey; over-provision to len(plan)*2)
+     for i in plan:
+       candidate := nextEligible(eligible)                            -- §2.5; download fall-through consumes failures
+       if download+upload succeeds → upsert plant_image_files(status=ingested, source, license, author, source_url, ...); continue
+       if eligible pool was depleted by download failures → record source_error (retryable, NOT terminal §9 #13)
+       else if gated BY/SA available → record deferred_attribution(store pending_url=best.RenditionURL)
+       else → record no_acceptable_image
+       sleep(minInterval) between source calls                        -- §4.1 source etiquette
 5. recompute plant_image_species.image_count_filled                   -- COUNT(status=ingested)
 6. regenerate plant_images/credits.json (§2.7)                        -- full rebuild
 7. releaseSingleFlight(slug)
@@ -312,11 +316,11 @@ Species-level aggregate in `plant_image_species`:
 
 | Code | HTTP | Meaning |
 |---|---|---|
-| `missing_attest` / `bad_attest` | 401 | `/v1/plants/imageingest` App Attest envelope absent / invalid (same as `/v1/identify`) |
+| `missing_device_id` / `missing_app_version` | 400 | `/v1/plants/imageingest` required headers absent. **App Attest is log-only in V1** — same as `/v1/identify`, the attest envelope is read + logged but NOT verified (iOS 26 issue, §5 / option_d_progress); there is no `missing_attest` / `bad_attest` 401 in V1. |
 | `missing_admin_token` / `bad_admin_token` | 401 | `/internal/imageingest/run` admin token absent / mismatched |
 | `ingest_disabled` | 503 | R2 / DB not configured (service nil) |
-| `bad_request` | 400 | empty / slug-empty `scientific_name`; `image_count` out of range; malformed JSON |
-| `rate_limited` | 429 | per-attest-device cap exceeded (§4.2) |
+| `bad_request` | 400 | empty / slug-empty `scientific_name`; `image_count` out of range; malformed JSON; internal run with neither `slug`+`name` nor `names` |
+| `rate_limited` | 429 | per-IP / per-device cap exceeded (§4.2; surfaced by the rate-limit middleware) |
 | `internal` | 500 | unmapped |
 
 Source 429 / `maxlag` from iNat / Wikimedia are handled internally (back off + honor `Retry-After`, §4.1), never surfaced to the client.
@@ -365,7 +369,7 @@ V2 splits v1's single `plant_image_ingest` table into:
 1. **`plant_image_species`** — one row per slug (species-level state for gallery aggregation + trigger dedup);
 2. **`plant_image_files`** — one row per `(slug, image_index)` (per-image idempotency + attribution).
 
-DDL in `proxy/imageingest/migrations/002_plant_image_v2.sql` (v1 migration `001_plant_image_ingest.sql` is rolled back inside 002: `DROP TABLE plant_image_ingest`. Single manual v1 row carries no production data; loss is benign.)
+DDL is split across two migrations for build-green expand/contract delivery: `002_plant_image_v2.sql` (Slice 1) **CREATEs** the two tables alongside the still-read v1 `plant_image_ingest`; `003_drop_plant_image_ingest.sql` (Slice 3) **drops** v1 once every caller moved to the two-table API. The single manual v1 row carries no production data; loss is benign.
 
 ```sql
 CREATE TABLE plant_image_species (
@@ -418,7 +422,7 @@ CREATE INDEX idx_plant_image_files_source ON plant_image_files (source);
 
 V1's `SELECT scientific_name FROM plants_pending` is **removed**. V2 is purely on-demand. The `plants_pending` table is still owned by enrichment; imageingest no longer reads it — the coupling is broken.
 
-If ops ever need to bulk-fill (e.g. R2 bucket restore), they use the internal endpoint with `?slugs=foo,bar,baz` (manually-curated list) — not the enrichment table.
+If ops ever need to bulk-fill (e.g. R2 bucket restore), they use the internal endpoint with `?names=SciName1,SciName2` (manually-curated scientific-name list) — not the enrichment table.
 
 ---
 
@@ -432,7 +436,7 @@ If ops ever need to bulk-fill (e.g. R2 bucket restore), they use the internal en
 - **D-multi-image-naming: positional `{i}.png`, not semantic `whole/closeup/...`.** Out-of-catalog sources don't carry photo-intent metadata. Inferring "whole vs closeup" from EXIF / heuristics is unreliable. Positional is honest; iOS handles in-catalog (semantic) + out-of-catalog (positional) via separate `PlantImageURL` builders.
 - **D-source-cascade: iNat primary → Wikimedia fallback.** iNat photos are real wild specimens with structured license metadata (faster than Wikimedia `extmetadata` HTML parsing) and match what Search shows users (visual continuity — Search list iNat photo → detail hero from the same source family). Wikimedia kept as fallback because Commons catalogs many species iNat lacks. GBIF / USDA = §8 (USDA has no public API; GBIF mediaSpecies has lower per-species coverage).
 - **D-public-rate: 100 req/min per attested device** (same default as `/v1/identify`), env `IMAGEINGEST_PUBLIC_RATE`. Single-flight per slug coalesces duplicates. Per-trigger outbound work is small (~3–5 source calls regardless of image_count) so cap is anti-abuse not anti-runaway.
-- **D-ledger-two-table: `plant_image_species` + `plant_image_files`.** V1's single-table schema can't represent multi-image gallery state (one species → N image rows). Two-table separates species-level aggregate (count filled, last trigger) from per-image facts. The v1 `plant_image_ingest` table is **dropped** in migration 002; the single manual v1 row carries no production data.
+- **D-ledger-two-table: `plant_image_species` + `plant_image_files`.** V1's single-table schema can't represent multi-image gallery state (one species → N image rows). Two-table separates species-level aggregate (count filled, last trigger) from per-image facts. The v1 `plant_image_ingest` table is **dropped** in migration 003 (002 only creates, for expand/contract build-green delivery); the single manual v1 row carries no production data.
 
 **Retained from v1 (Yao 2026-05-27):**
 
@@ -510,8 +514,9 @@ proxy/imageingest/
 ├── handlers.go                      POST /v1/plants/imageingest (attest middleware, {scientific_name, image_count}) + POST /internal/imageingest/run (admin-token, outside /v1)
 ├── handlers_test.go                 attest 401 / admin 401 / disabled 503 / rate 429 / single + batch
 └── migrations/
-    ├── 001_plant_image_ingest.sql   (v1 history, rolled back by 002)
-    └── 002_plant_image_v2.sql       (DROP plant_image_ingest; CREATE plant_image_species + plant_image_files)
+    ├── 001_plant_image_ingest.sql   (v1 history, dropped by 003)
+    ├── 002_plant_image_v2.sql       (CREATE plant_image_species + plant_image_files; expand step)
+    └── 003_drop_plant_image_ingest.sql (DROP plant_image_ingest; contract step)
 ```
 
 `main.go` wiring (mirrors `buildEnrichmentService`):
@@ -551,5 +556,5 @@ Estimated effort: ~2 day impl (sources/inat + ingestor + handlers public + two-t
 
 **v1 cleanup tasks** (separate ops PR after v2 ships):
 - Delete legacy R2 objects `plant_images/monstera-adansonii/hero.png` and `plant_images/monstera-adansonii-blanchetii/hero.png` (orphan; iOS no longer reads `hero.png`).
-- Migration 002 drops `plant_image_ingest` table (no prod data lost).
+- Migration 003 drops `plant_image_ingest` table (no prod data lost; 002 only created the v2 tables).
 - Delete `IMAGEINGEST_TICK_INTERVAL` / `IMAGEINGEST_BATCH_LIMIT` lines from `secrets.env.example` (they're no longer read).

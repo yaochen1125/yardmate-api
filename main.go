@@ -15,6 +15,7 @@ import (
 	"github.com/yaochen1125/yardmate-api/proxy"
 	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
 	"github.com/yaochen1125/yardmate-api/proxy/imageingest"
+	"github.com/yaochen1125/yardmate-api/proxy/imageingest/sources"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
@@ -134,28 +135,15 @@ func main() {
 	// WARN log if either is missing or the DB ping fails.
 	enrichSvc := buildEnrichmentService(vault, content, inat)
 
-	// Image-ingest service — fills out-of-catalog plant hero images on R2 from
-	// Wikimedia Commons (proxy/imageingest/SPEC.md). Requires R2 creds +
-	// SUPABASE_DB_URL + IMAGEINGEST_ADMIN_TOKEN; gracefully disabled (nil +
-	// WARN) if any is missing, in which case the /internal route is not
-	// registered and the ticker does not start.
+	// Image-ingest service — fills out-of-catalog plant galleries on R2 via the
+	// on-demand iNat→Wikimedia cascade (proxy/imageingest/SPEC.md). Requires R2
+	// creds + SUPABASE_DB_URL + IMAGEINGEST_ADMIN_TOKEN; gracefully disabled
+	// (nil + WARN) if any is missing, in which case neither the public
+	// POST /v1/plants/imageingest nor the internal route is registered.
 	ingestSvc := buildImageIngestService(vault)
 
 	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, ingestSvc)
 
-	// Optional background ingest ticker (proxy/imageingest/SPEC.md §2.1).
-	// Disabled by default (IMAGEINGEST_TICK_INTERVAL=0/unset → manual-only).
-	// Started only when the service is configured AND the interval > 0; the
-	// single-flight guard in RunBatch prevents overlapping passes.
-	if ingestSvc != nil {
-		if tick := vaultDurationOr(vault, "IMAGEINGEST_TICK_INTERVAL", 0); tick > 0 {
-			stop := ingestSvc.Start(tick)
-			defer stop()
-			log.Printf("imageingest ticker started: interval=%v", tick)
-		} else {
-			log.Printf("imageingest ticker disabled (IMAGEINGEST_TICK_INTERVAL unset/0); manual trigger only")
-		}
-	}
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream). Headroom 5 s.
 	httpSrv := &http.Server{
@@ -206,11 +194,11 @@ func buildEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex, i
 }
 
 // buildImageIngestService wires the proxy/imageingest dependencies: R2 client
-// (S3 SDK), the plant_image_ingest ledger + plants_pending seed reader (both
-// own small pgx pools, MaxConns=2), and the Wikimedia Commons client. Returns
+// (S3 SDK), the two-table plant_image_species/files ledger (own small pgx pool,
+// MaxConns=2), and the iNaturalist + Wikimedia cascade source clients. Returns
 // nil (with a WARN log) if any required secret is missing or a DB ping fails —
-// in that case the /internal route stays unregistered and the ticker never
-// starts (mirrors buildEnrichmentService graceful-disable).
+// in that case neither the public nor the internal route is registered
+// (mirrors buildEnrichmentService graceful-disable).
 //
 // Required secrets: R2_ACCESS_KEY_ID + R2_SECRET_ACCESS_KEY + R2_BUCKET +
 // (R2_ENDPOINT or R2_ACCOUNT_ID), SUPABASE_DB_URL, IMAGEINGEST_ADMIN_TOKEN.
@@ -254,26 +242,24 @@ func buildImageIngestService(vault *secrets.Vault) *imageingest.Service {
 		ledger.Close()
 		return nil
 	}
-	seeds, err := imageingest.NewSeedReader(initCtx, dsn)
-	if err != nil {
-		log.Printf("WARN: image ingest seed reader init failed: %v; disabled", err)
-		ledger.Close()
-		return nil
-	}
 
-	commons := imageingest.NewCommonsClient(imageingest.CommonsOptions{
+	maxBytes := int64(vaultIntOr(vault, "IMAGEINGEST_MAX_BYTES", 0))
+	inat := sources.NewINatClient(sources.INatOptions{
+		UserAgent: vault.Get("INATURALIST_USER_AGENT"), // empty → built-in default UA
+		MaxBytes:  maxBytes,
+	})
+	wikimedia := sources.NewWikimediaClient(sources.WikimediaOptions{
 		UserAgent: vault.Get("IMAGEINGEST_USER_AGENT"), // empty → built-in default UA
-		MaxBytes:  int64(vaultIntOr(vault, "IMAGEINGEST_MAX_BYTES", 0)),
+		MaxBytes:  maxBytes,
 	})
 
 	cfg := imageingest.Config{
 		AllowAttributionLicenses: vault.GetBool("IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES", false),
 		MinInterval:              vaultDurationOr(vault, "IMAGEINGEST_MIN_INTERVAL", time.Second),
-		BatchLimit:               vaultIntOr(vault, "IMAGEINGEST_BATCH_LIMIT", 25),
 	}
-	ingestor := imageingest.NewIngestor(commons, r2Client, ledger, seeds, cfg)
-	log.Printf("image ingest service ready: R2 bucket=%s ledger+seed pools + commons (allowAttribution=%v batchLimit=%d)",
-		r2Cfg.Bucket, cfg.AllowAttributionLicenses, cfg.BatchLimit)
+	ingestor := imageingest.NewIngestor(inat, wikimedia, r2Client, ledger, cfg)
+	log.Printf("image ingest service ready: R2 bucket=%s ledger pool + iNat/Wikimedia cascade (allowAttribution=%v)",
+		r2Cfg.Bucket, cfg.AllowAttributionLicenses)
 	return imageingest.NewService(ingestor, adminToken)
 }
 

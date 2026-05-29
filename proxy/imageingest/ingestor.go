@@ -2,542 +2,620 @@ package imageingest
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yaochen1125/yardmate-api/proxy/imageingest/sources"
 )
 
-// IngestOutcomeStatus is the per-species result of an ingest attempt (SPEC §3).
-// It maps onto the persisted IngestStatus (e.g. skipped_exists → ingested,
-// source_error/upload_error → failed).
-type IngestOutcomeStatus string
+// ImageStatus is the per-(slug, image_index) result of an ingest attempt (SPEC
+// §3). It is richer than the persisted IngestStatus: skipped_exists maps onto
+// StatusIngested, and source_error / upload_error map onto StatusFailed.
+type ImageStatus string
 
 const (
-	OutcomeIngested        IngestOutcomeStatus = "ingested"
-	OutcomeSkippedExists   IngestOutcomeStatus = "skipped_exists"
-	OutcomeNoAcceptableImg IngestOutcomeStatus = "no_acceptable_image"
-	OutcomeDeferredAttrib  IngestOutcomeStatus = "deferred_attribution"
-	OutcomeSourceError     IngestOutcomeStatus = "source_error"
-	OutcomeUploadError     IngestOutcomeStatus = "upload_error"
+	ImgIngested       ImageStatus = "ingested"
+	ImgSkippedExists  ImageStatus = "skipped_exists"
+	ImgNoAcceptable   ImageStatus = "no_acceptable_image"
+	ImgDeferredAttrib ImageStatus = "deferred_attribution"
+	ImgSourceError    ImageStatus = "source_error"
+	ImgUploadError    ImageStatus = "upload_error"
 )
 
-// IngestOutcome is the result of IngestOne (SPEC §1.4). Returned by the
-// single-slug HTTP path verbatim (forensics only — not a client contract).
-type IngestOutcome struct {
-	Status         IngestOutcomeStatus `json:"status"`
-	Slug           string              `json:"slug"`
-	ScientificName string              `json:"scientific_name"`
-	R2Key          string              `json:"r2_key,omitempty"`
-	License        string              `json:"license,omitempty"` // machine code
-	LicenseShort   string              `json:"license_short,omitempty"`
-	Author         string              `json:"author,omitempty"`
-	FilePage       string              `json:"file_page,omitempty"`
-	ThumbURL       string              `json:"thumb_url,omitempty"` // chosen 1600px rendition (stored on deferred rows)
-	MIME           string              `json:"mime,omitempty"`
-	Bytes          int64               `json:"bytes,omitempty"`
-	Width          int                 `json:"width,omitempty"`
-	Height         int                 `json:"height,omitempty"`
-	Note           string              `json:"note,omitempty"`
+// ImageOutcome is the result of one (slug, image_index) attempt (SPEC §1.4 /
+// §3). Returned in IngestOutcome.PerImage (forensics for the internal endpoint;
+// the public endpoint returns only 202 + slug).
+type ImageOutcome struct {
+	Index        int         `json:"index"`
+	Status       ImageStatus `json:"status"`
+	R2Key        string      `json:"r2_key,omitempty"`
+	Source       string      `json:"source,omitempty"`
+	License      string      `json:"license,omitempty"` // machine code
+	LicenseShort string      `json:"license_short,omitempty"`
+	LicenseURL   string      `json:"license_url,omitempty"`
+	Author       string      `json:"author,omitempty"`
+	SourceURL    string      `json:"source_url,omitempty"`
+	MIME         string      `json:"mime,omitempty"`
+	Bytes        int64       `json:"bytes,omitempty"`
+	Width        int         `json:"width,omitempty"`
+	Height       int         `json:"height,omitempty"`
+	Note         string      `json:"note,omitempty"`
 }
 
-// BatchSummary is the result of RunBatch (SPEC §1.4). Counts only — no PII.
-type BatchSummary struct {
-	Seen      int `json:"seen"`      // seeds returned by the seed query
-	Attempted int `json:"attempted"` // species actually processed this pass
-	Ingested  int `json:"ingested"`
-	NoImage   int `json:"no_image"`
-	Deferred  int `json:"deferred"`
-	Skipped   int `json:"skipped"` // skipped_exists (HEAD/ledger agree)
-	Errors    int `json:"errors"`  // source_error + upload_error
+// IngestOutcome is the result of IngestSpecies (SPEC §1.4). A gallery can carry
+// a mix of statuses (e.g. 2× ingested + 1× deferred_attribution + 1×
+// source_error). Coalesced reports a single-flight skip (another goroutine owns
+// the slug, SPEC §4.2) — PerImage is then nil.
+type IngestOutcome struct {
+	Slug      string         `json:"slug"`
+	Coalesced bool           `json:"coalesced,omitempty"`
+	PerImage  []ImageOutcome `json:"per_image,omitempty"`
+}
+
+// IngestRequest is the input to IngestSpecies (SPEC §1.3). ScientificName is the
+// search term; Slug, when empty, is derived from it (the public endpoint leaves
+// it empty; the internal single-slug endpoint may force a specific slug).
+type IngestRequest struct {
+	Slug           string
+	ScientificName string
+	ImageCount     int
 }
 
 // --- Collaborator interfaces (mocked in ingestor_test, SPEC §10) ---
 
-// CommonsSearcher is the Wikimedia surface the ingestor needs. *CommonsClient
-// satisfies it.
-type CommonsSearcher interface {
-	Search(ctx context.Context, scientificName string, limit int) ([]Candidate, error)
+// ImageSource is one cascade source (SPEC §2.4). *sources.INatClient and
+// *sources.WikimediaClient both satisfy it (Download is promoted from the
+// embedded fetcher). Returns RAW candidates; the ingestor classifies them.
+type ImageSource interface {
+	Search(ctx context.Context, scientificName string, limit int) ([]sources.Candidate, error)
 	Download(ctx context.Context, rawURL string) ([]byte, string, error)
 }
 
-// LedgerStore is the ledger surface the ingestor needs. *Ledger satisfies it.
+// LedgerStore is the two-table ledger surface the ingestor needs (SPEC §6.1).
+// *Ledger satisfies it.
 type LedgerStore interface {
-	Lookup(ctx context.Context, slug string) (*LedgerRow, error)
-	Upsert(ctx context.Context, row LedgerRow) error
-	IngestedRows(ctx context.Context) ([]LedgerRow, error)
-}
-
-// SeedSource is the seed surface the ingestor needs. *SeedReader satisfies it.
-type SeedSource interface {
-	Seeds(ctx context.Context) ([]string, error)
+	UpsertSpecies(ctx context.Context, row SpeciesRow) error
+	UpsertFile(ctx context.Context, row FileRow) error
+	LookupFile(ctx context.Context, slug string, imageIndex int) (*FileRow, error)
+	RecomputeCount(ctx context.Context, slug string) (int, error)
+	IngestedFiles(ctx context.Context) ([]FileRow, error)
 }
 
 // Config holds the ingestor's tunable behavior (SPEC §1.3 / §2.4 / §4).
 type Config struct {
 	// AllowAttributionLicenses is the Codex #22 release-coordination gate. When
-	// false (V1 default), CC-BY / CC-BY-SA are NOT uploaded — a species whose
-	// only acceptable candidates are BY/SA → deferred_attribution. CC0 / PD are
-	// always eligible. Flip true ONLY after the iOS Credits page is live.
+	// false (V1 default), CC-BY / CC-BY-SA are NOT uploaded — a slot whose only
+	// acceptable candidates are BY/SA → deferred_attribution. CC0 / PD are always
+	// eligible. Flip true ONLY after the iOS Credits page is live (§9 #14).
 	AllowAttributionLicenses bool
-	// MinInterval paces serial Wikimedia calls within a batch (SPEC §4).
+	// MinInterval paces serial source calls within an ingest (SPEC §4.1).
 	MinInterval time.Duration
-	// SearchLimit caps gsrlimit (default 10).
+	// SearchLimit caps per-source candidate fetch (default 12).
 	SearchLimit int
-	// BatchLimit caps species processed per RunBatch when the HTTP/ticker
-	// caller passes 0 (SPEC §1.3).
-	BatchLimit int
-	// MaxAttempts caps the failed-attempt retry counter before a slug is
-	// treated as negative-cached (SPEC §3, default 5).
-	MaxAttempts int
+	// DefaultImageCount is the gallery size when the request omits image_count
+	// (default 4; requests clamp to [1,6]).
+	DefaultImageCount int
 }
 
 const (
-	defaultBatchLimit  = 25
-	defaultMaxAttempts = 5
-	defaultSearchLimit = 10
-	heroCacheControl   = "public, max-age=31536000, immutable"
+	defaultSearchLimit = 12
+	defaultImageCount  = 4
+	minImageCount      = 1
+	maxImageCount      = 6
+	imageCacheControl  = "public, max-age=31536000, immutable"
 )
 
-// heroKey is the R2 object key for a slug's hero (SPEC §2.2).
-func heroKey(slug string) string { return "plant_images/" + slug + "/hero.png" }
+// galleryKey is the R2 object key for a slug's image_index slot (SPEC §2.2).
+func galleryKey(slug string, index int) string {
+	return fmt.Sprintf("plant_images/%s/%d.png", slug, index)
+}
 
-// Ingestor orchestrates per-species ingest + batch passes (SPEC §2.1). All
+// Ingestor orchestrates on-demand multi-image species ingest (SPEC §2.1). All
 // collaborators are interfaces so the core is fully mockable.
 type Ingestor struct {
-	commons CommonsSearcher
+	cascade []ImageSource // ordered: iNaturalist (primary) → Wikimedia (fallback)
 	store   ObjectStore
 	ledger  LedgerStore
-	seeds   SeedSource
 	cfg     Config
 
-	// single-flight guard so a ticker pass + manual trigger (or two ticks)
-	// never run concurrently (SPEC §9 #11).
-	runMu   sync.Mutex
-	running bool
+	// single-flight per slug: concurrent requests for the same slug coalesce
+	// (SPEC §4.2 / §9 #11 / #16). Process-local mutex map (single-instance OK).
+	flightMu sync.Mutex
+	inflight map[string]bool
 }
 
 // NewIngestor builds an Ingestor. Defaults are applied to zero Config fields.
-func NewIngestor(commons CommonsSearcher, store ObjectStore, ledger LedgerStore, seeds SeedSource, cfg Config) *Ingestor {
+// Cascade order is iNat → Wikimedia; nil sources are skipped (e.g. in tests
+// that exercise a single source).
+func NewIngestor(inat, wikimedia ImageSource, store ObjectStore, ledger LedgerStore, cfg Config) *Ingestor {
 	if cfg.MinInterval < 0 {
 		cfg.MinInterval = 0
 	}
 	if cfg.SearchLimit <= 0 {
 		cfg.SearchLimit = defaultSearchLimit
 	}
-	if cfg.BatchLimit <= 0 {
-		cfg.BatchLimit = defaultBatchLimit
+	if cfg.DefaultImageCount <= 0 {
+		cfg.DefaultImageCount = defaultImageCount
 	}
-	if cfg.MaxAttempts <= 0 {
-		cfg.MaxAttempts = defaultMaxAttempts
+	var cascade []ImageSource
+	if inat != nil {
+		cascade = append(cascade, inat)
 	}
-	return &Ingestor{commons: commons, store: store, ledger: ledger, seeds: seeds, cfg: cfg}
+	if wikimedia != nil {
+		cascade = append(cascade, wikimedia)
+	}
+	return &Ingestor{cascade: cascade, store: store, ledger: ledger, cfg: cfg, inflight: map[string]bool{}}
 }
 
-// IngestOne fills one species' hero (SPEC §2.1 IngestOne flow). slug is the R2
-// key segment (caller-derived, parameterized for future genus reuse);
-// searchTerm is the Wikimedia query (the scientific name). It NEVER returns a
-// hard error for an ordinary per-species failure — those collapse into the
-// Status; an error is returned only for a programmer/precondition fault.
-func (in *Ingestor) IngestOne(ctx context.Context, slug, searchTerm string) (IngestOutcome, error) {
-	out := IngestOutcome{Slug: slug, ScientificName: searchTerm}
-
-	// 1. R2 is the source of truth for "image present" (SPEC §9 #8). HEAD first.
-	exists, err := in.store.Exists(ctx, heroKey(slug))
-	if err != nil {
-		out.Status = OutcomeSourceError
-		out.Note = "head check failed"
-		return out, nil
+// IngestSpecies fills an out-of-catalog plant's gallery (SPEC §2.1 flow). It
+// NEVER returns a hard error for an ordinary per-image failure — those collapse
+// into ImageOutcome.Status; an error is returned only for a precondition fault
+// (empty slug after derivation) or a ledger species-row upsert failure.
+func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (IngestOutcome, error) {
+	slug := req.Slug
+	if slug == "" {
+		slug = Slug(req.ScientificName)
 	}
-	if exists {
-		out.Status = OutcomeSkippedExists
-		out.R2Key = heroKey(slug)
+	out := IngestOutcome{Slug: slug}
+	if slug == "" {
+		// Name has no [a-z0-9] characters → no valid R2 key. Nothing to do (the
+		// public handler 400s before reaching here; defense in depth).
 		return out, nil
 	}
 
-	// 2. Search Wikimedia.
-	cands, err := in.commons.Search(ctx, searchTerm, in.cfg.SearchLimit)
-	if err != nil {
-		out.Status = OutcomeSourceError
-		out.Note = "search failed"
+	// Single-flight: a concurrent ingest for this slug already owns the work.
+	if !in.acquire(slug) {
+		out.Coalesced = true
 		return out, nil
 	}
+	defer in.release(slug)
 
-	// 3. Partition acceptable (license-allowed) candidates into upload-eligible
-	//    (per the attribution gate) vs gated (BY/SA while the flag is OFF).
-	var eligible, gated []Candidate
-	for _, c := range cands {
-		if !c.License.Allowed {
-			continue
-		}
-		if strings.TrimSpace(c.ThumbURL) == "" {
-			// Commons couldn't render a 1600px rendition for this file; we only
-			// ever store the scaled rendition (D2), so it's unusable — skip it
-			// rather than later soft-fail Download("") and risk a spurious
-			// source_error when it was the only candidate.
-			continue
-		}
-		if c.License.AttributionRequired && !in.cfg.AllowAttributionLicenses {
-			gated = append(gated, c)
-			continue
-		}
-		eligible = append(eligible, c)
+	n := req.ImageCount
+	if n <= 0 {
+		n = in.cfg.DefaultImageCount
+	}
+	if n < minImageCount {
+		n = minImageCount
+	}
+	if n > maxImageCount {
+		n = maxImageCount
 	}
 
-	if len(eligible) == 0 {
-		if len(gated) > 0 {
-			// Only acceptable candidates are gated BY/SA → defer. Store the
-			// chosen candidate so flipping the gate uploads WITHOUT re-search
-			// (SPEC §2.4 / §9 #13).
-			pick := selectBest(gated)
-			out.Status = OutcomeDeferredAttrib
-			out.License = pick.License.Code
-			out.LicenseShort = pick.License.ShortName
-			out.Author = pick.License.Author
-			out.FilePage = pick.PageURL
-			out.ThumbURL = pick.ThumbURL
-			out.Note = "attribution gate off"
-			return out, nil
-		}
-		out.Status = OutcomeNoAcceptableImg
-		out.Note = "no acceptable license"
-		return out, nil
+	// Species row FIRST (SPEC §2.1 step 3 / §9 #17: the FK parent must exist
+	// before any plant_image_files insert, and before RecomputeCount).
+	if err := in.ledger.UpsertSpecies(ctx, SpeciesRow{
+		Slug: slug, ScientificName: req.ScientificName, ImageCountRequested: n,
+	}); err != nil {
+		return out, fmt.Errorf("imageingest: upsert species %q: %w", slug, err)
 	}
 
-	// 4. Rank eligible candidates (license tier → photo-likeness/size) and try
-	//    each in order; first that downloads + MIME-checks wins. On download
-	//    failure fall through to the next before declaring source_error.
-	ranked := rankCandidates(eligible)
-	var lastErr error
-	for _, pick := range ranked {
-		data, mime, derr := in.commons.Download(ctx, pick.ThumbURL)
-		if derr != nil {
-			lastErr = derr
-			continue
+	// Pass 1 — decide which slots need filling using ONLY the ledger + an R2
+	// HEAD (no source calls). R2 is the source of truth (SPEC §9 #8): an
+	// `ingested` ledger row is HEAD-verified here, so a deleted / restored-away
+	// object self-heals (it falls into needsFill and is re-fetched) instead of
+	// the ledger forever reporting skipped_exists for an absent object.
+	out.PerImage = make([]ImageOutcome, n)
+	var plan []int
+	priors := make(map[int]*FileRow, n)
+	for i := 1; i <= n; i++ {
+		oc, needsFill, prior := in.planSlot(ctx, slug, i)
+		out.PerImage[i-1] = oc
+		if needsFill {
+			plan = append(plan, i)
+			priors[i] = prior
 		}
-		// 5. Upload verbatim with the real MIME (SPEC §2.6).
-		if uerr := in.store.Put(ctx, heroKey(slug), data, mime, heroCacheControl); uerr != nil {
-			out.Status = OutcomeUploadError
-			out.Note = "put failed"
-			return out, nil
-		}
-		out.Status = OutcomeIngested
-		out.R2Key = heroKey(slug)
-		out.License = pick.License.Code
-		out.LicenseShort = pick.License.ShortName
-		out.Author = pick.License.Author
-		out.FilePage = pick.PageURL
-		out.MIME = mime
-		out.Bytes = int64(len(data))
-		out.Width = pick.Width
-		out.Height = pick.Height
-		return out, nil
 	}
 
-	// All eligible candidates failed to download.
-	out.Status = OutcomeSourceError
-	if lastErr != nil {
-		out.Note = "all downloads failed"
-	} else {
-		out.Note = "no downloadable candidate"
+	// Pass 2 — only when something needs filling do we hit the sources (SPEC
+	// §2.4 cascade + §2.5 ranking). A fully-filled gallery re-triggered on every
+	// detail-page mount thus makes zero outbound source calls. Eligible
+	// candidates are consumed sequentially → distinct photo per slot
+	// (within-gallery dedup, §2.5 #4). sawDownloadFail tracks whether the pool
+	// was depleted by transient download failures (vs genuinely no acceptable
+	// image) so later empty slots stay retryable (§3 / §9 #13).
+	if len(plan) > 0 {
+		eligible, gated := in.gatherCandidates(ctx, req.ScientificName, len(plan))
+		poolIdx, gatedIdx := 0, 0
+		sawDownloadFail := false
+		for _, i := range plan {
+			out.PerImage[i-1] = in.fillSlot(ctx, slug, i, priors[i], eligible, &poolIdx, gated, &gatedIdx, &sawDownloadFail)
+		}
 	}
+
+	// Recompute the species aggregate AFTER all file rows are written (SPEC §2.1
+	// step 5 / §9 #17 — never trust a separately-incremented counter; the species
+	// row already exists from the upsert above, so this never errors on missing).
+	if _, err := in.ledger.RecomputeCount(ctx, slug); err != nil {
+		log.Printf("imageingest recompute count err: slug=%s err=%v", slug, err)
+	}
+
+	// Rebuild the public credits manifest (SPEC §2.7 / §9 #15 — full rebuild).
+	if err := in.rebuildCredits(ctx); err != nil {
+		log.Printf("imageingest credits rebuild err: slug=%s err=%v", slug, err)
+	}
+
 	return out, nil
 }
 
-// RunBatch processes up to `limit` un-done seeds serially (SPEC §2.1 RunBatch
-// flow), then regenerates credits.json. limit<=0 uses cfg.BatchLimit. It is
-// guarded by a single-flight mutex (SPEC §9 #11) so concurrent ticker/manual
-// passes don't overlap; a second concurrent caller returns an empty summary.
-func (in *Ingestor) RunBatch(ctx context.Context, limit int) (BatchSummary, error) {
-	in.runMu.Lock()
-	if in.running {
-		in.runMu.Unlock()
-		log.Printf("imageingest batch skipped: a pass is already running")
-		return BatchSummary{}, nil
-	}
-	in.running = true
-	in.runMu.Unlock()
-	defer func() {
-		in.runMu.Lock()
-		in.running = false
-		in.runMu.Unlock()
-	}()
+// planSlot decides a (slug, image_index) using ONLY the ledger + an R2 HEAD (no
+// source calls). It returns (outcome, needsFill, prior): when needsFill is
+// false the outcome is terminal for this trigger (ledger skip / skipped_exists /
+// head error, all already recorded); when true the caller must fetch a
+// candidate (prior carried through for attempt accounting). R2 is the source of
+// truth (SPEC §9 #8) — an `ingested` row is HEAD-verified, so a lost object
+// re-fills rather than reporting a phantom skipped_exists.
+func (in *Ingestor) planSlot(ctx context.Context, slug string, i int) (ImageOutcome, bool, *FileRow) {
+	oc := ImageOutcome{Index: i}
 
-	if limit <= 0 {
-		limit = in.cfg.BatchLimit
+	prior, lerr := in.ledger.LookupFile(ctx, slug, i)
+	if lerr != nil {
+		log.Printf("imageingest lookup file err: slug=%s i=%d err=%v", slug, i, lerr)
+		prior = nil // transient lookup error shouldn't permanently block; treat as fresh
+	}
+	// Statuses representing NO R2 object short-circuit without a HEAD (it would
+	// always miss): a stable no_acceptable_image negative cache, or a gated
+	// deferred_attribution row while the flag is OFF.
+	if prior != nil && in.skipsWithoutHead(prior) {
+		oc.Status = statusToOutcome(prior.Status)
+		oc.Note = "ledger skip"
+		return oc, false, nil
 	}
 
-	var summary BatchSummary
-	seeds, err := in.seeds.Seeds(ctx)
+	key := galleryKey(slug, i)
+	exists, err := in.store.Exists(ctx, key)
 	if err != nil {
-		return summary, err
+		oc.Status = ImgSourceError
+		oc.Note = "head check failed"
+		in.recordFailed(ctx, slug, i, oc, prior)
+		return oc, false, nil
 	}
-	summary.Seen = len(seeds)
-
-	for _, name := range seeds {
-		if summary.Attempted >= limit {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return summary, ctx.Err()
-		default:
-		}
-
-		slug := Slug(name)
-		if slug == "" {
-			// Name has no ASCII slug characters (e.g. "×" / a non-Latin string),
-			// so there is no valid R2 key (plant_images//hero.png) and it can
-			// never be ingested. Do NOT write a ledger row: its PK would be the
-			// raw name, but every lookup keys on slug=="" and would never find it
-			// (Codex #23) — a dead, never-read upsert each pass. Just skip;
-			// re-evaluating next pass is a cheap Slug() call with no I/O.
-			log.Printf("imageingest skip: name=%q slugs to empty (no ASCII slug chars)", name)
-			continue
-		}
-
-		// Skip already-done / negative-cached slugs (SPEC §3). deferred_attribution
-		// is re-processed when the gate is ON (NOT permanent negative cache,
-		// SPEC §9 #13).
-		prior, lerr := in.ledger.Lookup(ctx, slug)
-		if lerr != nil {
-			log.Printf("imageingest ledger lookup err: slug=%s err=%v", slug, lerr)
-			summary.Errors++
-			continue
-		}
-		if in.shouldSkip(prior) {
-			summary.Skipped++
-			continue
-		}
-
-		out, _ := in.IngestOne(ctx, slug, name)
-		summary.Attempted++
-		in.recordOutcome(ctx, slug, name, out, prior)
-
-		switch out.Status {
-		case OutcomeIngested, OutcomeSkippedExists:
-			summary.Ingested++
-		case OutcomeNoAcceptableImg:
-			summary.NoImage++
-		case OutcomeDeferredAttrib:
-			summary.Deferred++
-		case OutcomeSourceError, OutcomeUploadError:
-			summary.Errors++
-		}
-
-		if in.cfg.MinInterval > 0 {
-			select {
-			case <-ctx.Done():
-				return summary, ctx.Err()
-			case <-time.After(in.cfg.MinInterval):
-			}
-		}
+	if exists {
+		oc.Status = ImgSkippedExists
+		oc.R2Key = key
+		in.recordSkippedExists(ctx, slug, i, key, prior)
+		return oc, false, nil
 	}
-
-	// Regenerate the public credits manifest from the ledger (full rebuild,
-	// SPEC §2.7 / §9 #15). A failure here is logged but does not fail the batch.
-	if err := in.rebuildCredits(ctx); err != nil {
-		log.Printf("imageingest credits rebuild err: %v", err)
-	}
-
-	return summary, nil
+	return oc, true, prior
 }
 
-// shouldSkip decides whether a prior ledger row means "don't re-attempt this
-// pass" (SPEC §3). nil prior → never skip (fresh). The NOIMAGE_TTL re-check is
-// a §8 refinement (SPEC §6.1); V1 treats no_acceptable_image + capped failures
-// as skip-this-pass. deferred_attribution is skipped only while the gate is OFF.
-func (in *Ingestor) shouldSkip(prior *LedgerRow) bool {
-	if prior == nil {
+// fillSlot fetches a candidate for a slot that planSlot marked needsFill (the
+// ledger lookup + R2 HEAD already happened). It consumes eligible candidates
+// with download fall-through before declaring source_error (SPEC §2.1 / §2.5
+// #5). poolIdx / gatedIdx advance past candidates consumed across slots.
+func (in *Ingestor) fillSlot(ctx context.Context, slug string, i int, prior *FileRow, eligible []scoredCandidate, poolIdx *int, gated []scoredCandidate, gatedIdx *int, sawDownloadFail *bool) ImageOutcome {
+	oc := ImageOutcome{Index: i}
+	key := galleryKey(slug, i)
+
+	// Try eligible candidates in rank order; first download+upload that succeeds
+	// wins. Advance poolIdx so the next slot gets a distinct candidate.
+	entryIdx := *poolIdx
+	for *poolIdx < len(eligible) {
+		pick := eligible[*poolIdx]
+		*poolIdx++
+
+		data, mime, derr := pick.dl.Download(ctx, pick.cand.DownloadURL)
+		if derr != nil {
+			// deriveLarge/thumb rendition may 404 — fall through to the next
+			// candidate before giving up (SPEC §2.5 #5; Slice 2 review item).
+			log.Printf("imageingest download fail (fall-through): slug=%s i=%d url=%s err=%v",
+				slug, i, pick.cand.DownloadURL, derr)
+			continue
+		}
+		if uerr := in.store.Put(ctx, key, data, mime, imageCacheControl); uerr != nil {
+			oc.Status = ImgUploadError
+			oc.Note = "put failed"
+			in.recordFailed(ctx, slug, i, oc, prior)
+			return oc
+		}
+		in.pace(ctx)
+		oc = in.ingestedOutcome(i, key, pick, mime, int64(len(data)))
+		in.recordIngested(ctx, slug, oc)
+		return oc
+	}
+
+	// Eligible candidates existed for this slot but every download failed →
+	// source_error (a transient/infra failure that should self-heal on retry,
+	// SPEC §3), distinct from "no acceptable license" below. Mark the gallery so
+	// later slots emptied by the same depletion are also treated as retryable.
+	if *poolIdx > entryIdx {
+		*sawDownloadFail = true
+		oc.Status = ImgSourceError
+		oc.Note = "all downloads failed"
+		in.recordFailed(ctx, slug, i, oc, prior)
+		return oc
+	}
+
+	// No eligible candidate left for this slot. If gated BY/SA candidates exist,
+	// defer (store provenance — re-cascades when the gate flips ON). Otherwise,
+	// if earlier slots depleted the eligible pool via download failures, this is
+	// a transient shortfall → source_error (retryable, NOT a permanent negative
+	// cache that an outage could park forever, §3 / §9 #13). Only a genuinely
+	// empty acceptable pool is no_acceptable_image.
+	if *gatedIdx < len(gated) {
+		pick := gated[*gatedIdx]
+		*gatedIdx++
+		oc.Status = ImgDeferredAttrib
+		oc.Source = pick.cand.Source
+		oc.License = pick.lic.Code
+		oc.LicenseShort = pick.lic.ShortName
+		oc.LicenseURL = licenseURLOf(pick.lic)
+		oc.Author = pick.lic.Author
+		oc.SourceURL = pick.cand.PageURL
+		oc.Note = "attribution gate off"
+		in.recordDeferred(ctx, slug, oc, pick.cand.DownloadURL, prior)
+		return oc
+	}
+
+	if *sawDownloadFail {
+		oc.Status = ImgSourceError
+		oc.Note = "eligible pool depleted by download failures"
+		in.recordFailed(ctx, slug, i, oc, prior)
+		return oc
+	}
+
+	oc.Status = ImgNoAcceptable
+	oc.Note = "no acceptable license"
+	in.recordNoAcceptable(ctx, slug, i, oc, prior)
+	return oc
+}
+
+// gatherCandidates walks the cascade, classifies each raw candidate, dedups on
+// DedupKey, and splits into upload-eligible vs gated (BY/SA while the flag is
+// OFF). Both slices are returned ranked (SPEC §2.5). It stops probing further
+// sources once it has enough eligible candidates for the gallery (SPEC §2.4).
+func (in *Ingestor) gatherCandidates(ctx context.Context, name string, n int) (eligible, gated []scoredCandidate) {
+	seen := map[string]bool{}
+	for idx, src := range in.cascade {
+		if idx > 0 {
+			in.pace(ctx) // §4.1 etiquette between source calls
+		}
+		cands, err := src.Search(ctx, name, in.cfg.SearchLimit)
+		if err != nil {
+			log.Printf("imageingest source search err: name=%q err=%v", name, err)
+			continue // fall through to the next source
+		}
+		for _, c := range cands {
+			if c.DedupKey != "" {
+				if seen[c.DedupKey] {
+					continue
+				}
+				seen[c.DedupKey] = true
+			}
+			if isExcludedFormat(c) {
+				continue
+			}
+			lic := classifyCandidate(c)
+			if !lic.Allowed {
+				continue
+			}
+			sc := scoredCandidate{cand: c, lic: lic, dl: src}
+			if lic.AttributionRequired && !in.cfg.AllowAttributionLicenses {
+				gated = append(gated, sc)
+				continue
+			}
+			eligible = append(eligible, sc)
+		}
+		// Over-provision before stopping (SPEC §2.4 "len(accumulator) >= N*2"):
+		// download fall-through (§2.5 #5) consumes a candidate per failed
+		// rendition, so an exactly-N pool under-fills the gallery on any 404.
+		// The extra headroom also ensures the Wikimedia fallback is still probed
+		// for gated BY/SA candidates when iNat is CC0-rich.
+		if len(eligible) >= n*2 {
+			break
+		}
+	}
+	rankScored(eligible)
+	rankScored(gated)
+	return eligible, gated
+}
+
+// pace sleeps MinInterval between source operations (SPEC §4.1 etiquette).
+func (in *Ingestor) pace(ctx context.Context) {
+	if in.cfg.MinInterval <= 0 {
+		return
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(in.cfg.MinInterval):
+	}
+}
+
+// --- single-flight (SPEC §4.2 / §9 #11 / #16) ---
+
+func (in *Ingestor) acquire(slug string) bool {
+	in.flightMu.Lock()
+	defer in.flightMu.Unlock()
+	if in.inflight[slug] {
 		return false
 	}
+	in.inflight[slug] = true
+	return true
+}
+
+func (in *Ingestor) release(slug string) {
+	in.flightMu.Lock()
+	delete(in.inflight, slug)
+	in.flightMu.Unlock()
+}
+
+// skipsWithoutHead reports whether a prior file row can be skipped WITHOUT a
+// HEAD because it represents no R2 object (HEAD would always miss): a stable
+// no_acceptable_image negative cache, or a deferred_attribution row while the
+// attribution gate is OFF (re-cascaded once it flips ON — SPEC §9 #13).
+//
+// `ingested` is deliberately EXCLUDED — it must be HEAD-verified (R2 = truth,
+// SPEC §9 #8), so it never short-circuits here and self-heals object loss.
+// `failed` is excluded — it always retries (transient/infra error must
+// self-heal; never a permanent negative cache that an outage could park, §3).
+func (in *Ingestor) skipsWithoutHead(prior *FileRow) bool {
 	switch prior.Status {
-	case StatusIngested:
-		return true
 	case StatusNoAcceptableImg:
 		return true
 	case StatusDeferredAttrib:
-		// Re-process when the gate is ON (so it can upload); skip while OFF.
 		return !in.cfg.AllowAttributionLicenses
-	case StatusFailed:
-		// Always retry in V1: `failed` means a transient / infra error (Wikimedia
-		// 5xx, R2 HEAD/PUT blip), which should self-heal — NOT a stable "no free
-		// image" (that's no_acceptable_image, cached above). Permanently
-		// negative-caching transient failures would park a healthy species
-		// forever on an outage (there is no TTL re-check in V1). `attempts` is
-		// retained as an observability counter only (SPEC §3).
-		return false
 	default:
 		return false
 	}
 }
 
-// recordOutcome upserts the ledger row for an outcome (SPEC §3 status mapping).
-func (in *Ingestor) recordOutcome(ctx context.Context, slug, name string, out IngestOutcome, prior *LedgerRow) {
-	row := LedgerRow{
-		Slug:           slug,
-		ScientificName: name,
-		Source:         SourceWikimediaCommons,
+// statusToOutcome maps a persisted IngestStatus back to the ImageStatus reported
+// when a prior row causes a skip (so the outcome reflects the existing state).
+func statusToOutcome(s IngestStatus) ImageStatus {
+	switch s {
+	case StatusIngested:
+		return ImgSkippedExists
+	case StatusNoAcceptableImg:
+		return ImgNoAcceptable
+	case StatusDeferredAttrib:
+		return ImgDeferredAttrib
+	default:
+		return ImgSourceError
 	}
-	priorAttempts := 0
+}
+
+// --- ledger writes (SPEC §3 status mapping) ---
+
+func (in *Ingestor) ingestedOutcome(i int, key string, pick scoredCandidate, mime string, n int64) ImageOutcome {
+	return ImageOutcome{
+		Index:        i,
+		Status:       ImgIngested,
+		R2Key:        key,
+		Source:       pick.cand.Source,
+		License:      pick.lic.Code,
+		LicenseShort: pick.lic.ShortName,
+		LicenseURL:   licenseURLOf(pick.lic),
+		Author:       pick.lic.Author,
+		SourceURL:    pick.cand.PageURL,
+		MIME:         mime,
+		Bytes:        n,
+		Width:        pick.cand.Width,
+		Height:       pick.cand.Height,
+	}
+}
+
+func (in *Ingestor) recordIngested(ctx context.Context, slug string, oc ImageOutcome) {
+	in.upsertFile(ctx, FileRow{
+		Slug:                slug,
+		ImageIndex:          oc.Index,
+		Status:              StatusIngested,
+		R2Key:               oc.R2Key,
+		Source:              oc.Source,
+		SourceURL:           oc.SourceURL,
+		LicenseCode:         oc.License,
+		LicenseShort:        oc.LicenseShort,
+		LicenseURL:          oc.LicenseURL,
+		AttributionAuthor:   oc.Author,
+		AttributionRequired: attributionRequiredFamily(oc.License),
+		MIME:                oc.MIME,
+		Bytes:               oc.Bytes,
+		Width:               oc.Width,
+		Height:              oc.Height,
+	})
+}
+
+// recordSkippedExists handles a HEAD hit (R2 has the key). The skip carries no
+// license/author (we never searched), so a PRIOR attribution row is preserved
+// UNCHANGED — re-writing would wipe a live CC-BY/SA image's required credit. No
+// prior row (object present but ledger missing) → minimal ingested marker.
+func (in *Ingestor) recordSkippedExists(ctx context.Context, slug string, i int, key string, prior *FileRow) {
 	if prior != nil {
-		priorAttempts = prior.Attempts
+		return
 	}
+	in.upsertFile(ctx, FileRow{
+		Slug: slug, ImageIndex: i, Status: StatusIngested, R2Key: key,
+	})
+}
 
-	switch out.Status {
-	case OutcomeSkippedExists:
-		// R2 already has the hero (HEAD hit). The skipped outcome carries NO
-		// license/author (we never searched), so preserve any prior attribution
-		// row UNCHANGED — re-writing would wipe a live image's credit, e.g. on a
-		// re-run of the single-slug smoke path. If there's no prior row (object
-		// in R2 but ledger missing — manual upload / ledger reset), record only a
-		// minimal ingested marker; attribution is unknown and not re-derivable
-		// here (a future reconcile job could backfill it from Commons).
-		if prior != nil {
-			return
-		}
-		row.Status = StatusIngested
-		row.R2Key = heroKey(slug)
-		row.Attempts = priorAttempts
-	case OutcomeIngested:
-		row.Status = StatusIngested
-		row.R2Key = heroKey(slug)
-		row.LicenseCode = out.License
-		row.LicenseShort = out.LicenseShort
-		row.LicenseURL = licenseURLFor(out)
-		row.AttributionAuthor = out.Author
-		// CC-BY / CC-BY-SA require attribution regardless of whether we captured
-		// an author string (extmetadata Artist can be absent); derive from the
-		// license family only, never gate on Author presence.
-		row.AttributionRequired = attributionRequiredFamily(out.License)
-		row.SourceFilePage = out.FilePage
-		row.MIME = out.MIME
-		row.Bytes = out.Bytes
-		row.Width = out.Width
-		row.Height = out.Height
-		row.Attempts = priorAttempts
-	case OutcomeNoAcceptableImg:
-		row.Status = StatusNoAcceptableImg
-		row.LastError = out.Note
-		row.Attempts = priorAttempts
-	case OutcomeDeferredAttrib:
-		row.Status = StatusDeferredAttrib
-		// Store the chosen 1600px rendition URL (NOT the File: page) for a future
-		// flip-fast-path that uploads without re-searching (§8). V1 re-searches on
-		// flip, so this is currently write-only provenance.
-		row.PendingThumbURL = out.ThumbURL
-		row.LicenseCode = out.License
-		row.LicenseShort = out.LicenseShort
-		row.LicenseURL = licenseURLFor(out)
-		row.AttributionAuthor = out.Author
-		row.AttributionRequired = true
-		row.SourceFilePage = out.FilePage
-		row.Attempts = priorAttempts
-	case OutcomeSourceError, OutcomeUploadError:
-		row.Status = StatusFailed
-		row.LastError = out.Note
-		row.Attempts = priorAttempts + 1
-	default:
-		row.Status = StatusFailed
-		row.LastError = "unknown outcome"
-		row.Attempts = priorAttempts + 1
-	}
+func (in *Ingestor) recordNoAcceptable(ctx context.Context, slug string, i int, oc ImageOutcome, prior *FileRow) {
+	in.upsertFile(ctx, FileRow{
+		Slug: slug, ImageIndex: i, Status: StatusNoAcceptableImg,
+		LastError: oc.Note, Attempts: priorAttempts(prior),
+	})
+}
 
-	if err := in.ledger.Upsert(ctx, row); err != nil {
-		log.Printf("imageingest ledger upsert err: slug=%s status=%s err=%v", slug, row.Status, err)
+func (in *Ingestor) recordDeferred(ctx context.Context, slug string, oc ImageOutcome, pendingURL string, prior *FileRow) {
+	in.upsertFile(ctx, FileRow{
+		Slug: slug, ImageIndex: oc.Index, Status: StatusDeferredAttrib,
+		Source: oc.Source, SourceURL: oc.SourceURL, PendingURL: pendingURL,
+		LicenseCode: oc.License, LicenseShort: oc.LicenseShort, LicenseURL: oc.LicenseURL,
+		AttributionAuthor: oc.Author, AttributionRequired: true,
+		Attempts: priorAttempts(prior),
+	})
+}
+
+func (in *Ingestor) recordFailed(ctx context.Context, slug string, i int, oc ImageOutcome, prior *FileRow) {
+	in.upsertFile(ctx, FileRow{
+		Slug: slug, ImageIndex: i, Status: StatusFailed,
+		LastError: oc.Note, Attempts: priorAttempts(prior) + 1,
+	})
+}
+
+func (in *Ingestor) upsertFile(ctx context.Context, row FileRow) {
+	if err := in.ledger.UpsertFile(ctx, row); err != nil {
+		log.Printf("imageingest upsert file err: slug=%s i=%d status=%s err=%v",
+			row.Slug, row.ImageIndex, row.Status, err)
 	}
 }
 
-// Start launches a background ticker that runs RunBatch(cfg.BatchLimit) every
-// interval (SPEC §2.1). Returns a stop func. interval<=0 is a no-op (ticker
-// disabled — manual-only). The single-flight guard in RunBatch prevents a slow
-// pass from overlapping the next tick (SPEC §9 #11).
-func (in *Ingestor) Start(interval time.Duration) (stop func()) {
-	if interval <= 0 {
-		return func() {}
+func priorAttempts(prior *FileRow) int {
+	if prior == nil {
+		return 0
 	}
-	ticker := time.NewTicker(interval)
-	done := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-done:
-				ticker.Stop()
-				return
-			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.Background(), interval)
-				summary, err := in.RunBatch(ctx, 0)
-				cancel()
-				if err != nil {
-					log.Printf("imageingest ticker batch err: %v", err)
-				} else {
-					log.Printf("imageingest ticker batch: seen=%d attempted=%d ingested=%d noImage=%d deferred=%d skipped=%d errors=%d",
-						summary.Seen, summary.Attempted, summary.Ingested, summary.NoImage,
-						summary.Deferred, summary.Skipped, summary.Errors)
-				}
-			}
-		}
-	}()
-	var once sync.Once
-	return func() { once.Do(func() { close(done) }) }
+	return prior.Attempts
 }
 
-// --- candidate ranking (SPEC §2.5) ---
+// --- candidate classification + ranking (SPEC §2.4.3 / §2.5) ---
+
+// scoredCandidate pairs a raw source candidate with its classified license and
+// the source client to download it from (UA differs per source, SPEC §4.1).
+type scoredCandidate struct {
+	cand sources.Candidate
+	lic  License
+	dl   ImageSource
+}
+
+// classifyCandidate runs the token-membership classifier (SPEC §2.4.3) on a raw
+// candidate, stripping any HTML in the author first (Commons Artist is HTML;
+// iNat attribution is plain text — stripHTML is a no-op there).
+func classifyCandidate(c sources.Candidate) License {
+	return ClassifyLicenseCode(c.LicenseCode, c.LicenseShortName, c.LicenseURL, stripHTML(c.Author))
+}
 
 // deprioritizeTokens in a title signal a non-photo (map / diagram / herbarium).
 var deprioritizeTokens = []string{
 	"map", "range", "distribution", "herbarium", "illustration", "diagram", "chart", "locator",
 }
 
-// rankCandidates orders by license tier (CC0=PD > CC_BY > CC_BY_SA), then
-// photo-likeness (non-deprioritized title), then larger pixel area (SPEC §2.5).
-// SVG/GIF/TIFF are excluded outright. Returns a new slice; input untouched.
-func rankCandidates(cands []Candidate) []Candidate {
-	filtered := make([]Candidate, 0, len(cands))
-	for _, c := range cands {
-		if isExcludedFormat(c) {
-			continue
-		}
-		filtered = append(filtered, c)
-	}
-	// Stable insertion sort by the comparison below (small N ≤ 10).
-	for i := 1; i < len(filtered); i++ {
-		for j := i; j > 0 && less(filtered[j], filtered[j-1]); j-- {
-			filtered[j], filtered[j-1] = filtered[j-1], filtered[j]
+// rankScored stable-sorts in place by license tier → source tier → photo-
+// likeness → pixel area (SPEC §2.5). Small N (≤ ~24) → insertion sort.
+func rankScored(cands []scoredCandidate) {
+	for i := 1; i < len(cands); i++ {
+		for j := i; j > 0 && lessScored(cands[j], cands[j-1]); j-- {
+			cands[j], cands[j-1] = cands[j-1], cands[j]
 		}
 	}
-	return filtered
 }
 
-// selectBest returns the single best candidate per the ranking (SPEC §2.5).
-// Used for the deferred_attribution pick where we only need the top choice.
-func selectBest(cands []Candidate) Candidate {
-	ranked := rankCandidates(cands)
-	if len(ranked) > 0 {
-		return ranked[0]
-	}
-	// All excluded by format — fall back to the first raw candidate so we still
-	// capture some provenance for the deferred row.
-	if len(cands) > 0 {
-		return cands[0]
-	}
-	return Candidate{}
-}
-
-// less reports whether a should rank before b (a is "better").
-func less(a, b Candidate) bool {
-	at, bt := licenseTier(a.License.Family), licenseTier(b.License.Family)
+func lessScored(a, b scoredCandidate) bool {
+	at, bt := licenseTier(a.lic.Family), licenseTier(b.lic.Family)
 	if at != bt {
-		return at < bt // lower tier number = less restrictive = better
+		return at < bt // less restrictive first
 	}
-	ap, bp := isPhotoLikely(a), isPhotoLikely(b)
+	as, bs := sourceTier(a.cand.Source), sourceTier(b.cand.Source)
+	if as != bs {
+		return as < bs // iNat before Wikimedia (SPEC §2.5 #2)
+	}
+	ap, bp := isPhotoLikely(a.cand), isPhotoLikely(b.cand)
 	if ap != bp {
-		return ap // photo-likely ranks before deprioritized
+		return ap // photo-likely before deprioritized
 	}
-	return pixelArea(a) > pixelArea(b) // larger area first
+	return pixelArea(a.cand) > pixelArea(b.cand) // larger area first
 }
 
-// licenseTier maps a family to a sort rank (lower = preferred). CC0 and PD tie.
+// licenseTier maps a family to a sort rank (lower = preferred). CC0 / PD tie.
 func licenseTier(f LicenseFamily) int {
 	switch f {
 	case FamilyCC0, FamilyPD:
@@ -551,17 +629,25 @@ func licenseTier(f LicenseFamily) int {
 	}
 }
 
-func isExcludedFormat(c Candidate) bool {
+// sourceTier prefers iNat over Wikimedia within a license tier (SPEC §2.5 #2).
+func sourceTier(source string) int {
+	if source == sources.SourceINaturalist {
+		return 0
+	}
+	return 1
+}
+
+func isExcludedFormat(c sources.Candidate) bool {
 	switch strings.ToLower(c.MIME) {
 	case "image/svg+xml", "image/gif", "image/tiff":
 		return true
 	}
-	// Also exclude by title extension as a backstop (mime can be blank).
 	t := strings.ToLower(c.Title)
-	return strings.HasSuffix(t, ".svg") || strings.HasSuffix(t, ".gif") || strings.HasSuffix(t, ".tif") || strings.HasSuffix(t, ".tiff")
+	return strings.HasSuffix(t, ".svg") || strings.HasSuffix(t, ".gif") ||
+		strings.HasSuffix(t, ".tif") || strings.HasSuffix(t, ".tiff")
 }
 
-func isPhotoLikely(c Candidate) bool {
+func isPhotoLikely(c sources.Candidate) bool {
 	t := strings.ToLower(c.Title)
 	for _, tok := range deprioritizeTokens {
 		if strings.Contains(t, tok) {
@@ -571,11 +657,11 @@ func isPhotoLikely(c Candidate) bool {
 	return true
 }
 
-func pixelArea(c Candidate) int64 {
+func pixelArea(c sources.Candidate) int64 {
 	return int64(c.Width) * int64(c.Height)
 }
 
-// attributionRequiredFamily reports whether a machine code denotes a
+// attributionRequiredFamily reports whether a machine code denotes an
 // attribution-required family (CC_BY / CC_BY_SA). CC0 / PD → false.
 func attributionRequiredFamily(code string) bool {
 	tokens := tokenize(code)
@@ -585,16 +671,18 @@ func attributionRequiredFamily(code string) bool {
 	return hasToken(tokens, "by")
 }
 
-// licenseURLFor returns a license deed URL for the outcome. The extmetadata URL
-// is captured into the FilePage path only for provenance; the credits manifest
-// uses the canonical CC deed derived from the family (stable, never null for
-// attribution-required rows). For V1 we derive from the machine code.
-func licenseURLFor(out IngestOutcome) string {
-	return ccDeedURL(out.License)
+// licenseURLOf returns the license deed URL for a classified candidate: the
+// upstream-provided URL (Commons LicenseUrl) when present, else the canonical
+// CC deed derived from the machine code (iNat carries no URL).
+func licenseURLOf(lic License) string {
+	if strings.TrimSpace(lic.URL) != "" {
+		return lic.URL
+	}
+	return ccDeedURL(lic.Code)
 }
 
 // ccDeedURL maps a machine code to the canonical Creative Commons deed URL.
-// Empty for unknown codes (PD/ARR have no single deed). Used for credits.json.
+// Empty for codes with no single deed (PD / unknown). Used for credits.json.
 func ccDeedURL(code string) string {
 	tokens := tokenize(code)
 	if hasToken(tokens, "cc0") {
@@ -603,25 +691,18 @@ func ccDeedURL(code string) string {
 	if !hasToken(tokens, "cc") || !hasToken(tokens, "by") {
 		return ""
 	}
-	// Build the path: by, by-sa, etc. + version.
 	parts := []string{"by"}
 	if hasToken(tokens, "sa") {
 		parts = append(parts, "sa")
 	}
-	version := ccVersion(tokens)
-	return "https://creativecommons.org/licenses/" + strings.Join(parts, "-") + "/" + version + "/"
+	return "https://creativecommons.org/licenses/" + strings.Join(parts, "-") + "/" + ccVersion(tokens) + "/"
 }
 
-// ccVersion extracts a "X.Y" version token from the license code tokens,
-// defaulting to "4.0".
+// ccVersion extracts an "X.Y" version from the license tokens, defaulting 4.0.
 func ccVersion(tokens []string) string {
-	// tokens like [cc by sa 4 0] → join trailing numerics into "4.0".
 	var nums []string
 	for _, t := range tokens {
-		if t == "" {
-			continue
-		}
-		isNum := true
+		isNum := t != ""
 		for _, r := range t {
 			if r < '0' || r > '9' {
 				isNum = false
