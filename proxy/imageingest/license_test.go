@@ -54,6 +54,51 @@ func TestClassifyLicense(t *testing.T) {
 	}
 }
 
+// TestClassifyLicenseCode_INatUnversioned locks the token-membership behavior
+// for iNaturalist's UNVERSIONED codes (SPEC §2.4.3 / Codex #29-B). A literal
+// "cc-by-*" glob would reject bare "cc-by"; membership must accept it.
+func TestClassifyLicenseCode_INatUnversioned(t *testing.T) {
+	cases := []struct {
+		name        string
+		code        string
+		wantAllowed bool
+		wantFamily  LicenseFamily
+		wantAttrib  bool
+	}{
+		{"bare cc0", "cc0", true, FamilyCC0, false},
+		{"bare cc-by", "cc-by", true, FamilyCCBY, true},
+		{"bare cc-by-sa", "cc-by-sa", true, FamilyCCBYSA, true},
+		{"cc-by-nc rejected", "cc-by-nc", false, FamilyUnknown, false},
+		{"cc-by-nc-nd rejected", "cc-by-nc-nd", false, FamilyUnknown, false},
+		{"cc-by-nd rejected", "cc-by-nd", false, FamilyUnknown, false},
+		{"uppercase CC-BY normalized", "CC-BY", true, FamilyCCBY, true},
+		{"empty (ARR) rejected", "", false, FamilyUnknown, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := ClassifyLicenseCode(c.code, "", "", "(c) Some User, some rights reserved")
+			if got.Allowed != c.wantAllowed {
+				t.Errorf("Allowed = %v, want %v", got.Allowed, c.wantAllowed)
+			}
+			if got.Family != c.wantFamily {
+				t.Errorf("Family = %q, want %q", got.Family, c.wantFamily)
+			}
+			if got.AttributionRequired != c.wantAttrib {
+				t.Errorf("AttributionRequired = %v, want %v", got.AttributionRequired, c.wantAttrib)
+			}
+		})
+	}
+}
+
+// TestClassifyLicenseCode_DerivesShortName verifies a bare iNat code (no short
+// name supplied) gets a sensible display ShortName from orDefault.
+func TestClassifyLicenseCode_DerivesShortName(t *testing.T) {
+	got := ClassifyLicenseCode("cc-by", "", "", "(c) Jane")
+	if !got.Allowed || got.ShortName != "CC BY" {
+		t.Errorf("ShortName = %q (allowed=%v), want \"CC BY\"", got.ShortName, got.Allowed)
+	}
+}
+
 func TestClassifyLicense_AuthorHTMLStripped(t *testing.T) {
 	got := ClassifyLicense(meta("cc-by-4.0", "CC BY 4.0", "", `<a rel="nofollow" href="//commons">Jane &amp; John</a>`, "True"))
 	if !got.Allowed {
