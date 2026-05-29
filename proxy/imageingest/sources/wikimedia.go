@@ -60,13 +60,13 @@ type commonsPage struct {
 }
 
 type commonsImageInfo struct {
-	URL            string         `json:"url"`
-	DescriptionURL string         `json:"descriptionurl"`
-	ThumbURL       string         `json:"thumburl"`
-	ThumbMIME      string         `json:"thumbmime"`
-	MIME           string         `json:"mime"`
-	Width          int            `json:"width"`
-	Height         int            `json:"height"`
+	URL            string              `json:"url"`
+	DescriptionURL string              `json:"descriptionurl"`
+	ThumbURL       string              `json:"thumburl"`
+	ThumbMIME      string              `json:"thumbmime"`
+	MIME           string              `json:"mime"`
+	Width          int                 `json:"width"`
+	Height         int                 `json:"height"`
 	ExtMetadata    map[string]extField `json:"extmetadata"`
 }
 
