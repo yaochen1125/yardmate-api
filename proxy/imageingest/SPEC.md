@@ -1,7 +1,7 @@
 # `proxy/imageingest` package — plant image ingest (V1 image self-hosting)
 
 > Status: **v2 — on-demand cascade pivot (2026-05-28); supersedes v1 batch-from-seed**. v1 (Wikimedia-only / batch-from-`plants_pending` / single `hero.png`) shipped (PR #22 SPEC + #23 impl), was validated on a single slug (`Monstera adansonii`) and withdrawn before opening to traffic — see PIVOT memory `v1_image_self_hosting`. v2 keeps the R2-ownership + B-档 license + `credits.json` invariants, replaces the trigger model + source cascade + R2 layout + ledger schema, and requires iOS-side changes (companion SPEC `yardmate-swiftui/docs/releases/v1/shared/plant-images/plant-images.md`).
-> **Pass-through dropped (2026-05-28, §7 D-cascade-only):** an earlier v2 draft had a "pass-through" path (iOS forwards image URLs from identify/diagnose for direct transcode). Verifying the `/v1/identify` contract (`proxy/SPEC.md` §2.1) showed identify returns **PlantNet-host** `image_url` (TOS-blocked for redistribution) with **no per-image `license_code`**; Search returns iNat URLs but `INatTaxaClient` doesn't capture their license. So **no iOS flow has a usable `{iNat-URL, license}` pair in V1** → v2 is **cascade-only**. Pass-through is a V1.1 candidate (§8) once a usable license-bearing source exists.
+> **Hero pass-through REVIVED for slot 1 (2026-05-29 realign, §7 D-hero-passthrough — supersedes the 2026-05-28 D-cascade-only drop).** The 2026-05-28 draft dropped pass-through because the only candidate source was identify's **PlantNet-host** `image_url` (TOS-blocked + no `license_code`). The realign fixes the premise from a different angle: the hero source is **iNaturalist, not PlantNet** — iOS Search already shows an iNat photo, and iOS will capture its `license_code` + `attribution` (the §8 "minimal unlock"). So there now IS a usable hero. iOS forwards an OPTIONAL `hero_image` carrying the **iNat photo id** it displayed; the backend matches that id **within its own §2.4 cascade results** (iNat-API-authoritative license/attribution) and stores THAT candidate as slot 1 — guaranteeing "search image == detail hero == stored R2 image" (no visual jump when the hero switches from the transient iNat URL to R2). Slots `2..N` still cascade. **The backend never fetches a client-supplied URL** (it downloads the matched candidate from the iNat-API URL), so `hero_image` adds no SSRF surface and the client cannot lie about license/attribution (§2.1.1, §5, §9 #15–16). PlantNet remains ineligible (TOS-blocked + not iNat). Cascade-only remains the behavior when `hero_image` is absent (cold-start without a forwarded id, or the internal endpoint).
 > Companion: parent `proxy/SPEC.md` (`/v1/identify`, `/v1/diagnose`) + `proxy/enrichment/SPEC.md` (`/v1/plants/enrichment`). This package is a **new, independent domain**. It does NOT hang off enrichment: enrichment SPEC §1.2 explicitly states "**Image storage. No R2 writes; text in / JSON out.**" — that boundary stays. This package is the *only* writer of plant imagery to R2 from the server.
 > Background: out-of-catalog plants (identification results / species outside the curated 1522) render a **gallery of images** from R2 at `plant_images/{slug}/{i}.png` (i ∈ 1..N, default N=4), where `slug` is derived from the scientific name (iOS `PlantImageURL.slug`, shipped PR #227, **trinomial — never folded to binomial** per PIVOT). iOS triggers ingest on-demand when an out-of-catalog detail page mounts: it POSTs the scientific name and the backend walks a multi-source cascade (iNat → Wikimedia, → GBIF / USDA P2) to fill the slots. Until ingest fills the keys, iOS shows a placeholder.
 
@@ -11,7 +11,8 @@
 
 ### 1.1 What this package is responsible for
 
-- **On-demand species ingest (HTTP-triggered).** Public `POST /v1/plants/imageingest` (App Attest gated, same envelope as `/v1/identify`). Request is name-only: `{scientific_name, image_count?}`. iOS fires it when an out-of-catalog detail page mounts (companion SPEC §3); the backend cascades to fill `image_count` (default 4) gallery slots.
+- **On-demand species ingest (HTTP-triggered).** Public `POST /v1/plants/imageingest` (App Attest gated, same envelope as `/v1/identify`). Request: `{scientific_name, image_count?, hero_image?}`. iOS fires it when an out-of-catalog detail page mounts (companion SPEC §3); the backend cascades to fill `image_count` (default 4) gallery slots.
+- **Hero pass-through — slot 1 = the image iOS already showed (§2.1.1, D-hero-passthrough).** When the request carries an optional `hero_image` whose **`photo_id`** is the iNat photo the user saw (Search thumbnail / cold-start live-fetch), the backend finds that photo **within its own §2.4 cascade results** and stores THAT candidate as slot 1 (instead of the cascade's own slot-1 pick). This makes "search image == detail hero == stored R2 image" (no visual jump). The backend **never fetches a client URL** — it downloads the matched candidate from the iNat-API URL, with iNat-authoritative license/attribution; the request's `url`/`license_code`/`attribution` are advisory (iOS display only). The matched candidate obeys the same gate (CC0/PD now, BY/SA `deferred_attribution` while OFF, NC/ND/ARR never eligible). No match, or `hero_image` absent → slot 1 cascades like the rest.
 - **Multi-source candidate cascade (§2.4):** query sources in order — iNaturalist (CC0/CC-BY taxa default photo + observations) → Wikimedia Commons (license-filtered). Each candidate classified into CC0/PD/CC-BY/CC-BY-SA (reject NC/ND/ARR — §2.4); BY/SA gated behind `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES` until the iOS Credits page lives (§7 D-attribution-gate). V2 implements iNat + Wikimedia; GBIF / USDA = §8.
 - **Multi-image gallery upload:** pick top-N candidates (license tier → source tier → photo-likeness — §2.5), download each at a source-generated downscale (~1024–1600px, §7 D-format), upload to R2 keys `plant_images/{slug}/{1..N}.png` with the real Content-Type (§2.6). Within-gallery dedup prevents the same photo populating multiple slots.
 - **Idempotency + per-image ledger (§6.1):** before each candidate download, HEAD-check the target R2 key (R2 = truth) + consult the `plant_image_files` ledger row keyed `(slug, image_index)`. Skip already-uploaded slots; partial-fail (e.g. slots 1/2 succeed, 3/4 fail) is normal — fail-soft, retry failed slots on next trigger.
@@ -22,7 +23,7 @@
 ### 1.2 What this package is NOT responsible for
 
 - **The enrichment endpoint / its logic.** v2 **does not read `plants_pending`** (v1 did; v2 deprecates that seed). enrichment + imageingest are now fully decoupled at the data layer — only the `/v1` HTTP prefix is shared. No imports of the `enrichment` Go package.
-- **Identification / diagnosis / detail-text generation.** No image *upload* endpoint (that's `/v1/identify` / `/v1/diagnose`); no LLM. `/v1/plants/imageingest` is request-driven from iOS — it does not itself call identify / diagnose / enrichment, and it does NOT consume their image URLs (those are PlantNet-host / license-less — see status note + §7 D-cascade-only).
+- **Identification / diagnosis / detail-text generation.** No image *upload* endpoint (that's `/v1/identify` / `/v1/diagnose`); no LLM. `/v1/plants/imageingest` is request-driven from iOS — it does not itself call identify / diagnose / enrichment, and it does NOT consume **identify/diagnose** image URLs (PlantNet-host / license-less). The only thing it takes from the client about the hero is a **`photo_id`** (§2.1.1) — used to MATCH within its own cascade results, not to fetch. It never sources images from identify/diagnose.
 - **In-catalog (1522) imagery.** Curated plants use `plant_images/{AAA-id}/{1_whole|2_closeup|3_state|4_scene}.png`, uploaded by separate offline tooling (the `scripts/` pipeline in `yardmate-swiftui`). This package only fills the **slug**-keyed gallery for **out-of-catalog** plants. It never touches AAA-id keys.
 - **Image transformation.** No re-encode, no crop, no resize-by-us, no AI enhancement. Bytes stored verbatim (§7 D-format). The one server-side decode is a read-only sniff for MIME / dimensions; the stored bytes are the downloaded bytes.
 - **Genus-level fallback fill.** v2 fills the **species** slug only (`PlantImageURL.slug`), because iOS reads only the species slug today (genus fallback is iOS P2). Core is slug-parameterized, so genus fill (`PlantImageURL.genusSlug`) reuses the same code once iOS reads it — §8.
@@ -30,15 +31,15 @@
 - **Promotion of out-of-catalog plants into the curated catalog**, or any change to `plants_detail.json`.
 - **GBIF / USDA sources.** v2 implements **iNaturalist + Wikimedia Commons** only. GBIF (`api.gbif.org/v1/species/match` → `mediaSpecies`) and USDA Plants (no public API; HTML scrape) are §8 candidates; the ledger `source` column accommodates them.
 - **Background ticker / batch-from-seed.** Both removed in v2. The internal admin endpoint is retained for ops only.
-- **Pass-through of client-supplied image URLs.** Dropped in v2 (§7 D-cascade-only). No iOS flow has a usable `{iNat-URL, license}` pair today; revisiting is a V1.1 item (§8).
+- **Fetching ANY client-supplied image URL.** The backend never does this. Hero pass-through forwards a `photo_id`, not a URL-to-fetch (§2.1.1): the backend downloads only from URLs in its OWN iNat/Wikimedia API responses. `hero_image.url` (if sent) is advisory for iOS display and is ignored by the backend. So there is no client-controlled fetch target — no SSRF surface, no host allowlist needed (§5).
 
 ### 1.3 Inputs
 
 | Layer | Input |
 |---|---|
-| Public HTTP `POST /v1/plants/imageingest` | App Attest envelope (header `X-App-Attest-*`, see `proxy/SPEC.md` §4 — same as `/v1/identify`). JSON body: `{"scientific_name": "Monstera adansonii", "image_count": 4?}`. `image_count` optional (default 4, clamp 1–6). Returns 202 immediately (fire-and-forget). |
+| Public HTTP `POST /v1/plants/imageingest` | App Attest envelope (header `X-App-Attest-*`, see `proxy/SPEC.md` §4 — same as `/v1/identify`). JSON body: `{"scientific_name": "Monstera adansonii", "image_count": 4?, "hero_image": {"photo_id": "123", "url"?, "license_code"?, "attribution"?}?}`. `image_count` optional (default 4, clamp 1–6). `hero_image` optional — only `photo_id` is acted on (slot-1 match within the cascade, §2.1.1); `url`/`license_code`/`attribution` are advisory (iOS display) and ignored by the backend. Returns 202 immediately (fire-and-forget). **(NEW — `publicRequest` must add `hero_image` parsing; shipped struct is name+count only.)** |
 | Internal HTTP `POST /internal/imageingest/run` | header `X-Ingest-Admin-Token: <token>` (matched against secret `IMAGEINGEST_ADMIN_TOKEN`, constant-time). Query: `?slug=<slug>&name=<scientificName>&image_count=<N>` (single, synchronous) or `?names=<sciName1,sciName2>&image_count=<N>` (batch reseed by scientific name, ops only). NOT a public route — internal-only, behind nginx. |
-| `Ingestor.IngestSpecies(ctx, req)` | `req = {Slug, ScientificName, ImageCount int}`. Returns `IngestOutcome{Slug, PerImage []ImageOutcome}`. |
+| `Ingestor.IngestSpecies(ctx, req)` | `req = {Slug, ScientificName, ImageCount int, HeroPhotoID string}` (**NEW field** — shipped struct is `{Slug, ScientificName, ImageCount}`). `HeroPhotoID==""` ⇒ no pass-through, cascade-only. The backend uses only this id (matched against cascade `DedupKey "inat-photo-"+id`); advisory client url/license/attribution are not threaded into the ingestor. Returns `IngestOutcome{Slug, PerImage []ImageOutcome}`. |
 | Server config (`secrets.Vault`) | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` (`yardmate-static`), optional `R2_ENDPOINT` (default `https://<account>.r2.cloudflarestorage.com`), `IMAGEINGEST_ADMIN_TOKEN`, `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES`, optional `IMAGEINGEST_USER_AGENT`, optional `INATURALIST_USER_AGENT`, optional `IMAGEINGEST_PUBLIC_RATE` (default 100). Supabase DSN `SUPABASE_DB_URL` (shared with enrichment; **only for this package's own ledger tables now, not `plants_pending`**). |
 
 ### 1.4 Outputs
@@ -76,10 +77,15 @@ Two entry points wrapping the same `Ingestor` core:
 
    {
      "scientific_name": "Monstera adansonii",
-     "image_count": 4                                  // OPTIONAL: default 4, clamp 1–6
+     "image_count": 4,                                 // OPTIONAL: default 4, clamp 1–6
+     "hero_image": {                                   // OPTIONAL: slot-1 pass-through (§2.1.1)
+       "photo_id": "12345",                            // the ONLY field the backend acts on
+       "url": "...", "license_code": "...", "attribution": "..."  // advisory (iOS display); backend ignores
+     }
    }
    ```
-   - Backend walks the §2.4 cascade (iNat → Wikimedia) to pick top-N candidates for the N slots.
+   - If `hero_image.photo_id` is present, the backend tries to MATCH it within its own §2.4 cascade results and store THAT candidate as slot 1 (§2.1.1) — it never fetches a client URL. No match → slot 1 cascades like the rest.
+   - Backend walks the §2.4 cascade (iNat → Wikimedia) to pick top-N candidates for all slots (slot 1 = the matched hero candidate when present, else the cascade's own pick).
    - Returns 202 `{accepted: true, slug, image_count_requested}` synchronously. Actual work continues in a background goroutine bounded by single-flight per slug (§4.2). Concurrent duplicate requests for the same slug coalesce.
 
 2. **Internal `POST /internal/imageingest/run`** (admin-token gated, internal-only, ops). For single-slug re-ingest / batch reseed during incidents (e.g. R2 bucket restore). `?slug=&name=&image_count=` for single (returns one `IngestOutcome`); `?names=sciName1,sciName2&image_count=` for batch (returns `[]IngestOutcome`; keyed by scientific name since the cascade searches by name). Synchronous. Mounted outside `/v1` (excluded from public nginx vhost).
@@ -105,19 +111,58 @@ Two entry points wrapping the same `Ingestor` core:
      plan.add(i)                                                      -- object absent → needs fill
    -- PASS 2: only when plan is non-empty do we touch the sources.
    if plan not empty:
-     eligible, gated := gatherCascade(req.ScientificName, len(plan))   -- §2.4 (iNat → Wikimedia; dedup on DedupKey; over-provision to len(plan)*2)
+     eligible, gated := gatherCandidates(req.ScientificName, len(plan))  -- §2.4 (iNat → Wikimedia; dedup on DedupKey; over-provision to len(plan)*2)
+                                                                          -- (window already top-12 obs by votes in shipped inat.go = superset of iOS top-1; no-jump needs iOS to pin the SAME query — §2.1.1)
+     -- Slot-1 hero pass-through (§2.1.1, Option Y): if slot 1 ∈ plan AND
+     -- req.HeroPhotoID != "", look for the candidate with
+     -- DedupKey == "inat-photo-"+HeroPhotoID among `eligible` (authoritative,
+     -- already license-classified). If found → make it slot 1's candidate and
+     -- remove it from the pool so slots 2..N don't repeat it (§2.5 #4). If only
+     -- present among `gated` (BY/SA, gate off) → slot 1 = deferred. If absent
+     -- from both → no pass-through, slot 1 takes the cascade's own top pick.
+     -- The backend NEVER fetches HeroImage.url (it isn't even passed in).
      for i in plan:
-       candidate := nextEligible(eligible)                            -- §2.5; download fall-through consumes failures
+       candidate := (i==1 && heroMatch != nil) ? heroMatch : nextEligible(eligible)  -- §2.5
        if download+upload succeeds → upsert plant_image_files(status=ingested, source, license, author, source_url, ...); continue
        if eligible pool was depleted by download failures → record source_error (retryable, NOT terminal §9 #13)
-       else if gated BY/SA available → record deferred_attribution(store pending_url=best.RenditionURL)
+       else if gated BY/SA available (or i==1 heroMatch was gated) → record deferred_attribution(store pending_url=candidate.DownloadURL)
        else → record no_acceptable_image
        sleep(minInterval) between source calls                        -- §4.1 source etiquette
+     -- (NEW code vs shipped: `gatherCandidates` gains the no-jump window; the
+     --  i==1 hero-match branch + DedupKey lookup are added in ingestor.go.)
 5. recompute plant_image_species.image_count_filled                   -- COUNT(status=ingested)
 6. regenerate plant_images/credits.json (§2.7)                        -- full rebuild
 7. releaseSingleFlight(slug)
 8. return IngestOutcome{Slug, PerImage}
 ```
+
+### 2.1.1 Hero pass-through (slot 1) — `hero_image` (photo_id match; the backend never fetches a client URL)
+
+**Why.** iOS shows an iNat photo as the Search-list thumbnail (and, on a cold-start detail open, fetches one live from iNat). When the user opens the detail page the hero must be **that same image, immediately**: iOS hot-link-displays the iNat photo right away (transient, with an inline attribution caption — companion SPEC), and we want the eventually-*stored* R2 slot 1 to be the SAME photo, so the hero does **not visually jump** when it switches from the transient URL to R2. Invariant target: **search image == detail hero == R2 slot 1**.
+
+**Mechanism (why photo_id, not "fetch the forwarded URL").** iOS forwards the **iNaturalist photo id** it displayed; the backend does **NOT** fetch any client-supplied URL. It instead identifies the matching photo **inside its own §2.4 cascade results** — which carry iNat-API-authoritative license + attribution + rendition URL — and stores THAT as slot 1, downloading from the iNat-API URL. This is the deliberate design choice (§7 D-hero-passthrough); its consequences are the whole point:
+- The backend **never fetches a client-supplied URL** ⇒ `hero_image` adds **no SSRF surface** (no host allowlist / redirect / IP-pin needed — §5).
+- `license`, `attribution`, `source_url`, and the download rendition are all **iNat-API-authoritative**, never trusted from the client ⇒ a malicious attested client cannot relabel an NC/ARR photo as CC0 to get it stored to the public bucket, nor poison `credits.json` with attacker-controlled attribution text (§9 #15–16).
+- `hero_image.url` / `license_code` / `attribution` are **advisory only** (iOS uses them for its own transient display); the backend acts **only on `photo_id`**.
+
+**Request shape.** `hero_image: { "photo_id": <iNat photo id, required>, "url"?, "license_code"?, "attribution"? }`. `photo_id` is the integer in `inaturalist-open-data.s3.amazonaws.com/photos/<id>/...`. Optional fields are advisory; the backend reads only `photo_id`.
+
+**Slot-1 handling (in IngestSpecies, after the §2.4 cascade gather).** When `hero_image.photo_id` is present AND slot 1 ∈ `plan` (slot 1 has no R2 object yet — see flow): find the gathered candidate whose iNat photo id == `photo_id`. Match it by the cascade DedupKey **`"inat-photo-" + photo_id`** — but the key must be **byte-identical** to what `sources.INatClient` builds, which is `"inat-photo-" + strconv.FormatInt(photo.ID, 10)` over an **int64** (inat.go). So the handler MUST canonicalize the incoming `photo_id` through int64 before forming the key: parse it as a base-10 integer (accept the JSON value as string or number; reject / ignore non-numeric, leading-zero, signed, or whitespace-padded values → treated as "no hero"), then `"inat-photo-" + strconv.FormatInt(n, 10)`. A raw string concat of an un-normalized client value risks a silent non-match (→ no pass-through → the 74% jump). This is the same byte-exactness discipline as the §2.3 Slug invariant.
+- **Match + eligible** (CC0/PD now, or BY/SA after the gate): store it as slot 1 using its **authoritative** license/attribution/source_url; **exclude it from the pool for slots 2..N**.
+- **Match but BY/SA while gate OFF**: record slot 1 `deferred_attribution` (store its authoritative rendition URL as `pending_url`); R2 slot 1 stays empty (iOS keeps displaying the transient URL).
+- **Match but NC/ARR**: §2.4.3 already dropped it, so it's absent from BOTH `eligible` and `gated` ⇒ no match ⇒ no pass-through (and iOS should never have displayed it — §5 compliance note).
+- **No match** (the displayed photo isn't in the cascade pool — rare): no pass-through; slot 1 falls to the cascade's own top pick. **This is the only "visual jump" case**, bounded by the no-jump rule below.
+- **`hero_image` absent** (cold-start with no forwarded id, internal admin endpoint): cascade-only, exactly as v2. Pass-through is a pure optimization over the cascade, never a hard dependency.
+- Slot 1 already has an R2 object ⇒ slot 1 ∉ `plan` ⇒ pass-through is **skipped, not an overwrite** (R2 immutable, §2.2). A slot 1 parked `deferred_attribution` / `no_acceptable_image` while gated stays short-circuited (§2.1 PASS 1) — the forwarded hero is not re-evaluated until that row clears.
+- Bytes stored **verbatim**, real Content-Type (D-format) — the matched candidate is an ordinary cascade candidate, downloaded + stored like any other.
+
+**No-jump rule (THE contract for "search == hero").** A jump occurs only when iOS's displayed photo is not in the backend's candidate pool. Measured reality (30-species sampling): the iNat `default_photo` is **NC/ARR ~74% of the time**, so for most species the displayed hero is a **free observation photo**, not the default. To guarantee the match, **iOS and the backend MUST select from the identical iNat free-photo set**:
+- Same query: iNat observations with `photo_license=cc0,cc-by`, `order_by=votes&order=desc` (plus the taxon `default_photo` only when it is itself free).
+- iOS displays + forwards the **top** such photo; the backend gathers a **superset window** (≥ top-12 by votes), so iOS's top-1 is always within the backend's window ⇒ matched ⇒ no jump.
+- **While the BY/SA gate is OFF, iOS should forward only CC0/CC-BY** (the *storable-now* set), NOT CC-BY-SA. The taxon `default_photo` is not API-license-filtered and can be CC-BY-SA; if iOS displays + forwards a free SA photo while the gate is off, the backend matches it into `gated` → `deferred_attribution` → R2 slot 1 stays empty → the hero jumps to a placeholder on the next visit. So "the identical free set" the two sides pin is specifically **cc0,cc-by** until the gate flips (after which SA joins on both sides). (Companion SPEC owns the iOS filter.)
+- Companion SPEC pins iOS to this exact selection. Divergent query params (different order / license filter / window) reintroduce jumps. This is the dominant path (74%), not an edge case.
+
+**Hero is a pointer, not a fixed key (companion SPEC).** Slot 1 is the *default* hero. iOS treats "which image is the hero" as a selectable pointer (default = gallery slot 1) so a future feature can let the user pick a different gallery image — or one of their own diary photos — as the hero, without changing this backend contract.
 
 ### 2.2 R2 layout (v2 multi-image)
 
@@ -289,7 +334,7 @@ Shape (V2 — per `(slug, image_index)`):
 ```
 - Built from `plant_image_files WHERE status='ingested'` JOIN `plant_image_species` — credits.json always matches what is live in R2.
 - One entry per **(slug, image_index)** in V2 (vs v1 one-per-slug). A multi-image gallery may carry different author + license per slot.
-- **Full rebuild per ingest, never diff-append** (pitfall §9 #15) — deleted / re-ingested rows must drop / refresh cleanly.
+- **Full rebuild per ingest, never diff-append** (pitfall §9 #18) — deleted / re-ingested rows must drop / refresh cleanly.
 - While the BY/SA gate is OFF only CC0 / PD rows are `ingested`, so credits.json carries those. When the gate flips ON, the next ingest's rebuild adds BY / SA rows automatically — the iOS page re-fetches, no code change.
 
 ---
@@ -338,24 +383,26 @@ V2 has two rate-limit dimensions: outbound (we are the *client* of iNat / Wikime
 - **iNat limits:** 100 req/min per IP, 10000/day. Per-trigger usage ~3 outbound calls (taxa + observations + optional photo metadata) keeps us well below. Honor 429 `Retry-After`.
 - **Wikimedia `maxlag=5`** on api.php queries — Wikimedia replies 503 + `Retry-After` when replication lag exceeds 5s; honor it.
 - **`Retry-After` / 429 / 503:** exponential backoff honoring the header, capped (3 retries, max 30s wait) per call; on exhaustion → `source_error` for that image_index.
-- **Download size guard:** cap byte downloads (`IMAGEINGEST_MAX_BYTES`, default 25 MB) via `LimitReader`. iNat `large_url` ≈ 1024px / 100–300 KB typical; Wikimedia 1600px thumb 200–600 KB — the cap is a backstop. The download client targets only the source-returned `RenditionURL` (an iNat / Wikimedia CDN URL from a trusted API response, not a client-supplied URL).
+- **Download size guard:** cap byte downloads (`IMAGEINGEST_MAX_BYTES`, default 25 MB) via `LimitReader`. iNat `large` ≈ 1024px / 100–300 KB typical; Wikimedia 1600px thumb 200–600 KB — the cap is a backstop. The download client targets only a source-returned `Candidate.DownloadURL` — an iNat / Wikimedia CDN URL from a trusted API response (incl. the hero candidate, which is matched within those API results, §2.1.1). It **never** fetches a client-supplied URL.
 - **MIME re-check on downloaded bytes** (`http.DetectContentType` on first 512 B) — source-declared mime is advisory; stored `Content-Type` comes from actual bytes. Reject if not `image/jpeg|png|webp`.
 
 ### 4.2 Inbound: `/v1/plants/imageingest` cap + single-flight
 
 - **Per-attested-device rate limit** (same middleware as `/v1/identify` — see `proxy/SPEC.md` §3): default 100/min, env `IMAGEINGEST_PUBLIC_RATE`. Returns 429 with `Retry-After` on exceed.
-- **Single-flight per slug**: concurrent requests for the same `Slug(scientific_name)` — from same OR different devices — coalesce. Second request returns 202 immediately, no additional outbound work queued. Implemented via in-memory mutex keyed by slug (process-local; OK for V2 single-instance — pitfall §9 #17 if scaled).
+- **Single-flight per slug**: concurrent requests for the same `Slug(scientific_name)` — from same OR different devices — coalesce. Second request returns 202 immediately, no additional outbound work queued. Implemented via in-memory mutex keyed by slug (process-local; OK for V2 single-instance — pitfall §9 #19 if scaled).
 - **Anti-abuse**: per-trigger outbound work is naturally bounded (~3–5 source calls per ingest, regardless of `image_count` slots — searches return many candidates at once) so even at the per-device cap, total outbound pressure is manageable. Cap is anti-abuse, not anti-runaway.
 
 ---
 
 ## 5. Security model
 
-- **Public surface: `POST /v1/plants/imageingest`** (App Attest gated, same envelope as `/v1/identify`). Attest failure → 401. Per-attested-device rate limit (§4.2). Single-flight per slug coalesces duplicates (anti-abuse via dedup, not just rate). The request body is name-only (`scientific_name` + `image_count`); no client-supplied URLs are ever fetched (cascade downloads only from iNat / Wikimedia API responses — §4.1).
+- **Public surface: `POST /v1/plants/imageingest`** (App Attest gated, same envelope as `/v1/identify`). Attest failure → 401. Per-attested-device rate limit (§4.2). Single-flight per slug coalesces duplicates (anti-abuse via dedup, not just rate). The request body is `scientific_name` + `image_count` + an OPTIONAL `hero_image` (§2.1.1). **No client-supplied URL is ever fetched** — the backend acts only on `hero_image.photo_id` (an identifier it MATCHES within its own iNat API results), and downloads exclusively from iNat / Wikimedia API-returned URLs (§4.1). So `hero_image` carries **no SSRF surface** and needs **no host allowlist** (the Option-Y choice — §7 D-hero-passthrough; §2.1.1).
+- **Hero metadata is never trusted from the client (§9 #15–16).** `hero_image.license_code` / `attribution` / `url` are advisory (iOS display only). The license, attribution, source_url, and rendition the backend STORES + writes into `credits.json` all come from the **iNat API record** of the matched `photo_id` (i.e. the cascade candidate), never from the request body. A malicious attested client therefore cannot (a) relabel an NC/ARR photo as CC0 to get it stored to the public bucket, nor (b) poison `credits.json` with attacker-controlled author text. If `photo_id` matches no eligible cascade candidate, there is no pass-through — slot 1 cascades.
+- **iOS-display compliance (companion-SPEC constraint, surfaced here).** Because ~74% of iNat `default_photo`s are NC/ARR (measured), iOS MUST NOT hot-link-display the default photo unconditionally — it shows only free (CC0/CC-BY) photos (the same free-observation selection the backend uses — §2.1.1 no-jump rule), else the *app itself* serves NC imagery commercially. This is an iOS obligation; the backend can't enforce it, but the contract depends on it.
 - **Internal surface: `POST /internal/imageingest/run`** (admin-token gated, internal-only). Mounted outside the `/v1` group → not in nginx public vhost. Server binds `127.0.0.1:8080` behind nginx → `/internal/*` unreachable externally even before the token check.
 - **Admin token.** `X-Ingest-Admin-Token == IMAGEINGEST_ADMIN_TOKEN`, **constant-time compare** (`subtle.ConstantTimeCompare`). Route registered only when secret is set. **Server-only**; NOT in `main.vendedKeys` (pitfall §9 #6).
 - **R2 credentials are write-scoped + server-only.** R2 API token scoped to *Object Read & Write* on `yardmate-static` only.
-- **Source input (iNat / Wikimedia public APIs) is low-risk.** Search term URL-encoded; downloaded bytes treated as opaque image data (sniffed for MIME, never executed); `extmetadata` / iNat `attribution` HTML-stripped before storage. Download URLs come from the source API responses (iNat `large_url` / Wikimedia `thumburl`), not from clients — no SSRF surface from user input.
+- **Source input (iNat / Wikimedia public APIs) is low-risk.** Search term URL-encoded; downloaded bytes treated as opaque image data (sniffed for MIME, never executed); `extmetadata` / iNat `attribution` HTML-stripped before storage. ALL download URLs (including the matched hero candidate) come from the source API responses (iNat / Wikimedia), never from clients — so there is no SSRF surface from user input at all. The only user-supplied datum acted on is `hero_image.photo_id`, used as a lookup key, never as a fetch target.
 - **Attribution integrity.** CC-BY / CC-BY-SA store author + license + file-page so the iOS Credits page satisfies CC §3(a). CC0 / PD recorded for audit.
 - **DSN secrecy** inherits enrichment SPEC §9 #14 — `SUPABASE_DB_URL` carries the DB password; never log / echo it.
 
@@ -431,7 +478,12 @@ If ops ever need to bulk-fill (e.g. R2 bucket restore), they use the internal en
 **V2 pivot decisions (2026-05-28, Yao):**
 
 - **D-pivot-2026-05-28: V1 batch-from-seed withdrawn.** V1 (`POST /internal/imageingest/run` + ticker, Wikimedia-only, single `hero.png`, `plants_pending` seed) shipped (PR #22 / #23 / #24) and was validated on `Monstera adansonii`. Withdrawn pre-traffic because (a) batch trigger violated "no batch scraping" intent, (b) Wikimedia-only diverged from in-app iNat photos, (c) single hero couldn't match the in-catalog 4-image gallery, (d) PR #27 binomial slug folding broke "different subspecies must show different images" (reverted in PR #28). Memory `v1_image_self_hosting` records the full PIVOT. V2 redesigns trigger + source + layout while preserving R2 ownership + B-档 license + `credits.json`.
-- **D-cascade-only (2026-05-28, supersedes the earlier v2 pass-through draft).** An earlier v2 draft had a "pass-through" path: iOS forwards image URLs from `/v1/identify` / `/v1/diagnose` so the backend transcodes them directly (skip cascade). Verifying the contracts killed the premise: `/v1/identify` returns **PlantNet-host** `image_url` (`proxy/SPEC.md` §2.1 / line 112 — TOS forbids redistribution) with **no per-image `license_code`**; Plant.id / AI paths return `null`; iOS Search (`INatTaxaClient`) gets iNat URLs but does **not** capture their `license_code`. So **no iOS flow has a usable `{iNat-URL, license}` pair in V1** → pass-through has no valid input → **v2 is cascade-only**: iOS sends `{scientific_name, image_count}`, backend always cascades. Removed: the `image_urls` request field, `classifyPassthrough`, slot-compaction, the pass-through host allowlist, and their pitfalls. Pass-through is a V1.1 candidate (§8) — its cheapest unblock is extending iOS `INatTaxaClient.DefaultPhoto` to capture `license_code` so Search-triggered ingest can forward `{iNat-URL, license}`.
+- **D-cascade-only (2026-05-28) — SUPERSEDED by D-hero-passthrough (2026-05-29).** *Historical:* an earlier v2 draft had a pass-through path forwarding image URLs from `/v1/identify` / `/v1/diagnose`. Verifying the contracts killed THAT premise: identify returns **PlantNet-host** `image_url` (TOS-blocked, no `license_code`); Plant.id / AI return `null`; iOS Search didn't capture iNat `license_code`. So at the time no flow had a usable `{URL, license}` pair → v2 shipped cascade-only. **What changed (see D-hero-passthrough):** the realign sources the hero from **iNaturalist (not identify/PlantNet)** and has iOS capture the iNat `license_code`, which IS the unblock this decision itself named. Cascade-only remains the *fallback* (no `hero_image`), but it is no longer the only mode.
+- **D-hero-passthrough (2026-05-29 realign, Yao).** The shipped cascade-only behavior didn't meet the UX bar: an out-of-catalog detail page showed a **placeholder on first open** (image only appeared on a later visit, after async ingest), and the backend's own cascade pick for slot 1 could **differ from the iNat photo the user saw in Search** → a visual "jump" when the hero switched to R2. Decision: iOS forwards the **iNat `photo_id`** of the photo it displayed; the backend MATCHES that id **within its own §2.4 cascade results** and stores that candidate as slot 1 (§2.1.1). This makes **search image == detail hero == stored R2 slot 1**.
+  - **Why `photo_id`-match and NOT "fetch the forwarded URL" (chose Option Y over Option X after review).** A first draft had iOS forward the image URL for the backend to fetch + transcode, gated by an iNat-CDN host allowlist. Review (internal + Codex on the doc PR) showed that path keeps two holes: (1) the forwarded `license_code`/`attribution` are client-supplied — re-classifying a client string doesn't stop a client lying (relabel an NC photo "cc0" → store it to a public bucket; poison `credits.json`); (2) fetching a client URL is an SSRF surface needing allowlist + redirect-off + IP-pin. Option Y removes both at the root: the backend fetches nothing client-supplied and derives license/attribution/rendition from the **iNat-authoritative** cascade record of `photo_id`. Client `url`/`license_code`/`attribution` become advisory (iOS display only).
+  - **Distinctions from the 2026-05-28 dropped draft:** source is **iNat, not PlantNet** (redistributable + iOS captures license — the §8 unblock); **display ≠ storage** (iOS hot-link-displays the transient iNat URL for first view, ungated, inline caption satisfies attribution; *storage* to R2 still obeys the BY/SA gate).
+  - **No-jump cost.** The only jump case is `photo_id` not present in the backend's candidate pool. Sampling showed the displayed hero is a free *observation* photo for ~74% of species (default_photo is NC/ARR), so iOS and the backend MUST pin the identical iNat free-photo selection and the backend window must be a superset of iOS's pick (§2.1.1 no-jump rule). Slots 2..N still cascade. Pass-through is a pure optimization, never a hard dependency.
+  - **Hero is an iOS-side selectable pointer** (default slot 1; future: user picks another gallery image or a diary photo) — the backend contract is unaffected.
 - **D-trigger-public-endpoint: `POST /v1/plants/imageingest` is the iOS-facing trigger.** Not `/v1/identify` (would couple identify to image ingest), not `/v1/plants/enrichment` (SPEC §1.2 reaffirmed — text in / JSON out, no R2 writes). New independent endpoint, App Attest gated (same envelope as `/v1/identify`). iOS fires it on out-of-catalog detail-page mount (companion SPEC §3). Internal `/internal/imageingest/run` retained for ops (single-slug retry, bulk reseed during incidents) — NOT iOS-facing.
 - **D-multi-image-naming: positional `{i}.png`, not semantic `whole/closeup/...`.** Out-of-catalog sources don't carry photo-intent metadata. Inferring "whole vs closeup" from EXIF / heuristics is unreliable. Positional is honest; iOS handles in-catalog (semantic) + out-of-catalog (positional) via separate `PlantImageURL` builders.
 - **D-source-cascade: iNat primary → Wikimedia fallback.** iNat photos are real wild specimens with structured license metadata (faster than Wikimedia `extmetadata` HTML parsing) and match what Search shows users (visual continuity — Search list iNat photo → detail hero from the same source family). Wikimedia kept as fallback because Commons catalogs many species iNat lacks. GBIF / USDA = §8 (USDA has no public API; GBIF mediaSpecies has lower per-species coverage).
@@ -451,7 +503,7 @@ If ops ever need to bulk-fill (e.g. R2 bucket restore), they use the internal en
 
 ## 8. Out-of-scope (V1.1+ candidates)
 
-- **Pass-through reuse of already-shown images.** Skip cascade by reusing an image a flow already displayed. Blocked in V1 (D-cascade-only): no flow has a usable `{iNat-URL, license}` pair. Cheapest unblock: extend iOS `INatTaxaClient.DefaultPhoto` (Home/Search) to decode `default_photo.license_code` + `attribution` (currently only `medium_url`), then a Search-triggered ingest can POST `{scientific_name, image_urls: [{url, license_code}]}` and the backend transcodes the iNat URL directly (host allowlist + content-type HEAD + SSRF IP-reject still required). identify/diagnose remain pass-through-ineligible (PlantNet host / no license).
+- **~~Pass-through reuse of already-shown images.~~ MOVED INTO V1** as hero pass-through (§2.1.1, D-hero-passthrough). iOS forwards the displayed photo's `photo_id`; the backend matches it within its own iNat cascade results and stores that candidate as slot 1 (no client-URL fetch, iNat-authoritative license — §5). Remaining V1.1 extensions: forwarding `photo_id`s for **gallery slots 2..N** too (not just the hero), and a `pending_url` fast-path on gate flip (below). identify/diagnose URLs remain pass-through-ineligible (PlantNet host / no license).
 - **Genus-level fallback fill** — turn on once iOS reads the genus slug (iOS P2, companion SPEC §10). Core already parameterized.
 - **GBIF mediaSpecies + USDA Plants** as additional cascade sources — ledger `source` column ready, license schemas to map.
 - **Progress endpoint for `/v1/plants/imageingest`** — V2 returns 202 only; iOS retries on next page mount, idempotency handles dedup. A `GET /v1/plants/imageingest/status?slug=` could expose `image_count_filled / image_count_requested` for UI progress indicators.
@@ -459,7 +511,7 @@ If ops ever need to bulk-fill (e.g. R2 bucket restore), they use the internal en
 - **Re-ingest automation** (refresh stale / low-quality images) beyond manual ledger delete.
 - **Photo-intent classification** — ML model to label "habit / leaf / flower / fruit" so positional `{i}.png` could be presented in a structured order. Currently positions are cascade output order.
 - **iOS Settings → Credits page** — IN SCOPE for this initiative (companion SPEC §6), implemented in `yardmate-swiftui`. Sequenced **after** this backend SPEC ships + impl + dev-deployed; flip BY/SA gate ON only after the iOS page is in TestFlight.
-- **Multi-instance single-flight** — V2 single-flight is process-local mutex (single-instance OK). Scaling to multiple backend instances would need redis / DB advisory lock for cross-instance dedup (pitfall §9 #17).
+- **Multi-instance single-flight** — V2 single-flight is process-local mutex (single-instance OK). Scaling to multiple backend instances would need redis / DB advisory lock for cross-instance dedup (pitfall §9 #19).
 - **`pending_url` fast-path on gate flip** — when `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES` flips ON, V2 re-cascades for `deferred_attribution` rows. A fast-path that uploads the stored `pending_url` without re-search would be cheaper (write-only field already populated, P2).
 
 ---
@@ -480,10 +532,13 @@ If ops ever need to bulk-fill (e.g. R2 bucket restore), they use the internal en
 12. **`config.LoadDefaultConfig` for aws-sdk-go-v2 reads env / `~/.aws` by default** — pass explicit `credentials.NewStaticCredentialsProvider` + `BaseEndpoint` for R2 so it never accidentally picks up ambient AWS creds on the box.
 13. **`deferred_attribution` is NOT permanent negative cache.** BY/SA gated rows are re-processed when `IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES` flips ON (`shouldSkip` returns false for deferred rows once the gate is on). V2 re-cascades; `pending_url` reserved for §8 fast-path.
 14. **Do NOT flip the gate ON before the iOS Credits page is live.** R2 is public and iOS renders directly — uploading BY/SA makes them user-visible immediately. Flipping early = serving BY/SA without visible attribution = license violation (the exact Codex #22 issue).
-15. **`credits.json` is a full rebuild from the ledger, never a diff-append.** Rebuild from current `status='ingested'` rows every ingest so deletions / re-ingests stay consistent. V2 rebuild JOINs species + files for per-image entries.
-16. **(V2) Single-flight is process-local.** In-memory mutex keyed by slug works for single-instance backend. Multi-instance scaling (§8) needs redis / DB advisory lock or a thundering herd resumes for trending species.
-17. **(V2) Two-table ledger consistency.** Always upsert `plant_image_species` BEFORE inserting `plant_image_files` rows (FK + cascade). Always recompute `image_count_filled` from `plant_image_files` after each ingest — never trust a separately-incremented counter.
-18. **(V2) v1 orphan R2 objects.** `plant_images/monstera-adansonii/hero.png` and `plant_images/monstera-adansonii-blanchetii/hero.png` exist from v1 smoke; iOS no longer reads `hero.png`. Delete in ops cleanup (§10).
+15. **(hero pass-through) NEVER fetch `hero_image.url`, and NEVER trust client `license_code`/`attribution`.** The backend acts only on `hero_image.photo_id` — it MATCHES that id within its own iNat API cascade results and uses that record's authoritative license/attribution/rendition (§2.1.1). Fetching the client URL would be SSRF; trusting the client license would let a malicious attested client relabel an NC/ARR photo "cc0" → stored to a PUBLIC bucket = license violation, or poison `credits.json` with attacker author text. Advisory client fields are iOS-display-only.
+16. **(hero pass-through) the hero is just a cascade candidate, so the gate applies unchanged.** Because the matched hero is an ordinary `eligible`/`gated` candidate from §2.4 (already license-classified from iNat-authoritative data), the BY/SA storage gate applies exactly as for any slot: CC0/PD → ingested, BY/SA → `deferred_attribution` (store its rendition as `pending_url`, mirroring `recordDeferred`), NC/ARR → never eligible (no match). Pass-through changes WHICH candidate lands in slot 1, never WHETHER the gate applies.
+17. **(hero pass-through) match + exclude on the EXACT DedupKey, and use the no-jump window.** (a) Match `photo_id` as `"inat-photo-"+strconv.FormatInt(id,10)` — **canonicalize the client `photo_id` through int64 first** (inat.go builds the key from an int64); a raw string concat of an un-normalized value (leading zero / whitespace / sign / the URL) silently never matches → no pass-through → the 74% jump. (b) After slot 1 takes the matched candidate, remove it from the pool so slots 2..N don't repeat it (§2.5 #4). (c) The match only works if the displayed photo is IN the gathered pool: iOS and backend must use the identical iNat free-photo selection and the backend window must be a superset of iOS's pick (§2.1.1 no-jump rule) — otherwise ~74% of species (NC default → free-observation hero) can jump.
+18. **`credits.json` is a full rebuild from the ledger, never a diff-append.** Rebuild from current `status='ingested'` rows every ingest so deletions / re-ingests stay consistent. V2 rebuild JOINs species + files for per-image entries.
+19. **(V2) Single-flight is process-local.** In-memory mutex keyed by slug works for single-instance backend. Multi-instance scaling (§8) needs redis / DB advisory lock or a thundering herd resumes for trending species.
+20. **(V2) Two-table ledger consistency.** Always upsert `plant_image_species` BEFORE inserting `plant_image_files` rows (FK + cascade). Always recompute `image_count_filled` from `plant_image_files` after each ingest — never trust a separately-incremented counter.
+21. **(V2) v1 orphan R2 objects.** `plant_images/monstera-adansonii/hero.png` and `plant_images/monstera-adansonii-blanchetii/hero.png` exist from v1 smoke; iOS no longer reads `hero.png`. Delete in ops cleanup (§10).
 
 ---
 
@@ -491,7 +546,7 @@ If ops ever need to bulk-fill (e.g. R2 bucket restore), they use the internal en
 
 ```
 proxy/imageingest/
-├── SPEC.md                          (this file, v2 cascade-only)
+├── SPEC.md                          (this file, v2 cascade + hero pass-through §2.1.1)
 ├── slug.go                          Slug + GenusSlug (byte-exact iOS port — unchanged from v1)
 ├── slug_test.go                     iOS-mirrored vectors (unchanged from v1)
 ├── license.go                       extmetadata + iNat license_code → {allowed, code, short, url, author, attributionRequired} — token-membership (§2.4.3); covers iNat unversioned + Wikimedia versioned
@@ -509,10 +564,10 @@ proxy/imageingest/
 ├── ledger_test.go                   hermetic two-table consistency
 ├── singleflight.go                  in-memory mutex map keyed by slug (anti-coalesce, §4.2)
 ├── singleflight_test.go             concurrent slug requests
-├── ingestor.go                      Ingestor.IngestSpecies + cascadeSearch + transcodeOne + selectBest + within-gallery dedup
-├── ingestor_test.go                 table-driven: end-to-end with sources/r2/ledger mocks; all Status values
-├── handlers.go                      POST /v1/plants/imageingest (attest middleware, {scientific_name, image_count}) + POST /internal/imageingest/run (admin-token, outside /v1)
-├── handlers_test.go                 attest 401 / admin 401 / disabled 503 / rate 429 / single + batch
+├── ingestor.go                      Ingestor.IngestSpecies + gatherCandidates + selectBest + within-gallery dedup + slot-1 hero match (§2.1.1: NEW — `HeroPhotoID` on IngestRequest; PASS-2 i==1 looks up DedupKey "inat-photo-"+HeroPhotoID in eligible/gated, fills slot 1 + removes from pool; NO client-URL fetch, NO allowlist file. The obs window is already top-12 by votes in shipped inat.go — no change needed there; the no-jump constraint is iOS-side pinning.)
+├── ingestor_test.go                 table-driven: all Status values + hero match (CC0 stored / BY deferred / NC=no-match→cascade / id absent from pool→cascade / matched hero excluded from 2..N)
+├── handlers.go                      POST /v1/plants/imageingest (attest middleware, {scientific_name, image_count, hero_image?} — parse hero_image.photo_id, ignore advisory url/license/attribution) + POST /internal/imageingest/run (admin-token, outside /v1, no hero)
+├── handlers_test.go                 attest 401 / admin 401 / disabled 503 / rate 429 / single + batch + hero_image.photo_id parse (advisory fields ignored)
 └── migrations/
     ├── 001_plant_image_ingest.sql   (v1 history, dropped by 003)
     ├── 002_plant_image_v2.sql       (CREATE plant_image_species + plant_image_files; expand step)
