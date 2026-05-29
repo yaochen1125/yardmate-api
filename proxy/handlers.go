@@ -54,6 +54,43 @@ const aiCatalogRecoveryMinConfidence = 0.10
 // "engine is very sure" bar; see SPEC §7 resolved decisions.
 const plantnetConfidentSkipAIConfidence = 0.80
 
+// Unknown sentinel (SPEC §2.1 "Unknown sentinel"). When identify cannot name a
+// real plant — AI vision explicitly reports is_plant=false, OR every engine
+// plus the AI probe yields ZERO suggestions — /v1/identify returns this single
+// canonical suggestion instead of an empty list or an upstream placeholder
+// name ("N/A" / "Unknown"). plant_id is the RESERVED AAA0000 (the curated 1522
+// catalog starts at AAA0001, so it never collides); the iOS client detects it
+// to open the "Mysterious plants" easter-egg page and block add-to-garden.
+// Contract mirrored in yardmate-swiftui recognition.md / mysterious-plants.md.
+const (
+	unknownSentinelPlantID        = "AAA0000"
+	unknownSentinelScientificName = "Plantae incognita"
+	unknownSentinelCommonName     = "Mysterious plants"
+	unknownSentinelImageURL       = "https://images.yardmate.ai/plant_images/AAA0000/1_whole.png"
+)
+
+// unknownSentinelResult builds the canonical Unknown sentinel IdentifyResult.
+// All fields are hardcoded; the handler MUST skip every post-processing step
+// (AI rerank, per-suggestion plant_id resolution, common-name upgrade) for a
+// sentinel result, else plant_id resolution would overwrite AAA0000 with nil.
+func unknownSentinelResult() *IdentifyResult {
+	pid := unknownSentinelPlantID
+	img := unknownSentinelImageURL
+	return &IdentifyResult{
+		IsPlant:           false,
+		IsPlantConfidence: 0,
+		Suggestions: []Suggestion{{
+			Name:           unknownSentinelScientificName,
+			ScientificName: unknownSentinelScientificName,
+			CommonNames:    []string{unknownSentinelCommonName},
+			Confidence:     0,
+			PlantID:        &pid,
+			ImageURL:       &img,
+		}},
+		AIEnhancedAt: nil,
+	}
+}
+
 // HandleIdentify returns the http.HandlerFunc for POST /v1/identify.
 // See SPEC §2.1, §3, §7 for the contract.
 //
@@ -236,6 +273,10 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			result *IdentifyResult
 			engine string
 		)
+		// Set true when result is the Unknown sentinel — gates OUT all
+		// post-processing (rerank / plant_id resolution / common-name upgrade),
+		// which would otherwise overwrite the hardcoded AAA0000 sentinel fields.
+		unknownSentinel := false
 		err = nil
 
 		if plantNet != nil {
@@ -395,6 +436,15 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					}
 				}
 				switch {
+				case errors.Is(verr, ErrVisionNotAPlant):
+					// AI vision EXPLICITLY says the image is not a plant →
+					// Unknown sentinel ("Mysterious plants", SPEC §2.1). This is
+					// authoritative even if the engine returned low-confidence
+					// candidates (engine never resolved to catalog and wasn't
+					// confident, else we'd not be here): vision's verdict wins.
+					result = unknownSentinelResult()
+					unknownSentinel = true
+					engine = "unknown-sentinel"
 				case verr == nil && aiSug != nil && aiHasPID &&
 					aiSug.Confidence >= aiCatalogRecoveryMinConfidence:
 					// AI recovered a catalog match with enough confidence →
@@ -408,7 +458,7 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					}
 					engine = "ai-catalog-recovery"
 				case len(cands) > 0:
-					// AI no catalog hit / low conf / vision err, but the
+					// AI no catalog hit / low conf / generic vision err, but the
 					// engine DID return candidates → keep the engine's
 					// ORIGINAL top candidate (out-of-catalog → iOS
 					// enrichment). The AI guess is NOT used (engine is the
@@ -418,8 +468,8 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					}
 					engine = base + "-raw-oob"
 				case verr == nil && aiSug != nil:
-					// Engine returned ZERO candidates but AI produced a guess
-					// (any confidence, out-of-catalog) → use it so the
+					// Engine returned ZERO candidates but AI produced a plant
+					// guess (any confidence, out-of-catalog) → use it so the
 					// "always a result" guarantee holds (#18).
 					result = &IdentifyResult{
 						IsPlant:           true,
@@ -428,20 +478,30 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					}
 					engine = "ai-raw-oob"
 				default:
-					// Engine returned zero AND vision errored → unchanged
-					// empty result → iOS "can't identify".
+					// Engine returned ZERO candidates AND vision errored (generic
+					// failure, not a not-a-plant verdict) → Unknown sentinel so
+					// identify still returns a result (was: empty → "can't
+					// identify"; now unified to the Mysterious plants easter egg,
+					// SPEC §2.1).
 					if verr != nil {
 						log.Printf("identify ai-vision fallback failed: deviceID=%s err=%v", deviceID, verr)
 					}
+					result = unknownSentinelResult()
+					unknownSentinel = true
+					engine = "unknown-sentinel-fallback"
 				}
 
 			default:
 				// 0 candidates in catalog AND vision == nil (no OPENAI key).
 				// cands non-empty → keep engine top as out-of-catalog
-				// (PlantID resolved nil by the loop below); cands empty →
-				// unchanged empty result → iOS "can't identify". Either way
-				// the engine tag stays <base> (no AI involved).
-				_ = cands
+				// (PlantID resolved nil by the loop below). cands empty → no
+				// engine result and no AI to confirm → Unknown sentinel (SPEC
+				// §2.1) so identify still returns a result.
+				if len(cands) == 0 {
+					result = unknownSentinelResult()
+					unknownSentinel = true
+					engine = base + "-unknown-sentinel"
+				}
 			}
 		}
 
@@ -466,7 +526,7 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		// 7. Optional AI rerank. Failures here do not affect the 200 response
 		//    contract — AIEnhancedAt simply stays null. The vision call uses
 		//    the same ctx but its client has an inner 8 s timeout (see SPEC §2.1).
-		if aiEnhance && vision != nil && len(result.Suggestions) > 0 {
+		if !unknownSentinel && aiEnhance && vision != nil && len(result.Suggestions) > 0 {
 			pick, verr := vision.RerankIdentify(ctx, imgBytes, mime, result.Suggestions)
 			if verr != nil {
 				log.Printf("identify ai_enhance failed: deviceID=%s err=%v", deviceID, verr)
@@ -490,29 +550,33 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     (SPEC §2.1 "plant_id mapping"). Same resolver /v1/diagnose uses
 		//     at the handler layer; content/LookupPlantID are nil-safe. Done
 		//     after the optional rerank but order-independent (per-suggestion).
+		//     SKIPPED for the Unknown sentinel: resolving "Plantae incognita"
+		//     would miss and overwrite the hardcoded AAA0000 with nil.
 		plantIDsResolved := 0
-		for i := range result.Suggestions {
-			sci := result.Suggestions[i].ScientificName
-			if id, ok := resolvePlantID(content, sci); ok {
-				pid := id
-				result.Suggestions[i].PlantID = &pid
-				plantIDsResolved++
-			}
-			result.Suggestions[i].ScientificName = speciesBinomial(sci) // display species-level (SPEC §2.1)
-		}
-
-		// 7b-2. Upgrade the PRIMARY suggestion's common name (Q2: top1 only).
-		// Priority (SPEC §2.1): curated catalog common_name > iNat preferred >
-		// upstream engine names. Best-effort — a miss/error keeps upstream.
-		if len(result.Suggestions) > 0 {
-			s0 := &result.Suggestions[0]
-			if s0.PlantID != nil {
-				if cn, ok := content.LookupCommonName(*s0.PlantID); ok {
-					s0.CommonNames = prependUnique(cn, s0.CommonNames)
+		if !unknownSentinel {
+			for i := range result.Suggestions {
+				sci := result.Suggestions[i].ScientificName
+				if id, ok := resolvePlantID(content, sci); ok {
+					pid := id
+					result.Suggestions[i].PlantID = &pid
+					plantIDsResolved++
 				}
-			} else if inat != nil {
-				if cn, ok := inat.PreferredCommonName(ctx, s0.ScientificName); ok {
-					s0.CommonNames = prependUnique(cn, s0.CommonNames)
+				result.Suggestions[i].ScientificName = speciesBinomial(sci) // display species-level (SPEC §2.1)
+			}
+
+			// 7b-2. Upgrade the PRIMARY suggestion's common name (Q2: top1 only).
+			// Priority (SPEC §2.1): curated catalog common_name > iNat preferred >
+			// upstream engine names. Best-effort — a miss/error keeps upstream.
+			if len(result.Suggestions) > 0 {
+				s0 := &result.Suggestions[0]
+				if s0.PlantID != nil {
+					if cn, ok := content.LookupCommonName(*s0.PlantID); ok {
+						s0.CommonNames = prependUnique(cn, s0.CommonNames)
+					}
+				} else if inat != nil {
+					if cn, ok := inat.PreferredCommonName(ctx, s0.ScientificName); ok {
+						s0.CommonNames = prependUnique(cn, s0.CommonNames)
+					}
 				}
 			}
 		}

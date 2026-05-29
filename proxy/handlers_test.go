@@ -651,6 +651,37 @@ func TestHandleIdentify_Cascade_PlantNet5xx_FallsBackToPlantID(t *testing.T) {
 }
 
 // (c) Pl@ntNet 404 "no match" → NO fallback; 200 with empty suggestions.
+// assertUnknownSentinel verifies the body is the canonical Unknown sentinel
+// (SPEC §2.1): is_plant=false + exactly one suggestion carrying the reserved
+// AAA0000 plant_id, "Plantae incognita", "Mysterious plants", and a non-empty
+// R2 hero image_url. Used by the cases that used to assert an empty result.
+func assertUnknownSentinel(t *testing.T, body []byte) {
+	t.Helper()
+	var result IdentifyResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if result.IsPlant {
+		t.Errorf("IsPlant = true, want false (Unknown sentinel)")
+	}
+	if len(result.Suggestions) != 1 {
+		t.Fatalf("Suggestions len = %d, want 1 (Unknown sentinel)", len(result.Suggestions))
+	}
+	s := result.Suggestions[0]
+	if s.PlantID == nil || *s.PlantID != "AAA0000" {
+		t.Errorf("plant_id = %v, want AAA0000", s.PlantID)
+	}
+	if s.ScientificName != "Plantae incognita" {
+		t.Errorf("scientific_name = %q, want Plantae incognita", s.ScientificName)
+	}
+	if len(s.CommonNames) == 0 || s.CommonNames[0] != "Mysterious plants" {
+		t.Errorf("common_names = %v, want [Mysterious plants]", s.CommonNames)
+	}
+	if s.ImageURL == nil || *s.ImageURL == "" {
+		t.Errorf("image_url = %v, want non-empty R2 URL", s.ImageURL)
+	}
+}
+
 func TestHandleIdentify_Cascade_PlantNet404_NoFallback_EmptyResult(t *testing.T) {
 	plantIDCalled := false
 	h, cleanup := newCascadeHandler(t,
@@ -671,16 +702,9 @@ func TestHandleIdentify_Cascade_PlantNet404_NoFallback_EmptyResult(t *testing.T)
 	if plantIDCalled {
 		t.Error("Plant.id was called; a Pl@ntNet 404 is a valid empty result")
 	}
-	var result IdentifyResult
-	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !result.IsPlant {
-		t.Errorf("IsPlant = false, want true (SPEC §1.4 empty result still is_plant)")
-	}
-	if len(result.Suggestions) != 0 {
-		t.Errorf("Suggestions len = %d, want 0 (no match)", len(result.Suggestions))
-	}
+	// Pl@ntNet 404 (empty) + no Plant.id + vision==nil → Unknown sentinel
+	// (SPEC §2.1; was 0 suggestions before the sentinel unification).
+	assertUnknownSentinel(t, rec.Body.Bytes())
 }
 
 // (d) Pl@ntNet image-rejected (400) → 400 bad_image, NO fallback.
@@ -894,7 +918,7 @@ const cannedPlantNetNoMatch = `{"error":"Not Found","message":"Species not found
 // the in-catalog AI species resolves to its YardMate plant_id (AAA0001).
 func TestHandleIdentify_Tier3_PlantNetEmpty_VisionFills(t *testing.T) {
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[\"Chinese Abelia\"],\"confidence\":0.71}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis\",\"common_names\":[\"Chinese Abelia\"],\"confidence\":0.71}"}}]}`)
 	}))
 	defer vsrv.Close()
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
@@ -950,7 +974,7 @@ func TestHandleIdentify_Tier3_PlantNetEmpty_VisionFills(t *testing.T) {
 // suggestions). Out-of-catalog AI species → plant_id stays null.
 func TestHandleIdentify_Tier3_PlantIDFallbackEmpty_VisionFills(t *testing.T) {
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Notaplant fakeium\",\"common_names\":[],\"confidence\":0.42}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Notaplant fakeium\",\"common_names\":[],\"confidence\":0.42}"}}]}`)
 	}))
 	defer vsrv.Close()
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
@@ -1006,18 +1030,11 @@ func TestHandleIdentify_Tier3_VisionError_KeepsEmptyResult(t *testing.T) {
 
 	rec := doCascadeReq(t, h)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (unchanged can't-identify), body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
 	}
-	var result IdentifyResult
-	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !result.IsPlant {
-		t.Errorf("IsPlant = false, want true (Pl@ntNet empty result still is_plant)")
-	}
-	if len(result.Suggestions) != 0 {
-		t.Errorf("Suggestions len = %d, want 0 (vision error → unchanged empty result)", len(result.Suggestions))
-	}
+	// Engine empty + vision GENUINE error (500, not a not-a-plant verdict) →
+	// Unknown sentinel (SPEC §2.1; was 0 suggestions before unification).
+	assertUnknownSentinel(t, rec.Body.Bytes())
 }
 
 // (j) Pl@ntNet no-match + vision==nil (no OPENAI key) → 200 empty
@@ -1036,24 +1053,46 @@ func TestHandleIdentify_Tier3_VisionNil_UnchangedBehavior(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
 	}
-	var result IdentifyResult
-	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !result.IsPlant || len(result.Suggestions) != 0 {
-		t.Errorf("result = %+v, want IsPlant=true + 0 suggestions (vision nil → unchanged)", result)
-	}
+	// Engine empty + vision==nil (no OPENAI key) → Unknown sentinel (SPEC §2.1;
+	// was 0 suggestions before the sentinel unification).
+	assertUnknownSentinel(t, rec.Body.Bytes())
 }
 
 // (k) Both engines DOWN (Pl@ntNet 5xx + Plant.id 5xx) + vision present →
 // STILL 502 plant_id_unavailable. Tier-3 must NOT mask an upstream error
 // (it only fires when the cascade SUCCEEDED with zero suggestions); wire
 // code unchanged.
+// (k') Pl@ntNet no-match + vision EXPLICITLY reports is_plant=false → Unknown
+// sentinel ("Mysterious plants", SPEC §2.1), NOT a best-guess suggestion and
+// NOT an empty result. This is the headline non-plant unification path.
+func TestHandleIdentify_Tier3_VisionNotAPlant_ReturnsSentinel(t *testing.T) {
+	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":false,\"scientific_name\":\"Unknown\",\"common_names\":[],\"confidence\":0.05}"}}]}`)
+	}))
+	defer vsrv.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
+
+	h, cleanup := newCascadeHandlerWithVision(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, cannedPlantNetNoMatch)
+		},
+		nil,
+		vision)
+	defer cleanup()
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	assertUnknownSentinel(t, rec.Body.Bytes())
+}
+
 func TestHandleIdentify_Tier3_BothEnginesDown_StillReturns502(t *testing.T) {
 	visionCalled := false
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		visionCalled = true
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"X\",\"common_names\":[],\"confidence\":0.9}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"X\",\"common_names\":[],\"confidence\":0.9}"}}]}`)
 	}))
 	defer vsrv.Close()
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
@@ -1186,7 +1225,7 @@ func TestHandleIdentify_CatalogPref_MultipleInCatalog_HighestConfidenceWins(t *t
 // ai-catalog-recovery; the AI suggestion becomes the sole in-catalog result.
 func TestHandleIdentify_CatalogPref_NoneInCatalog_AICatalogRecovery(t *testing.T) {
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[\"Chinese Abelia\"],\"confidence\":0.62}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis\",\"common_names\":[\"Chinese Abelia\"],\"confidence\":0.62}"}}]}`)
 	}))
 	defer vsrv.Close()
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
@@ -1251,7 +1290,7 @@ func TestHandleIdentify_CatalogPref_ConfidentTop_SkipsAI_EngineTopUsed(t *testin
 		// If reached this would (under the new 0.10 floor) be ACCEPTED as a
 		// catalog recovery — so reaching it at all is the bug we guard against.
 		visionCalled = true
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.40}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.40}"}}]}`)
 	}))
 	defer vsrv.Close()
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
@@ -1306,7 +1345,7 @@ func TestHandleIdentify_CatalogPref_ConfidentTop_SkipsAI_EngineTopUsed(t *testin
 // the "always a result" guarantee #18). plant_id null.
 func TestHandleIdentify_CatalogPref_EngineZero_AINonCatalog_AIRawOOB(t *testing.T) {
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Notincatalog fakeium\",\"common_names\":[],\"confidence\":0.33}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Notincatalog fakeium\",\"common_names\":[],\"confidence\":0.33}"}}]}`)
 	}))
 	defer vsrv.Close()
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
@@ -1351,13 +1390,9 @@ func TestHandleIdentify_CatalogPref_EngineZero_VisionNil_Empty(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
 	}
-	var result IdentifyResult
-	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !result.IsPlant || len(result.Suggestions) != 0 {
-		t.Errorf("result = %+v, want IsPlant=true + 0 suggestions (vision nil → unchanged)", result)
-	}
+	// Engine empty + vision==nil (no OPENAI key) → Unknown sentinel (SPEC §2.1;
+	// was 0 suggestions before the sentinel unification).
+	assertUnknownSentinel(t, rec.Body.Bytes())
 }
 
 // (g) BOTH engines unavailable → still 502 plant_id_unavailable; vision is
@@ -1366,7 +1401,7 @@ func TestHandleIdentify_CatalogPref_BothEnginesDown_502_VisionNotCalled(t *testi
 	visionCalled := false
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		visionCalled = true
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.99}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.99}"}}]}`)
 	}))
 	defer vsrv.Close()
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
@@ -1461,7 +1496,7 @@ func TestHandleIdentify_CatalogPref_ConfidentTop085_SkipsAIProbe(t *testing.T) {
 		visionCalled = true
 		// Would resolve to catalog at conf 0.99 (≥ new 0.10 floor) → if the
 		// probe were NOT skipped this would wrongly become the answer.
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.99}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.99}"}}]}`)
 	}))
 	defer vsrv.Close()
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
@@ -1514,7 +1549,7 @@ func TestHandleIdentify_CatalogPref_ConfidentTop085_SkipsAIProbe(t *testing.T) {
 // been rejected under the old 0.55 bar and kept the engine OOB top).
 func TestHandleIdentify_CatalogPref_AIConf012_RecoveredUnderNew010Floor(t *testing.T) {
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[\"Chinese Abelia\"],\"confidence\":0.12}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis\",\"common_names\":[\"Chinese Abelia\"],\"confidence\":0.12}"}}]}`)
 	}))
 	defer vsrv.Close()
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
@@ -1569,7 +1604,7 @@ func TestHandleIdentify_CatalogPref_AIConf012_RecoveredUnderNew010Floor(t *testi
 // 0.10 floor still rejects below it (the floor is lowered, not removed).
 func TestHandleIdentify_CatalogPref_AIConf005_BelowFloor_KeepsEngineTop(t *testing.T) {
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.05}"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.05}"}}]}`)
 	}))
 	defer vsrv.Close()
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
