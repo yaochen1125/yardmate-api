@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 )
 
 const commonsAPIBase = "https://commons.wikimedia.org/w/api.php"
@@ -70,9 +71,37 @@ type commonsImageInfo struct {
 	ExtMetadata    map[string]extField `json:"extmetadata"`
 }
 
-// extField is one extmetadata entry: Commons wraps each as {"value":"..."}.
+// extField is one extmetadata entry: Commons wraps each as {"value": ...}. The
+// `value` is USUALLY a string, but Commons returns a BARE JSON NUMBER for some
+// fields (e.g. an integer for certain files) — a fixed `string` type then makes
+// json.Unmarshal fail and abort the ENTIRE search (observed live on "Helianthus
+// annuus"). UnmarshalJSON coerces string / number / bool all into the string
+// Value so one numeric field never sinks the whole response.
 type extField struct {
-	Value string `json:"value"`
+	Value string
+}
+
+// UnmarshalJSON accepts {"value": <string|number|bool>, ...} and stores value as
+// a string. A string is taken verbatim; any other JSON scalar is kept as its raw
+// token (quotes trimmed). Other keys (e.g. "source") are ignored.
+func (e *extField) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		Value json.RawMessage `json:"value"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	if len(raw.Value) == 0 {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw.Value, &s); err == nil {
+		e.Value = s
+		return nil
+	}
+	// Non-string scalar (number / bool): keep the raw token, trimming any quotes.
+	e.Value = strings.Trim(string(raw.Value), `"`)
+	return nil
 }
 
 func (m commonsImageInfo) ext(key string) string {
