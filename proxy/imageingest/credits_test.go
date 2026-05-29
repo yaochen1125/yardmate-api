@@ -69,6 +69,20 @@ func TestBuildCreditsManifest_Empty(t *testing.T) {
 	}
 }
 
+// TestBuildCreditsManifest_SkipsBlankLicense locks the review fix: a minimal
+// "skipped_exists" marker for an orphan R2 object (no ledger attribution) has an
+// empty license and must NOT appear as a blank-attribution credits entry.
+func TestBuildCreditsManifest_SkipsBlankLicense(t *testing.T) {
+	rows := []FileRow{
+		{Slug: "a", ImageIndex: 1, ScientificName: "A plant", LicenseShort: "CC0"},
+		{Slug: "b", ImageIndex: 1, ScientificName: "B plant", LicenseShort: ""}, // orphan marker
+	}
+	m := BuildCreditsManifest(rows, time.Unix(0, 0))
+	if len(m.Entries) != 1 || m.Entries[0].Slug != "a" {
+		t.Fatalf("entries = %+v, want only the licensed row 'a'", m.Entries)
+	}
+}
+
 func TestRebuildCredits_FullRebuild(t *testing.T) {
 	// First rebuild with two rows; then the ledger drops one → the next
 	// rebuild reflects only the remaining row (full rebuild, not diff-append).

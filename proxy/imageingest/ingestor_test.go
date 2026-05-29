@@ -335,6 +335,37 @@ func TestIngestSpecies_DownloadFallThrough(t *testing.T) {
 	}
 }
 
+// TestIngestSpecies_DownloadFailureNotPermanentNegativeCache locks the review
+// fix: when the eligible pool is depleted by transient download failures, slots
+// that get no candidate are recorded as failed (retryable), NOT
+// no_acceptable_image (terminal negative cache that an outage could park
+// forever — the §3 / §9 #13 anti-pattern).
+func TestIngestSpecies_DownloadFailureNotPermanentNegativeCache(t *testing.T) {
+	src := &mockSource{
+		searchRet: []sources.Candidate{
+			cand(sources.SourceINaturalist, "a", "https://dl/a", "image/jpeg", "cc0", 4000, 3000),
+		},
+		downloadErrFor: map[string]error{"https://dl/a": sources.ErrUnavailable},
+	}
+	ledger := newMockLedger()
+	in := newIngestor(src, newMockStore(), ledger, Config{})
+	out, _ := in.IngestSpecies(context.Background(), IngestRequest{ScientificName: "Rosa regina", ImageCount: 2})
+	if len(out.PerImage) != 2 {
+		t.Fatalf("PerImage = %d, want 2", len(out.PerImage))
+	}
+	for i, oc := range out.PerImage {
+		if oc.Status != ImgSourceError {
+			t.Errorf("slot %d Status = %q, want source_error", i+1, oc.Status)
+		}
+	}
+	// Both file rows must persist as 'failed' (retryable), never no_acceptable.
+	for i := 1; i <= 2; i++ {
+		if r := ledger.files[fileKey("rosa-regina", i)]; r == nil || r.Status != StatusFailed {
+			t.Errorf("slot %d ledger = %+v, want StatusFailed", i, r)
+		}
+	}
+}
+
 func TestIngestSpecies_DeferredCapturesProvenance(t *testing.T) {
 	src := &mockSource{searchRet: []sources.Candidate{
 		cand(sources.SourceWikimediaCommons, "bysa", "https://dl/bysa", "image/jpeg", "cc-by-sa-4.0", 2000, 1500),

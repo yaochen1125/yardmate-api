@@ -149,7 +149,7 @@ func HandleRun(svc *Service) http.HandlerFunc {
 		imageCount := 0
 		if cs := q.Get("image_count"); cs != "" {
 			n, err := strconv.Atoi(cs)
-			if err != nil || n < 0 {
+			if err != nil || n < 0 || n > maxImageCount {
 				writeError(w, http.StatusBadRequest, "bad_request")
 				return
 			}

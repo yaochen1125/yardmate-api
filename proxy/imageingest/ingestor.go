@@ -197,10 +197,13 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 
 	// Fill each slot. Eligible candidates are consumed sequentially → distinct
 	// photo per slot (within-gallery dedup, SPEC §2.5 #4); already-deduped on
-	// DedupKey in gatherCandidates.
+	// DedupKey in gatherCandidates. sawDownloadFail tracks whether the eligible
+	// pool was depleted by transient download failures (vs genuinely having no
+	// acceptable image) so later empty slots are classified retryable (§3).
 	poolIdx, gatedIdx := 0, 0
+	sawDownloadFail := false
 	for i := 1; i <= n; i++ {
-		oc := in.fillSlot(ctx, slug, i, eligible, &poolIdx, gated, &gatedIdx)
+		oc := in.fillSlot(ctx, slug, i, eligible, &poolIdx, gated, &gatedIdx, &sawDownloadFail)
 		out.PerImage = append(out.PerImage, oc)
 	}
 
@@ -223,7 +226,7 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 // R2 HEAD for idempotency, then consumes eligible candidates with download
 // fall-through before declaring source_error (SPEC §2.1 / §2.5 #5). poolIdx /
 // gatedIdx advance past candidates consumed across slots.
-func (in *Ingestor) fillSlot(ctx context.Context, slug string, i int, eligible []scoredCandidate, poolIdx *int, gated []scoredCandidate, gatedIdx *int) ImageOutcome {
+func (in *Ingestor) fillSlot(ctx context.Context, slug string, i int, eligible []scoredCandidate, poolIdx *int, gated []scoredCandidate, gatedIdx *int, sawDownloadFail *bool) ImageOutcome {
 	oc := ImageOutcome{Index: i}
 
 	// Prior ledger row: skip terminal / fresh-negative / gated-while-off slots.
@@ -285,16 +288,22 @@ func (in *Ingestor) fillSlot(ctx context.Context, slug string, i int, eligible [
 
 	// Eligible candidates existed for this slot but every download failed →
 	// source_error (a transient/infra failure that should self-heal on retry,
-	// SPEC §3), distinct from "no acceptable license" below.
+	// SPEC §3), distinct from "no acceptable license" below. Mark the gallery so
+	// later slots emptied by the same depletion are also treated as retryable.
 	if *poolIdx > entryIdx {
+		*sawDownloadFail = true
 		oc.Status = ImgSourceError
 		oc.Note = "all downloads failed"
 		in.recordFailed(ctx, slug, i, oc, prior)
 		return oc
 	}
 
-	// No eligible candidate at all. If gated BY/SA candidates exist, defer (store
-	// provenance); else no acceptable image (SPEC §3).
+	// No eligible candidate left for this slot. If gated BY/SA candidates exist,
+	// defer (store provenance — re-cascades when the gate flips ON). Otherwise,
+	// if earlier slots depleted the eligible pool via download failures, this is
+	// a transient shortfall → source_error (retryable, NOT a permanent negative
+	// cache that an outage could park forever, §3 / §9 #13). Only a genuinely
+	// empty acceptable pool is no_acceptable_image.
 	if *gatedIdx < len(gated) {
 		pick := gated[*gatedIdx]
 		*gatedIdx++
@@ -310,6 +319,13 @@ func (in *Ingestor) fillSlot(ctx context.Context, slug string, i int, eligible [
 		return oc
 	}
 
+	if *sawDownloadFail {
+		oc.Status = ImgSourceError
+		oc.Note = "eligible pool depleted by download failures"
+		in.recordFailed(ctx, slug, i, oc, prior)
+		return oc
+	}
+
 	oc.Status = ImgNoAcceptable
 	oc.Note = "no acceptable license"
 	in.recordNoAcceptable(ctx, slug, i, oc, prior)
@@ -322,7 +338,10 @@ func (in *Ingestor) fillSlot(ctx context.Context, slug string, i int, eligible [
 // sources once it has enough eligible candidates for the gallery (SPEC §2.4).
 func (in *Ingestor) gatherCandidates(ctx context.Context, name string, n int) (eligible, gated []scoredCandidate) {
 	seen := map[string]bool{}
-	for _, src := range in.cascade {
+	for idx, src := range in.cascade {
+		if idx > 0 {
+			in.pace(ctx) // §4.1 etiquette between source calls
+		}
 		cands, err := src.Search(ctx, name, in.cfg.SearchLimit)
 		if err != nil {
 			log.Printf("imageingest source search err: name=%q err=%v", name, err)
@@ -349,9 +368,12 @@ func (in *Ingestor) gatherCandidates(ctx context.Context, name string, n int) (e
 			}
 			eligible = append(eligible, sc)
 		}
-		// Enough eligible candidates for the whole gallery → stop early. Keep
-		// probing while short so a CC0-poor primary source can be topped up.
-		if len(eligible) >= n {
+		// Over-provision before stopping (SPEC §2.4 "len(accumulator) >= N*2"):
+		// download fall-through (§2.5 #5) consumes a candidate per failed
+		// rendition, so an exactly-N pool under-fills the gallery on any 404.
+		// The extra headroom also ensures the Wikimedia fallback is still probed
+		// for gated BY/SA candidates when iNat is CC0-rich.
+		if len(eligible) >= n*2 {
 			break
 		}
 	}

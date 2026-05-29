@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -40,6 +41,13 @@ type CreditsEntry struct {
 func BuildCreditsManifest(rows []FileRow, now time.Time) CreditsManifest {
 	entries := make([]CreditsEntry, 0, len(rows))
 	for _, r := range rows {
+		// Skip rows with no license info (e.g. a minimal "skipped_exists" marker
+		// for an orphan R2 object with no ledger attribution): a credits entry
+		// with blank license/author is meaningless noise, and publishing it would
+		// look like an attribution-less credit for a possibly BY/SA image.
+		if strings.TrimSpace(r.LicenseShort) == "" {
+			continue
+		}
 		entries = append(entries, CreditsEntry{
 			Slug:           r.Slug,
 			ImageIndex:     r.ImageIndex,
