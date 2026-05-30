@@ -222,3 +222,29 @@ var (
 	_ ObjectStore = (*R2Client)(nil)
 	_ LedgerStore = (*Ledger)(nil)
 )
+
+// canonicalizeHeroPhotoID normalizes string/number JSON to a base-10 int64
+// string, or "" for anything non-canonical (SPEC §2.1.1 / §9 #17).
+func TestCanonicalizeHeroPhotoID(t *testing.T) {
+	cases := []struct {
+		raw  string // raw JSON token
+		want string
+	}{
+		{`"12345"`, "12345"}, // JSON string (what iOS sends)
+		{`12345`, "12345"},   // bare JSON number
+		{`"00123"`, "123"},   // leading zeros normalized away (still matches int64 key)
+		{`" 678 "`, "678"},   // whitespace-padded string
+		{``, ""},             // absent
+		{`""`, ""},           // empty string
+		{`"abc"`, ""},        // non-numeric
+		{`"-5"`, ""},         // negative
+		{`0`, ""},            // zero is not a valid id
+		{`"1 2"`, ""},        // embedded space
+		{`"+9"`, ""},         // signed
+	}
+	for _, c := range cases {
+		if got := canonicalizeHeroPhotoID(json.RawMessage(c.raw)); got != c.want {
+			t.Errorf("canonicalizeHeroPhotoID(%s) = %q, want %q", c.raw, got, c.want)
+		}
+	}
+}

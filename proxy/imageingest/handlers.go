@@ -38,9 +38,34 @@ func NewService(ingestor *Ingestor, adminToken string) *Service {
 }
 
 // publicRequest is the JSON body of POST /v1/plants/imageingest (SPEC §1.3).
+// hero_image.photo_id drives slot-1 pass-through (§2.1.1); url/license_code/
+// attribution (if sent) are advisory for iOS display and ignored here.
 type publicRequest struct {
 	ScientificName string `json:"scientific_name"`
 	ImageCount     int    `json:"image_count"`
+	HeroImage      *struct {
+		PhotoID json.RawMessage `json:"photo_id"` // string OR number; canonicalized to int64
+	} `json:"hero_image"`
+}
+
+// canonicalizeHeroPhotoID normalizes a forwarded iNat photo id (JSON string or
+// number) into the base-10 int64 string used for the cascade DedupKey match
+// (SPEC §2.1.1 / §9 #17: key = "inat-photo-"+id). Any non-numeric / non-positive
+// / unparseable value → "" (no pass-through; slot 1 cascades). Leading zeros are
+// normalized away so the key still byte-matches the iNat-built one.
+func canonicalizeHeroPhotoID(raw json.RawMessage) string {
+	s := strings.TrimSpace(string(raw))
+	s = strings.TrimSpace(strings.Trim(s, `"`)) // accept "123" (string) or 123 (number)
+	if s == "" {
+		return ""
+	}
+	// ParseUint rejects any sign ("+9" / "-5") and non-digits; leading zeros are
+	// normalized away by FormatUint so the key still matches the int64-built one.
+	n, err := strconv.ParseUint(s, 10, 64)
+	if err != nil || n == 0 {
+		return ""
+	}
+	return strconv.FormatUint(n, 10)
 }
 
 // HandlePublic returns the http.HandlerFunc for POST /v1/plants/imageingest
@@ -92,6 +117,11 @@ func HandlePublic(svc *Service) http.HandlerFunc {
 			n = svc.ingestor.cfg.DefaultImageCount
 		}
 
+		heroPhotoID := ""
+		if body.HeroImage != nil {
+			heroPhotoID = canonicalizeHeroPhotoID(body.HeroImage.PhotoID)
+		}
+
 		// Fire-and-forget: the real work runs in a detached goroutine bounded by
 		// single-flight per slug (concurrent duplicates coalesce, SPEC §4.2).
 		go func(req IngestRequest) {
@@ -108,7 +138,7 @@ func HandlePublic(svc *Service) http.HandlerFunc {
 			}
 			log.Printf("imageingest public ok: slug=%s images=%d attestKey=%q attestAssert=%v",
 				out.Slug, len(out.PerImage), attKeyID, attAssertPresent)
-		}(IngestRequest{ScientificName: name, ImageCount: n})
+		}(IngestRequest{ScientificName: name, ImageCount: n, HeroPhotoID: heroPhotoID})
 
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"accepted":              true,

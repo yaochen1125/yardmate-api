@@ -62,6 +62,11 @@ type IngestRequest struct {
 	Slug           string
 	ScientificName string
 	ImageCount     int
+	// HeroPhotoID is the iNaturalist photo id iOS displayed (hero pass-through,
+	// SPEC §2.1.1). "" = no pass-through (cascade-only). It must already be
+	// canonicalized to a base-10 int64 string by the caller so it byte-matches
+	// the cascade DedupKey "inat-photo-"+id (the handler does this; §9 #17).
+	HeroPhotoID string
 }
 
 // --- Collaborator interfaces (mocked in ingestor_test, SPEC §10) ---
@@ -122,7 +127,7 @@ type Ingestor struct {
 	cfg     Config
 
 	// single-flight per slug: concurrent requests for the same slug coalesce
-	// (SPEC §4.2 / §9 #11 / #16). Process-local mutex map (single-instance OK).
+	// (SPEC §4.2 / §9 #11 / #19). Process-local mutex map (single-instance OK).
 	flightMu sync.Mutex
 	inflight map[string]bool
 }
@@ -218,9 +223,32 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 	// image) so later empty slots stay retryable (§3 / §9 #13).
 	if len(plan) > 0 {
 		eligible, gated := in.gatherCandidates(ctx, req.ScientificName, len(plan))
+
+		// Hero pass-through (Option Y, SPEC §2.1.1): if slot 1 needs filling and a
+		// HeroPhotoID was forwarded, match it within OUR cascade results (never a
+		// client URL) and store THAT candidate as slot 1, removing it from the pool
+		// so slots 2..N don't repeat it (§2.5 #4). Match in eligible → store now;
+		// match in gated (BY/SA, gate off) → defer (R2 stays empty, iOS keeps
+		// showing the transient URL). No match → slot 1 falls to the cascade pick.
+		heroHandled := false
+		if req.HeroPhotoID != "" && plan[0] == 1 {
+			if rest, hero, ok := takeHeroCandidate(eligible, req.HeroPhotoID); ok {
+				eligible = rest
+				out.PerImage[0] = in.storeHero(ctx, slug, priors[1], hero, false)
+				heroHandled = true
+			} else if rest, hero, ok := takeHeroCandidate(gated, req.HeroPhotoID); ok {
+				gated = rest
+				out.PerImage[0] = in.storeHero(ctx, slug, priors[1], hero, true)
+				heroHandled = true
+			}
+		}
+
 		poolIdx, gatedIdx := 0, 0
 		sawDownloadFail := false
 		for _, i := range plan {
+			if i == 1 && heroHandled {
+				continue
+			}
 			out.PerImage[i-1] = in.fillSlot(ctx, slug, i, priors[i], eligible, &poolIdx, gated, &gatedIdx, &sawDownloadFail)
 		}
 	}
@@ -232,7 +260,7 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 		log.Printf("imageingest recompute count err: slug=%s err=%v", slug, err)
 	}
 
-	// Rebuild the public credits manifest (SPEC §2.7 / §9 #15 — full rebuild).
+	// Rebuild the public credits manifest (SPEC §2.7 / §9 #18 — full rebuild).
 	if err := in.rebuildCredits(ctx); err != nil {
 		log.Printf("imageingest credits rebuild err: slug=%s err=%v", slug, err)
 	}
@@ -362,6 +390,59 @@ func (in *Ingestor) fillSlot(ctx context.Context, slug string, i int, prior *Fil
 	return oc
 }
 
+// takeHeroCandidate finds and removes the candidate matching the forwarded iNat
+// photo id from a pool (hero pass-through, SPEC §2.1.1). The match key is
+// "inat-photo-"+photoID — byte-identical to what sources.INatClient assigns as
+// DedupKey (§9 #17); photoID must already be canonicalized (handler normalizes
+// through int64). Returns the pool WITHOUT the match + the matched candidate +
+// ok. The three-index slice keeps the original backing array untouched.
+func takeHeroCandidate(pool []scoredCandidate, photoID string) ([]scoredCandidate, scoredCandidate, bool) {
+	key := "inat-photo-" + photoID
+	for idx := range pool {
+		if pool[idx].cand.DedupKey == key {
+			return append(pool[:idx:idx], pool[idx+1:]...), pool[idx], true
+		}
+	}
+	return pool, scoredCandidate{}, false
+}
+
+// storeHero fills slot 1 with the specific matched hero candidate (Option Y,
+// SPEC §2.1.1). gated=true → the hero is BY/SA while the attribution gate is OFF
+// → record deferred_attribution (R2 stays empty, iOS keeps showing the transient
+// URL; stored on the next trigger after the gate flips). Otherwise download the
+// candidate's iNat-API rendition + upload. A download/upload failure records a
+// retryable error for slot 1 (next trigger re-matches + retries).
+func (in *Ingestor) storeHero(ctx context.Context, slug string, prior *FileRow, hero scoredCandidate, gated bool) ImageOutcome {
+	const i = 1
+	key := galleryKey(slug, i)
+	if gated {
+		oc := ImageOutcome{
+			Index: i, Status: ImgDeferredAttrib,
+			Source: hero.cand.Source, License: hero.lic.Code, LicenseShort: hero.lic.ShortName,
+			LicenseURL: licenseURLOf(hero.lic), Author: hero.lic.Author, SourceURL: hero.cand.PageURL,
+			Note: "hero attribution gate off",
+		}
+		in.recordDeferred(ctx, slug, oc, hero.cand.DownloadURL, prior)
+		return oc
+	}
+	data, mime, derr := hero.dl.Download(ctx, hero.cand.DownloadURL)
+	if derr != nil {
+		log.Printf("imageingest hero download fail: slug=%s url=%s err=%v", slug, hero.cand.DownloadURL, derr)
+		oc := ImageOutcome{Index: i, Status: ImgSourceError, Note: "hero download failed"}
+		in.recordFailed(ctx, slug, i, oc, prior)
+		return oc
+	}
+	if uerr := in.store.Put(ctx, key, data, mime, imageCacheControl); uerr != nil {
+		oc := ImageOutcome{Index: i, Status: ImgUploadError, Note: "hero put failed"}
+		in.recordFailed(ctx, slug, i, oc, prior)
+		return oc
+	}
+	in.pace(ctx)
+	oc := in.ingestedOutcome(i, key, hero, mime, int64(len(data)))
+	in.recordIngested(ctx, slug, oc)
+	return oc
+}
+
 // gatherCandidates walks the cascade, classifies each raw candidate, dedups on
 // DedupKey, and splits into upload-eligible vs gated (BY/SA while the flag is
 // OFF). Both slices are returned ranked (SPEC §2.5). It stops probing further
@@ -423,7 +504,7 @@ func (in *Ingestor) pace(ctx context.Context) {
 	}
 }
 
-// --- single-flight (SPEC §4.2 / §9 #11 / #16) ---
+// --- single-flight (SPEC §4.2 / §9 #11 / #19) ---
 
 func (in *Ingestor) acquire(slug string) bool {
 	in.flightMu.Lock()

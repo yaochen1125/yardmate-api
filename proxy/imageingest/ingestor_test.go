@@ -548,3 +548,78 @@ func TestCcDeedURL(t *testing.T) {
 		}
 	}
 }
+
+// --- hero pass-through (Option Y, SPEC §2.1.1) ---
+
+// HeroPhotoID overrides slot 1 to the matched candidate even when another
+// candidate ranks higher, and that hero is excluded from slots 2..N.
+func TestIngestSpecies_HeroPassThroughMatch(t *testing.T) {
+	src := &mockSource{searchRet: []sources.Candidate{
+		cand(sources.SourceINaturalist, "a", "https://dl/a", "image/jpeg", "cc0", 4000, 3000),                  // ranks first by size
+		cand(sources.SourceINaturalist, "inat-photo-12345", "https://dl/hero", "image/jpeg", "cc0", 1000, 800), // the hero, smaller
+	}}
+	store := newMockStore()
+	ledger := newMockLedger()
+	in := newIngestor(src, store, ledger, Config{})
+	out, err := in.IngestSpecies(context.Background(), IngestRequest{
+		ScientificName: "Rosa regina", ImageCount: 2, HeroPhotoID: "12345",
+	})
+	if err != nil {
+		t.Fatalf("hard error: %v", err)
+	}
+	if out.PerImage[0].Status != ImgIngested || out.PerImage[1].Status != ImgIngested {
+		t.Fatalf("want 2 ingested, got %+v", out.PerImage)
+	}
+	// Slot 1 = the forwarded hero (NOT the higher-ranked "a").
+	if out.PerImage[0].SourceURL != "https://example.org/inat-photo-12345" {
+		t.Errorf("slot 1 = %q, want the hero candidate", out.PerImage[0].SourceURL)
+	}
+	// Hero excluded from slot 2 → slot 2 is the other candidate.
+	if out.PerImage[1].SourceURL != "https://example.org/a" {
+		t.Errorf("slot 2 = %q, want the non-hero candidate", out.PerImage[1].SourceURL)
+	}
+}
+
+// A gated (BY/SA, gate off) hero defers slot 1 to itself rather than taking a
+// different eligible candidate — preserving "stored == displayed" (no jump).
+func TestIngestSpecies_HeroGatedDefersNotSwap(t *testing.T) {
+	src := &mockSource{searchRet: []sources.Candidate{
+		cand(sources.SourceINaturalist, "freebie", "https://dl/free", "image/jpeg", "cc0", 4000, 3000),
+		cand(sources.SourceWikimediaCommons, "inat-photo-999", "https://dl/hero", "image/jpeg", "cc-by-sa-4.0", 2000, 1500),
+	}}
+	store := newMockStore()
+	in := newIngestor(src, store, newMockLedger(), Config{AllowAttributionLicenses: false})
+	out, err := in.IngestSpecies(context.Background(), IngestRequest{
+		ScientificName: "Rosa regina", ImageCount: 1, HeroPhotoID: "999",
+	})
+	if err != nil {
+		t.Fatalf("hard error: %v", err)
+	}
+	if out.PerImage[0].Status != ImgDeferredAttrib {
+		t.Fatalf("slot 1 status = %s, want deferred (defer to hero, not swap to cc0)", out.PerImage[0].Status)
+	}
+	if out.PerImage[0].License != "cc-by-sa-4.0" {
+		t.Errorf("slot 1 license = %q, want the hero's cc-by-sa-4.0", out.PerImage[0].License)
+	}
+	if _, ok := store.puts[galleryKey("rosa-regina", 1)]; ok {
+		t.Errorf("slot 1 should NOT be uploaded while gated")
+	}
+}
+
+// An unmatched HeroPhotoID falls back to the cascade's own slot-1 pick.
+func TestIngestSpecies_HeroNoMatchCascades(t *testing.T) {
+	src := &mockSource{searchRet: []sources.Candidate{
+		cand(sources.SourceINaturalist, "a", "https://dl/a", "image/jpeg", "cc0", 4000, 3000),
+	}}
+	store := newMockStore()
+	in := newIngestor(src, store, newMockLedger(), Config{})
+	out, err := in.IngestSpecies(context.Background(), IngestRequest{
+		ScientificName: "Rosa regina", ImageCount: 1, HeroPhotoID: "404040", // no candidate has this id
+	})
+	if err != nil {
+		t.Fatalf("hard error: %v", err)
+	}
+	if out.PerImage[0].Status != ImgIngested || out.PerImage[0].SourceURL != "https://example.org/a" {
+		t.Errorf("want cascade slot 1 = a, got %+v", out.PerImage[0])
+	}
+}
