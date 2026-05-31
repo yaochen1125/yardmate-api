@@ -315,7 +315,8 @@ func (in *Ingestor) planSlot(ctx context.Context, slug string, i int) (ImageOutc
 		oc.Status = ImgSkippedExists
 		oc.R2Key = key
 		in.recordSkippedExists(ctx, slug, i, key, prior)
-		return oc, false, nil
+		// 返回 prior（带 source_url）→ 调用方据此排除已存照片，增量补图去重（4→6）。
+		return oc, false, prior
 	}
 	return oc, true, prior
 }
