@@ -62,8 +62,8 @@ func inatRouter(t *testing.T, taxaBody, obsBody string, sawObsLicense *string) h
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/taxa"):
-			if r.URL.Query().Get("rank") != "species" {
-				t.Errorf("taxa rank = %q, want species", r.URL.Query().Get("rank"))
+			if got := r.URL.Query().Get("rank"); got != "species,genus,subspecies,variety" {
+				t.Errorf("taxa rank = %q, want species,genus,subspecies,variety", got)
 			}
 			_, _ = w.Write([]byte(taxaBody))
 		case strings.HasPrefix(r.URL.Path, "/observations"):

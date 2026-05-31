@@ -152,11 +152,17 @@ func (c *INatClient) Search(ctx context.Context, scientificName string, limit in
 	return out, nil
 }
 
-// searchTaxa runs GET /taxa?q=&rank=species&per_page=5.
+// searchTaxa runs GET /taxa?q=&rank=species,genus,subspecies,variety&per_page=5.
+// Ranks mirror the iOS search (Home/Search INatTaxaClient): a genus/subspecies
+// entry (e.g. "Trifolium", "clovers") must resolve to its iNat taxon too, else
+// the rank=species-only filter drops it, the exact-name match below finds no
+// match, this source returns zero candidates, and the whole gallery falls
+// through to Wikimedia — diverging from the iNat photo the user saw in search
+// (hero pass-through then can never pin the forwarded photo).
 func (c *INatClient) searchTaxa(ctx context.Context, name string) ([]inatTaxon, error) {
 	q := url.Values{}
 	q.Set("q", name)
-	q.Set("rank", "species")
+	q.Set("rank", "species,genus,subspecies,variety")
 	q.Set("per_page", "5")
 	reqURL := c.apiBase + "/taxa?" + q.Encode()
 
