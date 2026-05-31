@@ -623,3 +623,26 @@ func TestIngestSpecies_HeroNoMatchCascades(t *testing.T) {
 		t.Errorf("want cascade slot 1 = a, got %+v", out.PerImage[0])
 	}
 }
+
+func TestDropUsedCandidates(t *testing.T) {
+	mk := func(page string) scoredCandidate {
+		return scoredCandidate{cand: sources.Candidate{PageURL: page}}
+	}
+	pool := []scoredCandidate{
+		mk("https://www.inaturalist.org/photos/1"),
+		mk("https://www.inaturalist.org/photos/2"),
+		mk("https://www.inaturalist.org/photos/3"),
+		mk(""), // PageURL 空：永不被排除
+	}
+	used := map[string]bool{
+		"https://www.inaturalist.org/photos/1": true, // 已存 slot 用过
+		"https://www.inaturalist.org/photos/3": true,
+	}
+	got := dropUsedCandidates(pool, used)
+	if len(got) != 2 {
+		t.Fatalf("want 2 survivors, got %d", len(got))
+	}
+	if got[0].cand.PageURL != "https://www.inaturalist.org/photos/2" || got[1].cand.PageURL != "" {
+		t.Fatalf("unexpected survivors: %q, %q", got[0].cand.PageURL, got[1].cand.PageURL)
+	}
+}

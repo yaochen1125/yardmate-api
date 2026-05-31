@@ -205,12 +205,18 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 	out.PerImage = make([]ImageOutcome, n)
 	var plan []int
 	priors := make(map[int]*FileRow, n)
+	// 已 ingested 槽位用过的照片（source_url = candidate.PageURL）。增量补图（如 4→6）时
+	// 新槽位要排除这些，否则填 slot 5/6 会重复挑已在 slot 1-4 的照片（within-gather 去重
+	// 只在本次抓取内生效，不跨已存槽位 §2.5 #4）。
+	usedSourceURLs := map[string]bool{}
 	for i := 1; i <= n; i++ {
 		oc, needsFill, prior := in.planSlot(ctx, slug, i)
 		out.PerImage[i-1] = oc
 		if needsFill {
 			plan = append(plan, i)
 			priors[i] = prior
+		} else if prior != nil && prior.SourceURL != "" {
+			usedSourceURLs[prior.SourceURL] = true
 		}
 	}
 
@@ -223,6 +229,11 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 	// image) so later empty slots stay retryable (§3 / §9 #13).
 	if len(plan) > 0 {
 		eligible, gated := in.gatherCandidates(ctx, req.ScientificName, len(plan))
+		// 增量补图去重：排除已 ingested 槽位用过的照片，新槽位不重复（4→6 不再重复 1-4）。
+		if len(usedSourceURLs) > 0 {
+			eligible = dropUsedCandidates(eligible, usedSourceURLs)
+			gated = dropUsedCandidates(gated, usedSourceURLs)
+		}
 
 		// Hero pass-through (Option Y, SPEC §2.1.1): if slot 1 needs filling and a
 		// HeroPhotoID was forwarded, match it within OUR cascade results (never a
@@ -388,6 +399,22 @@ func (in *Ingestor) fillSlot(ctx context.Context, slug string, i int, prior *Fil
 	oc.Note = "no acceptable license"
 	in.recordNoAcceptable(ctx, slug, i, oc, prior)
 	return oc
+}
+
+// dropUsedCandidates removes candidates whose PageURL (== ledger source_url of an
+// already-ingested slot) is already used, so incremental top-ups (e.g. growing a
+// gallery 4→6) don't re-pick a photo that's already stored in an earlier slot.
+// The within-gather dedup (§2.5 #4) only de-dupes inside one fetch; this extends
+// it across slots already on disk. Returns a fresh slice (backing array untouched).
+func dropUsedCandidates(cands []scoredCandidate, used map[string]bool) []scoredCandidate {
+	out := make([]scoredCandidate, 0, len(cands))
+	for _, c := range cands {
+		if c.cand.PageURL != "" && used[c.cand.PageURL] {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // takeHeroCandidate finds and removes the candidate matching the forwarded iNat
