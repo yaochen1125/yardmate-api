@@ -228,12 +228,9 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 	// was depleted by transient download failures (vs genuinely no acceptable
 	// image) so later empty slots stay retryable (§3 / §9 #13).
 	if len(plan) > 0 {
-		eligible, gated := in.gatherCandidates(ctx, req.ScientificName, len(plan))
-		// 增量补图去重：排除已 ingested 槽位用过的照片，新槽位不重复（4→6 不再重复 1-4）。
-		if len(usedSourceURLs) > 0 {
-			eligible = dropUsedCandidates(eligible, usedSourceURLs)
-			gated = dropUsedCandidates(gated, usedSourceURLs)
-		}
+		// usedSourceURLs 传进 gather：在 n*2 提前 break 之前就排除已用图，凑不够才继续
+		// 问下一源（Codex #40 P1：gather 后再过滤会因 break 提前导致新槽位永久缺图）。
+		eligible, gated := in.gatherCandidates(ctx, req.ScientificName, len(plan), usedSourceURLs)
 
 		// Hero pass-through (Option Y, SPEC §2.1.1): if slot 1 needs filling and a
 		// HeroPhotoID was forwarded, match it within OUR cascade results (never a
@@ -402,22 +399,6 @@ func (in *Ingestor) fillSlot(ctx context.Context, slug string, i int, prior *Fil
 	return oc
 }
 
-// dropUsedCandidates removes candidates whose PageURL (== ledger source_url of an
-// already-ingested slot) is already used, so incremental top-ups (e.g. growing a
-// gallery 4→6) don't re-pick a photo that's already stored in an earlier slot.
-// The within-gather dedup (§2.5 #4) only de-dupes inside one fetch; this extends
-// it across slots already on disk. Returns a fresh slice (backing array untouched).
-func dropUsedCandidates(cands []scoredCandidate, used map[string]bool) []scoredCandidate {
-	out := make([]scoredCandidate, 0, len(cands))
-	for _, c := range cands {
-		if c.cand.PageURL != "" && used[c.cand.PageURL] {
-			continue
-		}
-		out = append(out, c)
-	}
-	return out
-}
-
 // takeHeroCandidate finds and removes the candidate matching the forwarded iNat
 // photo id from a pool (hero pass-through, SPEC §2.1.1). The match key is
 // "inat-photo-"+photoID — byte-identical to what sources.INatClient assigns as
@@ -475,7 +456,7 @@ func (in *Ingestor) storeHero(ctx context.Context, slug string, prior *FileRow, 
 // DedupKey, and splits into upload-eligible vs gated (BY/SA while the flag is
 // OFF). Both slices are returned ranked (SPEC §2.5). It stops probing further
 // sources once it has enough eligible candidates for the gallery (SPEC §2.4).
-func (in *Ingestor) gatherCandidates(ctx context.Context, name string, n int) (eligible, gated []scoredCandidate) {
+func (in *Ingestor) gatherCandidates(ctx context.Context, name string, n int, usedSourceURLs map[string]bool) (eligible, gated []scoredCandidate) {
 	seen := map[string]bool{}
 	for idx, src := range in.cascade {
 		if idx > 0 {
@@ -492,6 +473,12 @@ func (in *Ingestor) gatherCandidates(ctx context.Context, name string, n int) (e
 					continue
 				}
 				seen[c.DedupKey] = true
+			}
+			// 增量补图：排除已 ingested 槽位用过的照片（source_url=PageURL）。必须在
+			// `len(eligible) >= n*2` 提前 break 之前排——否则 iNat 全是已用图时会凑够
+			// n*2 break 掉、不再问 Wikimedia，新槽位永久缺图（Codex #40 P1）。
+			if len(usedSourceURLs) > 0 && c.PageURL != "" && usedSourceURLs[c.PageURL] {
+				continue
 			}
 			if isExcludedFormat(c) {
 				continue
