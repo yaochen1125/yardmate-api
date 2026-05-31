@@ -523,7 +523,7 @@ func TestGatherCandidates_ExcludesFormatsAndDeprioritizes(t *testing.T) {
 		cand(sources.SourceWikimediaCommons, "photo.jpg", "https://dl/photo", "image/jpeg", "cc0", 2000, 1500),
 	}}
 	in := newIngestor(src, newMockStore(), newMockLedger(), Config{})
-	eligible, _ := in.gatherCandidates(context.Background(), "Rosa regina", 4)
+	eligible, _ := in.gatherCandidates(context.Background(), "Rosa regina", 4, nil)
 	if len(eligible) != 2 {
 		t.Fatalf("want svg excluded → 2 eligible, got %d", len(eligible))
 	}

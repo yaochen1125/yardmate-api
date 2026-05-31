@@ -205,12 +205,18 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 	out.PerImage = make([]ImageOutcome, n)
 	var plan []int
 	priors := make(map[int]*FileRow, n)
+	// 已 ingested 槽位用过的照片（source_url = candidate.PageURL）。增量补图（如 4→6）时
+	// 新槽位要排除这些，否则填 slot 5/6 会重复挑已在 slot 1-4 的照片（within-gather 去重
+	// 只在本次抓取内生效，不跨已存槽位 §2.5 #4）。
+	usedSourceURLs := map[string]bool{}
 	for i := 1; i <= n; i++ {
 		oc, needsFill, prior := in.planSlot(ctx, slug, i)
 		out.PerImage[i-1] = oc
 		if needsFill {
 			plan = append(plan, i)
 			priors[i] = prior
+		} else if prior != nil && prior.SourceURL != "" {
+			usedSourceURLs[prior.SourceURL] = true
 		}
 	}
 
@@ -222,7 +228,9 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 	// was depleted by transient download failures (vs genuinely no acceptable
 	// image) so later empty slots stay retryable (§3 / §9 #13).
 	if len(plan) > 0 {
-		eligible, gated := in.gatherCandidates(ctx, req.ScientificName, len(plan))
+		// usedSourceURLs 传进 gather：在 n*2 提前 break 之前就排除已用图，凑不够才继续
+		// 问下一源（Codex #40 P1：gather 后再过滤会因 break 提前导致新槽位永久缺图）。
+		eligible, gated := in.gatherCandidates(ctx, req.ScientificName, len(plan), usedSourceURLs)
 
 		// Hero pass-through (Option Y, SPEC §2.1.1): if slot 1 needs filling and a
 		// HeroPhotoID was forwarded, match it within OUR cascade results (never a
@@ -304,7 +312,8 @@ func (in *Ingestor) planSlot(ctx context.Context, slug string, i int) (ImageOutc
 		oc.Status = ImgSkippedExists
 		oc.R2Key = key
 		in.recordSkippedExists(ctx, slug, i, key, prior)
-		return oc, false, nil
+		// 返回 prior（带 source_url）→ 调用方据此排除已存照片，增量补图去重（4→6）。
+		return oc, false, prior
 	}
 	return oc, true, prior
 }
@@ -447,7 +456,7 @@ func (in *Ingestor) storeHero(ctx context.Context, slug string, prior *FileRow, 
 // DedupKey, and splits into upload-eligible vs gated (BY/SA while the flag is
 // OFF). Both slices are returned ranked (SPEC §2.5). It stops probing further
 // sources once it has enough eligible candidates for the gallery (SPEC §2.4).
-func (in *Ingestor) gatherCandidates(ctx context.Context, name string, n int) (eligible, gated []scoredCandidate) {
+func (in *Ingestor) gatherCandidates(ctx context.Context, name string, n int, usedSourceURLs map[string]bool) (eligible, gated []scoredCandidate) {
 	seen := map[string]bool{}
 	for idx, src := range in.cascade {
 		if idx > 0 {
@@ -464,6 +473,12 @@ func (in *Ingestor) gatherCandidates(ctx context.Context, name string, n int) (e
 					continue
 				}
 				seen[c.DedupKey] = true
+			}
+			// 增量补图：排除已 ingested 槽位用过的照片（source_url=PageURL）。必须在
+			// `len(eligible) >= n*2` 提前 break 之前排——否则 iNat 全是已用图时会凑够
+			// n*2 break 掉、不再问 Wikimedia，新槽位永久缺图（Codex #40 P1）。
+			if len(usedSourceURLs) > 0 && c.PageURL != "" && usedSourceURLs[c.PageURL] {
+				continue
 			}
 			if isExcludedFormat(c) {
 				continue
