@@ -13,11 +13,13 @@ import (
 const inatAPIBase = "https://api.inaturalist.org/v1"
 
 // inatObservationLicenses filters supplementary observation photos at the API
-// level (SPEC §2.4.1). CC-BY-SA is intentionally omitted here to match SPEC;
-// SA images can still arrive via a taxon's default_photo (which is NOT
-// license-filtered at the API and is classified by the parent). Widening this
-// to include cc-by-sa is a future tweak if iNat-sourced SA galleries matter.
-const inatObservationLicenses = "cc0,cc-by"
+// level (SPEC §2.4.1). Includes cc-by-sa: the BY/SA gate is ON
+// (IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES=true, after the iOS Credits page went
+// live), so SA joins the pinned free set on BOTH iOS + backend (no-jump rule,
+// §2.4.1) — keeping the two sides' iNat selection identical. SA still ranks last
+// (license tier CC0=PD > BY > SA, §2.5), so it only fills slots with no
+// CC0/CC-BY/PD candidate.
+const inatObservationLicenses = "cc0,cc-by,cc-by-sa"
 
 // INatClient queries iNaturalist (SPEC §2.4.1) — the cascade PRIMARY source.
 // Returns RAW candidates (LicenseCode unversioned, e.g. "cc-by"; Author = the
@@ -177,7 +179,7 @@ func (c *INatClient) searchTaxa(ctx context.Context, name string) ([]inatTaxon, 
 	return resp.Results, nil
 }
 
-// searchObservations runs GET /observations?taxon_id=&photo_license=cc0,cc-by
+// searchObservations runs GET /observations?taxon_id=&photo_license=cc0,cc-by,cc-by-sa
 // &per_page=&order_by=votes&order=desc.
 func (c *INatClient) searchObservations(ctx context.Context, taxonID int64, perPage int) ([]inatObservation, error) {
 	if perPage <= 0 || perPage > 30 {
