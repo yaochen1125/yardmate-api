@@ -114,8 +114,10 @@ const (
 )
 
 // galleryKey is the R2 object key for a slug's image_index slot (SPEC §2.2).
+// 库外 ingest 图存在 plant_images/ingested/ 子目录，与库内 curated（plant_images/{key}/）
+// 分目录：便于区分/管理/清理，且消除「slug 撞库内 key」隐患（SPEC §4）。iOS 读同路径。
 func galleryKey(slug string, index int) string {
-	return fmt.Sprintf("plant_images/%s/%d.png", slug, index)
+	return fmt.Sprintf("plant_images/ingested/%s/%d.png", slug, index)
 }
 
 // Ingestor orchestrates on-demand multi-image species ingest (SPEC §2.1). All
