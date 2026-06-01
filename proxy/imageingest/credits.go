@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	creditsKey          = "plant_images/credits.json"
+	creditsKey          = "plant_images/ingested/credits.json" // 库外 ingest 图分目录（SPEC §4）
 	creditsCacheControl = "public, max-age=3600" // short — changes as ingest runs (SPEC §2.7)
 )
 
