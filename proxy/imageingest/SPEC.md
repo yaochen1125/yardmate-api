@@ -242,7 +242,7 @@ UA: YardMate-ImageIngest/2.0 (https://yardmate.ai; contact@yardmate.ai)
 ```
 Response: matched taxa with `default_photo: {medium_url, large_url?, license_code, attribution, url}` + `id`. License codes: `cc0`, `cc-by`, `cc-by-nc`, `cc-by-nc-nd`, etc. (lowercase hyphen-delimited — same tokenization as §2.4.3).
 
-**Observations photos** (when default_photo is missing or non-free): one HTTP GET per matched taxon (limit 1, only the first match):
+**Observations photos** (when default_photo is missing or non-free): **two** HTTP GETs per matched taxon (limit 1, first match) — the full set (below) **plus** a `cc0,cc-by`-only query whose results are added first, so a votes-window full of high-vote CC-BY-SA can't crowd out preferred-license photos before ranking (critical while the BY/SA gate is OFF — those SA are gated and the slot would wrongly fall through; Codex #42/#43):
 ```
 GET https://api.inaturalist.org/v1/observations?taxon_id=<id>&photo_license=cc0,cc-by,cc-by-sa&per_page=12&order_by=votes
 UA: <same>
