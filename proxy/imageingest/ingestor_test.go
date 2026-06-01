@@ -494,7 +494,7 @@ func scored(source, title, mime, code string, w, h int) scoredCandidate {
 	return scoredCandidate{cand: c, lic: classifyCandidate(c)}
 }
 
-func TestRankScored_LicenseThenSourceThenSize(t *testing.T) {
+func TestRankScored_SourceThenSize_LicenseBlind(t *testing.T) {
 	cands := []scoredCandidate{
 		scored(sources.SourceWikimediaCommons, "bysa", "image/jpeg", "cc-by-sa-4.0", 5000, 4000),
 		scored(sources.SourceWikimediaCommons, "cc0small", "image/jpeg", "cc0", 1000, 800),
@@ -503,16 +503,18 @@ func TestRankScored_LicenseThenSourceThenSize(t *testing.T) {
 		scored(sources.SourceWikimediaCommons, "by", "image/jpeg", "cc-by-4.0", 6000, 5000),
 	}
 	rankScored(cands)
-	// Tier 0 (CC0) first; within tier iNat beats Wikimedia regardless of size.
+	// Quality-first, license-blind (CC0/BY/SA tie): iNat source tier first, then
+	// larger pixel area. License no longer affects rank — only NC/ND/ARR are
+	// rejected upstream. (Was: license tier CC0=PD>BY>SA first.)
 	if cands[0].cand.Title != "cc0inat" {
 		t.Errorf("ranked[0] = %q, want cc0inat (iNat source tier)", cands[0].cand.Title)
 	}
-	// Then CC0 Wikimedia by larger area.
-	if cands[1].cand.Title != "cc0big" || cands[2].cand.Title != "cc0small" {
-		t.Errorf("ranked[1..2] = %q,%q, want cc0big,cc0small", cands[1].cand.Title, cands[2].cand.Title)
-	}
-	if cands[3].cand.Title != "by" || cands[4].cand.Title != "bysa" {
-		t.Errorf("ranked[3..4] = %q,%q, want by,bysa", cands[3].cand.Title, cands[4].cand.Title)
+	// Then Wikimedia by larger area, license-blind: by(30M) > bysa(20M) > cc0big(12M) > cc0small(0.8M).
+	want := []string{"by", "bysa", "cc0big", "cc0small"}
+	for i, w := range want {
+		if cands[i+1].cand.Title != w {
+			t.Errorf("ranked[%d] = %q, want %q", i+1, cands[i+1].cand.Title, w)
+		}
 	}
 }
 

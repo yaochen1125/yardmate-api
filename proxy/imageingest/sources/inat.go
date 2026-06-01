@@ -12,21 +12,14 @@ import (
 
 const inatAPIBase = "https://api.inaturalist.org/v1"
 
-// iNat observation photo license filters (SPEC §2.4.1). The BY/SA gate is ON
+// inatObservationLicenses is the iNat observation photo_license filter (SPEC
+// §2.4.1) — the full free set incl CC-BY-SA. The BY/SA gate is ON
 // (IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES=true, after the iOS Credits page went
 // live), so SA joins the pinned free set on BOTH iOS + backend (no-jump rule,
-// §2.4.1) — keeping the two sides' iNat selection identical.
-//
-// Two filters, fetched as two calls (Codex #42 PR42): one fixed-size votes-ordered
-// API window shared by all three licenses lets high-vote SA evict preferred-license
-// photos before the parent's license-tier ranking (§2.5 CC0=PD > BY > SA) runs —
-// in the gate-OFF default that even strands usable CC0/CC-BY behind gated SA. So we
-// fetch CC0/CC-BY on its own (never displaced) plus the full set for the
-// hero-passthrough match + SA gap-fill. See Search().
-const (
-	inatPrimaryLicenses     = "cc0,cc-by"          // preferred set — fetched on its own, never displaced
-	inatObservationLicenses = "cc0,cc-by,cc-by-sa" // full free set — hero match (§2.1.1) + SA gap-fill
-)
+// §2.4.1), keeping the two sides' iNat selection identical. A single votes-ordered
+// query suffices: the parent ranks license-blind / quality-first (§2.5), so there
+// is no preferred license to protect from window displacement.
+const inatObservationLicenses = "cc0,cc-by,cc-by-sa"
 
 // INatClient queries iNaturalist (SPEC §2.4.1) — the cascade PRIMARY source.
 // Returns RAW candidates (LicenseCode unversioned, e.g. "cc-by"; Author = the
@@ -138,39 +131,27 @@ func (c *INatClient) Search(ctx context.Context, scientificName string, limit in
 	// 1. Taxon default photo (not license-filtered at the API — may be any code).
 	add(top.DefaultPhoto)
 
-	// 2. Supplementary observation photos. Two calls so high-vote CC-BY-SA cannot
-	// evict preferred licenses from the votes-ordered, fixed-size API window before
-	// the parent's license-tier ranking (Codex #42 PR42): fetch CC0/CC-BY on its own
-	// (never displaced), and the full set (incl SA) for the hero-passthrough match
-	// (iOS forwards its top-vote photo of the full set — must be in our pool for the
-	// §2.1.1 no-jump match, even when it is SA) plus SA gap-fill.
+	// 2. Supplementary observation photos (full free set incl CC-BY-SA, votes-
+	// ordered). The parent ranks license-blind / quality-first (§2.5), so a single
+	// query suffices — iOS forwards its top-vote photo of this same set, matched in
+	// our pool for the §2.1.1 no-jump pin (the #1 by votes is always present).
 	if len(out) < limit {
-		primary, perr := c.searchObservations(ctx, top.ID, limit, inatPrimaryLicenses)
-		mixed, merr := c.searchObservations(ctx, top.ID, limit, inatObservationLicenses)
-		if perr != nil && merr != nil {
-			// Both observation queries failed: propagate only when the default
-			// photo gave us nothing, so the cascade falls through to Wikimedia.
+		obs, oerr := c.searchObservations(ctx, top.ID, limit, inatObservationLicenses)
+		if oerr != nil {
+			// Observations are supplementary: only propagate the error when the
+			// default photo gave us nothing, else return what we have.
 			if len(out) == 0 {
-				return nil, merr
+				return nil, oerr
 			}
 		} else {
-			addObs := func(obs []inatObservation) {
-				for _, o := range obs {
-					for i := range o.Photos {
-						add(&o.Photos[i])
-					}
-					if len(out) >= limit {
-						return
-					}
+			for _, o := range obs {
+				for i := range o.Photos {
+					add(&o.Photos[i])
+				}
+				if len(out) >= limit {
+					break
 				}
 			}
-			// Hero first: the top-vote photo (any license, incl SA) is what iOS
-			// forwards as its hero — keep it in the pool for the §2.1.1 match.
-			if len(mixed) > 0 && len(mixed[0].Photos) > 0 {
-				add(&mixed[0].Photos[0])
-			}
-			addObs(primary) // CC0/CC-BY — preferred, never displaced by SA
-			addObs(mixed)   // SA gap-fill (dedup skips already-added)
 		}
 	}
 	return out, nil
@@ -203,7 +184,7 @@ func (c *INatClient) searchTaxa(ctx context.Context, name string) ([]inatTaxon, 
 
 // searchObservations runs GET /observations?taxon_id=&photo_license=<licenses>
 // &per_page=&order_by=votes&order=desc. `licenses` is a comma-separated iNat
-// photo_license filter (inatPrimaryLicenses or inatObservationLicenses).
+// photo_license filter (inatObservationLicenses).
 func (c *INatClient) searchObservations(ctx context.Context, taxonID int64, perPage int, licenses string) ([]inatObservation, error) {
 	if perPage <= 0 || perPage > 30 {
 		perPage = 12
