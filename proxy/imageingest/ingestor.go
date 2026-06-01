@@ -698,10 +698,12 @@ func rankScored(cands []scoredCandidate) {
 }
 
 func lessScored(a, b scoredCandidate) bool {
-	at, bt := licenseTier(a.lic.Family), licenseTier(b.lic.Family)
-	if at != bt {
-		return at < bt // less restrictive first
-	}
+	// Quality-first, license-blind: among allowed licenses (CC0/PD/BY/SA — NC/ND/
+	// ARR already rejected by the classifier) pick the best image regardless of
+	// license, so SA competes equally (attribution auto-recorded in credits.json).
+	// Removed the prior CC0=PD>BY>SA tier (product decision: match the iOS display's
+	// votes/quality-first selection). No-jump still pins iOS's forwarded hero via
+	// HeroPhotoID (§2.1.1), independent of this gallery ordering.
 	as, bs := sourceTier(a.cand.Source), sourceTier(b.cand.Source)
 	if as != bs {
 		return as < bs // iNat before Wikimedia (SPEC §2.5 #2)
@@ -713,21 +715,7 @@ func lessScored(a, b scoredCandidate) bool {
 	return pixelArea(a.cand) > pixelArea(b.cand) // larger area first
 }
 
-// licenseTier maps a family to a sort rank (lower = preferred). CC0 / PD tie.
-func licenseTier(f LicenseFamily) int {
-	switch f {
-	case FamilyCC0, FamilyPD:
-		return 0
-	case FamilyCCBY:
-		return 1
-	case FamilyCCBYSA:
-		return 2
-	default:
-		return 3
-	}
-}
-
-// sourceTier prefers iNat over Wikimedia within a license tier (SPEC §2.5 #2).
+// sourceTier prefers iNat over Wikimedia (SPEC §2.5 #2).
 func sourceTier(source string) int {
 	if source == sources.SourceINaturalist {
 		return 0
