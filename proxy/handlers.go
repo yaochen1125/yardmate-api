@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/yaochen1125/yardmate-api/proxy/rosererank"
 )
 
 // Body cap for POST /v1/identify: 8 MB image + 1 MB multipart overhead headroom.
@@ -150,7 +152,15 @@ func unknownSentinelResult() *IdentifyResult {
 //     identify" empty result). This subsumes the old tier-3 "zero suggestions
 //     → AI" block.
 func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient) http.HandlerFunc {
+	// Rose cultivar rerank candidates, built once here at route registration
+	// (startup) and captured by the closure — no server.go/main.go change needed,
+	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
+	roseCands := buildRoseCandidates(content)
+	roseIDs := roseIDSet(roseCands)
+	roseMap := roseByID(roseCands)
 	return func(w http.ResponseWriter, r *http.Request) {
+		reqStart := time.Now() // WriteTimeout wall-clock start, for the rose budget (SPEC §2.1 #4)
+
 		// 1. Body cap (drops the connection on overflow, returning *MaxBytesError
 		//    on the next Read so we can map to image_too_large).
 		r.Body = http.MaxBytesReader(w, r.Body, identifyMaxBody)
@@ -543,6 +553,24 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				}
 				ts := time.Now().UTC().Format(time.RFC3339)
 				result.AIEnhancedAt = &ts
+			}
+		}
+
+		// 7a. Optional rose cultivar rerank — opt-in via X-YM-Rose-Rerank header.
+		//     Best-effort: any failure / timeout / uncertainty falls back to the
+		//     species result. Budget-aware: shares identify's 30 s ctx (rosererank SPEC).
+		if r.Header.Get("X-YM-Rose-Rerank") == "1" && !unknownSentinel && vision != nil &&
+			len(result.Suggestions) > 0 && len(roseCands) > 0 &&
+			genusOf(result.Suggestions[0].ScientificName) == "Rosa" {
+			if budget := roseBudget(ctx, reqStart); budget >= minRoseBudget {
+				rctx, cancel := context.WithTimeout(ctx, budget)
+				res, verr := vision.RerankRose(rctx, imgBytes, mime, roseCands)
+				cancel()
+				if verr != nil {
+					log.Printf("identify rose rerank failed: deviceID=%s err=%v", deviceID, verr)
+				} else if matches, ok := rosererank.Decide(res, roseIDs); ok {
+					rewriteSuggestionsFromRose(result, matches, roseMap)
+				}
 			}
 		}
 
