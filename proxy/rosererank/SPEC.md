@@ -142,6 +142,7 @@ Rose rerank does **not** add new error codes to parent SPEC §3 and never conver
 - **Candidate set = all 110 `Rosa` (9 species + 101 cultivars).** Including the 9 species lets the model legitimately "stay at species" (pick `Rosa rugosa`) for a wild/uncertain photo instead of being forced onto a cultivar.
 - **Text candidates + single user image — no per-cultivar reference photos.** The catalog has no clean canonical per-cultivar image, and 110-image comparison is slow + costly; `flower_color` + `description` carry enough discriminative signal.
 - **`gpt-4o` (vision), 18 s `identifyHTTP` client.** Cultivar disambiguation needs the image; the candidate-heavy strict-JSON call matches `IdentifyPlant`'s latency, not `RerankIdentify`'s 8 s.
+- **`temperature: 0` (deterministic).** Pins the rerank so the same photo yields the same cultivar verdict instead of flip-flopping `cultivar_certain` across identical requests — observed on a boundary `Rosa chinensis` photo during default-on smoke. Implemented via a new `*float64` `Temperature` field on `openAIChatRequest` (omitempty → the other vision calls `RerankIdentify`/`IdentifyPlant` keep their default; only `RerankRose` sets it).
 - **No new response field (MVP).** Reuse `suggestions`. The visible "AI-guessed cultivar" marker is V1.1.
 - **Best-effort.** Rose rerank failure is invisible to the client — it degrades to the species result, never a 5xx.
 - **Downstream reuse, no special-casing.** Rewritten `Rosa 'Cultivar'` scientific names flow through the existing `resolvePlantID` + common-name override unchanged.
