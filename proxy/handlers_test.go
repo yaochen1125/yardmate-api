@@ -58,7 +58,7 @@ func newIdentifyHandlerWithVision(t *testing.T, upstream http.HandlerFunc, visio
 	if err != nil {
 		t.Fatalf("LoadContent: %v", err)
 	}
-	return HandleIdentify(nil, c, content, vision, nil), srv
+	return HandleIdentify(nil, c, content, vision, nil, false), srv
 }
 
 func TestHandleIdentify_Success(t *testing.T) {
@@ -553,7 +553,7 @@ func newCascadeHandler(t *testing.T, plantNetUp, plantIDUp http.HandlerFunc) (ht
 			c()
 		}
 	}
-	return HandleIdentify(pnClient, piClient, content, nil, nil), cleanup
+	return HandleIdentify(pnClient, piClient, content, nil, nil, false), cleanup
 }
 
 func doCascadeReq(t *testing.T, h http.Handler) *httptest.ResponseRecorder {
@@ -796,7 +796,7 @@ func TestHandleIdentify_Cascade_OrganForwardedToPlantNet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadContent: %v", err)
 	}
-	h := HandleIdentify(pn, nil, content, nil, nil)
+	h := HandleIdentify(pn, nil, content, nil, nil, false)
 
 	// Build a multipart body with image + organ=flower.
 	var buf bytes.Buffer
@@ -846,7 +846,7 @@ func TestHandleIdentify_Cascade_UnknownOrganDefaultsAuto(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadContent: %v", err)
 	}
-	h := HandleIdentify(pn, nil, content, nil, nil)
+	h := HandleIdentify(pn, nil, content, nil, nil, false)
 
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
@@ -905,7 +905,88 @@ func newCascadeHandlerWithVision(t *testing.T, plantNetUp, plantIDUp http.Handle
 			c()
 		}
 	}
-	return HandleIdentify(pnClient, piClient, content, vision, nil), cleanup
+	return HandleIdentify(pnClient, piClient, content, vision, nil, false), cleanup
+}
+
+// cannedPlantNetRosa — Pl@ntNet returns a Rosa species, so genus == "Rosa"
+// triggers the rose cultivar rerank branch (when enabled).
+const cannedPlantNetRosa = `{
+  "bestMatch": "Rosa chinensis",
+  "results": [
+    {"score": 0.88, "species": {
+      "scientificNameWithoutAuthor": "Rosa chinensis",
+      "scientificName": "Rosa chinensis Jacq.",
+      "commonNames": ["China Rose"]}}
+  ],
+  "remainingIdentificationRequests": 480
+}`
+
+// TestHandleIdentify_RoseRerank_KillSwitch verifies ROSE_RERANK_ENABLED gates
+// the rose cultivar rerank: ON -> suggestions rewritten to the AI-picked catalog
+// cultivar + ai_enhanced_at set; OFF -> the species cascade result is returned
+// unchanged (no rose rewrite, no ai_enhanced_at).
+func TestHandleIdentify_RoseRerank_KillSwitch(t *testing.T) {
+	pnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, cannedPlantNetRosa)
+	}))
+	defer pnSrv.Close()
+	pn := &PlantNetClient{APIKey: "k", Endpoint: pnSrv.URL, Lang: "en", NbResults: 10, HTTP: pnSrv.Client()}
+
+	// Vision picks catalog cultivar AAA1136 (Rosa 'About Face') with high confidence.
+	visSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"cultivar_certain\":true,\"matches\":[{\"plant_id\":\"AAA1136\",\"confidence\":0.9,\"reason\":\"bicolor grandiflora\"}]}"}}]}`)
+	}))
+	defer visSrv.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: visSrv.URL, Model: "t", HTTP: visSrv.Client(), identifyHTTP: visSrv.Client()}
+
+	content, err := LoadContent()
+	if err != nil {
+		t.Fatalf("LoadContent: %v", err)
+	}
+
+	doReq := func(roseEnabled bool) IdentifyResult {
+		h := HandleIdentify(pn, nil, content, vision, nil, roseEnabled)
+		var buf bytes.Buffer
+		w := multipart.NewWriter(&buf)
+		fw, _ := w.CreateFormFile("image", "r.jpg")
+		_, _ = fw.Write(jpegMagic)
+		_ = w.WriteField("organ", "flower")
+		_ = w.Close()
+		req := httptest.NewRequest(http.MethodPost, "/v1/identify", &buf)
+		req.Header.Set("Content-Type", w.FormDataContentType())
+		req.Header.Set("X-Device-Install-Id", testUUID)
+		req.Header.Set("X-App-Version", "1.1.1")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+		}
+		var out IdentifyResult
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return out
+	}
+
+	// ON: rewritten to the AI-picked cultivar + ai_enhanced_at set.
+	on := doReq(true)
+	if len(on.Suggestions) == 0 || on.Suggestions[0].PlantID == nil || *on.Suggestions[0].PlantID != "AAA1136" {
+		t.Fatalf("roseEnabled=true: want suggestion[0] plant_id AAA1136, got %+v", on.Suggestions)
+	}
+	if on.AIEnhancedAt == nil {
+		t.Error("roseEnabled=true: want ai_enhanced_at set")
+	}
+
+	// OFF (kill-switch): species cascade result, no rose rewrite, no ai_enhanced_at.
+	off := doReq(false)
+	if off.AIEnhancedAt != nil {
+		t.Error("roseEnabled=false: ai_enhanced_at must stay nil (rose rerank skipped)")
+	}
+	if len(off.Suggestions) > 0 && off.Suggestions[0].PlantID != nil && *off.Suggestions[0].PlantID == "AAA1136" {
+		t.Error("roseEnabled=false: must NOT rewrite to the rose cultivar AAA1136")
+	}
 }
 
 // cannedPlantNetNoMatch — Pl@ntNet 404 "no match" canned upstream (a VALID
