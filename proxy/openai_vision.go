@@ -106,6 +106,8 @@ func NewVisionClient(apiKey string) *VisionClient {
 type openAIChatRequest struct {
 	Model          string                 `json:"model"`
 	MaxTokens      int                    `json:"max_tokens"`
+	Temperature    *float64               `json:"temperature,omitempty"`
+	Seed           *int                   `json:"seed,omitempty"`
 	Messages       []openAIChatRequestMsg `json:"messages"`
 	ResponseFormat any                    `json:"response_format,omitempty"`
 }
