@@ -47,7 +47,7 @@ When applied: `result.Suggestions` is rewritten to the matched cultivars (each `
 
 ### 1.5 External dependencies
 
-- **`proxy.VisionClient`** — reuse the **18 s `identifyHTTP` client** (openai_vision.go:80, `visionIdentifyClientTimeout`), NOT the 8 s shared client: 110 text candidates + one image + strict `json_schema` output is closer to `IdentifyPlant`'s latency profile than `RerankIdentify`'s. The method is `VisionClient.RerankRose` in the **`proxy`** package (beside `RerankIdentify` in openai_vision.go), reusing the `post(...)` / `dataURL(...)` plumbing. **Do not reuse `RerankIdentify`** (different shape, wrong client, returns a single string — §7).
+- **`proxy.VisionClient`** — reuse the **18 s `identifyHTTP` client** (openai_vision.go:80, `visionIdentifyClientTimeout`), NOT the 8 s shared client: 110 text candidates + one image + strict `json_schema` output is closer to `IdentifyPlant`'s latency profile than `RerankIdentify`'s. The method is `VisionClient.RerankRose` in the **`proxy`** package (beside `RerankIdentify` in openai_vision.go), reusing the `post(...)` / `dataURL(...)` plumbing. **Do not reuse `RerankIdentify`** (different shape, wrong client, returns a single string — §7). `RerankRose` shares identify's request `ctx` (already partly consumed by the cascade) and derives `context.WithTimeout(ctx, roseRerankTimeout = 18 s)`, so its effective budget = `min(18 s, ctx remaining)` — it can never push identify past its 30 s `ctx` / 35 s WriteTimeout; the handler's budget gate (§2.1 #4) skips it outright when too little remains.
 - **`proxy.ContentIndex`** — `fullPlantByID` (content.go:69) for the candidate index; `resolvePlantID` / `LookupCommonName` run later in the existing handler flow (not called from this package).
 - **`gpt-4o-2024-08-06`** (`defaultVisionModel`) — vision-capable; cultivar disambiguation needs the image. (Enrichment uses `mini`; that is text-only and irrelevant here.)
 - **Import boundary (no cycle).** `rosererank` holds only plain types + the pure `Decide` function and imports **nothing** from `proxy`. `proxy` imports `rosererank` one-way — `VisionClient.RerankRose` (vision IO), `buildRoseCandidates` (reads `proxy.PlantDetail`), and the handler rewrite all sit in `proxy`. This inverts the naive `rosererank → proxy.VisionClient` + `proxy.handlers → rosererank` cycle (Codex #44 P2).
@@ -61,7 +61,8 @@ When applied: `result.Suggestions` is rewritten to the matched cultivars (each `
 
 1. `X-YM-Rose-Rerank: 1` header present, AND
 2. identify cascade succeeded — `!unknownSentinel`, `vision != nil`, `len(result.Suggestions) > 0`, AND
-3. `genusOf(result.Suggestions[0].ScientificName) == "Rosa"` (exact token match — §1.3).
+3. `genusOf(result.Suggestions[0].ScientificName) == "Rosa"` (exact token match — §1.3), AND
+4. **enough request budget left** — `ctx.Deadline()` minus now ≥ `minRoseBudget` (~6 s). A slow PlantNet/Plant.id cascade can consume most of identify's 30 s `ctx`; with too little left, skip rather than spend a vision call doomed to time out (Codex #44 P2 — budget).
 
 Any false → skip; return the original result verbatim.
 
@@ -166,7 +167,7 @@ Rose rerank does **not** add new error codes to parent SPEC §3 and never conver
 3. **Do NOT reuse `RerankIdentify`.** It returns a single best-guess *species* string via the 8 s client and takes `[]Suggestion`. Rose rerank needs a list result, the 18 s client, and `[]RoseCandidate`. New method, parent SPEC §1.2 boundary (mirrors enrichment pitfall §9 #11).
 4. **Validate `plant_id` against the candidate index before applying.** The model can hallucinate an id; drop unknown ids, and if none survive, fall back. Never emit a `plant_id` that isn't a real rose candidate.
 5. **Candidate index is built once at startup, never per-request.** Iterating `fullPlantByID` (1522 entries) on every identify is needless work; build `roseCandidates` in the constructor.
-6. **18 s vision client must fit under the handler's 30 s outer `requestTimeout`** alongside the cascade that already ran. The cascade has completed by the insertion point, so the remaining budget is ample, but keep the inner context deadline ≤ ~15 s.
+6. **Budget-aware: the 18 s rerank SHARES identify's 30 s `ctx` — it does NOT get a fresh 18 s.** `ctx` (handlers.go:265) is `WithTimeout(r.Context(), 30 s)` measured from request start; a slow PlantNet/Plant.id cascade can leave far less than 18 s by the time rose rerank runs (Codex #44 P2). So: (a) gate on remaining budget (§2.1 #4) — skip if `< minRoseBudget` (~6 s); (b) `RerankRose` derives `WithTimeout(ctx, 18 s)` so its real deadline is `min(18 s, ctx remaining)` and it can never push identify past its 30 s ctx / 35 s WriteTimeout; (c) a timeout just falls back to the species result (§4). Do NOT give rose rerank an independent `context.Background()` budget — that could overrun WriteTimeout and the client would get nothing.
 7. **`AIEnhancedAt` only on apply.** Set it when suggestions are actually rewritten; on fallback leave it as the cascade left it (parent contract: non-null iff AI influenced the result).
 8. **`reason` / any model text is English-only** (`app_language`) — enforce in the system prompt + per-field schema description.
 9. **strict `json_schema` rejects extra fields** — `additionalProperties:false`, `required == properties`, `matches.maxItems = 3`.
@@ -196,13 +197,15 @@ Parent-package changes (in `proxy/`, not this package):
 // handlers.go, after the RerankIdentify block (~545), before plant_id resolution (~549):
 if r.Header.Get("X-YM-Rose-Rerank") == "1" &&
    !unknownSentinel && vision != nil && len(result.Suggestions) > 0 &&
-   genusOf(result.Suggestions[0].ScientificName) == "Rosa" {
+   genusOf(result.Suggestions[0].ScientificName) == "Rosa" && hasRoseBudget(ctx) {
     if res, err := vision.RerankRose(ctx, imgBytes, mime, roseCandidates); err == nil {
         if matches, ok := rosererank.Decide(res, roseCandidateIDs); ok {
             rewriteSuggestionsFromRose(result, matches, roseByID)  // sets AIEnhancedAt
         }
-    } // err or !ok → best-effort fall back; species result untouched
+    } // err / timeout / !ok → best-effort fall back; species result untouched
 }
+// hasRoseBudget(ctx): dl, ok := ctx.Deadline(); return !ok || time.Until(dl) >= minRoseBudget  // ~6 s
+// RerankRose internally: rctx, cancel := context.WithTimeout(ctx, 18 s) → min(18 s, ctx remaining)
 ```
 
 - `roseCandidates` (`[]rosererank.RoseCandidate`) + derived `roseCandidateIDs` (set) + `roseByID` (map) built once at startup near `LoadContent()` (main.go), threaded into the handler closure alongside `content`/`vision`.
