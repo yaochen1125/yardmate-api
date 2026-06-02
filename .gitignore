@@ -26,3 +26,6 @@ coverage.html
 .DS_Store
 .vscode/
 .idea/
+
+# Claude Code worktrees + agent working dir
+.claude/
