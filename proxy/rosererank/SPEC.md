@@ -1,0 +1,202 @@
+# `proxy/rosererank` package — rose cultivar rerank (V1, behind a test flag)
+
+> Status: **draft — SPEC for review; implementation in a follow-up commit.**
+> Companion: parent `proxy/SPEC.md` §2.1 `POST /v1/identify`. This package is **not a new endpoint** — it is an optional in-line step inside the identify handler, after the cascade settles and before plant_id resolution.
+> Background: PlantNet (primary) + Plant.id (fallback) only resolve roses to a **species** (`Rosa chinensis` → "China Rose", `Rosa rugosa`, …). Garden roses are overwhelmingly **named cultivars** (`Rosa 'Peace'`, `Rosa 'About Face'`, …), so every rose photo comes back as the generic "China Rose". The curated catalog already carries **110 `Rosa` entries** (9 species + 101 cultivars) with flower colour / habit / description fields. This package re-ranks the user's photo against those 110 candidates with a vision model and, when the photo is distinguishable, replaces the species result with the best-matching cultivars. When it can't tell, it leaves the species result untouched.
+
+---
+
+## 1. Five questions (per `AI_ENGINEERING_STANDARD.md` §6)
+
+### 1.1 What this package is responsible for
+
+- Given the uploaded image + a settled species-level identify result whose **genus is `Rosa`**, re-rank against the 110 embedded `Rosa` catalog candidates and return up to **3** best-matching cultivars (or "can't tell").
+- Build the static **rose candidate index** once at startup from `ContentIndex.fullPlantByID` (entries where `genus == "Rosa"`). Each candidate = `{plantId, scientificName, commonName, flowerColor[], description}` — the visual-discriminative subset.
+- Expose one vision method `RerankRose(ctx, image, mime, candidates) -> (RoseRerankResult, error)` using `gpt-4o` + strict `json_schema`, reusing `VisionClient`'s HTTP transport.
+- Decide rewrite-vs-fallback: rewrite `result.Suggestions` only when the model is confident a cultivar is distinguishable; otherwise leave the species result unchanged.
+- Be **best-effort**: any failure (vision error / timeout / invalid JSON / empty matches) falls back to the original species result. Rose rerank **never** makes `/v1/identify` fail.
+
+### 1.2 What this package is NOT responsible for
+
+- **Identification.** The species genus is already settled by the parent cascade (`proxy/handlers.go`). This package only refines a known-`Rosa` result; it never calls PlantNet / Plant.id / iNaturalist.
+- **Being on by default in V1.** Gated behind request header `X-YM-Rose-Rerank: 1`. Absent header (release builds, toggle off) → skip entirely, identical to today. Flipping the default to on is a separate post-validation step (§6).
+- **A new response field / "AI-guessed" marker.** V1 MVP fills the existing `suggestions[0..2]` contract unchanged; iOS needs **zero** display changes. The visible "possibly XX" cultivar marker is V1.1 (§6).
+- **Other genera.** Hydrangea / Tulipa / Camellia / Hosta etc. are the same pattern but explicitly out of scope (§6). V1 implements `Rosa` only — no premature genus abstraction.
+- **Image-based similarity.** No per-cultivar reference photos / embeddings. Candidates are described in **text** (colour + habit + description); only the *user's* photo is sent to the vision model (§5).
+- **Mutating the catalog.** Candidates are read-only views over `fullPlantByID`.
+
+### 1.3 Inputs
+
+| Source | Input |
+|---|---|
+| In-process call from `handlers.go` | `image []byte`, `mime string` (the already-validated upload), the settled `*IdentifyResult`, and the parsed `X-YM-Rose-Rerank` flag. |
+| Request header | `X-YM-Rose-Rerank: 1` — opt-in test flag. Any other value / absent → rerank skipped. |
+| Startup | `ContentIndex.fullPlantByID` (already built in `content.go`) — source of the 110 `Rosa` candidates. |
+| Server config | `OPENAI_API_KEY` from `secrets.Vault` (already loaded; same key as identify tier-3 + enrichment). |
+
+Genus gate: the result's `suggestions[0].ScientificName` first token must equal **`Rosa` exactly** (case-insensitive) — an exact genus-token match, **not** a substring. Substring matching would wrongly fire on `Hibiscus rosa-sinensis`, `Anemone nemorosa`, `Pinus ponderosa` (real catalog false-positives — §7). Use `speciesBinomial(...)` (content.go:415) then split on first space.
+
+### 1.4 Outputs
+
+| Function | Output | Behaviour |
+|---|---|---|
+| `RerankRose(ctx, image, mime, candidates)` | `RoseRerankResult{ CultivarCertain bool, Matches []RoseMatch }` or typed error | `RoseMatch{ PlantID string, Confidence float64, Reason string }`, ≤3, descending confidence. |
+| Handler-side apply | mutates `result.Suggestions` in place + sets `result.AIEnhancedAt` | only when the result is *applied* (not on fallback). |
+
+When applied: `result.Suggestions` is rewritten to the matched cultivars (each `ScientificName` = candidate's `Rosa 'Cultivar'`, `Name` = common name, `Confidence` = model confidence). Downstream `resolvePlantID` + common-name override (handlers.go:549+) run **unchanged** — a `Rosa 'About Face'` scientific name resolves cleanly to its `AAA####` plantId and curated common name, so no special-casing downstream. `AIEnhancedAt` is set (AI influenced the result), matching the existing `RerankIdentify` convention.
+
+### 1.5 External dependencies
+
+- **`proxy.VisionClient`** — reuse the **18 s `identifyHTTP` client** (openai_vision.go:80, `visionIdentifyClientTimeout`), NOT the 8 s shared client: 110 text candidates + one image + strict `json_schema` output is closer to `IdentifyPlant`'s latency profile than `RerankIdentify`'s. New method lives in this package's `rerank.go`; HTTP plumbing (`post(...)`, `dataURL(...)`) is reused. **Do not reuse `RerankIdentify`** (different shape, wrong client, returns a single string — §7).
+- **`proxy.ContentIndex`** — `fullPlantByID` (content.go:69) for the candidate index; `resolvePlantID` / `LookupCommonName` run later in the existing handler flow (not called from this package).
+- **`gpt-4o-2024-08-06`** (`defaultVisionModel`) — vision-capable; cultivar disambiguation needs the image. (Enrichment uses `mini`; that is text-only and irrelevant here.)
+- Standard library only otherwise (json / context / time / strings).
+
+---
+
+## 2. Trigger + flow (in-line in `/v1/identify`, not an endpoint)
+
+### 2.1 Trigger conditions (ALL must hold)
+
+1. `X-YM-Rose-Rerank: 1` header present, AND
+2. identify cascade succeeded — `!unknownSentinel`, `vision != nil`, `len(result.Suggestions) > 0`, AND
+3. `genusOf(result.Suggestions[0].ScientificName) == "Rosa"` (exact token match — §1.3).
+
+Any false → skip; return the original result verbatim.
+
+### 2.2 Candidate index (built once at startup)
+
+```
+roseCandidates = [ RoseCandidate{plantId, scientificName, commonName, flowerColor, description}
+                   for entry in fullPlantByID if entry.genus == "Rosa" ]   // ~110
+```
+
+`description` is truncated to ~30 words (the catalog `description` already encodes habit + colour + distinguishing trait, e.g. *"a bicolor grandiflora rose with reverse-colored petals, bright orange on the back, yellow face"*). Built once; **never** scanned per-request.
+
+### 2.3 Rerank call (prompt I/O)
+
+- **User content**: the photo as a base64 data URL (`dataURL(mime, image)`) + the candidate list serialized compactly:
+  `[{"id":"AAA1136","name":"About Face","colors":["orange","yellow"],"desc":"…"}, …]` (110 rows).
+- **System instruction** (English-only output, per `app_language`):
+  > You are a rose-cultivar expert. From the candidate list, pick the cultivars whose described flower colour / form (grandiflora, floribunda, climber, …) / petal shape / habit best match the photo. **First decide whether the photo even has enough distinguishing features** — flower colour combination, bloom form, petal count, plant habit. If many red double roses would look identical, or the photo is unclear, set `cultivar_certain:false` and return no matches. Only give high confidence when the visible traits genuinely single out a cultivar. Return at most 3, most-likely first. `reason` ≤ 15 words, English.
+- **Output** (`response_format: {type:"json_schema", strict:true}`, `additionalProperties:false`):
+  ```json
+  { "cultivar_certain": true,
+    "matches": [ {"plant_id":"AAA1136","confidence":0.78,"reason":"bicolor orange-back/yellow-face grandiflora"} ] }
+  ```
+  `matches` maxItems 3; strict mode keeps `required == properties`.
+
+### 2.4 Decision: rewrite vs fall back
+
+```
+res, err := RerankRose(...)
+if err != nil                      → fall back (log, keep species result)   // best-effort
+if !res.CultivarCertain            → fall back (model says indistinguishable)
+if len(res.Matches) == 0           → fall back
+if res.Matches[0].Confidence < 0.35 → fall back   // defensive numeric floor only
+otherwise:
+  validate each match.plant_id is a known rose candidate (drop unknown ids)
+  if none survive                  → fall back
+  rewrite result.Suggestions from surviving matches (≤3), set result.AIEnhancedAt
+```
+
+The **primary** gate is `cultivar_certain` (the model's own "can I distinguish?" judgement) plus catalog membership; the `0.35` floor is a defensive backstop for the self-contradiction case (certain=true yet trivially low confidence), **not** a tuned threshold — model self-reported confidence is uncalibrated, so we don't lean on a magic number (resolved discussion).
+
+### 2.5 Where it hooks in `handlers.go`
+
+After the existing optional `RerankIdentify` block (handlers.go:~529–545, the `aiEnhance` path) and **before** the plant_id resolution loop (handlers.go:~549). At that point `result.Suggestions[0]` is the final species; rose rerank may replace the slice; the downstream resolution + common-name override then run normally over whatever is in the slice. The two flags are independent: `aiEnhance` (multipart `ai_enhance`) refines *species*; `X-YM-Rose-Rerank` refines *cultivar*. Both, either, or neither may be set.
+
+---
+
+## 3. Feature flag
+
+- **Transport**: HTTP request header `X-YM-Rose-Rerank: 1`. Chosen over a multipart field / query param so the identify **body contract is untouched** and the flag is trivially removable.
+- **iOS (separate `yardmate-swiftui` PR)**: a DEBUG-only toggle in the More tab (same DEBUG block as the #325 subscription switch), stored via `@AppStorage` (UserDefaults — **no** `EnvironmentObject`, to avoid the #325 env-injection crash). When on, the identify request adds the header.
+- **Server default = off**: absent header → original behavior. Rose rerank only runs when a build explicitly opts in. This is the V1 test-phase default; flipping to on-by-default is post-validation (§6).
+- **Ship order**: this server package first (no-header callers unaffected → safe), then the iOS toggle.
+
+---
+
+## 4. Error handling — best-effort, never blocks identify
+
+Rose rerank is a pure enhancement wrapped so it can only **improve or no-op**, never degrade:
+
+| Failure | Result |
+|---|---|
+| Vision 5xx / timeout (18 s) | log, fall back to species result, identify returns 200 |
+| Invalid / non-strict JSON | log, fall back |
+| `cultivar_certain:false` / empty / all ids unknown / below floor | fall back (the designed "can't tell" path, not an error) |
+| Panic inside rerank | `recover()` → fall back |
+
+Rose rerank does **not** add new error codes to parent SPEC §3 and never converts a successful identify into a 4xx/5xx. Upstream OpenAI error bodies are never surfaced (parent SPEC §5).
+
+---
+
+## 5. Resolved decisions (don't re-debate)
+
+- **Header-gated, default OFF in V1.** Pure test instrument; validated on real photos before any default flip.
+- **`top-3`, not `top-1`.** Multiple candidates honestly convey uncertainty, fill the existing ≤3 `suggestions` contract, and need zero iOS display change.
+- **Primary gate = model `cultivar_certain` bool, not a numeric threshold.** Self-reported vision confidence is uncalibrated/overconfident; we ask the model the binary "can the photo distinguish a cultivar?" and only keep a `0.35` floor as a defensive backstop.
+- **Candidate set = all 110 `Rosa` (9 species + 101 cultivars).** Including the 9 species lets the model legitimately "stay at species" (pick `Rosa rugosa`) for a wild/uncertain photo instead of being forced onto a cultivar.
+- **Text candidates + single user image — no per-cultivar reference photos.** The catalog has no clean canonical per-cultivar image, and 110-image comparison is slow + costly; `flower_color` + `description` carry enough discriminative signal.
+- **`gpt-4o` (vision), 18 s `identifyHTTP` client.** Cultivar disambiguation needs the image; the candidate-heavy strict-JSON call matches `IdentifyPlant`'s latency, not `RerankIdentify`'s 8 s.
+- **No new response field (MVP).** Reuse `suggestions`. The visible "AI-guessed cultivar" marker is V1.1.
+- **Best-effort.** Rose rerank failure is invisible to the client — it degrades to the species result, never a 5xx.
+- **Downstream reuse, no special-casing.** Rewritten `Rosa 'Cultivar'` scientific names flow through the existing `resolvePlantID` + common-name override unchanged.
+- **Genus match is exact-token, never substring** — avoids the `Hibiscus rosa-sinensis` / `Anemone nemorosa` false-positives (§7).
+- **All model text (`reason`) is English** per `app_language`.
+
+---
+
+## 6. Out-of-scope (V1.1+ candidates)
+
+- **Default-on.** After real-photo validation, drop the header gate (or invert default) so all clients get rose rerank.
+- **Visible "possibly / best match" marker.** Add a response field (e.g. `match_kind: "cultivar_guess"`) + iOS "possibly XX" phrasing so the guess reads as a guess. Requires an iOS PR + contract bump.
+- **Other cultivar-heavy genera** (Hydrangea, Tulipa, Camellia, Hosta, Iris …). Same machine; keep trigger-genus + candidate-source as the only genus-specific knobs so adding a genus = config + candidate data, not a rewrite. Still: V1 implements `Rosa` only.
+- **Image-based similarity** (reference photos / embeddings per cultivar) if text descriptions prove too weak.
+- **Confidence calibration / telemetry** on accept-vs-fallback rates to tune the floor and the prompt.
+
+---
+
+## 7. Pitfalls (don't re-rediscover)
+
+1. **Genus gate must be exact-token, not substring.** `strings.Contains(sci, "rosa")` wrongly fires on `Hibiscus rosa-sinensis`, `Anemone nemorosa`, `Drosanthemum`, `Pinus ponderosa` — all real catalog entries. Match `genusOf(sci) == "Rosa"` (first token of the binomial, case-insensitive).
+2. **Best-effort or bust.** Wrap the whole step so a vision failure/timeout/panic can only fall back. A rose rerank bug must never turn a working identify into a 5xx. Cover with a test that injects a failing vision stub and asserts the species result survives with 200.
+3. **Do NOT reuse `RerankIdentify`.** It returns a single best-guess *species* string via the 8 s client and takes `[]Suggestion`. Rose rerank needs a list result, the 18 s client, and `[]RoseCandidate`. New method, parent SPEC §1.2 boundary (mirrors enrichment pitfall §9 #11).
+4. **Validate `plant_id` against the candidate index before applying.** The model can hallucinate an id; drop unknown ids, and if none survive, fall back. Never emit a `plant_id` that isn't a real rose candidate.
+5. **Candidate index is built once at startup, never per-request.** Iterating `fullPlantByID` (1522 entries) on every identify is needless work; build `roseCandidates` in the constructor.
+6. **18 s vision client must fit under the handler's 30 s outer `requestTimeout`** alongside the cascade that already ran. The cascade has completed by the insertion point, so the remaining budget is ample, but keep the inner context deadline ≤ ~15 s.
+7. **`AIEnhancedAt` only on apply.** Set it when suggestions are actually rewritten; on fallback leave it as the cascade left it (parent contract: non-null iff AI influenced the result).
+8. **`reason` / any model text is English-only** (`app_language`) — enforce in the system prompt + per-field schema description.
+9. **strict `json_schema` rejects extra fields** — `additionalProperties:false`, `required == properties`, `matches.maxItems = 3`.
+
+---
+
+## 8. Implementation outline (not part of the contract)
+
+```
+proxy/rosererank/
+├── SPEC.md                 (this file)
+├── candidates.go           RoseCandidate struct + BuildRoseCandidates(*ContentIndex) []RoseCandidate (genus=="Rosa")
+├── rerank.go               RerankRose(ctx, image, mime, candidates) -> (RoseRerankResult, error); reuses VisionClient transport + 18 s client
+├── prompt.go               system prompt + json_schema (strict) + compact candidate serialization
+├── rerank_test.go          table-driven: certain→rewrite, !certain→fallback, low-conf→fallback, hallucinated id→drop, vision error→fallback
+└── candidates_test.go      genus filter excludes Hibiscus rosa-sinensis / Anemone nemorosa; includes 9 species + 101 cultivars
+```
+
+Parent-package changes (in `proxy/`, not this package):
+
+```go
+// handlers.go, after the RerankIdentify block (~545), before plant_id resolution (~549):
+if r.Header.Get("X-YM-Rose-Rerank") == "1" &&
+   !unknownSentinel && vision != nil && len(result.Suggestions) > 0 &&
+   genusOf(result.Suggestions[0].ScientificName) == "Rosa" {
+    applyRoseRerank(ctx, vision, roseCandidates, imgBytes, mime, result)  // best-effort, mutates result
+}
+```
+
+- `roseCandidates` built at startup near `LoadContent()` (main.go) and threaded into the handler closure alongside `content`/`vision`.
+- `genusOf` is a tiny helper (first token of `speciesBinomial`), exported from `proxy` or duplicated trivially.
+- No `secrets.Vault` additions (`OPENAI_API_KEY` already present). No new route, no rate-limit change (inherits identify's two-layer limit).
+
+Estimated effort: ~1 day implementation + 0.5 day tests + 0.5 day deploy/smoke. iOS DEBUG toggle (separate `yardmate-swiftui` PR): ~0.5 day.
