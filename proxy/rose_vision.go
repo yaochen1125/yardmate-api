@@ -16,6 +16,12 @@ import (
 // boundary photo during default-on smoke).
 const roseRerankTemperature = 0.0
 
+// roseRerankSeed is a fixed seed passed with temperature=0 to make the rerank as
+// reproducible as Chat Completions allows. OpenAI documents seed +
+// system_fingerprint as BEST-EFFORT determinism, NOT a guarantee — so this makes
+// repeats substantially more consistent, not bit-identical (Codex #47 P2).
+const roseRerankSeed = 1
+
 // roseRerankTimeout caps the rose rerank vision call. Applied via
 // context.WithTimeout(ctx, ...) where ctx already carries identify's 30 s
 // budget, so the effective deadline is min(18 s, ctx remaining) — rose rerank
@@ -107,10 +113,12 @@ func (c *VisionClient) RerankRose(ctx context.Context, image []byte, mime string
 	user := "Candidates (JSON):\n" + string(candJSON) + "\n\nWhich candidate(s) best match this rose photo?"
 
 	temp := roseRerankTemperature
+	seed := roseRerankSeed
 	body := openAIChatRequest{
 		Model:       c.Model,
 		MaxTokens:   400,
 		Temperature: &temp,
+		Seed:        &seed,
 		Messages: []openAIChatRequestMsg{
 			{Role: "system", Content: sys},
 			{Role: "user", Content: []any{
