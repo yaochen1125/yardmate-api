@@ -12,8 +12,8 @@
 
 - Given the uploaded image + a settled species-level identify result whose **genus is `Rosa`**, re-rank against the 110 embedded `Rosa` catalog candidates and return up to **3** best-matching cultivars (or "can't tell").
 - Build the static **rose candidate index** once at startup from `ContentIndex.fullPlantByID` (entries where `genus == "Rosa"`). Each candidate = `{plantId, scientificName, commonName, flowerColor[], description}` — the visual-discriminative subset.
-- Expose one vision method `RerankRose(ctx, image, mime, candidates) -> (RoseRerankResult, error)` using `gpt-4o` + strict `json_schema`, reusing `VisionClient`'s HTTP transport.
-- Decide rewrite-vs-fallback: rewrite `result.Suggestions` only when the model is confident a cultivar is distinguishable; otherwise leave the species result unchanged.
+- Own the **pure decision logic** (`Decide`) + the candidate/result **types** (`RoseCandidate` / `RoseRerankResult` / `RoseMatch`) in a `rosererank` package that imports **nothing** from `proxy` (dependency inversion — §1.5, resolves the import cycle Codex flagged). The vision IO (`VisionClient.RerankRose`: `gpt-4o` + strict `json_schema`, 18 s client) and candidate building live in the `proxy` package, which imports `rosererank` one-way.
+- Decide rewrite-vs-fallback in this order: **validate ids → certainty → confidence floor on the first *surviving* candidate** (§2.4). Rewrite `result.Suggestions` only when a real cultivar is distinguishable; otherwise leave the species result unchanged.
 - Be **best-effort**: any failure (vision error / timeout / invalid JSON / empty matches) falls back to the original species result. Rose rerank **never** makes `/v1/identify` fail.
 
 ### 1.2 What this package is NOT responsible for
@@ -47,9 +47,10 @@ When applied: `result.Suggestions` is rewritten to the matched cultivars (each `
 
 ### 1.5 External dependencies
 
-- **`proxy.VisionClient`** — reuse the **18 s `identifyHTTP` client** (openai_vision.go:80, `visionIdentifyClientTimeout`), NOT the 8 s shared client: 110 text candidates + one image + strict `json_schema` output is closer to `IdentifyPlant`'s latency profile than `RerankIdentify`'s. New method lives in this package's `rerank.go`; HTTP plumbing (`post(...)`, `dataURL(...)`) is reused. **Do not reuse `RerankIdentify`** (different shape, wrong client, returns a single string — §7).
+- **`proxy.VisionClient`** — reuse the **18 s `identifyHTTP` client** (openai_vision.go:80, `visionIdentifyClientTimeout`), NOT the 8 s shared client: 110 text candidates + one image + strict `json_schema` output is closer to `IdentifyPlant`'s latency profile than `RerankIdentify`'s. The method is `VisionClient.RerankRose` in the **`proxy`** package (beside `RerankIdentify` in openai_vision.go), reusing the `post(...)` / `dataURL(...)` plumbing. **Do not reuse `RerankIdentify`** (different shape, wrong client, returns a single string — §7).
 - **`proxy.ContentIndex`** — `fullPlantByID` (content.go:69) for the candidate index; `resolvePlantID` / `LookupCommonName` run later in the existing handler flow (not called from this package).
 - **`gpt-4o-2024-08-06`** (`defaultVisionModel`) — vision-capable; cultivar disambiguation needs the image. (Enrichment uses `mini`; that is text-only and irrelevant here.)
+- **Import boundary (no cycle).** `rosererank` holds only plain types + the pure `Decide` function and imports **nothing** from `proxy`. `proxy` imports `rosererank` one-way — `VisionClient.RerankRose` (vision IO), `buildRoseCandidates` (reads `proxy.PlantDetail`), and the handler rewrite all sit in `proxy`. This inverts the naive `rosererank → proxy.VisionClient` + `proxy.handlers → rosererank` cycle (Codex #44 P2).
 - Standard library only otherwise (json / context / time / strings).
 
 ---
@@ -89,15 +90,15 @@ roseCandidates = [ RoseCandidate{plantId, scientificName, commonName, flowerColo
 ### 2.4 Decision: rewrite vs fall back
 
 ```
-res, err := RerankRose(...)
-if err != nil                      → fall back (log, keep species result)   // best-effort
-if !res.CultivarCertain            → fall back (model says indistinguishable)
-if len(res.Matches) == 0           → fall back
-if res.Matches[0].Confidence < 0.35 → fall back   // defensive numeric floor only
-otherwise:
-  validate each match.plant_id is a known rose candidate (drop unknown ids)
-  if none survive                  → fall back
-  rewrite result.Suggestions from surviving matches (≤3), set result.AIEnhancedAt
+res, err := vision.RerankRose(...)
+if err != nil           → fall back (log, keep species result)   // best-effort
+if !res.CultivarCertain → fall back (model says indistinguishable)
+// VALIDATE BEFORE THE FLOOR — a hallucinated high-confidence first id must not
+// shield a low-confidence real candidate behind it (Codex #44 P2):
+survivors := [ m in res.Matches : m.PlantID is a known rose candidate id ]   // drop hallucinated, keep order
+if len(survivors) == 0            → fall back
+if survivors[0].Confidence < 0.35 → fall back   // floor on the FIRST SURVIVING real candidate
+rewrite result.Suggestions from survivors (≤3), set result.AIEnhancedAt
 ```
 
 The **primary** gate is `cultivar_certain` (the model's own "can I distinguish?" judgement) plus catalog membership; the `0.35` floor is a defensive backstop for the self-contradiction case (certain=true yet trivially low confidence), **not** a tuned threshold — model self-reported confidence is uncalibrated, so we don't lean on a magic number (resolved discussion).
@@ -169,19 +170,24 @@ Rose rerank does **not** add new error codes to parent SPEC §3 and never conver
 7. **`AIEnhancedAt` only on apply.** Set it when suggestions are actually rewritten; on fallback leave it as the cascade left it (parent contract: non-null iff AI influenced the result).
 8. **`reason` / any model text is English-only** (`app_language`) — enforce in the system prompt + per-field schema description.
 9. **strict `json_schema` rejects extra fields** — `additionalProperties:false`, `required == properties`, `matches.maxItems = 3`.
+10. **No import cycle — depend one-way.** Naively `rosererank` would import `proxy` for `VisionClient` while `proxy/handlers.go` imports `rosererank` → Go import cycle (Codex #44 P2). Keep `rosererank` free of any `proxy` import (plain types + pure `Decide`); put `VisionClient.RerankRose`, `buildRoseCandidates` (it reads `proxy.PlantDetail`), and the suggestion rewrite in `proxy`. Direction: `proxy → rosererank` only.
+11. **Validate ids BEFORE the confidence floor.** Applying `matches[0].confidence < floor` before dropping hallucinated ids lets a hallucinated high-confidence first id shield a low-confidence real candidate that then gets applied below the floor (Codex #44 P2). Drop unknown ids first, then floor `survivors[0]`. Covered by `decide_test.go`.
 
 ---
 
 ## 8. Implementation outline (not part of the contract)
 
 ```
-proxy/rosererank/
+proxy/rosererank/            package rosererank — imports NOTHING from proxy (dependency inversion)
 ├── SPEC.md                 (this file)
-├── candidates.go           RoseCandidate struct + BuildRoseCandidates(*ContentIndex) []RoseCandidate (genus=="Rosa")
-├── rerank.go               RerankRose(ctx, image, mime, candidates) -> (RoseRerankResult, error); reuses VisionClient transport + 18 s client
-├── prompt.go               system prompt + json_schema (strict) + compact candidate serialization
-├── rerank_test.go          table-driven: certain→rewrite, !certain→fallback, low-conf→fallback, hallucinated id→drop, vision error→fallback
-└── candidates_test.go      genus filter excludes Hibiscus rosa-sinensis / Anemone nemorosa; includes 9 species + 101 cultivars
+├── types.go                RoseCandidate / RoseRerankResult / RoseMatch (plain data)
+├── decide.go               Decide(res, candidateIDs) ([]RoseMatch, bool) — pure: drop hallucinated ids → certainty → floor on first survivor
+└── decide_test.go          hallucinated-first-id-shields-low-real (Codex #44 P2) · !certain · empty · all-unknown · below-floor
+
+proxy/                       package proxy — imports rosererank one-way
+├── rose_vision.go          VisionClient.RerankRose(...) -> rosererank.RoseRerankResult (gpt-4o · strict json_schema · 18 s identifyHTTP · dataURL) — beside RerankIdentify
+├── rose_candidates.go      buildRoseCandidates(*ContentIndex) []rosererank.RoseCandidate (fullPlantByID where Genus=="Rosa"; excludes Hibiscus rosa-sinensis etc.)
+└── rose_vision_test.go     mock-HTTP: schema · parse · timeout→error
 ```
 
 Parent-package changes (in `proxy/`, not this package):
@@ -191,11 +197,15 @@ Parent-package changes (in `proxy/`, not this package):
 if r.Header.Get("X-YM-Rose-Rerank") == "1" &&
    !unknownSentinel && vision != nil && len(result.Suggestions) > 0 &&
    genusOf(result.Suggestions[0].ScientificName) == "Rosa" {
-    applyRoseRerank(ctx, vision, roseCandidates, imgBytes, mime, result)  // best-effort, mutates result
+    if res, err := vision.RerankRose(ctx, imgBytes, mime, roseCandidates); err == nil {
+        if matches, ok := rosererank.Decide(res, roseCandidateIDs); ok {
+            rewriteSuggestionsFromRose(result, matches, roseByID)  // sets AIEnhancedAt
+        }
+    } // err or !ok → best-effort fall back; species result untouched
 }
 ```
 
-- `roseCandidates` built at startup near `LoadContent()` (main.go) and threaded into the handler closure alongside `content`/`vision`.
+- `roseCandidates` (`[]rosererank.RoseCandidate`) + derived `roseCandidateIDs` (set) + `roseByID` (map) built once at startup near `LoadContent()` (main.go), threaded into the handler closure alongside `content`/`vision`.
 - `genusOf` is a tiny helper (first token of `speciesBinomial`), exported from `proxy` or duplicated trivially.
 - No `secrets.Vault` additions (`OPENAI_API_KEY` already present). No new route, no rate-limit change (inherits identify's two-layer limit).
 
