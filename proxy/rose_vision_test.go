@@ -70,6 +70,24 @@ func TestRerankRose_Non200_Errors(t *testing.T) {
 	}
 }
 
+func TestRerankRose_ClampsConfidence(t *testing.T) {
+	canned := `{"choices":[{"message":{"content":"{\"cultivar_certain\":true,\"matches\":[{\"plant_id\":\"AAA1\",\"confidence\":1.4,\"reason\":\"x\"},{\"plant_id\":\"AAA2\",\"confidence\":-0.2,\"reason\":\"y\"}]}"}}]}`
+	c, srv := newRoseVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, canned)
+	})
+	defer srv.Close()
+	res, err := c.RerankRose(context.Background(), roseImg, "image/jpeg", testRoseCands())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if res.Matches[0].Confidence != 1.0 {
+		t.Errorf("conf[0] = %v, want clamped 1.0", res.Matches[0].Confidence)
+	}
+	if res.Matches[1].Confidence != 0.0 {
+		t.Errorf("conf[1] = %v, want clamped 0.0", res.Matches[1].Confidence)
+	}
+}
+
 func TestRerankRose_GuardArgs(t *testing.T) {
 	c := &VisionClient{Model: "t"}
 	if _, err := c.RerankRose(context.Background(), roseImg, "image/jpeg", nil); err == nil {

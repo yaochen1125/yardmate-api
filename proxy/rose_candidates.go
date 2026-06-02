@@ -115,7 +115,7 @@ func rewriteSuggestionsFromRose(result *IdentifyResult, matches []rosererank.Ros
 		}
 		pid := cand.PlantID
 		subs = append(subs, Suggestion{
-			Name:           cand.ScientificName,
+			Name:           cand.CommonName, // curated cultivar name for display (e.g. "About Face"), not "Rosa 'About Face'" (Codex #45 P2)
 			ScientificName: cand.ScientificName,
 			CommonNames:    []string{cand.CommonName},
 			Confidence:     m.Confidence,

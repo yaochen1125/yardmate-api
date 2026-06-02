@@ -125,5 +125,15 @@ func (c *VisionClient) RerankRose(ctx context.Context, image []byte, mime string
 	if err := json.Unmarshal([]byte(raw), &res); err != nil {
 		return zero, fmt.Errorf("vision rose rerank: decode reply: %w", err)
 	}
+	// Clamp model-reported confidence to [0,1]: strict json_schema enforces the
+	// number type but not the range, so the model can emit e.g. 1.4 (Codex #45 P2).
+	// Mirrors IdentifyPlant's clamp.
+	for i := range res.Matches {
+		if res.Matches[i].Confidence < 0 {
+			res.Matches[i].Confidence = 0
+		} else if res.Matches[i].Confidence > 1 {
+			res.Matches[i].Confidence = 1
+		}
+	}
 	return res, nil
 }
