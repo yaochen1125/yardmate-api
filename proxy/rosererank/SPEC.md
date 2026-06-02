@@ -19,7 +19,7 @@
 ### 1.2 What this package is NOT responsible for
 
 - **Identification.** The species genus is already settled by the parent cascade (`proxy/handlers.go`). This package only refines a known-`Rosa` result; it never calls PlantNet / Plant.id / iNaturalist.
-- **Being on by default in V1.** Gated behind request header `X-YM-Rose-Rerank: 1`. Absent header (release builds, toggle off) → skip entirely, identical to today. Flipping the default to on is a separate post-validation step (§6).
+- **A client opt-in.** Rose rerank is **ON by default** for every Rosa identify; clients send nothing. The only gate is a **server kill-switch** `ROSE_RERANK_ENABLED` (secrets.env, defaults true) for cost/quality emergencies — no client release needed. (History: the V1 rollout was first header-gated `X-YM-Rose-Rerank` + an iOS DEBUG toggle for testing, then flipped to default-on after real-photo validation — §3 / §6.)
 - **A new response field / "AI-guessed" marker.** V1 MVP fills the existing `suggestions[0..2]` contract unchanged; iOS needs **zero** display changes. The visible "possibly XX" cultivar marker is V1.1 (§6).
 - **Other genera.** Hydrangea / Tulipa / Camellia / Hosta etc. are the same pattern but explicitly out of scope (§6). V1 implements `Rosa` only — no premature genus abstraction.
 - **Image-based similarity.** No per-cultivar reference photos / embeddings. Candidates are described in **text** (colour + habit + description); only the *user's* photo is sent to the vision model (§5).
@@ -29,8 +29,8 @@
 
 | Source | Input |
 |---|---|
-| In-process call from `handlers.go` | `image []byte`, `mime string` (the already-validated upload), the settled `*IdentifyResult`, and the parsed `X-YM-Rose-Rerank` flag. |
-| Request header | `X-YM-Rose-Rerank: 1` — opt-in test flag. Any other value / absent → rerank skipped. |
+| In-process call from `handlers.go` | `image []byte`, `mime string` (the already-validated upload), the settled `*IdentifyResult`, and the `roseEnabled` kill-switch state. |
+| Server config | `ROSE_RERANK_ENABLED` (secrets.env, default true) → `roseEnabled` bool. `false` disables rose rerank server-wide. |
 | Startup | `ContentIndex.fullPlantByID` (already built in `content.go`) — source of the 110 `Rosa` candidates. |
 | Server config | `OPENAI_API_KEY` from `secrets.Vault` (already loaded; same key as identify tier-3 + enrichment). |
 
@@ -59,7 +59,7 @@ When applied: `result.Suggestions` is rewritten to the matched cultivars (each `
 
 ### 2.1 Trigger conditions (ALL must hold)
 
-1. `X-YM-Rose-Rerank: 1` header present, AND
+1. `roseEnabled` — the server kill-switch is on (`ROSE_RERANK_ENABLED` defaults true; set false to disable server-wide), AND
 2. identify cascade succeeded — `!unknownSentinel`, `vision != nil`, `len(result.Suggestions) > 0`, AND
 3. `genusOf(result.Suggestions[0].ScientificName) == "Rosa"` (exact token match — §1.3), AND
 4. **enough budget left** — `roseBudget(ctx, reqStart) ≥ minRoseBudget` (~6 s), where `roseBudget = min(18 s, ctx remaining, roseWallClockBudget − since(reqStart))`. Bounded by BOTH identify's `ctx` AND the WriteTimeout wall clock from request start: a slow cascade eats `ctx`; a slow upload + fast cascade leaves `ctx` but little wall clock — either way skip rather than risk a timeout or WriteTimeout overrun (Codex #44 P2 — budget).
@@ -107,16 +107,15 @@ The **primary** gate is `cultivar_certain` (the model's own "can I distinguish?"
 
 ### 2.5 Where it hooks in `handlers.go`
 
-After the existing optional `RerankIdentify` block (handlers.go:~529–545, the `aiEnhance` path) and **before** the plant_id resolution loop (handlers.go:~549). At that point `result.Suggestions[0]` is the final species; rose rerank may replace the slice; the downstream resolution + common-name override then run normally over whatever is in the slice. The two flags are independent: `aiEnhance` (multipart `ai_enhance`) refines *species*; `X-YM-Rose-Rerank` refines *cultivar*. Both, either, or neither may be set.
+After the existing optional `RerankIdentify` block (handlers.go:~529–545, the `aiEnhance` path) and **before** the plant_id resolution loop (handlers.go:~549). At that point `result.Suggestions[0]` is the final species; rose rerank may replace the slice; the downstream resolution + common-name override then run normally over whatever is in the slice. The two paths are independent: `aiEnhance` (multipart `ai_enhance`) refines *species*; `roseEnabled` (default-on, `ROSE_RERANK_ENABLED` kill-switch) controls the *cultivar* rerank.
 
 ---
 
 ## 3. Feature flag
 
-- **Transport**: HTTP request header `X-YM-Rose-Rerank: 1`. Chosen over a multipart field / query param so the identify **body contract is untouched** and the flag is trivially removable.
-- **iOS (separate `yardmate-swiftui` PR)**: a DEBUG-only toggle in the More tab (same DEBUG block as the #325 subscription switch), stored via `@AppStorage` (UserDefaults — **no** `EnvironmentObject`, to avoid the #325 env-injection crash). When on, the identify request adds the header.
-- **Server default = off**: absent header → original behavior. Rose rerank only runs when a build explicitly opts in. This is the V1 test-phase default; flipping to on-by-default is post-validation (§6).
-- **Ship order**: this server package first (no-header callers unaffected → safe), then the iOS toggle.
+- **Default ON.** Rose rerank runs for every identify whose genus is Rosa — no client opt-in, no request header. The identify body/header contract is unchanged.
+- **Kill-switch**: `ROSE_RERANK_ENABLED` in secrets.env, read once at startup via `vault.GetBool("ROSE_RERANK_ENABLED", true)` and passed to `HandleIdentify` as `roseEnabled`. Missing/empty = ON. Set `=false` + restart to disable server-wide (cost/quality emergency) without any client release. It is **not** in deploy.sh's required-keys gate (optional key).
+- **History (V1 rollout)**: first shipped header-gated (`X-YM-Rose-Rerank`, server) + a DEBUG toggle (iOS More tab, `@AppStorage`, no `EnvironmentObject` per the #325 crash) for safe real-photo testing. After validation, both were removed — the header read in `handlers.go` and the iOS toggle/header — and the default flipped to on (§6).
 
 ---
 
@@ -137,7 +136,7 @@ Rose rerank does **not** add new error codes to parent SPEC §3 and never conver
 
 ## 5. Resolved decisions (don't re-debate)
 
-- **Header-gated, default OFF in V1.** Pure test instrument; validated on real photos before any default flip.
+- **Default-ON with a server kill-switch (`ROSE_RERANK_ENABLED`).** Validated on real photos during a header-gated test phase, then flipped to default-on. The kill-switch is server-controlled (not a client flag) so the emergency off needs no client release.
 - **`top-3`, not `top-1`.** Multiple candidates honestly convey uncertainty, fill the existing ≤3 `suggestions` contract, and need zero iOS display change.
 - **Primary gate = model `cultivar_certain` bool, not a numeric threshold.** Self-reported vision confidence is uncalibrated/overconfident; we ask the model the binary "can the photo distinguish a cultivar?" and only keep a `0.35` floor as a defensive backstop.
 - **Candidate set = all 110 `Rosa` (9 species + 101 cultivars).** Including the 9 species lets the model legitimately "stay at species" (pick `Rosa rugosa`) for a wild/uncertain photo instead of being forced onto a cultivar.
@@ -153,7 +152,7 @@ Rose rerank does **not** add new error codes to parent SPEC §3 and never conver
 
 ## 6. Out-of-scope (V1.1+ candidates)
 
-- **Default-on.** After real-photo validation, drop the header gate (or invert default) so all clients get rose rerank.
+- ~~**Default-on.**~~ **DONE** — header gate + iOS toggle removed; rose rerank is on by default for all clients, gated only by the `ROSE_RERANK_ENABLED` server kill-switch.
 - **Visible "possibly / best match" marker.** Add a response field (e.g. `match_kind: "cultivar_guess"`) + iOS "possibly XX" phrasing so the guess reads as a guess. Requires an iOS PR + contract bump.
 - **Other cultivar-heavy genera** (Hydrangea, Tulipa, Camellia, Hosta, Iris …). Same machine; keep trigger-genus + candidate-source as the only genus-specific knobs so adding a genus = config + candidate data, not a rewrite. Still: V1 implements `Rosa` only.
 - **Image-based similarity** (reference photos / embeddings per cultivar) if text descriptions prove too weak.
@@ -199,7 +198,7 @@ Parent-package changes (in `proxy/`, not this package):
 //   roseCands := buildRoseCandidates(content); roseIDs := roseIDSet(roseCands); roseMap := roseByID(roseCands)
 // Handler body captures reqStart := time.Now() (WriteTimeout wall-clock start).
 // After the RerankIdentify block (~547), before plant_id resolution (~549):
-if r.Header.Get("X-YM-Rose-Rerank") == "1" && !unknownSentinel && vision != nil &&
+if roseEnabled && !unknownSentinel && vision != nil &&
    len(result.Suggestions) > 0 && len(roseCands) > 0 &&
    genusOf(result.Suggestions[0].ScientificName) == "Rosa" {
     if budget := roseBudget(ctx, reqStart); budget >= minRoseBudget {  // min(18s, ctx, wall clock)

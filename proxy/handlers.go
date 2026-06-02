@@ -151,7 +151,7 @@ func unknownSentinelResult() *IdentifyResult {
 //     or, when the engine also returned nothing, the unchanged "can't
 //     identify" empty result). This subsumes the old tier-3 "zero suggestions
 //     → AI" block.
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, roseEnabled bool) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -556,10 +556,11 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			}
 		}
 
-		// 7a. Optional rose cultivar rerank — opt-in via X-YM-Rose-Rerank header.
-		//     Best-effort: any failure / timeout / uncertainty falls back to the
-		//     species result. Budget-aware: shares identify's 30 s ctx (rosererank SPEC).
-		if r.Header.Get("X-YM-Rose-Rerank") == "1" && !unknownSentinel && vision != nil &&
+		// 7a. Rose cultivar rerank — ON by default; ROSE_RERANK_ENABLED=false is a
+		//     server kill-switch (roseEnabled). Best-effort: any failure / timeout /
+		//     uncertainty falls back to the species result. Budget-aware: shares
+		//     identify's 30 s ctx (rosererank SPEC).
+		if roseEnabled && !unknownSentinel && vision != nil &&
 			len(result.Suggestions) > 0 && len(roseCands) > 0 &&
 			genusOf(result.Suggestions[0].ScientificName) == "Rosa" {
 			if budget := roseBudget(ctx, reqStart); budget >= minRoseBudget {
