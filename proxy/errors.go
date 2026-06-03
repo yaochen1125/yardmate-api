@@ -80,3 +80,13 @@ var ErrVisionIdentifyUnavailable = errors.New("vision: identify unavailable")
 // plants" easter egg, plant_id=AAA0000) instead of an empty / best-guess
 // suggestion. Contract: SPEC §2.1 "Unknown sentinel".
 var ErrVisionNotAPlant = errors.New("vision: not a plant")
+
+// ErrVisionDiagnoseUnavailable is returned by VisionClient.DiagnosePlant when
+// the GPT-4o look-at-the-photo diagnosis fails for any reason (network, non-200,
+// decode, model refusal / empty reply, blank scientific_name). It is the
+// diagnose analogue of ErrVisionIdentifyUnavailable: HandleDiagnose only needs
+// err != nil to decide to degrade to the static safety net (it never surfaces
+// the OpenAI failure to the client, per §3), but the sentinel lets the fallback
+// branch and its tests errors.Is-match a genuine vision FAILURE. Used only on
+// the Plant.id-down path (SPEC §2.2 "Plant.id-down AI vision fallback").
+var ErrVisionDiagnoseUnavailable = errors.New("vision: diagnose unavailable")

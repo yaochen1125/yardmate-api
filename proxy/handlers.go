@@ -761,11 +761,32 @@ func isUUID(s string) bool {
 // diagnoseMaxBody = identifyMaxBody (same 8 MB image cap + multipart overhead).
 const diagnoseMaxBody = identifyMaxBody
 
-// diagnoseUpstreamTimeout caps the Plant.id call. The handler context is
-// further bounded by the chi RequestID + Logger middleware; vision
-// disambiguation runs inside the same context but has its own client
-// timeout (≤8 s) inside VisionClient.
+// diagnoseUpstreamTimeout caps the Plant.id call, anchored at reqStart (request
+// entry) — NOT "now" — so a slow multipart upload counts against it and the
+// upstream attempt can't run past the diagnoseWallClockBudget ceiling, leaving
+// the AI fallback / static net room to write the 200 before the server
+// WriteTimeout (Codex #48 P2). Must be ≤ diagnoseWallClockBudget. The
+// /v1/diagnose route runs with NO chi-level Timeout middleware (server.go "Slow
+// proxy endpoints"), so the handler manages its own deadline; vision
+// disambiguation runs inside the same context but has its own client timeout
+// (≤8 s) inside VisionClient.
 const diagnoseUpstreamTimeout = 30 * time.Second
+
+// diagnoseWallClockBudget bounds the WHOLE diagnose handler (Plant.id attempt +
+// the optional GPT-4o vision fallback) by the 35 s server WriteTimeout (main.go)
+// measured from request start — NOT from the upstream ctx, which is created only
+// AFTER the multipart body is read. Go resets WriteTimeout at header-read, so a
+// slow upload counts against it: a deadline anchored post-upload could let the
+// 200 fallback response land past WriteTimeout (Codex #48 P2, the same trap the
+// rose roseWallClockBudget fixed in #44 P2). 30 s leaves ~5 s write margin.
+const diagnoseWallClockBudget = 30 * time.Second
+
+// minDiagnoseFallbackBudget is the floor below which the vision fallback is not
+// worth attempting: a real look-at-the-photo diagnosis needs several seconds, so
+// below this (e.g. Plant.id consumed nearly the whole wall clock before failing)
+// we skip straight to the instant static safety net rather than spend a doomed
+// OpenAI call that would itself risk the WriteTimeout. Mirrors minRoseBudget.
+const minDiagnoseFallbackBudget = 6 * time.Second
 
 // HandleDiagnose returns the http.HandlerFunc for POST /v1/diagnose.
 // Combines Plant.id v3 health_assessment with YardMate catalog lookups
@@ -775,6 +796,7 @@ const diagnoseUpstreamTimeout = 30 * time.Second
 // null, catalogId falls back to name-match only, generic Leaf-spot tail).
 func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *VisionClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		reqStart := time.Now() // WriteTimeout wall-clock start, for the AI fallback budget (mirrors HandleIdentify)
 		r.Body = http.MaxBytesReader(w, r.Body, diagnoseMaxBody)
 
 		// X-Device-Install-Id is validated by ratelimit.PerDeviceMiddleware
@@ -858,13 +880,54 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), diagnoseUpstreamTimeout)
+		// Anchored at reqStart (not now) so a slow upload is charged against the
+		// upstream budget too — the whole handler (Plant.id + fallback/static net)
+		// then fits under the 35 s server WriteTimeout, so even a slow-upload +
+		// Plant.id hang still delivers its 200 in time (Codex #48 P2).
+		ctx, cancel := context.WithDeadline(r.Context(), reqStart.Add(diagnoseUpstreamTimeout))
 		defer cancel()
 
 		api, err := client.Diagnose(ctx, imgBytes, mime)
 		if err != nil {
 			log.Printf("diagnose upstream err: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v err=%v",
 				deviceID, appVer, attKeyID, attAssertPresent, err)
+			// Plant.id-down AI vision fallback (SPEC §2.2). When Plant.id is
+			// rate-limited (e.g. account balance exhausted → 429) or otherwise
+			// unavailable AND a vision client is configured, diagnose the plant
+			// directly from the image with GPT-4o instead of 502-ing. Narrow by
+			// design: bad_image / unauthorized fall through to their own codes,
+			// and Plant.id stays PRIMARY — this is the error path, so a recovered
+			// Plant.id account is served by Plant.id and never pre-empted by AI.
+			if (errors.Is(err, ErrPlantIDRateLimit) || errors.Is(err, ErrPlantIDUnavailable)) && vision != nil {
+				// Budget the fallback on the wall clock from reqStart, NOT on ctx:
+				// (1) ctx may already be expired here — a Plant.id *timeout* fails
+				//     only once ctx hit diagnoseUpstreamTimeout (its own HTTP client
+				//     cap is the same 30 s) — so the call hangs off the still-live
+				//     r.Context() (this route has no chi Timeout); and
+				// (2) the budget must respect the 35 s server WriteTimeout measured
+				//     from request start, so a slow upload + the vision call can't
+				//     push the 200 past it (Codex #48 P2; rose roseBudget precedent).
+				// Too little wall clock left → skip the doomed OpenAI call and ship
+				// the instant static net (still 200, never 502 — diagnose 不全废).
+				if budget := diagnoseFallbackBudget(reqStart); budget >= minDiagnoseFallbackBudget {
+					fbCtx, fbCancel := context.WithTimeout(r.Context(), budget)
+					defer fbCancel()
+					result, viaVision := buildDiagnoseResultViaVision(fbCtx, imgBytes, mime, content, vision)
+					// Distinct prefix from the "diagnose fallback ai" disease-pick
+					// layer (buildFallbackIssue) so the two AI paths stay separable
+					// in logs. viaVision=false means the vision call itself failed
+					// and the static safety net was used.
+					log.Printf("diagnose vision fallback done: deviceID=%s appVer=%s viaVision=%v isHealthy=%v issues=%d plantIdResolved=%v",
+						deviceID, appVer, viaVision, result.IsHealthy, len(result.Issues), result.PlantID != nil)
+					writeJSON(w, http.StatusOK, result)
+					return
+				}
+				result := diagnoseStaticNetResult(ctx, content, vision)
+				log.Printf("diagnose vision fallback done: deviceID=%s appVer=%s viaVision=false budgetSkipped=true isHealthy=%v issues=%d plantIdResolved=false",
+					deviceID, appVer, result.IsHealthy, len(result.Issues))
+				writeJSON(w, http.StatusOK, result)
+				return
+			}
 			switch {
 			case errors.Is(err, ErrPlantIDImageRejected):
 				writeError(w, http.StatusBadRequest, "bad_image")
@@ -954,6 +1017,119 @@ func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, cont
 	// Plant.id says unhealthy but returned zero disease suggestions —
 	// construct a fallback issue rather than ship an empty Issues array.
 	res.Issues = []HealthIssue{buildFallbackIssue(ctx, res.PlantID, res.IdentifiedName, res.HealthProbability, content, vision)}
+	return res
+}
+
+// diagnoseFallbackBudget returns how long the AI vision fallback may run: the
+// wall clock remaining until the diagnoseWallClockBudget ceiling measured from
+// reqStart (request entry ≈ when the server armed the 35 s WriteTimeout at
+// header-read). Anchoring to reqStart — not to the post-body-read ctx — means a
+// slow multipart upload eats INTO the budget instead of stacking on top of it,
+// so the 200 fallback response can never overrun WriteTimeout. May be ≤ 0 (or
+// below minDiagnoseFallbackBudget) when Plant.id consumed most of the clock; the
+// caller then skips the OpenAI call for the instant static net. Mirrors roseBudget.
+func diagnoseFallbackBudget(reqStart time.Time) time.Duration {
+	return diagnoseWallClockBudget - time.Since(reqStart)
+}
+
+// diagnoseStaticNetResult is the last-resort DiagnoseResult when no vision
+// diagnosis is available (the vision call failed, or too little wall clock
+// remained to attempt it): an unhealthy result carrying the generic L06
+// safety-net issue (200, not 502 — diagnose 不全废). With no plant/disease
+// context, buildFallbackIssue skips its AI layer (plantName="") and makes NO
+// OpenAI call, so this is instant and safe even on an already-expired ctx.
+func diagnoseStaticNetResult(ctx context.Context, content *ContentIndex, vision *VisionClient) *DiagnoseResult {
+	return &DiagnoseResult{
+		IsHealthy: false,
+		Issues:    []HealthIssue{buildFallbackIssue(ctx, nil, "", 0, content, vision)},
+	}
+}
+
+// buildDiagnoseResultViaVision is the Plant.id-down fallback (SPEC §2.2): it
+// runs the GPT-4o look-at-the-photo diagnosis and maps it into a DiagnoseResult.
+// It NEVER returns nil — if DiagnosePlant itself fails (OpenAI down / timeout /
+// refusal / malformed reply) it degrades to the generic L06 safety-net issue, a
+// 200 result rather than a 502 (diagnose 不全废). The bool reports whether the AI
+// diagnosis succeeded (true) or the safety net was used (false), for the
+// handler's observability log.
+func buildDiagnoseResultViaVision(ctx context.Context, image []byte, mime string, content *ContentIndex, vision *VisionClient) (*DiagnoseResult, bool) {
+	vr, err := vision.DiagnosePlant(ctx, image, mime)
+	if err != nil {
+		// Vision unavailable too — no plant/disease context to ground on, so
+		// fall straight to the static net (same instant L06 the budget-skip path uses).
+		log.Printf("diagnose vision fallback err: err=%v", err)
+		return diagnoseStaticNetResult(ctx, content, vision), false
+	}
+	return diagnoseResultFromVision(ctx, vr, content, vision), true
+}
+
+// diagnoseResultFromVision maps a successful GPT-4o vision diagnosis into the
+// client-facing DiagnoseResult — the SAME shape the Plant.id path produces, so
+// iOS cannot tell the two apart (无声 fallback, SPEC §2.2). scientific_name
+// drives identifiedName / top / plantId (via the shared LookupPlantID resolver);
+// each issue name is mapped to a catalogId via the same name-match → LLM
+// disambiguation chain the Plant.id path uses (mapCatalogID); top-3 cap. The
+// per-issue isFallback=true marks AI-sourced issues for server/log distinction
+// only — iOS does not branch on it (it already ships true on the unhealthy-empty
+// path). On a healthy verdict Issues stays empty, mirroring the Plant.id healthy
+// path; on unhealthy-but-no-usable-issue it falls to the same static safety net.
+func diagnoseResultFromVision(ctx context.Context, vr *visionDiagnoseResult, content *ContentIndex, vision *VisionClient) *DiagnoseResult {
+	res := &DiagnoseResult{Issues: []HealthIssue{}}
+
+	name := strings.TrimSpace(vr.ScientificName)
+	cn := vr.CommonNames
+	if cn == nil {
+		cn = []string{}
+	}
+	res.IdentifiedName = name
+	res.Top = &PlantSuggestion{
+		Name:           name,
+		ScientificName: name,
+		CommonNames:    cn,
+		Confidence:     clamp01(vr.Confidence),
+	}
+	if name != "" {
+		if id, ok := content.LookupPlantID(name); ok {
+			pid := id
+			res.PlantID = &pid
+		}
+	}
+
+	res.HealthProbability = clamp01(vr.HealthProbability)
+	res.IsHealthy = vr.IsHealthy
+	if res.IsHealthy {
+		// Healthy verdict → empty issues, same as the Plant.id healthy path.
+		return res
+	}
+
+	for _, iss := range vr.Issues {
+		nm := strings.TrimSpace(iss.Name)
+		if nm == "" {
+			continue
+		}
+		issue := HealthIssue{
+			Name:        nm,
+			Probability: clamp01(iss.Confidence),
+			Description: strings.TrimSpace(iss.Description),
+			Cause:       strings.TrimSpace(iss.Cause),
+			IsFallback:  true, // AI-sourced; server/log distinction only (silent to iOS)
+			Treatment: Treatment{
+				Biological: nonNil(iss.Treatment.Biological),
+				Chemical:   nonNil(iss.Treatment.Chemical),
+				Prevention: nonNil(iss.Treatment.Prevention),
+			},
+		}
+		issue.CatalogID = mapCatalogID(ctx, nm, content, vision)
+		res.Issues = append(res.Issues, issue)
+		if len(res.Issues) >= 3 {
+			break
+		}
+	}
+	if len(res.Issues) == 0 {
+		// AI flagged unhealthy but gave no usable issue → static safety net,
+		// grounded by the resolved plantId / name when available.
+		res.Issues = []HealthIssue{buildFallbackIssue(ctx, res.PlantID, res.IdentifiedName, res.HealthProbability, content, vision)}
+	}
 	return res
 }
 
@@ -1070,4 +1246,17 @@ func nonNil(s []string) []string {
 		return []string{}
 	}
 	return s
+}
+
+// clamp01 clamps a model-reported probability / confidence into [0,1]; gpt-4o
+// occasionally returns a slightly out-of-range value. Used when mapping the AI
+// diagnose fallback into DiagnoseResult.
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
 }
