@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // testUUID is a fixed RFC 4122 string the tests reuse for X-Device-Install-Id.
@@ -2386,6 +2388,49 @@ func TestHandleDiagnose_Unauthorized_NotHijackedByAIFallback(t *testing.T) {
 	}
 	if visionCalled {
 		t.Error("vision was called on an unauthorized Plant.id error; the AI fallback must be narrow (rate-limit/unavailable only)")
+	}
+}
+
+// fallbackDeadline must anchor the AI fallback to the whole-handler ceiling
+// (entry + diagnoseHandlerBudget), reconstructed from the upstream ctx deadline,
+// and that ceiling must sit BEYOND the upstream deadline so a Plant.id timeout
+// still leaves the vision fallback a live budget (the Codex P2 regression: a
+// timed-out upstream ctx must not be what bounds the fallback). The whole
+// budget must stay under the 35s server WriteTimeout so the 200 always writes.
+func TestFallbackDeadline_AnchoredBeyondUpstreamDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), diagnoseUpstreamTimeout)
+	defer cancel()
+	upDL, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("upstream ctx has no deadline")
+	}
+
+	got := fallbackDeadline(ctx)
+	want := upDL.Add(diagnoseHandlerBudget - diagnoseUpstreamTimeout)
+	if !got.Equal(want) {
+		t.Errorf("fallbackDeadline = %v, want upstream deadline + handler tail (%v)", got, want)
+	}
+	// Must extend PAST the upstream deadline — else a Plant.id timeout (which
+	// expires the upstream ctx) would leave the fallback zero budget.
+	if !got.After(upDL) {
+		t.Errorf("fallback deadline %v must be after the upstream deadline %v", got, upDL)
+	}
+	// Whole-handler budget must stay under the 35s server WriteTimeout (main.go)
+	// so the 200 fallback response is always writable.
+	if diagnoseHandlerBudget >= 35*time.Second {
+		t.Errorf("diagnoseHandlerBudget %v must stay under the 35s server WriteTimeout", diagnoseHandlerBudget)
+	}
+	if diagnoseHandlerBudget <= diagnoseUpstreamTimeout {
+		t.Errorf("diagnoseHandlerBudget %v must exceed diagnoseUpstreamTimeout %v (else no fallback tail)", diagnoseHandlerBudget, diagnoseUpstreamTimeout)
+	}
+}
+
+// Defensive branch: a context with no deadline yields a now+tail deadline in the
+// future (never the zero time, which would expire the fallback instantly).
+func TestFallbackDeadline_NoUpstreamDeadline_Defensive(t *testing.T) {
+	got := fallbackDeadline(context.Background())
+	if !got.After(time.Now()) {
+		t.Errorf("fallbackDeadline(no-deadline ctx) = %v, want a future time", got)
 	}
 }
 

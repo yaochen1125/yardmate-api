@@ -761,11 +761,22 @@ func isUUID(s string) bool {
 // diagnoseMaxBody = identifyMaxBody (same 8 MB image cap + multipart overhead).
 const diagnoseMaxBody = identifyMaxBody
 
-// diagnoseUpstreamTimeout caps the Plant.id call. The handler context is
-// further bounded by the chi RequestID + Logger middleware; vision
-// disambiguation runs inside the same context but has its own client
-// timeout (≤8 s) inside VisionClient.
+// diagnoseUpstreamTimeout caps the Plant.id call. The /v1/diagnose route runs
+// with NO chi-level Timeout middleware (server.go "Slow proxy endpoints"), so
+// the handler manages its own deadline; vision disambiguation runs inside the
+// same context but has its own client timeout (≤8 s) inside VisionClient.
 const diagnoseUpstreamTimeout = 30 * time.Second
+
+// diagnoseHandlerBudget is the whole-handler wall-clock ceiling (Plant.id
+// attempt + the optional GPT-4o vision fallback), measured from the same entry
+// instant as the upstream ctx. It is kept under the 35 s server WriteTimeout
+// (main.go) so the 200 response is always writable. The AI fallback derives its
+// deadline from this ceiling off the still-live r.Context() — NOT off the
+// upstream ctx, which a Plant.id timeout leaves expired (see fallbackDeadline).
+// The difference (diagnoseHandlerBudget − diagnoseUpstreamTimeout) is the tail
+// the fallback gets after a full upstream hang; a fast upstream failure
+// (429 / 5xx / network) leaves it the larger remainder up to its own client cap.
+const diagnoseHandlerBudget = 33 * time.Second
 
 // HandleDiagnose returns the http.HandlerFunc for POST /v1/diagnose.
 // Combines Plant.id v3 health_assessment with YardMate catalog lookups
@@ -873,7 +884,17 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 			// and Plant.id stays PRIMARY — this is the error path, so a recovered
 			// Plant.id account is served by Plant.id and never pre-empted by AI.
 			if (errors.Is(err, ErrPlantIDRateLimit) || errors.Is(err, ErrPlantIDUnavailable)) && vision != nil {
-				result, viaVision := buildDiagnoseResultViaVision(ctx, imgBytes, mime, content, vision)
+				// Do NOT reuse ctx: a Plant.id *timeout* returns
+				// ErrPlantIDUnavailable only once ctx has already hit
+				// diagnoseUpstreamTimeout (Plant.id's own HTTP client cap is the
+				// same 30 s), so ctx is expired here and DiagnosePlant on it would
+				// fail instantly — every hung request silently degrading to L06.
+				// Derive a fresh deadline from the still-live r.Context() (this
+				// route has no chi Timeout), anchored to the whole-handler ceiling
+				// so the 200 always writes (see fallbackDeadline / diagnoseHandlerBudget).
+				fbCtx, fbCancel := context.WithDeadline(r.Context(), fallbackDeadline(ctx))
+				defer fbCancel()
+				result, viaVision := buildDiagnoseResultViaVision(fbCtx, imgBytes, mime, content, vision)
 				// Distinct prefix from the "diagnose fallback ai" disease-pick
 				// layer (buildFallbackIssue) so the two AI paths stay separable
 				// in logs. viaVision=false means the vision call itself failed
@@ -973,6 +994,23 @@ func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, cont
 	// construct a fallback issue rather than ship an empty Issues array.
 	res.Issues = []HealthIssue{buildFallbackIssue(ctx, res.PlantID, res.IdentifiedName, res.HealthProbability, content, vision)}
 	return res
+}
+
+// fallbackDeadline returns the wall-clock deadline for the AI vision fallback:
+// the whole-handler ceiling (request entry + diagnoseHandlerBudget), reconstructed
+// from the upstream ctx's deadline (entry + diagnoseUpstreamTimeout). Anchoring
+// to entry — not to "now" — means a fast Plant.id failure leaves the fallback
+// the large remainder while a full upstream hang leaves only the tail, and in
+// both cases the total stays under the 35 s server WriteTimeout so the 200 is
+// writable. The caller hangs this deadline off the live r.Context(), so it holds
+// even when the upstream ctx is already expired. Defensive now+tail fallback if
+// ctx carries no deadline (it always does on this path).
+func fallbackDeadline(ctx context.Context) time.Time {
+	tail := diagnoseHandlerBudget - diagnoseUpstreamTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		return dl.Add(tail)
+	}
+	return time.Now().Add(tail)
 }
 
 // buildDiagnoseResultViaVision is the Plant.id-down fallback (SPEC §2.2): it
