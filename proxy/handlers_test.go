@@ -2213,6 +2213,182 @@ func TestHandleDiagnose_CatalogID_LLMDisambiguation(t *testing.T) {
 	}
 }
 
+// --- Plant.id-down AI vision fallback (SPEC §2.2) ---
+
+// Plant.id 429 (account balance exhausted) + a configured vision client → the
+// handler diagnoses straight from the image with GPT-4o and returns 200 with a
+// DiagnoseResult byte-shaped like a Plant.id one (无声 fallback), NOT a 502.
+// scientific_name resolves to the catalog plantId, the disease name name-matches
+// a catalogId, and isFallback=true marks the AI source for server/log only.
+func TestHandleDiagnose_PlantIDRateLimit_AIVisionFallbackSucceeds(t *testing.T) {
+	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[\"Chinese Abelia\"],\"confidence\":0.88,\"is_healthy\":false,\"health_probability\":0.2,\"issues\":[{\"name\":\"Powdery mildew\",\"confidence\":0.76,\"cause\":\"high humidity\",\"description\":\"white powdery coating\",\"treatment\":{\"biological\":[\"neem oil\"],\"chemical\":[\"copper fungicide\"],\"prevention\":[\"increase airflow\"]}}]}"}}]}`)
+	})
+	defer vsrv.Close()
+
+	// Plant.id upstream is rate-limited (429 → ErrPlantIDRateLimit).
+	h, srv := newDiagnoseHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}, vision)
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/diagnose", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200 (AI fallback, not 502) body=%s", rec.Code, rec.Body)
+	}
+	var result DiagnoseResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, rec.Body)
+	}
+	if result.IsHealthy {
+		t.Error("IsHealthy = true, want false")
+	}
+	if result.IdentifiedName != "Abelia chinensis" {
+		t.Errorf("IdentifiedName = %q, want Abelia chinensis", result.IdentifiedName)
+	}
+	if result.PlantID == nil || *result.PlantID != "AAA0001" {
+		t.Errorf("PlantID = %v, want AAA0001 (resolved from AI scientific_name)", result.PlantID)
+	}
+	if result.Top == nil || result.Top.Name != "Abelia chinensis" || result.Top.Confidence != 0.88 {
+		t.Errorf("Top = %+v, want Abelia chinensis @0.88", result.Top)
+	}
+	if result.HealthProbability != 0.2 {
+		t.Errorf("HealthProbability = %v, want 0.2", result.HealthProbability)
+	}
+	if len(result.Issues) != 1 {
+		t.Fatalf("Issues len = %d, want 1", len(result.Issues))
+	}
+	issue := result.Issues[0]
+	if issue.Name != "Powdery mildew" {
+		t.Errorf("Issue Name = %q, want Powdery mildew", issue.Name)
+	}
+	if issue.CatalogID == nil || *issue.CatalogID != "L20" {
+		t.Errorf("CatalogID = %v, want L20 (name-match)", issue.CatalogID)
+	}
+	if !issue.IsFallback {
+		t.Error("IsFallback = false, want true (AI-sourced)")
+	}
+	if issue.Probability != 0.76 {
+		t.Errorf("Probability = %v, want 0.76 (AI per-issue confidence)", issue.Probability)
+	}
+	if issue.Cause != "high humidity" || issue.Description != "white powdery coating" {
+		t.Errorf("Cause/Description = %q/%q", issue.Cause, issue.Description)
+	}
+	if len(issue.Treatment.Biological) != 1 || issue.Treatment.Biological[0] != "neem oil" ||
+		len(issue.Treatment.Chemical) != 1 || len(issue.Treatment.Prevention) != 1 {
+		t.Errorf("Treatment = %+v, want neem/copper/airflow", issue.Treatment)
+	}
+}
+
+// Plant.id 429 AND the vision diagnosis also fails (OpenAI 500) → the handler
+// still returns 200 with the generic L06 safety-net issue, never a 502
+// (diagnose 不全废, SPEC §2.2).
+func TestHandleDiagnose_PlantIDRateLimit_AIVisionAlsoFails_GracefulSafetyNet(t *testing.T) {
+	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	defer vsrv.Close()
+
+	h, srv := newDiagnoseHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}, vision)
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/diagnose", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200 (graceful safety net, not 502) body=%s", rec.Code, rec.Body)
+	}
+	var result DiagnoseResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, rec.Body)
+	}
+	if result.IsHealthy {
+		t.Error("IsHealthy = true, want false (safety net ships an unhealthy issue)")
+	}
+	if len(result.Issues) != 1 {
+		t.Fatalf("Issues len = %d, want 1 (generic fallback)", len(result.Issues))
+	}
+	issue := result.Issues[0]
+	if !issue.IsFallback || issue.CatalogID == nil || *issue.CatalogID != "L06" || issue.Name != "Leaf spot" {
+		t.Errorf("issue = %+v, want L06 Leaf spot isFallback=true (AI failed → static net)", issue)
+	}
+}
+
+// vision == nil (no OPENAI_API_KEY) → the AI fallback cannot run, so a Plant.id
+// rate-limit still maps to 502 plant_id_unavailable (unchanged pre-fix behavior;
+// the fallback is strictly opt-in on a configured vision client).
+func TestHandleDiagnose_PlantIDRateLimit_NoVision_Still502(t *testing.T) {
+	h, srv := newDiagnoseHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}, nil)
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/diagnose", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code = %d, want 502 body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"plant_id_unavailable"`) {
+		t.Errorf("body = %s", rec.Body.String())
+	}
+}
+
+// Plant.id 401/403 is a server key misconfig, NOT a transient outage — the AI
+// fallback must NOT hijack it (that would mask the misconfig). Even with a
+// working vision client, an unauthorized Plant.id maps to 502
+// plant_id_unauthorized and the vision client is never called.
+func TestHandleDiagnose_Unauthorized_NotHijackedByAIFallback(t *testing.T) {
+	visionCalled := false
+	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		visionCalled = true
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.5,\"is_healthy\":true,\"health_probability\":0.9,\"issues\":[]}"}}]}`)
+	})
+	defer vsrv.Close()
+
+	h, srv := newDiagnoseHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}, vision)
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/diagnose", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code = %d, want 502", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"plant_id_unauthorized"`) {
+		t.Errorf("body = %s, want plant_id_unauthorized", rec.Body.String())
+	}
+	if visionCalled {
+		t.Error("vision was called on an unauthorized Plant.id error; the AI fallback must be narrow (rate-limit/unavailable only)")
+	}
+}
+
 func TestIsUUID(t *testing.T) {
 	tests := []struct {
 		s    string

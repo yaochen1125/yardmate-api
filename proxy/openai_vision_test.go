@@ -573,3 +573,126 @@ func TestIdentifyPlant_NilIdentifyHTTP_FallsBackToHTTP(t *testing.T) {
 		t.Errorf("ScientificName = %q, want Ficus lyrata", sug.ScientificName)
 	}
 }
+
+// --- DiagnosePlant (Plant.id-down vision fallback, SPEC §2.2) ---
+
+func TestDiagnosePlant_Success(t *testing.T) {
+	var gotBody, gotAuth string
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Rosa chinensis\",\"common_names\":[\"China rose\"],\"confidence\":0.82,\"is_healthy\":false,\"health_probability\":0.18,\"issues\":[{\"name\":\"Powdery mildew\",\"confidence\":0.7,\"cause\":\"high humidity\",\"description\":\"white coating\",\"treatment\":{\"biological\":[\"neem\"],\"chemical\":[\"sulfur\"],\"prevention\":[\"airflow\"]}}]}"}}]}`)
+	})
+	defer srv.Close()
+
+	vr, err := c.DiagnosePlant(context.Background(), []byte("\xff\xd8img"), "image/jpeg")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if vr.ScientificName != "Rosa chinensis" {
+		t.Errorf("ScientificName = %q, want Rosa chinensis", vr.ScientificName)
+	}
+	if len(vr.CommonNames) != 1 || vr.CommonNames[0] != "China rose" {
+		t.Errorf("CommonNames = %v, want [China rose]", vr.CommonNames)
+	}
+	if vr.Confidence != 0.82 || vr.IsHealthy || vr.HealthProbability != 0.18 {
+		t.Errorf("conf/healthy/healthProb = %v/%v/%v", vr.Confidence, vr.IsHealthy, vr.HealthProbability)
+	}
+	if len(vr.Issues) != 1 {
+		t.Fatalf("Issues len = %d, want 1", len(vr.Issues))
+	}
+	iss := vr.Issues[0]
+	if iss.Name != "Powdery mildew" || iss.Confidence != 0.7 || iss.Cause != "high humidity" || iss.Description != "white coating" {
+		t.Errorf("issue = %+v", iss)
+	}
+	if len(iss.Treatment.Biological) != 1 || iss.Treatment.Biological[0] != "neem" ||
+		len(iss.Treatment.Chemical) != 1 || len(iss.Treatment.Prevention) != 1 {
+		t.Errorf("treatment = %+v, want neem/sulfur/airflow", iss.Treatment)
+	}
+	if gotAuth != "Bearer test-key" {
+		t.Errorf("auth = %q", gotAuth)
+	}
+	// Request must carry the image data URL + the strict json_schema response_format.
+	if !strings.Contains(gotBody, "data:image/jpeg;base64,") {
+		t.Errorf("request body missing image data URL: %s", gotBody)
+	}
+	if !strings.Contains(gotBody, `"response_format"`) || !strings.Contains(gotBody, `"json_schema"`) || !strings.Contains(gotBody, `"strict":true`) {
+		t.Errorf("request body missing strict json_schema response_format: %s", gotBody)
+	}
+}
+
+func TestDiagnosePlant_HealthyEmptyIssues(t *testing.T) {
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Monstera deliciosa\",\"common_names\":[],\"confidence\":0.9,\"is_healthy\":true,\"health_probability\":0.95,\"issues\":[]}"}}]}`)
+	})
+	defer srv.Close()
+	vr, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !vr.IsHealthy || len(vr.Issues) != 0 {
+		t.Errorf("healthy=%v issues=%d, want true/0", vr.IsHealthy, len(vr.Issues))
+	}
+}
+
+func TestDiagnosePlant_Non200_SentinelError(t *testing.T) {
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":"server"}`)
+	})
+	defer srv.Close()
+	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg")
+	if err == nil || !errors.Is(err, ErrVisionDiagnoseUnavailable) {
+		t.Errorf("err = %v, want ErrVisionDiagnoseUnavailable", err)
+	}
+}
+
+func TestDiagnosePlant_MalformedJSON_SentinelError(t *testing.T) {
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"not json at all"}}]}`)
+	})
+	defer srv.Close()
+	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg")
+	if err == nil || !errors.Is(err, ErrVisionDiagnoseUnavailable) {
+		t.Errorf("err = %v, want ErrVisionDiagnoseUnavailable (decode failure)", err)
+	}
+}
+
+func TestDiagnosePlant_Refusal_EmptyContent_SentinelError(t *testing.T) {
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":""}}]}`)
+	})
+	defer srv.Close()
+	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg")
+	if err == nil || !errors.Is(err, ErrVisionDiagnoseUnavailable) {
+		t.Errorf("err = %v, want ErrVisionDiagnoseUnavailable (refusal)", err)
+	}
+}
+
+func TestDiagnosePlant_EmptyScientificName_SentinelError(t *testing.T) {
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"   \",\"common_names\":[],\"confidence\":0.3,\"is_healthy\":false,\"health_probability\":0.4,\"issues\":[]}"}}]}`)
+	})
+	defer srv.Close()
+	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg")
+	if err == nil || !errors.Is(err, ErrVisionDiagnoseUnavailable) {
+		t.Errorf("err = %v, want ErrVisionDiagnoseUnavailable (blank scientific_name)", err)
+	}
+}
+
+func TestDiagnosePlant_NilReceiver_SentinelError(t *testing.T) {
+	var c *VisionClient
+	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg")
+	if err == nil || !errors.Is(err, ErrVisionDiagnoseUnavailable) {
+		t.Errorf("err = %v, want ErrVisionDiagnoseUnavailable (nil receiver)", err)
+	}
+}
+
+func TestDiagnosePlant_EmptyImage_SentinelError(t *testing.T) {
+	c := &VisionClient{}
+	_, err := c.DiagnosePlant(context.Background(), nil, "image/jpeg")
+	if err == nil || !errors.Is(err, ErrVisionDiagnoseUnavailable) {
+		t.Errorf("err = %v, want ErrVisionDiagnoseUnavailable (empty image)", err)
+	}
+}
