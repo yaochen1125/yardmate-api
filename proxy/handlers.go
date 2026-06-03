@@ -767,16 +767,21 @@ const diagnoseMaxBody = identifyMaxBody
 // same context but has its own client timeout (≤8 s) inside VisionClient.
 const diagnoseUpstreamTimeout = 30 * time.Second
 
-// diagnoseHandlerBudget is the whole-handler wall-clock ceiling (Plant.id
-// attempt + the optional GPT-4o vision fallback), measured from the same entry
-// instant as the upstream ctx. It is kept under the 35 s server WriteTimeout
-// (main.go) so the 200 response is always writable. The AI fallback derives its
-// deadline from this ceiling off the still-live r.Context() — NOT off the
-// upstream ctx, which a Plant.id timeout leaves expired (see fallbackDeadline).
-// The difference (diagnoseHandlerBudget − diagnoseUpstreamTimeout) is the tail
-// the fallback gets after a full upstream hang; a fast upstream failure
-// (429 / 5xx / network) leaves it the larger remainder up to its own client cap.
-const diagnoseHandlerBudget = 33 * time.Second
+// diagnoseWallClockBudget bounds the WHOLE diagnose handler (Plant.id attempt +
+// the optional GPT-4o vision fallback) by the 35 s server WriteTimeout (main.go)
+// measured from request start — NOT from the upstream ctx, which is created only
+// AFTER the multipart body is read. Go resets WriteTimeout at header-read, so a
+// slow upload counts against it: a deadline anchored post-upload could let the
+// 200 fallback response land past WriteTimeout (Codex #48 P2, the same trap the
+// rose roseWallClockBudget fixed in #44 P2). 30 s leaves ~5 s write margin.
+const diagnoseWallClockBudget = 30 * time.Second
+
+// minDiagnoseFallbackBudget is the floor below which the vision fallback is not
+// worth attempting: a real look-at-the-photo diagnosis needs several seconds, so
+// below this (e.g. Plant.id consumed nearly the whole wall clock before failing)
+// we skip straight to the instant static safety net rather than spend a doomed
+// OpenAI call that would itself risk the WriteTimeout. Mirrors minRoseBudget.
+const minDiagnoseFallbackBudget = 6 * time.Second
 
 // HandleDiagnose returns the http.HandlerFunc for POST /v1/diagnose.
 // Combines Plant.id v3 health_assessment with YardMate catalog lookups
@@ -786,6 +791,7 @@ const diagnoseHandlerBudget = 33 * time.Second
 // null, catalogId falls back to name-match only, generic Leaf-spot tail).
 func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *VisionClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		reqStart := time.Now() // WriteTimeout wall-clock start, for the AI fallback budget (mirrors HandleIdentify)
 		r.Body = http.MaxBytesReader(w, r.Body, diagnoseMaxBody)
 
 		// X-Device-Install-Id is validated by ratelimit.PerDeviceMiddleware
@@ -884,23 +890,32 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 			// and Plant.id stays PRIMARY — this is the error path, so a recovered
 			// Plant.id account is served by Plant.id and never pre-empted by AI.
 			if (errors.Is(err, ErrPlantIDRateLimit) || errors.Is(err, ErrPlantIDUnavailable)) && vision != nil {
-				// Do NOT reuse ctx: a Plant.id *timeout* returns
-				// ErrPlantIDUnavailable only once ctx has already hit
-				// diagnoseUpstreamTimeout (Plant.id's own HTTP client cap is the
-				// same 30 s), so ctx is expired here and DiagnosePlant on it would
-				// fail instantly — every hung request silently degrading to L06.
-				// Derive a fresh deadline from the still-live r.Context() (this
-				// route has no chi Timeout), anchored to the whole-handler ceiling
-				// so the 200 always writes (see fallbackDeadline / diagnoseHandlerBudget).
-				fbCtx, fbCancel := context.WithDeadline(r.Context(), fallbackDeadline(ctx))
-				defer fbCancel()
-				result, viaVision := buildDiagnoseResultViaVision(fbCtx, imgBytes, mime, content, vision)
-				// Distinct prefix from the "diagnose fallback ai" disease-pick
-				// layer (buildFallbackIssue) so the two AI paths stay separable
-				// in logs. viaVision=false means the vision call itself failed
-				// and the static safety net was used.
-				log.Printf("diagnose vision fallback done: deviceID=%s appVer=%s viaVision=%v isHealthy=%v issues=%d plantIdResolved=%v",
-					deviceID, appVer, viaVision, result.IsHealthy, len(result.Issues), result.PlantID != nil)
+				// Budget the fallback on the wall clock from reqStart, NOT on ctx:
+				// (1) ctx may already be expired here — a Plant.id *timeout* fails
+				//     only once ctx hit diagnoseUpstreamTimeout (its own HTTP client
+				//     cap is the same 30 s) — so the call hangs off the still-live
+				//     r.Context() (this route has no chi Timeout); and
+				// (2) the budget must respect the 35 s server WriteTimeout measured
+				//     from request start, so a slow upload + the vision call can't
+				//     push the 200 past it (Codex #48 P2; rose roseBudget precedent).
+				// Too little wall clock left → skip the doomed OpenAI call and ship
+				// the instant static net (still 200, never 502 — diagnose 不全废).
+				if budget := diagnoseFallbackBudget(reqStart); budget >= minDiagnoseFallbackBudget {
+					fbCtx, fbCancel := context.WithTimeout(r.Context(), budget)
+					defer fbCancel()
+					result, viaVision := buildDiagnoseResultViaVision(fbCtx, imgBytes, mime, content, vision)
+					// Distinct prefix from the "diagnose fallback ai" disease-pick
+					// layer (buildFallbackIssue) so the two AI paths stay separable
+					// in logs. viaVision=false means the vision call itself failed
+					// and the static safety net was used.
+					log.Printf("diagnose vision fallback done: deviceID=%s appVer=%s viaVision=%v isHealthy=%v issues=%d plantIdResolved=%v",
+						deviceID, appVer, viaVision, result.IsHealthy, len(result.Issues), result.PlantID != nil)
+					writeJSON(w, http.StatusOK, result)
+					return
+				}
+				result := diagnoseStaticNetResult(ctx, content, vision)
+				log.Printf("diagnose vision fallback done: deviceID=%s appVer=%s viaVision=false budgetSkipped=true isHealthy=%v issues=%d plantIdResolved=false",
+					deviceID, appVer, result.IsHealthy, len(result.Issues))
 				writeJSON(w, http.StatusOK, result)
 				return
 			}
@@ -996,21 +1011,29 @@ func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, cont
 	return res
 }
 
-// fallbackDeadline returns the wall-clock deadline for the AI vision fallback:
-// the whole-handler ceiling (request entry + diagnoseHandlerBudget), reconstructed
-// from the upstream ctx's deadline (entry + diagnoseUpstreamTimeout). Anchoring
-// to entry — not to "now" — means a fast Plant.id failure leaves the fallback
-// the large remainder while a full upstream hang leaves only the tail, and in
-// both cases the total stays under the 35 s server WriteTimeout so the 200 is
-// writable. The caller hangs this deadline off the live r.Context(), so it holds
-// even when the upstream ctx is already expired. Defensive now+tail fallback if
-// ctx carries no deadline (it always does on this path).
-func fallbackDeadline(ctx context.Context) time.Time {
-	tail := diagnoseHandlerBudget - diagnoseUpstreamTimeout
-	if dl, ok := ctx.Deadline(); ok {
-		return dl.Add(tail)
+// diagnoseFallbackBudget returns how long the AI vision fallback may run: the
+// wall clock remaining until the diagnoseWallClockBudget ceiling measured from
+// reqStart (request entry ≈ when the server armed the 35 s WriteTimeout at
+// header-read). Anchoring to reqStart — not to the post-body-read ctx — means a
+// slow multipart upload eats INTO the budget instead of stacking on top of it,
+// so the 200 fallback response can never overrun WriteTimeout. May be ≤ 0 (or
+// below minDiagnoseFallbackBudget) when Plant.id consumed most of the clock; the
+// caller then skips the OpenAI call for the instant static net. Mirrors roseBudget.
+func diagnoseFallbackBudget(reqStart time.Time) time.Duration {
+	return diagnoseWallClockBudget - time.Since(reqStart)
+}
+
+// diagnoseStaticNetResult is the last-resort DiagnoseResult when no vision
+// diagnosis is available (the vision call failed, or too little wall clock
+// remained to attempt it): an unhealthy result carrying the generic L06
+// safety-net issue (200, not 502 — diagnose 不全废). With no plant/disease
+// context, buildFallbackIssue skips its AI layer (plantName="") and makes NO
+// OpenAI call, so this is instant and safe even on an already-expired ctx.
+func diagnoseStaticNetResult(ctx context.Context, content *ContentIndex, vision *VisionClient) *DiagnoseResult {
+	return &DiagnoseResult{
+		IsHealthy: false,
+		Issues:    []HealthIssue{buildFallbackIssue(ctx, nil, "", 0, content, vision)},
 	}
-	return time.Now().Add(tail)
 }
 
 // buildDiagnoseResultViaVision is the Plant.id-down fallback (SPEC §2.2): it
@@ -1024,13 +1047,9 @@ func buildDiagnoseResultViaVision(ctx context.Context, image []byte, mime string
 	vr, err := vision.DiagnosePlant(ctx, image, mime)
 	if err != nil {
 		// Vision unavailable too — no plant/disease context to ground on, so
-		// fall straight to the static net (plantName="" skips the AI layer in
-		// buildFallbackIssue, avoiding a second doomed OpenAI call).
+		// fall straight to the static net (same instant L06 the budget-skip path uses).
 		log.Printf("diagnose vision fallback err: err=%v", err)
-		return &DiagnoseResult{
-			IsHealthy: false,
-			Issues:    []HealthIssue{buildFallbackIssue(ctx, nil, "", 0, content, vision)},
-		}, false
+		return diagnoseStaticNetResult(ctx, content, vision), false
 	}
 	return diagnoseResultFromVision(ctx, vr, content, vision), true
 }

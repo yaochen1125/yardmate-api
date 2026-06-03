@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -2391,46 +2390,42 @@ func TestHandleDiagnose_Unauthorized_NotHijackedByAIFallback(t *testing.T) {
 	}
 }
 
-// fallbackDeadline must anchor the AI fallback to the whole-handler ceiling
-// (entry + diagnoseHandlerBudget), reconstructed from the upstream ctx deadline,
-// and that ceiling must sit BEYOND the upstream deadline so a Plant.id timeout
-// still leaves the vision fallback a live budget (the Codex P2 regression: a
-// timed-out upstream ctx must not be what bounds the fallback). The whole
-// budget must stay under the 35s server WriteTimeout so the 200 always writes.
-func TestFallbackDeadline_AnchoredBeyondUpstreamDeadline(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), diagnoseUpstreamTimeout)
-	defer cancel()
-	upDL, ok := ctx.Deadline()
-	if !ok {
-		t.Fatal("upstream ctx has no deadline")
+// diagnoseFallbackBudget must measure from the REAL request wall clock (reqStart),
+// so a slow multipart upload eats into the budget rather than letting the AI
+// fallback push the 200 past the 35s server WriteTimeout (Codex #48 P2). A fresh
+// request gets ~the full wall-clock budget; a request that already spent most of
+// the clock drops below the floor so the caller skips the doomed OpenAI call.
+func TestDiagnoseFallbackBudget_WallClockBounded(t *testing.T) {
+	// Fresh request → ~full budget (never more than the ceiling).
+	full := diagnoseFallbackBudget(time.Now())
+	if full > diagnoseWallClockBudget {
+		t.Errorf("fresh budget %v exceeds wall-clock ceiling %v", full, diagnoseWallClockBudget)
 	}
-
-	got := fallbackDeadline(ctx)
-	want := upDL.Add(diagnoseHandlerBudget - diagnoseUpstreamTimeout)
-	if !got.Equal(want) {
-		t.Errorf("fallbackDeadline = %v, want upstream deadline + handler tail (%v)", got, want)
+	if full < diagnoseWallClockBudget-2*time.Second {
+		t.Errorf("fresh budget %v unexpectedly small vs ceiling %v", full, diagnoseWallClockBudget)
 	}
-	// Must extend PAST the upstream deadline — else a Plant.id timeout (which
-	// expires the upstream ctx) would leave the fallback zero budget.
-	if !got.After(upDL) {
-		t.Errorf("fallback deadline %v must be after the upstream deadline %v", got, upDL)
+	// Most of the clock already spent (e.g. a slow Plant.id) → below the floor,
+	// so the handler skips the vision call and ships the instant static net.
+	near := diagnoseFallbackBudget(time.Now().Add(-(diagnoseWallClockBudget - 2*time.Second)))
+	if near >= minDiagnoseFallbackBudget {
+		t.Errorf("near-exhausted budget %v should be below the %v floor", near, minDiagnoseFallbackBudget)
 	}
-	// Whole-handler budget must stay under the 35s server WriteTimeout (main.go)
-	// so the 200 fallback response is always writable.
-	if diagnoseHandlerBudget >= 35*time.Second {
-		t.Errorf("diagnoseHandlerBudget %v must stay under the 35s server WriteTimeout", diagnoseHandlerBudget)
-	}
-	if diagnoseHandlerBudget <= diagnoseUpstreamTimeout {
-		t.Errorf("diagnoseHandlerBudget %v must exceed diagnoseUpstreamTimeout %v (else no fallback tail)", diagnoseHandlerBudget, diagnoseUpstreamTimeout)
+	// Past the ceiling → non-positive (never schedules an OpenAI call).
+	if over := diagnoseFallbackBudget(time.Now().Add(-2 * diagnoseWallClockBudget)); over > 0 {
+		t.Errorf("over-budget should be <= 0, got %v", over)
 	}
 }
 
-// Defensive branch: a context with no deadline yields a now+tail deadline in the
-// future (never the zero time, which would expire the fallback instantly).
-func TestFallbackDeadline_NoUpstreamDeadline_Defensive(t *testing.T) {
-	got := fallbackDeadline(context.Background())
-	if !got.After(time.Now()) {
-		t.Errorf("fallbackDeadline(no-deadline ctx) = %v, want a future time", got)
+// The budget ceiling must stay under the 35s server WriteTimeout (main.go) so a
+// 200 vision-fallback response is always writable, and the skip floor must be a
+// sane fraction of it.
+func TestDiagnoseBudgetConstants_UnderWriteTimeout(t *testing.T) {
+	const serverWriteTimeout = 35 * time.Second // main.go http.Server.WriteTimeout
+	if diagnoseWallClockBudget >= serverWriteTimeout {
+		t.Errorf("diagnoseWallClockBudget %v must stay under the %v server WriteTimeout", diagnoseWallClockBudget, serverWriteTimeout)
+	}
+	if minDiagnoseFallbackBudget <= 0 || minDiagnoseFallbackBudget >= diagnoseWallClockBudget {
+		t.Errorf("minDiagnoseFallbackBudget %v must be in (0, %v)", minDiagnoseFallbackBudget, diagnoseWallClockBudget)
 	}
 }
 
