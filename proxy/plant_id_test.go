@@ -282,8 +282,8 @@ func TestPlantIDClient_Diagnose_Success(t *testing.T) {
 	if gotCT != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", gotCT)
 	}
-	if !strings.Contains(string(gotBody), `"images"`) || !strings.Contains(string(gotBody), `"health":"all"`) {
-		t.Errorf("body = %s, want images[] + health:all", gotBody)
+	if !strings.Contains(string(gotBody), `"images"`) || !strings.Contains(string(gotBody), `"health":"auto"`) {
+		t.Errorf("body = %s, want images[] + health:auto (SPEC §2.2 cost note)", gotBody)
 	}
 	if api.Result.IsHealthy.Binary {
 		t.Error("IsHealthy=true, want false (canned response is unhealthy)")

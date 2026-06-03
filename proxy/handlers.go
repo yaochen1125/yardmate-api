@@ -792,8 +792,11 @@ const minDiagnoseFallbackBudget = 6 * time.Second
 // Combines Plant.id v3 health_assessment with YardMate catalog lookups
 // (content) and an optional LLM disambiguation pass (vision). See SPEC §2.2.
 //
-// content / vision may be nil — both are graceful no-ops (plantId stays
-// null, catalogId falls back to name-match only, generic Leaf-spot tail).
+// Diagnose NEVER returns a healthy result: a healthy verdict (from Plant.id or
+// the GPT-4o fallback) is force-picked into a disease (SPEC §2.2 "Never
+// healthy"). content / vision may be nil — both are graceful no-ops (plantId
+// stays null, catalogId falls back to name-match only); even with both nil the
+// force-pick still ships the generic Leaf-spot tail, so issues is never empty.
 func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *VisionClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		reqStart := time.Now() // WriteTimeout wall-clock start, for the AI fallback budget (mirrors HandleIdentify)
@@ -951,7 +954,9 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 // buildDiagnoseResult maps a Plant.id /identification health_assessment
 // response into the YardMate-facing DiagnoseResult.
 //
-// Healthy path: issues=[] + Top + plantId populated.
+// Healthy path ("Never healthy", SPEC §2.2): a healthy verdict is OVERRIDDEN —
+// forceDiseaseOnHealthyVerdict force-picks the single most likely disease and
+// sets IsHealthy=false, so the result never ships healthy with empty issues.
 // Unhealthy path: top-3 disease suggestions from Plant.id; on each, attempt
 // catalog id lookup (name-match, then LLM disambiguation). If Plant.id says
 // unhealthy but returns zero suggestions, an AI layer picks the single most
@@ -986,8 +991,10 @@ func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, cont
 	res.IsHealthy = api.Result.IsHealthy.Binary
 
 	if res.IsHealthy {
-		// Healthy path — iOS shows the plant detail with a "this plant is
-		// healthy" toast; no disease card. F-option-2 (诚实 fallback).
+		// "Never healthy" (SPEC §2.2): diagnose must ALWAYS return a disease.
+		// Override Plant.id's healthy verdict by force-picking the single most
+		// likely disease for the identified plant and flipping IsHealthy=false.
+		forceDiseaseOnHealthyVerdict(ctx, res, content, vision)
 		return res
 	}
 
@@ -1071,8 +1078,10 @@ func buildDiagnoseResultViaVision(ctx context.Context, image []byte, mime string
 // disambiguation chain the Plant.id path uses (mapCatalogID); top-3 cap. The
 // per-issue isFallback=true marks AI-sourced issues for server/log distinction
 // only — iOS does not branch on it (it already ships true on the unhealthy-empty
-// path). On a healthy verdict Issues stays empty, mirroring the Plant.id healthy
-// path; on unhealthy-but-no-usable-issue it falls to the same static safety net.
+// path). On a healthy verdict the result is OVERRIDDEN by the same force-pick as
+// the Plant.id path ("Never healthy", SPEC §2.2 — forceDiseaseOnHealthyVerdict
+// sets IsHealthy=false with a forced issue); on unhealthy-but-no-usable-issue it
+// falls to the same static safety net.
 func diagnoseResultFromVision(ctx context.Context, vr *visionDiagnoseResult, content *ContentIndex, vision *VisionClient) *DiagnoseResult {
 	res := &DiagnoseResult{Issues: []HealthIssue{}}
 
@@ -1098,7 +1107,9 @@ func diagnoseResultFromVision(ctx context.Context, vr *visionDiagnoseResult, con
 	res.HealthProbability = clamp01(vr.HealthProbability)
 	res.IsHealthy = vr.IsHealthy
 	if res.IsHealthy {
-		// Healthy verdict → empty issues, same as the Plant.id healthy path.
+		// "Never healthy" (SPEC §2.2): the GPT-4o fallback also force-picks a
+		// disease on a healthy verdict — identical to the Plant.id healthy path.
+		forceDiseaseOnHealthyVerdict(ctx, res, content, vision)
 		return res
 	}
 
@@ -1174,6 +1185,30 @@ func fallbackIssueFrom(d *DiseaseCatalog) HealthIssue {
 		IsFallback:  true,
 		Treatment:   Treatment{Biological: []string{}, Chemical: []string{}, Prevention: []string{}},
 	}
+}
+
+// forceDiseaseOnHealthyVerdict implements the SPEC §2.2 "Never healthy" product
+// rule: /v1/diagnose must ALWAYS return a disease, never a "healthy" result.
+// When EITHER the Plant.id health assessment (buildDiagnoseResult) OR the GPT-4o
+// vision fallback (diagnoseResultFromVision) concludes the plant is healthy, the
+// server force-picks the single most likely disease for the identified plant —
+// the SAME AI-or-static buildFallbackIssue machinery the unhealthy-but-empty
+// path uses — and stamps the result IsHealthy=false. The pick is grounded on the
+// resolved plantId's curated common_diseases_list (else the full catalog, by
+// name); a nil/keyless vision client or an unidentified plant degrades to the
+// static L06 net, so res.Issues is NEVER empty. HealthProbability is left as the
+// upstream "healthy" estimate (honest data; iOS routes on IsHealthy, and the
+// disease page surfaces neither HealthProbability nor the plant name — so the
+// still-populated Top / IdentifiedName are harmless). res must already carry
+// IdentifiedName / PlantID / HealthProbability from the upstream mapping.
+func forceDiseaseOnHealthyVerdict(ctx context.Context, res *DiagnoseResult, content *ContentIndex, vision *VisionClient) {
+	// Distinct log prefix from buildFallbackIssue's "diagnose fallback ai" lines
+	// so prod can measure how often a HEALTHY verdict is overridden (vs a
+	// genuinely unhealthy-but-empty Plant.id result that also reaches buildFallbackIssue).
+	log.Printf("diagnose force-pick on healthy verdict: plant=%q plantIdResolved=%v healthProb=%.2f",
+		res.IdentifiedName, res.PlantID != nil, res.HealthProbability)
+	res.Issues = []HealthIssue{buildFallbackIssue(ctx, res.PlantID, res.IdentifiedName, res.HealthProbability, content, vision)}
+	res.IsHealthy = false
 }
 
 // buildFallbackIssue is the unhealthy-but-empty-suggestions tail (SPEC §2.2).

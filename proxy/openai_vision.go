@@ -24,8 +24,9 @@ import (
 //  3. DisambiguateDiseaseName — text-only call mapping a Plant.id disease name
 //     to one of the 70 YardMate catalog ids when normalization missed.
 //  4. SuggestCommonDisease — text-only call picking the single most likely
-//     disease for a plant from a candidate catalog, when Plant.id flags the
-//     plant unhealthy but returns zero specific suggestions (SPEC §2.2).
+//     disease for a plant from a candidate catalog. Drives BOTH the
+//     unhealthy-but-zero-suggestions fallback AND the "Never healthy" force-pick
+//     that overrides a healthy verdict into a disease (SPEC §2.2).
 //  5. DiagnosePlant — whole-endpoint diagnose fallback: given ONLY the uploaded
 //     image, return a full look-at-the-photo health assessment (species +
 //     is_healthy + per-disease cause / description / treatment) via json_schema
@@ -627,9 +628,14 @@ func (c *VisionClient) DisambiguateDiseaseName(ctx context.Context, plantIDName 
 
 // SuggestCommonDisease asks the model (text-only) to infer the single most
 // likely disease for a plant species, constrained to a candidate catalog.
-// Drives the unhealthy-but-zero-Plant.id-suggestions fallback (SPEC §2.2):
-// callers pass the plant's curated common_diseases_list as refs when the
-// plantId resolved, or the full ~70-entry catalog on a plantId miss.
+// Drives TWO diagnose paths (SPEC §2.2), both via buildFallbackIssue: the
+// unhealthy-but-zero-Plant.id-suggestions fallback AND the "Never healthy"
+// force-pick that overrides a healthy verdict. Callers pass the plant's curated
+// common_diseases_list as refs when the plantId resolved, or the full ~70-entry
+// catalog on a plantId miss. (The prompt's "found the plant unhealthy" framing is
+// reused unchanged for the healthy force-pick too — it simply primes the model to
+// commit to the most likely disease for the species, the intended behavior on
+// both paths.)
 //
 // Reply is constrained to a single catalog id token (like "L20" / "P05"),
 // or "NONE" when nothing fits. Returns ("", nil) on a NONE / malformed /
