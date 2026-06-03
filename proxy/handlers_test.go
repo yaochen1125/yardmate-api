@@ -1911,6 +1911,68 @@ func TestHandleDiagnose_Healthy_AIForcePicksDisease(t *testing.T) {
 	}
 }
 
+// cannedDiagnoseAutoHealthyNoHealthBlock simulates Plant.id under health=auto
+// judging the plant healthy: it returns the species classification but OMITS the
+// is_healthy + disease blocks (and does not charge the 2nd credit). is_healthy.
+// binary then decodes to the Go zero value false.
+const cannedDiagnoseAutoHealthyNoHealthBlock = `{
+  "result": {
+    "is_plant": {"probability": 0.99, "binary": true},
+    "classification": {
+      "suggestions": [
+        {"name": "Abelia chinensis", "probability": 0.94,
+         "details": {"common_names": ["Chinese Abelia"], "scientific_name": "Abelia chinensis"}}
+      ]
+    }
+  }
+}`
+
+// Robustness for the health=auto response shape (SPEC §2.2): even if Plant.id
+// under health=auto OMITS the is_healthy/disease blocks on a healthy plant, the
+// "Never healthy" invariant must STILL hold. is_healthy.binary defaults to false,
+// so the result force-picks a disease via the unhealthy-but-empty path (not the
+// dedicated healthy branch) and ships isHealthy=false + a non-empty issue.
+// vision=nil → static net → AAA0001 common_diseases_list[0] = R01 Root rot.
+// classification is always returned under auto, so plant grounding is intact.
+func TestHandleDiagnose_HealthAuto_NoHealthBlock_StillForcesDisease(t *testing.T) {
+	h, srv := newDiagnoseHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, cannedDiagnoseAutoHealthyNoHealthBlock)
+	}, nil)
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/diagnose", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body=%s", rec.Code, rec.Body)
+	}
+	var result DiagnoseResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if result.IsHealthy {
+		t.Error("IsHealthy = true, want false (never-healthy holds even when auto omits is_healthy)")
+	}
+	if len(result.Issues) != 1 {
+		t.Fatalf("Issues len = %d, want 1 (forced disease)", len(result.Issues))
+	}
+	issue := result.Issues[0]
+	if !issue.IsFallback {
+		t.Error("IsFallback = false, want true (force-picked)")
+	}
+	if issue.CatalogID == nil || *issue.CatalogID != "R01" || issue.Name != "Root rot" {
+		t.Errorf("issue = %+v, want R01 Root rot (static net on classification-only auto-healthy)", issue)
+	}
+	if result.PlantID == nil || *result.PlantID != "AAA0001" {
+		t.Errorf("PlantID = %v, want AAA0001 (classification always returned under auto)", result.PlantID)
+	}
+}
+
 func TestHandleDiagnose_Unhealthy_TopIssueMapsToCatalog(t *testing.T) {
 	h, srv := newDiagnoseHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, cannedDiagnoseUnhealthy)
