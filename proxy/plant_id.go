@@ -23,7 +23,11 @@ const defaultPlantIDEndpoint = "https://plant.id/api/v3/identification?details=c
 
 // defaultPlantIDDiagnoseEndpoint is the Plant.id v3 identification URL used
 // for diagnose calls — same endpoint with health-assessment details and the
-// `health=all` flag passed in the JSON body (SPEC §2.2).
+// `health=auto` flag passed in the JSON body (SPEC §2.2). `auto` (not `all`)
+// bills the 2nd health-assessment credit ONLY when the plant is unhealthy;
+// because diagnose force-picks a disease on every healthy verdict anyway (SPEC
+// §2.2 "Never healthy"), the assessment on a healthy plant would be unused, so
+// `auto` saves that credit with no behavioral change.
 const defaultPlantIDDiagnoseEndpoint = "https://plant.id/api/v3/identification?details=local_name,description,treatment,cause&language=en"
 
 // defaultPlantIDTimeout caps the upstream Plant.id call. 30 s matches SPEC §5.2.
@@ -116,14 +120,19 @@ func (c *PlantIDClient) Identify(ctx context.Context, image io.Reader, mime stri
 	}
 }
 
-// Diagnose calls Plant.id v3 with `health=all`, returning both the plant
-// identification (classification.suggestions) and the health assessment
-// (disease.suggestions). image is the raw bytes (≤8 MB cap enforced by the
-// handler); mime must be "image/jpeg" or "image/png" (caller validates).
+// Diagnose calls Plant.id v3 with `health=auto`, returning the plant
+// identification (classification.suggestions, always) plus the health
+// assessment (disease.suggestions + is_healthy) WHEN the plant looks unhealthy.
+// `auto` (not `all`) charges the 2nd health-assessment credit only on an
+// unhealthy plant — a healthy plant costs the 1 identification credit; diagnose
+// force-picks a disease on every healthy verdict regardless (SPEC §2.2 "Never
+// healthy"), so the skipped assessment is never missed. image is the raw bytes
+// (≤8 MB cap enforced by the handler); mime must be "image/jpeg" or "image/png"
+// (caller validates).
 //
 // Plant.id v3 accepts both multipart and JSON-body uploads. We use JSON +
 // base64 here (instead of multipart like Identify) because the contract
-// requires `images: [...]` as a JSON array plus the sibling `health: "all"`
+// requires `images: [...]` as a JSON array plus the sibling `health: "auto"`
 // flag — multipart can't express the named flag cleanly. The trade-off is
 // ~33% extra payload size from base64 encoding.
 func (c *PlantIDClient) Diagnose(ctx context.Context, image []byte, mime string) (*plantIDDiagnoseResponse, error) {
@@ -134,7 +143,9 @@ func (c *PlantIDClient) Diagnose(ctx context.Context, image []byte, mime string)
 
 	body := map[string]any{
 		"images": []string{"data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)},
-		"health": "all",
+		// "auto": charge the health-assessment credit only when unhealthy (SPEC
+		// §2.2 cost note); identification (classification) is returned either way.
+		"health": "auto",
 	}
 	bs, err := json.Marshal(body)
 	if err != nil {

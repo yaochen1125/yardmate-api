@@ -24,8 +24,9 @@ import (
 //  3. DisambiguateDiseaseName — text-only call mapping a Plant.id disease name
 //     to one of the 70 YardMate catalog ids when normalization missed.
 //  4. SuggestCommonDisease — text-only call picking the single most likely
-//     disease for a plant from a candidate catalog, when Plant.id flags the
-//     plant unhealthy but returns zero specific suggestions (SPEC §2.2).
+//     disease for a plant from a candidate catalog. Drives BOTH the
+//     unhealthy-but-zero-suggestions fallback AND the "Never healthy" force-pick
+//     that overrides a healthy verdict into a disease (SPEC §2.2).
 //  5. DiagnosePlant — whole-endpoint diagnose fallback: given ONLY the uploaded
 //     image, return a full look-at-the-photo health assessment (species +
 //     is_healthy + per-disease cause / description / treatment) via json_schema
@@ -36,7 +37,7 @@ import (
 // for them to decide whether to fall back gracefully (RerankIdentify →
 // AIEnhancedAt=null + Plant.id raw result; DisambiguateDiseaseName →
 // CatalogID=null + generic Leaf-spot fallback; SuggestCommonDisease →
-// static common_diseases_list[0] → L06 safety net).
+// static common_diseases_list[0] → L08 safety net).
 type VisionClient struct {
 	APIKey   string
 	Endpoint string
@@ -571,7 +572,7 @@ func (c *VisionClient) DiagnosePlant(ctx context.Context, image []byte, mime str
 // whose name best matches plantIDName from refs. Reply is constrained to a
 // single id token like "L20", "P05", or "NONE" when nothing is close. Returns
 // ("", nil) on a "NONE" reply or any malformed answer — callers should
-// fall back to the generic catalog (L06 "Leaf spot").
+// fall back to the generic catalog (L08 "Waterlogging").
 //
 // All errors (network, non-200, JSON decode) are returned to the caller so
 // the diagnose handler can log + degrade gracefully.
@@ -627,14 +628,19 @@ func (c *VisionClient) DisambiguateDiseaseName(ctx context.Context, plantIDName 
 
 // SuggestCommonDisease asks the model (text-only) to infer the single most
 // likely disease for a plant species, constrained to a candidate catalog.
-// Drives the unhealthy-but-zero-Plant.id-suggestions fallback (SPEC §2.2):
-// callers pass the plant's curated common_diseases_list as refs when the
-// plantId resolved, or the full ~70-entry catalog on a plantId miss.
+// Drives TWO diagnose paths (SPEC §2.2), both via buildFallbackIssue: the
+// unhealthy-but-zero-Plant.id-suggestions fallback AND the "Never healthy"
+// force-pick that overrides a healthy verdict. Callers pass the plant's curated
+// common_diseases_list as refs when the plantId resolved, or the full ~70-entry
+// catalog on a plantId miss. (The prompt's "found the plant unhealthy" framing is
+// reused unchanged for the healthy force-pick too — it simply primes the model to
+// commit to the most likely disease for the species, the intended behavior on
+// both paths.)
 //
 // Reply is constrained to a single catalog id token (like "L20" / "P05"),
 // or "NONE" when nothing fits. Returns ("", nil) on a NONE / malformed /
 // hallucinated-id reply so the caller degrades to the static
-// common_diseases_list[0] → L06 safety net. All transport errors are
+// common_diseases_list[0] → L08 safety net. All transport errors are
 // returned to the caller for the same graceful degrade (the diagnose
 // handler never ships isHealthy=false with an empty issues array).
 func (c *VisionClient) SuggestCommonDisease(ctx context.Context, plantName string, healthProb float64, refs []DiseaseNameRef) (string, error) {

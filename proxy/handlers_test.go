@@ -1823,7 +1823,14 @@ const cannedDiagnoseUnhealthyEmptyUnknownPlant = `{
   }
 }`
 
-func TestHandleDiagnose_Healthy_EmptyIssues(t *testing.T) {
+// "Never healthy" (SPEC §2.2): a Plant.id HEALTHY verdict is OVERRIDDEN — the
+// server force-picks a disease and flips IsHealthy=false (was: TestHandleDiagnose
+// _Healthy_EmptyIssues, the old honest-fallback behavior, now reversed). With
+// vision=nil the AI layer is skipped and the static net picks the plant's
+// common_diseases_list[0] (AAA0001 → R01 "Root rot"). identifiedName / top /
+// plantId stay populated (honest, unused by the disease page); healthProbability
+// keeps the upstream "healthy" estimate.
+func TestHandleDiagnose_Healthy_NoVision_ForcesStaticDisease(t *testing.T) {
 	h, srv := newDiagnoseHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, cannedDiagnoseHealthy)
 	}, nil)
@@ -1844,12 +1851,23 @@ func TestHandleDiagnose_Healthy_EmptyIssues(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if !result.IsHealthy {
-		t.Error("IsHealthy = false, want true")
+	if result.IsHealthy {
+		t.Error("IsHealthy = true, want false (never healthy — healthy verdict is force-picked)")
 	}
-	if len(result.Issues) != 0 {
-		t.Errorf("Issues len = %d, want 0 (healthy)", len(result.Issues))
+	if len(result.Issues) != 1 {
+		t.Fatalf("Issues len = %d, want 1 (forced disease)", len(result.Issues))
 	}
+	issue := result.Issues[0]
+	if !issue.IsFallback {
+		t.Error("IsFallback = false, want true (force-picked)")
+	}
+	if issue.CatalogID == nil || *issue.CatalogID != "R01" {
+		t.Errorf("CatalogID = %v, want R01 (static net: AAA0001 common_diseases_list[0])", issue.CatalogID)
+	}
+	if issue.Name != "Root rot" {
+		t.Errorf("Name = %q, want Root rot", issue.Name)
+	}
+	// Identification fields stay populated (honest; the disease page ignores them).
 	if result.PlantID == nil || *result.PlantID != "AAA0001" {
 		t.Errorf("PlantID = %v, want AAA0001", result.PlantID)
 	}
@@ -1858,6 +1876,100 @@ func TestHandleDiagnose_Healthy_EmptyIssues(t *testing.T) {
 	}
 	if result.IdentifiedName != "Abelia chinensis" {
 		t.Errorf("IdentifiedName = %q", result.IdentifiedName)
+	}
+	if result.HealthProbability != 0.92 {
+		t.Errorf("HealthProbability = %v, want 0.92 (upstream healthy estimate preserved)", result.HealthProbability)
+	}
+}
+
+// "Never healthy" with a vision client: a HEALTHY Plant.id verdict triggers the
+// AI force-pick (SuggestCommonDisease), which picks P05 "Spider mites" from
+// AAA0001's curated common_diseases_list — proving the AI layer (not just the
+// static net) fires on a healthy verdict, and the result ships isHealthy=false.
+func TestHandleDiagnose_Healthy_AIForcePicksDisease(t *testing.T) {
+	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"P05"}}]}`)
+	})
+	defer vsrv.Close()
+
+	result := runDiagnoseFallback(t, cannedDiagnoseHealthy, vision)
+	if result.IsHealthy {
+		t.Error("IsHealthy = true, want false (healthy verdict force-picked)")
+	}
+	if len(result.Issues) != 1 {
+		t.Fatalf("Issues len = %d, want 1", len(result.Issues))
+	}
+	issue := result.Issues[0]
+	if !issue.IsFallback {
+		t.Error("IsFallback = false, want true (AI force-pick)")
+	}
+	if issue.CatalogID == nil || *issue.CatalogID != "P05" {
+		t.Errorf("CatalogID = %v, want P05 (AI pick from common list on a HEALTHY verdict)", issue.CatalogID)
+	}
+	if issue.Name != "Spider mites" {
+		t.Errorf("Name = %q, want Spider mites", issue.Name)
+	}
+}
+
+// cannedDiagnoseAutoHealthyNoHealthBlock simulates Plant.id under health=auto
+// judging the plant healthy: it returns the species classification but OMITS the
+// is_healthy + disease blocks (and does not charge the 2nd credit). is_healthy.
+// binary then decodes to the Go zero value false.
+const cannedDiagnoseAutoHealthyNoHealthBlock = `{
+  "result": {
+    "is_plant": {"probability": 0.99, "binary": true},
+    "classification": {
+      "suggestions": [
+        {"name": "Abelia chinensis", "probability": 0.94,
+         "details": {"common_names": ["Chinese Abelia"], "scientific_name": "Abelia chinensis"}}
+      ]
+    }
+  }
+}`
+
+// Robustness for the health=auto response shape (SPEC §2.2): even if Plant.id
+// under health=auto OMITS the is_healthy/disease blocks on a healthy plant, the
+// "Never healthy" invariant must STILL hold. is_healthy.binary defaults to false,
+// so the result force-picks a disease via the unhealthy-but-empty path (not the
+// dedicated healthy branch) and ships isHealthy=false + a non-empty issue.
+// vision=nil → static net → AAA0001 common_diseases_list[0] = R01 Root rot.
+// classification is always returned under auto, so plant grounding is intact.
+func TestHandleDiagnose_HealthAuto_NoHealthBlock_StillForcesDisease(t *testing.T) {
+	h, srv := newDiagnoseHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, cannedDiagnoseAutoHealthyNoHealthBlock)
+	}, nil)
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/diagnose", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body=%s", rec.Code, rec.Body)
+	}
+	var result DiagnoseResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if result.IsHealthy {
+		t.Error("IsHealthy = true, want false (never-healthy holds even when auto omits is_healthy)")
+	}
+	if len(result.Issues) != 1 {
+		t.Fatalf("Issues len = %d, want 1 (forced disease)", len(result.Issues))
+	}
+	issue := result.Issues[0]
+	if !issue.IsFallback {
+		t.Error("IsFallback = false, want true (force-picked)")
+	}
+	if issue.CatalogID == nil || *issue.CatalogID != "R01" || issue.Name != "Root rot" {
+		t.Errorf("issue = %+v, want R01 Root rot (static net on classification-only auto-healthy)", issue)
+	}
+	if result.PlantID == nil || *result.PlantID != "AAA0001" {
+		t.Errorf("PlantID = %v, want AAA0001 (classification always returned under auto)", result.PlantID)
 	}
 }
 
@@ -2074,9 +2186,9 @@ func TestHandleDiagnose_EmptySuggestions_PlantIdMiss_AIFullCatalog(t *testing.T)
 }
 
 // plantId miss + AI error → degrade. plantId is nil so the [0] branch is
-// skipped; safety net lands on generic L06 "Leaf spot" (unchanged pre-AI
+// skipped; safety net lands on generic L08 "Waterlogging" (unchanged pre-AI
 // behavior for the unknown-plant case).
-func TestHandleDiagnose_EmptySuggestions_PlantIdMiss_AIError_DegradesToL06(t *testing.T) {
+func TestHandleDiagnose_EmptySuggestions_PlantIdMiss_AIError_DegradesToL08(t *testing.T) {
 	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 	})
@@ -2087,8 +2199,8 @@ func TestHandleDiagnose_EmptySuggestions_PlantIdMiss_AIError_DegradesToL06(t *te
 		t.Errorf("PlantID = %v, want nil", result.PlantID)
 	}
 	issue := result.Issues[0]
-	if !issue.IsFallback || issue.CatalogID == nil || *issue.CatalogID != "L06" || issue.Name != "Leaf spot" {
-		t.Errorf("issue = %+v, want L06 Leaf spot isFallback=true (miss + AI error → L06)", issue)
+	if !issue.IsFallback || issue.CatalogID == nil || *issue.CatalogID != "L08" || issue.Name != "Waterlogging" {
+		t.Errorf("issue = %+v, want L08 Waterlogging isFallback=true (miss + AI error → L08)", issue)
 	}
 }
 
@@ -2288,8 +2400,135 @@ func TestHandleDiagnose_PlantIDRateLimit_AIVisionFallbackSucceeds(t *testing.T) 
 	}
 }
 
+// "Never healthy" end-to-end on the Plant.id-DOWN path (SPEC §2.2): Plant.id is
+// rate-limited → the GPT-4o DiagnosePlant fallback runs and itself returns
+// is_healthy=true with no issues → the handler force-picks a disease anyway
+// (SuggestCommonDisease → P05) and ships isHealthy=false. The mock vision server
+// answers the two calls distinctly: the image-bearing DiagnosePlant call returns
+// the HEALTHY diagnosis, the text-only SuggestCommonDisease call returns the id.
+func TestHandleDiagnose_PlantIDRateLimit_AIVisionHealthy_ForcesDisease(t *testing.T) {
+	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(b), "image_url") {
+			// DiagnosePlant (image-conditioned) → a HEALTHY diagnosis.
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[\"Chinese Abelia\"],\"confidence\":0.84,\"is_healthy\":true,\"health_probability\":0.95,\"issues\":[]}"}}]}`)
+			return
+		}
+		// SuggestCommonDisease (text-only force-pick) → P05.
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"P05"}}]}`)
+	})
+	defer vsrv.Close()
+
+	h, srv := newDiagnoseHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}, vision)
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/diagnose", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200 body=%s", rec.Code, rec.Body)
+	}
+	var result DiagnoseResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, rec.Body)
+	}
+	if result.IsHealthy {
+		t.Error("IsHealthy = true, want false (AI-fallback healthy verdict force-picked)")
+	}
+	if result.IdentifiedName != "Abelia chinensis" {
+		t.Errorf("IdentifiedName = %q, want Abelia chinensis (from the AI diagnosis)", result.IdentifiedName)
+	}
+	if result.PlantID == nil || *result.PlantID != "AAA0001" {
+		t.Errorf("PlantID = %v, want AAA0001", result.PlantID)
+	}
+	if len(result.Issues) != 1 {
+		t.Fatalf("Issues len = %d, want 1 (forced disease)", len(result.Issues))
+	}
+	issue := result.Issues[0]
+	if !issue.IsFallback {
+		t.Error("IsFallback = false, want true (force-picked)")
+	}
+	if issue.CatalogID == nil || *issue.CatalogID != "P05" {
+		t.Errorf("CatalogID = %v, want P05 (force-pick from AAA0001 common list)", issue.CatalogID)
+	}
+	if issue.Name != "Spider mites" {
+		t.Errorf("Name = %q, want Spider mites", issue.Name)
+	}
+}
+
+// The "Never healthy" invariant across diagnose paths (SPEC §2.2): EVERY 200
+// diagnosis ships isHealthy=false AND a non-empty issues array — whether the
+// verdict came back healthy or unhealthy, from Plant.id or the GPT-4o fallback.
+func TestHandleDiagnose_NeverHealthy_Invariant(t *testing.T) {
+	// A vision client that handles BOTH the image-bearing DiagnosePlant call
+	// (returns a HEALTHY diagnosis, to exercise the AI-fallback force-pick) and
+	// the text-only SuggestCommonDisease force-pick (returns P05).
+	visionHandler := func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(b), "image_url") {
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.8,\"is_healthy\":true,\"health_probability\":0.95,\"issues\":[]}"}}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"P05"}}]}`)
+	}
+
+	tests := []struct {
+		name   string
+		status int    // Plant.id upstream status; 0 means 200 OK with body
+		body   string // Plant.id upstream body when status == 0
+	}{
+		{"plantid_healthy", 0, cannedDiagnoseHealthy},
+		{"plantid_unhealthy", 0, cannedDiagnoseUnhealthy},
+		{"plantid_unhealthy_empty", 0, cannedDiagnoseUnhealthyEmpty},
+		{"plantid_ratelimit_ai_fallback_healthy", http.StatusTooManyRequests, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			vision, vsrv := newTestVisionClient(t, visionHandler)
+			defer vsrv.Close()
+			h, srv := newDiagnoseHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				if tc.status != 0 {
+					w.WriteHeader(tc.status)
+					return
+				}
+				_, _ = io.WriteString(w, tc.body)
+			}, vision)
+			defer srv.Close()
+
+			body, ct := buildMultipart(t, "image", jpegMagic)
+			req := httptest.NewRequest(http.MethodPost, "/v1/diagnose", body)
+			req.Header.Set("Content-Type", ct)
+			req.Header.Set("X-Device-Install-Id", testUUID)
+			req.Header.Set("X-App-Version", "1.1.1")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("code = %d, want 200 body=%s", rec.Code, rec.Body)
+			}
+			var result DiagnoseResult
+			if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+				t.Fatalf("unmarshal: %v body=%s", err, rec.Body)
+			}
+			if result.IsHealthy {
+				t.Errorf("IsHealthy = true, want false (never healthy)")
+			}
+			if len(result.Issues) == 0 {
+				t.Errorf("Issues empty, want non-empty (never healthy)")
+			}
+		})
+	}
+}
+
 // Plant.id 429 AND the vision diagnosis also fails (OpenAI 500) → the handler
-// still returns 200 with the generic L06 safety-net issue, never a 502
+// still returns 200 with the generic L08 safety-net issue, never a 502
 // (diagnose 不全废, SPEC §2.2).
 func TestHandleDiagnose_PlantIDRateLimit_AIVisionAlsoFails_GracefulSafetyNet(t *testing.T) {
 	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2324,8 +2563,8 @@ func TestHandleDiagnose_PlantIDRateLimit_AIVisionAlsoFails_GracefulSafetyNet(t *
 		t.Fatalf("Issues len = %d, want 1 (generic fallback)", len(result.Issues))
 	}
 	issue := result.Issues[0]
-	if !issue.IsFallback || issue.CatalogID == nil || *issue.CatalogID != "L06" || issue.Name != "Leaf spot" {
-		t.Errorf("issue = %+v, want L06 Leaf spot isFallback=true (AI failed → static net)", issue)
+	if !issue.IsFallback || issue.CatalogID == nil || *issue.CatalogID != "L08" || issue.Name != "Waterlogging" {
+		t.Errorf("issue = %+v, want L08 Waterlogging isFallback=true (AI failed → static net)", issue)
 	}
 }
 

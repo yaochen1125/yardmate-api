@@ -41,13 +41,13 @@ type Suggestion struct {
 
 // DiagnoseResult is the client-facing JSON shape for POST /v1/diagnose.
 //
-// Healthy path (IsHealthy=true): Issues is an empty array. The iOS client
-// is expected to route into the plant-detail page and surface a toast
-// confirming the plant is healthy (no disease card needed).
-//
-// Unhealthy path: Issues is guaranteed non-empty (top-3 max). The server
-// constructs a fallback issue with IsFallback=true if Plant.id reports
-// unhealthy but returns zero disease suggestions.
+// "Never healthy" (SPEC §2.2): diagnose ALWAYS returns a disease. IsHealthy is
+// always false on the wire and Issues is always non-empty (top-3 max) — a
+// healthy verdict from Plant.id OR the GPT-4o vision fallback is overridden by a
+// force-pick (the single most likely disease for the identified species). The
+// server stamps IsFallback=true on any issue it synthesizes (healthy verdict, or
+// unhealthy-but-zero-suggestions); a real Plant.id disease ships
+// IsFallback=false. iOS branches on IsHealthy and needs no change.
 type DiagnoseResult struct {
 	IdentifiedName    string           `json:"identifiedName"`
 	PlantID           *string          `json:"plantId"`
@@ -90,8 +90,9 @@ type Treatment struct {
 }
 
 // plantIDDiagnoseResponse mirrors the Plant.id v3 response when called with
-// health=all. Adds disease.suggestions and is_healthy on top of the shape
-// plantIDAPIResponse already covers. description is `any` because Plant.id
+// health=auto. Adds disease.suggestions and is_healthy on top of the shape
+// plantIDAPIResponse already covers (disease.suggestions populated only when the
+// plant is assessed unhealthy; classification is always present). description is `any` because Plant.id
 // occasionally returns it as an object (e.g. {value, citations}) rather
 // than a plain string; diagnoseDescriptionString flattens it.
 type plantIDDiagnoseResponse struct {
