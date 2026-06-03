@@ -2427,6 +2427,12 @@ func TestDiagnoseBudgetConstants_UnderWriteTimeout(t *testing.T) {
 	if minDiagnoseFallbackBudget <= 0 || minDiagnoseFallbackBudget >= diagnoseWallClockBudget {
 		t.Errorf("minDiagnoseFallbackBudget %v must be in (0, %v)", minDiagnoseFallbackBudget, diagnoseWallClockBudget)
 	}
+	// The Plant.id upstream attempt is anchored at reqStart, so it must not be
+	// allowed to run past the wall-clock ceiling — else a slow-upload + Plant.id
+	// hang blows WriteTimeout before the fallback/static net can write (Codex #48 P2).
+	if diagnoseUpstreamTimeout > diagnoseWallClockBudget {
+		t.Errorf("diagnoseUpstreamTimeout %v must be <= diagnoseWallClockBudget %v (upstream bounded by the wall budget)", diagnoseUpstreamTimeout, diagnoseWallClockBudget)
+	}
 }
 
 func TestIsUUID(t *testing.T) {

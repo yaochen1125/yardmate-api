@@ -761,10 +761,15 @@ func isUUID(s string) bool {
 // diagnoseMaxBody = identifyMaxBody (same 8 MB image cap + multipart overhead).
 const diagnoseMaxBody = identifyMaxBody
 
-// diagnoseUpstreamTimeout caps the Plant.id call. The /v1/diagnose route runs
-// with NO chi-level Timeout middleware (server.go "Slow proxy endpoints"), so
-// the handler manages its own deadline; vision disambiguation runs inside the
-// same context but has its own client timeout (≤8 s) inside VisionClient.
+// diagnoseUpstreamTimeout caps the Plant.id call, anchored at reqStart (request
+// entry) — NOT "now" — so a slow multipart upload counts against it and the
+// upstream attempt can't run past the diagnoseWallClockBudget ceiling, leaving
+// the AI fallback / static net room to write the 200 before the server
+// WriteTimeout (Codex #48 P2). Must be ≤ diagnoseWallClockBudget. The
+// /v1/diagnose route runs with NO chi-level Timeout middleware (server.go "Slow
+// proxy endpoints"), so the handler manages its own deadline; vision
+// disambiguation runs inside the same context but has its own client timeout
+// (≤8 s) inside VisionClient.
 const diagnoseUpstreamTimeout = 30 * time.Second
 
 // diagnoseWallClockBudget bounds the WHOLE diagnose handler (Plant.id attempt +
@@ -875,7 +880,11 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), diagnoseUpstreamTimeout)
+		// Anchored at reqStart (not now) so a slow upload is charged against the
+		// upstream budget too — the whole handler (Plant.id + fallback/static net)
+		// then fits under the 35 s server WriteTimeout, so even a slow-upload +
+		// Plant.id hang still delivers its 200 in time (Codex #48 P2).
+		ctx, cancel := context.WithDeadline(r.Context(), reqStart.Add(diagnoseUpstreamTimeout))
 		defer cancel()
 
 		api, err := client.Diagnose(ctx, imgBytes, mime)
