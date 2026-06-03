@@ -37,7 +37,7 @@ import (
 // for them to decide whether to fall back gracefully (RerankIdentify →
 // AIEnhancedAt=null + Plant.id raw result; DisambiguateDiseaseName →
 // CatalogID=null + generic Leaf-spot fallback; SuggestCommonDisease →
-// static common_diseases_list[0] → L06 safety net).
+// static common_diseases_list[0] → L08 safety net).
 type VisionClient struct {
 	APIKey   string
 	Endpoint string
@@ -572,7 +572,7 @@ func (c *VisionClient) DiagnosePlant(ctx context.Context, image []byte, mime str
 // whose name best matches plantIDName from refs. Reply is constrained to a
 // single id token like "L20", "P05", or "NONE" when nothing is close. Returns
 // ("", nil) on a "NONE" reply or any malformed answer — callers should
-// fall back to the generic catalog (L06 "Leaf spot").
+// fall back to the generic catalog (L08 "Waterlogging").
 //
 // All errors (network, non-200, JSON decode) are returned to the caller so
 // the diagnose handler can log + degrade gracefully.
@@ -640,7 +640,7 @@ func (c *VisionClient) DisambiguateDiseaseName(ctx context.Context, plantIDName 
 // Reply is constrained to a single catalog id token (like "L20" / "P05"),
 // or "NONE" when nothing fits. Returns ("", nil) on a NONE / malformed /
 // hallucinated-id reply so the caller degrades to the static
-// common_diseases_list[0] → L06 safety net. All transport errors are
+// common_diseases_list[0] → L08 safety net. All transport errors are
 // returned to the caller for the same graceful degrade (the diagnose
 // handler never ships isHealthy=false with an empty issues array).
 func (c *VisionClient) SuggestCommonDisease(ctx context.Context, plantName string, healthProb float64, refs []DiseaseNameRef) (string, error) {

@@ -961,7 +961,7 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 // catalog id lookup (name-match, then LLM disambiguation). If Plant.id says
 // unhealthy but returns zero suggestions, an AI layer picks the single most
 // likely disease (candidate set narrows when plantId resolves), with the
-// static common_diseases_list[0] → L06 chain as the graceful safety net.
+// static common_diseases_list[0] → L08 chain as the graceful safety net.
 func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, content *ContentIndex, vision *VisionClient) *DiagnoseResult {
 	res := &DiagnoseResult{Issues: []HealthIssue{}}
 
@@ -1041,7 +1041,7 @@ func diagnoseFallbackBudget(reqStart time.Time) time.Duration {
 
 // diagnoseStaticNetResult is the last-resort DiagnoseResult when no vision
 // diagnosis is available (the vision call failed, or too little wall clock
-// remained to attempt it): an unhealthy result carrying the generic L06
+// remained to attempt it): an unhealthy result carrying the generic L08
 // safety-net issue (200, not 502 — diagnose 不全废). With no plant/disease
 // context, buildFallbackIssue skips its AI layer (plantName="") and makes NO
 // OpenAI call, so this is instant and safe even on an already-expired ctx.
@@ -1055,7 +1055,7 @@ func diagnoseStaticNetResult(ctx context.Context, content *ContentIndex, vision 
 // buildDiagnoseResultViaVision is the Plant.id-down fallback (SPEC §2.2): it
 // runs the GPT-4o look-at-the-photo diagnosis and maps it into a DiagnoseResult.
 // It NEVER returns nil — if DiagnosePlant itself fails (OpenAI down / timeout /
-// refusal / malformed reply) it degrades to the generic L06 safety-net issue, a
+// refusal / malformed reply) it degrades to the generic L08 safety-net issue, a
 // 200 result rather than a 502 (diagnose 不全废). The bool reports whether the AI
 // diagnosis succeeded (true) or the safety net was used (false), for the
 // handler's observability log.
@@ -1063,7 +1063,7 @@ func buildDiagnoseResultViaVision(ctx context.Context, image []byte, mime string
 	vr, err := vision.DiagnosePlant(ctx, image, mime)
 	if err != nil {
 		// Vision unavailable too — no plant/disease context to ground on, so
-		// fall straight to the static net (same instant L06 the budget-skip path uses).
+		// fall straight to the static net (same instant L08 the budget-skip path uses).
 		log.Printf("diagnose vision fallback err: err=%v", err)
 		return diagnoseStaticNetResult(ctx, content, vision), false
 	}
@@ -1170,7 +1170,7 @@ func mapCatalogID(ctx context.Context, name string, content *ContentIndex, visio
 }
 
 // fallbackIssueFrom builds the canonical isFallback=true HealthIssue from a
-// catalog entry. The AI-suggested pick and the static [0]/L06 safety net
+// catalog entry. The AI-suggested pick and the static [0]/L08 safety net
 // both go through this, so the wire shape is byte-identical regardless of
 // how the disease was chosen — the iOS client cannot tell them apart and
 // the /v1/diagnose response contract is unchanged (SPEC §2.2).
@@ -1196,7 +1196,7 @@ func fallbackIssueFrom(d *DiseaseCatalog) HealthIssue {
 // path uses — and stamps the result IsHealthy=false. The pick is grounded on the
 // resolved plantId's curated common_diseases_list (else the full catalog, by
 // name); a nil/keyless vision client or an unidentified plant degrades to the
-// static L06 net, so res.Issues is NEVER empty. HealthProbability is left as the
+// static L08 net, so res.Issues is NEVER empty. HealthProbability is left as the
 // upstream "healthy" estimate (honest data; iOS routes on IsHealthy, and the
 // disease page surfaces neither HealthProbability nor the plant name — so the
 // still-populated Top / IdentifiedName are harmless). res must already carry
@@ -1219,7 +1219,7 @@ func forceDiseaseOnHealthyVerdict(ctx context.Context, res *DiagnoseResult, cont
 //     (plant-grounded; replaces the old mechanical [0] pick);
 //   - plantId miss      → the full ~70-entry catalog, chosen by plant name.
 //
-// The static common_diseases_list[0] → L06 → hard-coded chain is the safety
+// The static common_diseases_list[0] → L08 → hard-coded chain is the safety
 // net below the AI layer: every case that worked before still works if
 // vision is nil (no OPENAI key) / errors / times out / replies NONE /
 // hallucinates an id. Output shape is identical either way
@@ -1261,12 +1261,12 @@ func buildFallbackIssue(ctx context.Context, plantID *string, plantName string, 
 		}
 	}
 	if content != nil {
-		if d, ok := content.DiseaseByID("L06"); ok && d != nil {
+		if d, ok := content.DiseaseByID("L08"); ok && d != nil {
 			return fallbackIssueFrom(d)
 		}
 	}
 	return HealthIssue{
-		Name:        "Leaf spot",
+		Name:        "Waterlogging",
 		CatalogID:   nil,
 		Probability: 0,
 		IsFallback:  true,

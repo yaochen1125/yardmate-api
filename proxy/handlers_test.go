@@ -2124,9 +2124,9 @@ func TestHandleDiagnose_EmptySuggestions_PlantIdMiss_AIFullCatalog(t *testing.T)
 }
 
 // plantId miss + AI error → degrade. plantId is nil so the [0] branch is
-// skipped; safety net lands on generic L06 "Leaf spot" (unchanged pre-AI
+// skipped; safety net lands on generic L08 "Waterlogging" (unchanged pre-AI
 // behavior for the unknown-plant case).
-func TestHandleDiagnose_EmptySuggestions_PlantIdMiss_AIError_DegradesToL06(t *testing.T) {
+func TestHandleDiagnose_EmptySuggestions_PlantIdMiss_AIError_DegradesToL08(t *testing.T) {
 	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 	})
@@ -2137,8 +2137,8 @@ func TestHandleDiagnose_EmptySuggestions_PlantIdMiss_AIError_DegradesToL06(t *te
 		t.Errorf("PlantID = %v, want nil", result.PlantID)
 	}
 	issue := result.Issues[0]
-	if !issue.IsFallback || issue.CatalogID == nil || *issue.CatalogID != "L06" || issue.Name != "Leaf spot" {
-		t.Errorf("issue = %+v, want L06 Leaf spot isFallback=true (miss + AI error → L06)", issue)
+	if !issue.IsFallback || issue.CatalogID == nil || *issue.CatalogID != "L08" || issue.Name != "Waterlogging" {
+		t.Errorf("issue = %+v, want L08 Waterlogging isFallback=true (miss + AI error → L08)", issue)
 	}
 }
 
@@ -2466,7 +2466,7 @@ func TestHandleDiagnose_NeverHealthy_Invariant(t *testing.T) {
 }
 
 // Plant.id 429 AND the vision diagnosis also fails (OpenAI 500) → the handler
-// still returns 200 with the generic L06 safety-net issue, never a 502
+// still returns 200 with the generic L08 safety-net issue, never a 502
 // (diagnose 不全废, SPEC §2.2).
 func TestHandleDiagnose_PlantIDRateLimit_AIVisionAlsoFails_GracefulSafetyNet(t *testing.T) {
 	vision, vsrv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2501,8 +2501,8 @@ func TestHandleDiagnose_PlantIDRateLimit_AIVisionAlsoFails_GracefulSafetyNet(t *
 		t.Fatalf("Issues len = %d, want 1 (generic fallback)", len(result.Issues))
 	}
 	issue := result.Issues[0]
-	if !issue.IsFallback || issue.CatalogID == nil || *issue.CatalogID != "L06" || issue.Name != "Leaf spot" {
-		t.Errorf("issue = %+v, want L06 Leaf spot isFallback=true (AI failed → static net)", issue)
+	if !issue.IsFallback || issue.CatalogID == nil || *issue.CatalogID != "L08" || issue.Name != "Waterlogging" {
+		t.Errorf("issue = %+v, want L08 Waterlogging isFallback=true (AI failed → static net)", issue)
 	}
 }
 
