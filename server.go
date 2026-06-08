@@ -118,6 +118,10 @@ func newServer(
 				// same envelope as /v1/identify — proxy/imageingest/SPEC.md §2.1).
 				if ingest != nil {
 					r.Post("/plants/imageingest", imageingest.HandlePublic(ingest))
+					// In-catalog (AAA-id) supplementary third-party gallery
+					// ingest → plant_images/{AAA}/external/ (zero-DB, per-species
+					// index.json; proxy/imageingest/SPEC.md §"catalog external").
+					r.Post("/plants/catalog-images", imageingest.HandleCatalog(ingest))
 				}
 			})
 		}

@@ -24,7 +24,7 @@
 
 - **The enrichment endpoint / its logic.** v2 **does not read `plants_pending`** (v1 did; v2 deprecates that seed). enrichment + imageingest are now fully decoupled at the data layer — only the `/v1` HTTP prefix is shared. No imports of the `enrichment` Go package.
 - **Identification / diagnosis / detail-text generation.** No image *upload* endpoint (that's `/v1/identify` / `/v1/diagnose`); no LLM. `/v1/plants/imageingest` is request-driven from iOS — it does not itself call identify / diagnose / enrichment, and it does NOT consume **identify/diagnose** image URLs (PlantNet-host / license-less). The only thing it takes from the client about the hero is a **`photo_id`** (§2.1.1) — used to MATCH within its own cascade results, not to fetch. It never sources images from identify/diagnose.
-- **In-catalog (1522) imagery.** Curated plants use `plant_images/{AAA-id}/{1_whole|2_closeup|3_state|4_scene}.png`, uploaded by separate offline tooling (the `scripts/` pipeline in `yardmate-swiftui`). This package only fills the **slug**-keyed gallery for **out-of-catalog** plants. It never touches AAA-id keys.
+- **In-catalog (1522) curated/generated imagery.** The four semantic images `plant_images/{AAA-id}/{1_whole|2_closeup|3_state|4_scene}.png` are uploaded by separate offline tooling (the `scripts/` pipeline in `yardmate-swiftui`); this package never touches them. **NEW exception — the `external/` subfolder (§2.8):** this package DOES now fill `plant_images/{AAA-id}/external/{i}.png` with third-party *supplementary* gallery images for in-catalog plants — a physically disjoint subfolder, so the offline-generated semantic images are never collided with or overwritten. The slug-keyed out-of-catalog gallery (§2.1) remains the primary path; the curated semantic images remain the `scripts/` pipeline's exclusive domain.
 - **Image transformation.** No re-encode, no crop, no resize-by-us, no AI enhancement. Bytes stored verbatim (§7 D-format). The one server-side decode is a read-only sniff for MIME / dimensions; the stored bytes are the downloaded bytes.
 - **Genus-level fallback fill.** v2 fills the **species** slug only (`PlantImageURL.slug`), because iOS reads only the species slug today (genus fallback is iOS P2). Core is slug-parameterized, so genus fill (`PlantImageURL.genusSlug`) reuses the same code once iOS reads it — §8.
 - **The iOS Credits *page* (UI).** This package generates `credits.json` (§2.7) but does not render it. The Settings → Credits *page* is iOS-side (companion SPEC §6, separate `yardmate-swiftui` PR) and is the compliance prerequisite for flipping the BY/SA gate ON (§7 D-attribution-gate, §8).
@@ -336,6 +336,35 @@ Shape (V2 — per `(slug, image_index)`):
 - One entry per **(slug, image_index)** in V2 (vs v1 one-per-slug). A multi-image gallery may carry different author + license per slot.
 - **Full rebuild per ingest, never diff-append** (pitfall §9 #18) — deleted / re-ingested rows must drop / refresh cleanly.
 - While the BY/SA gate is OFF only CC0 / PD rows are `ingested`, so credits.json carries those. When the gate flips ON, the next ingest's rebuild adds BY / SA rows automatically — the iOS page re-fetches, no code change.
+
+### 2.8 In-catalog supplementary images (`external/` subfolder, zero-DB)
+
+**Purpose.** In-catalog (curated 1522) plants render a gallery of 4 offline-generated semantic images (`{AAA}/{1_whole..4_scene}.png`, the `scripts/` pipeline's domain). This endpoint appends **up to 4 third-party supplementary images** AFTER those 4, sourced from the SAME iNat → Wikimedia cascade as the out-of-catalog path, so a curated detail page shows `4 curated + N supplementary`. Lazy-triggered: iOS fires it the first time a curated detail page mounts with an empty `external/`. The first viewer sees the 4 curated + a transient live-iNat fallback while R2 fills; subsequent viewers get the stored R2 supplementary images (companion `yardmate-swiftui` SPEC owns the iOS side).
+
+**Entry point.** Public `POST /v1/plants/catalog-images` (App Attest log-only + per-IP/per-device rate-limited, same group as `/v1/plants/imageingest`). Body `{catalog_id, scientific_name, image_count?}`:
+- `catalog_id` — the AAA id, validated `^[A-Z]{3}[0-9]{4}$`. This is a **security boundary**, not mere validation: it is interpolated into the R2 key, so the strict charset (no `/`, no `.`) forecloses path traversal / curated-image clobbering by an attested client.
+- `scientific_name` — drives the cascade search (same as out-of-catalog).
+- `image_count` — optional, default 4, clamp [1,6].
+
+Returns 202 fire-and-forget; work runs in a goroutine bounded by single-flight keyed `"catalog:"+catalog_id` (concurrent duplicate opens coalesce). `IngestCatalogSpecies` is the core (`proxy/imageingest/catalog.go`).
+
+**R2 layout.**
+
+| | |
+|---|---|
+| Image keys | `plant_images/{AAA}/external/{i}.png`, `i ∈ 1..N` (1-based, matching the out-of-catalog convention) |
+| Manifest | `plant_images/{AAA}/external/index.json` — `{count, images:[{index, source, license_short, license_url, author, source_url}]}` |
+| Image CacheControl | `public, max-age=31536000, immutable` (same as the out-of-catalog images) |
+| Manifest CacheControl | `public, max-age=3600` (short — refreshable on re-ingest, like credits.json) |
+
+**Zero-DB design (the key divergence from §2.1).** The in-catalog path writes **NO** `plant_image_*` ledger rows and does **NOT** rebuild the global `credits.json`. The curated set is large and these images are best-effort enrichment; a per-species `index.json` built from the in-memory ingest outcome carries all the attribution iOS needs (the per-species analogue of credits.json, fully decoupled). Consequences:
+- **Attribution** lives in each species' `external/index.json` (built by `BuildExternalIndex` from the `ImageOutcome` slice), never in the global credits.json — so this path can never wipe the out-of-catalog credits.
+- **Idempotency** is the existence of `index.json`, written **LAST** (after every image upload) as a commit marker: a species whose `index.json` already exists is skipped wholesale (`already_done`). There is no per-slot ledger, so a partial fill (images uploaded, `index.json` not yet written) is re-done in full on the next trigger rather than resumed — the manifest is the single source of "done". `index.json` is written only when ≥1 image was stored, so a species iNat has no free photos for is retried later (never marked done-with-zero).
+- **License gate** reuses §2.4.3: with the BY/SA gate ON (prod) `eligible` already includes CC-BY/-SA. The in-catalog path ignores `gated`/`deferred_attribution` (no ledger to park deferrals in) — a curated plant simply shows fewer supplementary images if a gate is OFF.
+
+**Reuse vs divergence.** Candidate gathering (`gatherCandidates`), ranking (§2.5), license classification (§2.4.3), download + MIME sniff (§4.1), and R2 upload (§2.6) are shared **verbatim** with the out-of-catalog path. Only three things differ: the key scheme (`catalogKey`), the manifest writer (`BuildExternalIndex` instead of the ledger-backed credits rebuild), and a zero-ledger inline fill loop that packs successes into **contiguous** indices (a 404 mid-list leaves no gap; a retryable shortfall skips the commit marker so it retries). It never writes the 4 curated semantic images, never the slug-keyed gallery, never the global credits.json.
+
+**Known limitation — `(catalog_id, scientific_name)` pair is not cross-validated (V1, Codex P1).** The handler validates `catalog_id`'s shape and that `scientific_name` is non-empty, but does NOT verify the name actually belongs to that catalog id (this package holds no catalog→name map — §1.2). A tampered attested client could submit a real id (`AAA0001`) with an unrelated name; the backend would ingest that name's images under `AAA0001/external/` and mark it `already_done`, so legitimate clients keep seeing the wrong supplementary gallery until the `index.json` is manually deleted. **Bounded blast radius:** affects only the *supplementary* gallery of a not-yet-ingested species (the `already_done` marker also blocks re-pollution once a correct fill has run), never the curated semantic images (separate `scripts/` keys), and is manually clearable. **V1 stance: accepted + documented.** The clean fix — embed the 1522 `id→scientific_name` map and derive/verify the name server-side, ignoring the client's — is deferred to V1.1 because it introduces a cross-repo data-sync dependency (`plants_index.json` lives in `yardmate-swiftui`).
 
 ---
 
