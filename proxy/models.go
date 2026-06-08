@@ -68,8 +68,9 @@ type PlantSuggestion struct {
 }
 
 // HealthIssue is one disease suggestion attached to a diagnose result.
-// CatalogID is null when no YardMate catalog id could be mapped (neither
-// the name-match nor the LLM fallback found a candidate).
+// CatalogID is an in-catalog id (e.g. "L20") when mapped; an "O…" id when the
+// disease was out-of-catalog but enriched (StructuredDetail set); or null when
+// out-of-catalog and not enriched (slim issue — legacy Treatment only).
 type HealthIssue struct {
 	Name        string    `json:"name"`
 	CatalogID   *string   `json:"catalogId"`
@@ -78,6 +79,12 @@ type HealthIssue struct {
 	Cause       string    `json:"cause"`
 	IsFallback  bool      `json:"isFallback"`
 	Treatment   Treatment `json:"treatment"`
+
+	// StructuredDetail carries generated catalog-quality detail for an
+	// out-of-catalog disease (disease enrichment, SPEC_disease.md). Present only
+	// when CatalogID is an "O…" id; nil/omitted for in-catalog issues (iOS reads
+	// their detail from the CDN by CatalogID) and slim out-of-catalog issues.
+	StructuredDetail *StructuredDiseaseDetail `json:"structuredDetail,omitempty"`
 }
 
 // Treatment groups the Plant.id-provided remediation lists. All three slices
