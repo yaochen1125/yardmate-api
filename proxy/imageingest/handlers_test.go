@@ -214,6 +214,118 @@ func TestHandlePublic_Accepted_202(t *testing.T) {
 	t.Errorf("public ingest did not record rosa-regina within deadline")
 }
 
+// --- public /v1/plants/catalog-images (in-catalog supplementary, SPEC §2.8) ---
+
+// newTestCatalogService builds a Service whose ingestor carries a 1-entry
+// authoritative catalog map (AAA0001 -> "Abelia chinensis"), a mock cascade, a
+// mock store, and a NIL ledger (the in-catalog path is zero-DB). Returns the
+// source + store so tests can inspect what was searched / uploaded.
+func newTestCatalogService() (*Service, *mockSource, *mockStore) {
+	src := &mockSource{searchRet: cc0Cands(4)}
+	store := newMockStore()
+	in := NewIngestor(src, nil, store, nil, Config{
+		AllowAttributionLicenses: true,
+		DefaultImageCount:        4,
+		CatalogNames:             map[string]string{"AAA0001": "Abelia chinensis"},
+	})
+	return NewService(in, testAdminToken), src, store
+}
+
+func catalogReq(svc *Service, deviceID, appVer, body string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodPost, "/v1/plants/catalog-images", strings.NewReader(body))
+	if deviceID != "" {
+		r.Header.Set("X-Device-Install-Id", deviceID)
+	}
+	if appVer != "" {
+		r.Header.Set("X-App-Version", appVer)
+	}
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	HandleCatalog(svc)(w, r)
+	return w
+}
+
+func TestHandleCatalog_Disabled_503(t *testing.T) {
+	w := catalogReq(nil, testDeviceID, "1.0", `{"catalog_id":"AAA0001"}`)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "ingest_disabled") {
+		t.Fatalf("code=%d body=%q", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleCatalog_MissingDeviceID_400(t *testing.T) {
+	svc, _, _ := newTestCatalogService()
+	w := catalogReq(svc, "", "1.0", `{"catalog_id":"AAA0001"}`)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "missing_device_id") {
+		t.Fatalf("code=%d body=%q", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleCatalog_BadID_400(t *testing.T) {
+	svc, src, store := newTestCatalogService()
+	w := catalogReq(svc, testDeviceID, "1.0", `{"catalog_id":"bad/id","scientific_name":"X"}`)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "bad_request") {
+		t.Fatalf("code=%d body=%q", w.Code, w.Body.String())
+	}
+	if src.lastQuery() != "" || len(store.puts) != 0 {
+		t.Error("a malformed catalog_id must never search or write (path-injection guard)")
+	}
+}
+
+// TestHandleCatalog_UnknownID_400 is the second required P1 test: a well-formed
+// catalog_id that is not one of the curated 1522 → 400 unknown_catalog_id, with
+// no search and no R2 write (the 400 short-circuits before the goroutine).
+func TestHandleCatalog_UnknownID_400(t *testing.T) {
+	svc, src, store := newTestCatalogService()
+	w := catalogReq(svc, testDeviceID, "1.0", `{"catalog_id":"ZZZ9999","scientific_name":"Abelia chinensis"}`)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "unknown_catalog_id") {
+		t.Fatalf("code=%d body=%q", w.Code, w.Body.String())
+	}
+	if src.lastQuery() != "" {
+		t.Errorf("unknown id must not trigger a cascade search, got %q", src.lastQuery())
+	}
+	if len(store.puts) != 0 {
+		t.Error("unknown id must never write to R2")
+	}
+}
+
+func TestHandleCatalog_NoClientName_202(t *testing.T) {
+	svc, _, _ := newTestCatalogService()
+	// scientific_name is now advisory; its absence must NOT 400 (it used to).
+	w := catalogReq(svc, testDeviceID, "1.0", `{"catalog_id":"AAA0001"}`)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestHandleCatalog_WrongClientName_UsesAuthoritative is the first required P1
+// test: a tampered client pairs a real id (AAA0001) with an UNRELATED species
+// name; the backend must search the SERVER's authoritative name regardless, so
+// the stored external/ gallery can never be poisoned (SPEC §2.8).
+func TestHandleCatalog_WrongClientName_UsesAuthoritative(t *testing.T) {
+	svc, src, store := newTestCatalogService()
+	w := catalogReq(svc, testDeviceID, "1.0",
+		`{"catalog_id":"AAA0001","scientific_name":"Toxicodendron radicans"}`)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	// Fire-and-forget: poll for the index.json commit marker the goroutine writes;
+	// once present the cascade has run, so its recorded query is final.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		store.mu.Lock()
+		_, done := store.puts[catalogIndexKey("AAA0001")]
+		store.mu.Unlock()
+		if done {
+			if got := src.lastQuery(); got != "Abelia chinensis" {
+				t.Fatalf("cascade searched %q, want authoritative %q (client name leaked into the search)", got, "Abelia chinensis")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("catalog ingest did not complete within deadline")
+}
+
 // Compile-time guards: production types satisfy the ingestor interfaces so a
 // signature drift fails the build, not just at wiring time.
 var (

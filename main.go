@@ -145,7 +145,9 @@ func main() {
 	// creds + SUPABASE_DB_URL + IMAGEINGEST_ADMIN_TOKEN; gracefully disabled
 	// (nil + WARN) if any is missing, in which case neither the public
 	// POST /v1/plants/imageingest nor the internal route is registered.
-	ingestSvc := buildImageIngestService(vault)
+	// `content` supplies the authoritative catalog id→scientific_name map used by
+	// the /v1/plants/catalog-images server-side name resolution (SPEC §2.8).
+	ingestSvc := buildImageIngestService(vault, content)
 
 	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc)
 
@@ -229,7 +231,12 @@ func buildDiseaseEnrichmentService(vault *secrets.Vault, content *proxy.ContentI
 // Pool lifetime is the process lifetime (no graceful Close on shutdown in V1;
 // systemd SIGTERM kills the process, Postgres reclaims via idle timeout —
 // same stance as buildEnrichmentService).
-func buildImageIngestService(vault *secrets.Vault) *imageingest.Service {
+//
+// content supplies the authoritative catalog id→scientific_name map
+// (CatalogScientificNames) injected as Config.CatalogNames — the server-side
+// search name for /v1/plants/catalog-images (SPEC §2.8, Codex P1). It is always
+// non-nil here: main fatals if LoadContent fails before this is called.
+func buildImageIngestService(vault *secrets.Vault, content *proxy.ContentIndex) *imageingest.Service {
 	dsn := vault.Get("SUPABASE_DB_URL")
 	adminToken := vault.Get("IMAGEINGEST_ADMIN_TOKEN")
 	r2Cfg := imageingest.R2Config{
@@ -278,6 +285,11 @@ func buildImageIngestService(vault *secrets.Vault) *imageingest.Service {
 	cfg := imageingest.Config{
 		AllowAttributionLicenses: vault.GetBool("IMAGEINGEST_ALLOW_ATTRIBUTION_LICENSES", false),
 		MinInterval:              vaultDurationOr(vault, "IMAGEINGEST_MIN_INTERVAL", time.Second),
+		// Authoritative catalog id→scientific_name map from the embedded
+		// plants_index.json (SPEC §2.8 catalog-images P1 fix): the catalog-images
+		// search name is derived server-side from catalog_id, never the client's
+		// scientific_name. Reuses the single existing embed (no second copy).
+		CatalogNames: content.CatalogScientificNames(),
 	}
 	ingestor := imageingest.NewIngestor(inat, wikimedia, r2Client, ledger, cfg)
 	log.Printf("image ingest service ready: R2 bucket=%s ledger pool + iNat/Wikimedia cascade (allowAttribution=%v)",

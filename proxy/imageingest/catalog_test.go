@@ -61,9 +61,16 @@ func TestBuildExternalIndex(t *testing.T) {
 
 // catalogTestIngestor wires the cascade with a mock source + store and a NIL
 // ledger — proving the in-catalog path never touches the database (it would
-// panic on any ledger call if it did).
+// panic on any ledger call if it did). CatalogNames injects a 1-entry
+// authoritative map so IngestCatalogSpecies can resolve AAA0001's server-side
+// scientific name (SPEC §2.8); the test source ignores the query, so the value
+// matters only where a test asserts the searched name (DerivesAuthoritativeName).
 func catalogTestIngestor(src *mockSource, store *mockStore) *Ingestor {
-	return NewIngestor(src, nil, store, nil, Config{AllowAttributionLicenses: true, DefaultImageCount: 4})
+	return NewIngestor(src, nil, store, nil, Config{
+		AllowAttributionLicenses: true,
+		DefaultImageCount:        4,
+		CatalogNames:             map[string]string{"AAA0001": "Abelia chinensis"},
+	})
 }
 
 func cc0Cands(n int) []sources.Candidate {
@@ -80,7 +87,7 @@ func TestIngestCatalogSpecies_HappyPath(t *testing.T) {
 	store := newMockStore()
 	in := catalogTestIngestor(src, store)
 
-	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", "Abelia chinensis", 4)
+	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +121,7 @@ func TestIngestCatalogSpecies_Idempotent(t *testing.T) {
 	store.existsRet[catalogIndexKey("AAA0001")] = true // already done
 	in := catalogTestIngestor(src, store)
 
-	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", "X species", 4)
+	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +138,7 @@ func TestIngestCatalogSpecies_NoCandidates(t *testing.T) {
 	store := newMockStore()
 	in := catalogTestIngestor(src, store)
 
-	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", "X species", 4)
+	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +155,7 @@ func TestIngestCatalogSpecies_PartialFill(t *testing.T) {
 	store := newMockStore()
 	in := catalogTestIngestor(src, store)
 
-	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", "X species", 4)
+	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +197,7 @@ func TestIngestCatalogSpecies_InteriorDownloadFail(t *testing.T) {
 	store := newMockStore()
 	in := catalogTestIngestor(src, store)
 
-	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", "X species", 4)
+	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +224,7 @@ func TestIngestCatalogSpecies_RejectBadID(t *testing.T) {
 	store := newMockStore()
 	in := catalogTestIngestor(src, store)
 
-	out, err := in.IngestCatalogSpecies(context.Background(), "bad/id", "X species", 4)
+	out, err := in.IngestCatalogSpecies(context.Background(), "bad/id", 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +245,7 @@ func TestIngestCatalogSpecies_IndexHeadError(t *testing.T) {
 	store.existsErr = errors.New("head boom")
 	in := catalogTestIngestor(src, store)
 
-	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", "X species", 4)
+	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,5 +254,51 @@ func TestIngestCatalogSpecies_IndexHeadError(t *testing.T) {
 	}
 	if len(store.puts) != 0 {
 		t.Error("HEAD error must not write to R2 (retryable skip)")
+	}
+}
+
+// TestIngestCatalogSpecies_DerivesAuthoritativeName is the core P1 test: the
+// cascade is searched with the SERVER's authoritative scientific_name for the
+// catalog id (from Config.CatalogNames), never a caller-supplied value. The
+// function takes no name parameter, so there is no way to pass a poisoned name —
+// this asserts the resolved value actually reaches Search (SPEC §2.8).
+func TestIngestCatalogSpecies_DerivesAuthoritativeName(t *testing.T) {
+	src := &mockSource{searchRet: cc0Cands(4)}
+	store := newMockStore()
+	in := catalogTestIngestor(src, store) // maps AAA0001 -> "Abelia chinensis"
+
+	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.PerImage) != 4 {
+		t.Fatalf("ingested %d, want 4", len(out.PerImage))
+	}
+	if got := src.lastQuery(); got != "Abelia chinensis" {
+		t.Errorf("cascade searched %q, want the authoritative %q (client name must never drive the search)", got, "Abelia chinensis")
+	}
+}
+
+// TestIngestCatalogSpecies_UnknownID_NoOp asserts a well-formed catalog id that
+// is NOT one of the curated 1522 (absent from Config.CatalogNames) is refused: no
+// search, no upload. Defense in depth behind the handler's 400 unknown_catalog_id
+// — an attacker-fabricated id can never seed an external/ gallery (SPEC §2.8).
+func TestIngestCatalogSpecies_UnknownID_NoOp(t *testing.T) {
+	src := &mockSource{searchRet: cc0Cands(4)}
+	store := newMockStore()
+	in := catalogTestIngestor(src, store) // only AAA0001 is known
+
+	out, err := in.IngestCatalogSpecies(context.Background(), "ZZZ9999", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.PerImage) != 0 {
+		t.Errorf("unknown catalog id should ingest 0 images, got %+v", out)
+	}
+	if len(store.puts) != 0 {
+		t.Error("unknown catalog id must never write to R2")
+	}
+	if q := src.lastQuery(); q != "" {
+		t.Errorf("unknown catalog id must not search the cascade, but searched %q", q)
 	}
 }
