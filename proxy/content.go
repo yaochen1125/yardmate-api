@@ -93,8 +93,9 @@ type DiseaseCatalog struct {
 // prompt when an upstream Plant.id disease name doesn't directly match a
 // catalog name.
 type DiseaseNameRef struct {
-	ID   string
-	Name string
+	ID          string
+	Name        string
+	Description string // short symptom hint (shortDescription) for LLM disambiguation
 }
 
 // LoadContent parses the embedded JSON files and builds the lookup maps.
@@ -245,9 +246,10 @@ func (c *ContentIndex) LookupCommonName(plantID string) (string, bool) {
 // (e.g. "Powdery mildew" → "L20"). Match is case-insensitive and strips
 // boilerplate suffixes ("disease", "infection"). Returns ("", false) on miss.
 //
-// On miss, callers should fall back to LLM disambiguation
-// (VisionClient.DisambiguateDiseaseName); on LLM miss/timeout, generic
-// catalog (L06 "Leaf spot") with isFallback=true.
+// On miss, mapCatalogID falls back to the alias table then LLM disambiguation
+// (VisionClient.DisambiguateDiseaseName); a genuine miss yields catalogId=null
+// and the out-of-catalog detail is handled by disease enrichment
+// (proxy/enrichment/SPEC_disease.md).
 func (c *ContentIndex) LookupCatalogID(name string) (string, bool) {
 	if c == nil {
 		return "", false
@@ -292,9 +294,72 @@ func (c *ContentIndex) AllDiseaseNames() []DiseaseNameRef {
 		if d == nil {
 			continue
 		}
-		out = append(out, DiseaseNameRef{ID: id, Name: d.Name})
+		out = append(out, DiseaseNameRef{ID: id, Name: d.Name, Description: diseaseRefHint(d)})
 	}
 	return out
+}
+
+// diseaseRefHint returns a short semantic description for a catalog entry so the
+// LLM disambiguation prompt can match on meaning, not just the catalog name
+// (e.g. "drought stress" → L07 "Underwatering yellowing"). Prefers
+// shortDescription, falls back to symptomAnalysis, truncated to keep the
+// ~70-entry prompt bounded.
+func diseaseRefHint(d *DiseaseCatalog) string {
+	s := strings.TrimSpace(d.ShortDescription)
+	if s == "" {
+		s = strings.TrimSpace(d.SymptomAnalysis)
+	}
+	const maxRunes = 140
+	if r := []rune(s); len(r) > maxRunes {
+		s = strings.TrimSpace(string(r[:maxRunes]))
+	}
+	return s
+}
+
+// diseaseNameAliases maps a disease name to a catalog id when the name is a TRUE
+// synonym / spelling variant of an existing catalog disease that exact/fuzzy
+// match misses (e.g. "overwatering" → L08 "Waterlogging"). Keys MUST be in
+// normalizeDiseaseName form (lowercased, space-collapsed, no " disease"/
+// " infection" suffix). Scope (synonyms only, NOT causal names) is documented
+// on the map literal below.
+var diseaseNameAliases = map[string]string{
+	// TRUE synonyms / spelling variants of an EXISTING catalog disease only.
+	// Causal / environmental names (drought stress, nutrient deficiency, sunburn,
+	// frost…) are intentionally NOT remapped here — they keep their own name and
+	// route to disease enrichment's O-series (proxy/enrichment/SPEC_disease.md),
+	// rather than being collapsed into a symptom-named catalog entry.
+	"overwatering":  "L08", // = Waterlogging (same condition)
+	"over-watering": "L08",
+	"over watering": "L08",
+	"waterlogged":   "L08",
+	"water logging": "L08",
+	"botrytis":      "L23", // catalog name is "Gray mold (botrytis)"
+	"gray mold":     "L23",
+	"grey mold":     "L23",
+	"gray mould":    "L23",
+	"grey mould":    "L23",
+	"sooty mould":   "L21", // = "Sooty mold" (spelling)
+}
+
+// LookupDiseaseAlias resolves a synonym / spelling-variant disease name to a
+// catalog id via diseaseNameAliases, validating the target still exists so a
+// stale alias can't return a dangling id.
+func (c *ContentIndex) LookupDiseaseAlias(name string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	key := normalizeDiseaseName(name)
+	if key == "" {
+		return "", false
+	}
+	id, ok := diseaseNameAliases[key]
+	if !ok {
+		return "", false
+	}
+	if _, exists := c.diseaseByID[id]; !exists {
+		return "", false
+	}
+	return id, true
 }
 
 // NormalizeScientificName is the exported form of the package-private

@@ -274,8 +274,9 @@ Top-3 issues max. Issues are guaranteed non-empty when `isHealthy=false`.
 **`catalogId` mapping** (Plant.id disease `name` → YardMate catalog id):
 
 1. Exact / fuzzy match against the 70 catalog names in `diseases.json`. Fuzzy normalization lowercases, trims, and strips `disease` / `infection` suffixes.
-2. LLM disambiguation: GPT-4o text-only is fed the input name + the full (id, name) list and asked to reply with a single catalog id or `NONE`. Hallucinated ids (not in the catalog) are treated as misses. ~70-entry prompt is small enough that we don't cache the catalog list payload.
-3. `catalogId: null` on miss.
+2. Alias table — a small curated map of **true synonyms / spelling variants** of an existing catalog disease (e.g. `overwatering`/`waterlogged` → L08 Waterlogging, `botrytis`/`gray mold` → L23, `sooty mould` → L21), keyed in the same normalized form as step 1. **Causal / environmental names that are not the same disease (drought stress, nutrient deficiency, sunburn…) are deliberately NOT in this map** — they are out-of-catalog and route to disease enrichment (step 4), not collapsed onto a symptom-named entry.
+3. LLM disambiguation: GPT-4o text-only is fed the input name + the catalog as **(id, name — shortDescription)** so it matches on meaning, not just wording, and replies with a single catalog id or `NONE`. Hallucinated ids (not in the catalog) are treated as misses. ~70-entry prompt is small enough that we don't cache the catalog list payload.
+4. `catalogId: null` on miss. The genuinely out-of-catalog tail (slim detail today) is enriched separately by `proxy/enrichment` disease enrichment — it preserves the real disease name, generates structured detail referencing the shared step pools, and assigns an `O`-series id (see `proxy/enrichment/SPEC_disease.md`). Steps 2–3 are the "mapping-recall boost": they map names that truly correspond to an existing entry; the handler **never force-maps an unrelated name** onto a catalog entry.
 
 **Never healthy — force a disease (product decision, supersedes F-option-2):**
 

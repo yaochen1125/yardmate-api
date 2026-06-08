@@ -589,11 +589,19 @@ func (c *VisionClient) DisambiguateDiseaseName(ctx context.Context, plantIDName 
 		b.WriteString(r.ID)
 		b.WriteString(": ")
 		b.WriteString(r.Name)
+		if r.Description != "" {
+			b.WriteString(" — ")
+			b.WriteString(r.Description)
+		}
 		b.WriteByte('\n')
 	}
 
-	sys := "You map plant disease names to a fixed catalog. Reply ONLY with the catalog id (like 'L20' or 'P05') that best matches the input. If nothing in the catalog is close, reply with 'NONE'. No commentary."
-	user := "Input disease name: " + plantIDName + "\n\nCatalog:\n" + b.String() + "\nReply with the best-matching catalog id, or NONE."
+	// The description-enriched catalog (id: name — description) lets the model
+	// match on meaning, not just wording — that's the recall boost. It may still
+	// answer NONE for a genuinely out-of-catalog name; that name then routes to
+	// disease enrichment (proxy/enrichment/SPEC_disease.md), not a forced pick.
+	sys := "You map plant disease names to a fixed catalog. Reply ONLY with the catalog id (like 'L20' or 'P05') that best matches the input, using each entry's description to judge meaning (not just wording). If truly nothing in the catalog is close, reply with 'NONE'. No commentary."
+	user := "Input disease name: " + plantIDName + "\n\nCatalog (id: name — description):\n" + b.String() + "\nReply with the best-matching catalog id, or NONE."
 
 	body := openAIChatRequest{
 		Model:     c.Model,

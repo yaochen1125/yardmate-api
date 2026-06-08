@@ -1144,29 +1144,40 @@ func diagnoseResultFromVision(ctx context.Context, vr *visionDiagnoseResult, con
 	return res
 }
 
-// mapCatalogID resolves a Plant.id disease name to a YardMate catalog id.
-// Order: exact/fuzzy name match → LLM disambiguation → nil.
+// mapCatalogID resolves an upstream disease name to a catalog id:
+//  1. exact catalog-name match;
+//  2. alias table — true synonyms / spelling variants of an existing disease;
+//  3. LLM disambiguation against the description-enriched catalog (may NONE).
+//
+// Returns nil on a genuine miss. The out-of-catalog tail (empty/slim detail
+// today) is handled separately by disease enrichment (SPEC_disease.md) — this
+// function never force-maps an unrelated name onto a catalog entry. Steps 2+3's
+// descriptions + narrowed alias table are the "mapping-recall boost": they map
+// names that truly correspond to an existing entry, nothing more.
 func mapCatalogID(ctx context.Context, name string, content *ContentIndex, vision *VisionClient) *string {
+	if content == nil {
+		return nil
+	}
+	// 1) Exact catalog-name match.
 	if id, ok := content.LookupCatalogID(name); ok {
-		s := id
-		return &s
+		return &id
 	}
-	if vision == nil || content == nil {
-		return nil
+	// 2) Alias table — true synonyms / spelling variants only.
+	if id, ok := content.LookupDiseaseAlias(name); ok {
+		return &id
 	}
-	refs := content.AllDiseaseNames()
-	if len(refs) == 0 {
-		return nil
+	// 3) LLM disambiguation against the description-enriched catalog.
+	if vision != nil {
+		if refs := content.AllDiseaseNames(); len(refs) > 0 {
+			if id, err := vision.DisambiguateDiseaseName(ctx, name, refs); err != nil {
+				log.Printf("diagnose disambiguate err: name=%q err=%v", name, err)
+			} else if id != "" {
+				return &id
+			}
+		}
 	}
-	id, err := vision.DisambiguateDiseaseName(ctx, name, refs)
-	if err != nil {
-		log.Printf("diagnose disambiguate err: name=%q err=%v", name, err)
-		return nil
-	}
-	if id == "" {
-		return nil
-	}
-	return &id
+	// Genuine miss → nil; out-of-catalog detail handled by disease enrichment.
+	return nil
 }
 
 // fallbackIssueFrom builds the canonical isFallback=true HealthIssue from a
