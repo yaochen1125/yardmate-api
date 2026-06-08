@@ -27,7 +27,7 @@ type DiseaseStepGroups struct {
 }
 
 type DiseaseStepGroup struct {
-	Label string        `json:"label"` // e.g. "For mild cases"; "" when ungrouped
+	Label *string       `json:"label"` // e.g. "For mild cases"; null when ungrouped (matches diseases.json)
 	Steps []DiseaseStep `json:"steps"`
 }
 

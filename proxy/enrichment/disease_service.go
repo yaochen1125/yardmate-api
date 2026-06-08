@@ -159,7 +159,11 @@ func (s *DiseaseService) backfillGroups(g diseaseGenGroups) proxy.DiseaseStepGro
 		if len(steps) == 0 {
 			continue
 		}
-		out.Groups = append(out.Groups, proxy.DiseaseStepGroup{Label: grp.Label, Steps: steps})
+		var label *string
+		if l := strings.TrimSpace(grp.Label); l != "" {
+			label = &l
+		}
+		out.Groups = append(out.Groups, proxy.DiseaseStepGroup{Label: label, Steps: steps})
 	}
 	return out
 }
