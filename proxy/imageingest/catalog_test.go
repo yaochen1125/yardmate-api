@@ -177,9 +177,11 @@ func TestIngestCatalogSpecies_PartialFill(t *testing.T) {
 	}
 }
 
-// TestIngestCatalogSpecies_InteriorDownloadFail guards P1: a 404 on a candidate
-// in the MIDDLE of the list must NOT leave a hole (1.png, _, 3.png). Contiguous
-// packing means the gallery + manifest are always 1..count with no gap.
+// TestIngestCatalogSpecies_InteriorDownloadFail asserts two guarantees when a
+// candidate in the MIDDLE of the list 404s: (P1) stored keys are CONTIGUOUS
+// (1,2,3 — no hole, never 1,_,3), and (P2) because a retryable failure occurred
+// and we fell short of n, the manifest is NOT committed — so a later trigger
+// retries instead of locking in the short gallery via AlreadyDone.
 func TestIngestCatalogSpecies_InteriorDownloadFail(t *testing.T) {
 	src := &mockSource{
 		searchRet:      cc0Cands(4),
@@ -195,6 +197,7 @@ func TestIngestCatalogSpecies_InteriorDownloadFail(t *testing.T) {
 	if len(out.PerImage) != 3 {
 		t.Fatalf("ingested %d, want 3 (one of four 404'd)", len(out.PerImage))
 	}
+	// (P1) contiguous keys 1..3, no hole, no 4th
 	for i := 1; i <= 3; i++ {
 		if _, ok := store.puts[catalogKey("AAA0001", i)]; !ok {
 			t.Errorf("missing contiguous slot %d", i)
@@ -203,17 +206,9 @@ func TestIngestCatalogSpecies_InteriorDownloadFail(t *testing.T) {
 	if _, ok := store.puts[catalogKey("AAA0001", 4)]; ok {
 		t.Error("4th image should not exist")
 	}
-	var idx ExternalIndex
-	if err := json.Unmarshal(store.puts[catalogIndexKey("AAA0001")], &idx); err != nil {
-		t.Fatal(err)
-	}
-	if idx.Count != 3 {
-		t.Errorf("index count = %d, want 3", idx.Count)
-	}
-	for k, im := range idx.Images {
-		if im.Index != k+1 {
-			t.Errorf("manifest index gap: images[%d].index = %d, want %d", k, im.Index, k+1)
-		}
+	// (P2) retryable shortfall → no commit marker, so it retries next time
+	if _, ok := store.puts[catalogIndexKey("AAA0001")]; ok {
+		t.Error("index.json must NOT be committed after a retryable failure (so it retries)")
 	}
 }
 

@@ -176,6 +176,7 @@ func (in *Ingestor) IngestCatalogSpecies(ctx context.Context, catalogID, scienti
 	// NO gap — the manifest's indices are always 1..count, so iOS never derives a
 	// key for a missing object. out.PerImage IS the ingested set (the manifest).
 	out.PerImage = make([]ImageOutcome, 0, n)
+	sawFailure := false
 	for poolIdx := 0; len(out.PerImage) < n && poolIdx < len(eligible); poolIdx++ {
 		pick := eligible[poolIdx]
 		data, mime, derr := pick.dl.Download(ctx, pick.cand.DownloadURL)
@@ -183,6 +184,7 @@ func (in *Ingestor) IngestCatalogSpecies(ctx context.Context, catalogID, scienti
 			// rendition may 404 — fall through to the next candidate (SPEC §2.5 #5).
 			log.Printf("imageingest catalog download fall-through: id=%s url=%s err=%v",
 				catalogID, pick.cand.DownloadURL, derr)
+			sawFailure = true
 			continue
 		}
 		slot := len(out.PerImage) + 1
@@ -191,18 +193,23 @@ func (in *Ingestor) IngestCatalogSpecies(ctx context.Context, catalogID, scienti
 			// transient R2 blip — fall through; don't burn the slot index.
 			log.Printf("imageingest catalog upload fall-through: id=%s slot=%d err=%v",
 				catalogID, slot, uerr)
+			sawFailure = true
 			continue
 		}
 		in.pace(ctx)
 		out.PerImage = append(out.PerImage, in.ingestedOutcome(slot, key, pick, mime, int64(len(data))))
 	}
 
-	// Write the manifest LAST (commit marker), only if ≥1 image was stored. An
-	// empty gallery (no acceptable candidate / all downloads failed) writes
-	// nothing, so a later retrigger re-attempts instead of marking the species
-	// permanently done. "Got 2 of 4" is committed as 2 — supplementary images are
-	// best-effort; iNat genuinely having fewer free photos is normal.
-	if len(out.PerImage) > 0 {
+	// Commit decision (Codex P2): the manifest is the AlreadyDone marker, so write
+	// it ONLY when the gallery is either full (n images) OR fell short with NO
+	// retryable failure — i.e. the candidate pool was genuinely exhausted (iNat
+	// simply has fewer free photos, a stable result worth committing as-is). If we
+	// fell short AND hit a download/upload failure, the shortfall may be transient,
+	// so we DON'T write the marker and a later trigger retries. The already-uploaded
+	// images are harmless contiguous orphans, overwritten on the next full run. An
+	// empty gallery never writes (also retries).
+	committable := len(out.PerImage) >= n || (len(out.PerImage) > 0 && !sawFailure)
+	if committable {
 		body, err := BuildExternalIndex(out.PerImage)
 		if err != nil {
 			return out, fmt.Errorf("imageingest catalog: marshal index %s: %w", catalogID, err)
