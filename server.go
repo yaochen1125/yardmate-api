@@ -49,6 +49,7 @@ func newServer(
 	inat *proxy.INatClient,
 	content *proxy.ContentIndex,
 	enrich *enrichment.Service,
+	diseaseEnricher proxy.DiseaseEnricher,
 	ingest *imageingest.Service,
 ) *Server {
 	// Rose cultivar rerank is ON by default; ROSE_RERANK_ENABLED=false kill-switches it.
@@ -108,7 +109,7 @@ func newServer(
 				// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
 				// assessment, SPEC §1.5) — still requires plantID.
 				if plantID != nil {
-					r.Post("/diagnose", proxy.HandleDiagnose(plantID, content, vision))
+					r.Post("/diagnose", proxy.HandleDiagnose(plantID, content, vision, diseaseEnricher))
 				}
 				if enrich != nil {
 					r.Post("/plants/enrichment", enrichment.HandleEnrichment(enrich))

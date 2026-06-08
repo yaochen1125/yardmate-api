@@ -72,6 +72,14 @@ type ContentIndex struct {
 	// Drives the "catalog hit -> curated common name" step of /v1/identify name
 	// resolution (SPEC §2.1): a catalog hit prefers this over iNat / upstream.
 	commonByID map[string]string
+
+	// stepByID / remedyByID are the shared treatment-step (S01–S44) and
+	// home-remedy (K01–K15) pools from diseases.json `shared`. Disease enrichment
+	// back-fills an out-of-catalog disease's generated step/remedy refs from these
+	// (proxy/enrichment/SPEC_disease.md). In-catalog diseases don't use them
+	// (iOS reads their already-denormalized steps from the CDN).
+	stepByID   map[string]*SharedStep
+	remedyByID map[string]*SharedRemedy
 }
 
 // DiseaseCatalog is the subset of diseases.json[*] fields the server consumes
@@ -87,6 +95,29 @@ type DiseaseCatalog struct {
 	FullName         string `json:"fullName"`
 	ShortDescription string `json:"shortDescription"`
 	SymptomAnalysis  string `json:"symptomAnalysis"`
+}
+
+// SharedStep is one entry of diseases.json `shared.steps` (S01–S44): a reusable
+// treatment/prevention step. Disease enrichment back-fills generated step refs
+// from this pool (title/body/image), so an out-of-catalog disease's steps reuse
+// the same human-reviewed copy + image as in-catalog diseases.
+type SharedStep struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Body  string `json:"body"`
+	Image string `json:"image"`
+}
+
+// SharedRemedy is one entry of diseases.json `shared.remedies` (K01–K15): a
+// reusable home remedy. Treats lists the disease ids it applies to (pool-internal;
+// dropped when denormalized into an issue).
+type SharedRemedy struct {
+	ID     string   `json:"id"`
+	Title  string   `json:"title"`
+	Recipe string   `json:"recipe"`
+	Usage  string   `json:"usage"`
+	Treats []string `json:"treats"`
+	Image  string   `json:"image"`
 }
 
 // DiseaseNameRef is a (id, name) tuple used to feed the LLM disambiguation
@@ -159,6 +190,10 @@ func LoadContent() (*ContentIndex, error) {
 	}
 
 	var diseaseFile struct {
+		Shared struct {
+			Steps    map[string]*SharedStep   `json:"steps"`
+			Remedies map[string]*SharedRemedy `json:"remedies"`
+		} `json:"shared"`
 		Diseases map[string]*DiseaseCatalog `json:"diseases"`
 	}
 	if err := json.Unmarshal(diseasesRaw, &diseaseFile); err != nil {
@@ -183,6 +218,8 @@ func LoadContent() (*ContentIndex, error) {
 		diseaseByID:               diseaseFile.Diseases,
 		fullPlantByID:             fpd,
 		commonByID:                common,
+		stepByID:                  diseaseFile.Shared.Steps,
+		remedyByID:                diseaseFile.Shared.Remedies,
 	}, nil
 }
 
@@ -475,6 +512,61 @@ func normalizeDiseaseName(s string) string {
 		s = strings.TrimSuffix(s, suffix)
 	}
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// NormalizeDiseaseName is the exported wrapper over the disease-name normalizer.
+// Disease enrichment uses it for the diseases_pending PK + LRU cache key so they
+// stay the single source of truth shared with catalog lookup (SPEC_disease §7).
+func NormalizeDiseaseName(s string) string { return normalizeDiseaseName(s) }
+
+// StepByID returns the shared treatment step (S01–S44) for an id, or (nil,false).
+func (c *ContentIndex) StepByID(id string) (*SharedStep, bool) {
+	if c == nil {
+		return nil, false
+	}
+	s, ok := c.stepByID[id]
+	return s, ok
+}
+
+// RemedyByID returns the shared home remedy (K01–K15) for an id, or (nil,false).
+func (c *ContentIndex) RemedyByID(id string) (*SharedRemedy, bool) {
+	if c == nil {
+		return nil, false
+	}
+	r, ok := c.remedyByID[id]
+	return r, ok
+}
+
+// AllStepRefs returns every shared step as (id, title) — for the disease-
+// enrichment prompt (lets the model choose meaningfully) and the server-side
+// whitelist set.
+func (c *ContentIndex) AllStepRefs() []DiseaseNameRef {
+	if c == nil {
+		return nil
+	}
+	out := make([]DiseaseNameRef, 0, len(c.stepByID))
+	for id, s := range c.stepByID {
+		if s == nil {
+			continue
+		}
+		out = append(out, DiseaseNameRef{ID: id, Name: s.Title})
+	}
+	return out
+}
+
+// AllRemedyRefs returns every shared remedy as (id, title), same use as AllStepRefs.
+func (c *ContentIndex) AllRemedyRefs() []DiseaseNameRef {
+	if c == nil {
+		return nil
+	}
+	out := make([]DiseaseNameRef, 0, len(c.remedyByID))
+	for id, r := range c.remedyByID {
+		if r == nil {
+			continue
+		}
+		out = append(out, DiseaseNameRef{ID: id, Name: r.Title})
+	}
+	return out
 }
 
 // speciesBinomial reduces a scientific name to its "Genus species" binomial for

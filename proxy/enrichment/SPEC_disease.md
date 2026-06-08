@@ -113,15 +113,15 @@ type HealthIssue struct {
     Treatment        Treatment                `json:"treatment"`        // legacy 3×[]string, unchanged
     StructuredDetail *StructuredDiseaseDetail `json:"structuredDetail,omitempty"` // present for O-series enriched issues
 }
-// StructuredDiseaseDetail{ ShortDescription, SymptomAnalysis string; Treatment, Prevention TreatmentGroups; HomeRemedies []Remedy }
-// TreatmentGroups{ Groups []Group }; Group{ Label string; Steps []Step }
-// Step{ Num int; Title, Body, Image, Ref string; SubSteps []Step }; Remedy{ Ref, Title, Recipe, Usage, Image string }
+// StructuredDiseaseDetail{ ShortDescription, SymptomAnalysis, Cause string; Treatment, Prevention DiseaseStepGroups; HomeRemedies []DiseaseRemedy }
+// DiseaseStepGroups{ Groups []DiseaseStepGroup }; DiseaseStepGroup{ Label *string (null=ungrouped, matches diseases.json); Steps []DiseaseStep }
+// DiseaseStep{ Num int; Title, Body, Image, Ref string; SubSteps []DiseaseStep }; DiseaseRemedy{ Ref, Title, Recipe, Usage, Image string }
 ```
 
 **iOS dispatches by `catalogId`:**
 - prefix `O` → render `structuredDetail` (backend-supplied steps + images)
 - `L / R / ST / FL / FR / P` → read CDN `diseases.json` by id (**existing logic, unchanged**)
-- `null` → slim (legacy `Treatment` text)
+- `null` → if `structuredDetail` is present (DB-down generated, no O id minted), render it; else slim (legacy `Treatment` text)
 
 `image` is a **filename** (e.g. `"uoIzi.png"`); iOS applies the **existing CDN-prefix rule** it already uses for in-catalog step images — same asset source.
 
