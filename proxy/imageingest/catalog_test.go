@@ -3,6 +3,7 @@ package imageingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/yaochen1125/yardmate-api/proxy/imageingest/sources"
@@ -86,6 +87,9 @@ func TestIngestCatalogSpecies_HappyPath(t *testing.T) {
 	if out.AlreadyDone || out.Coalesced {
 		t.Fatalf("unexpected skip: %+v", out)
 	}
+	if len(out.PerImage) != 4 {
+		t.Fatalf("ingested %d, want 4", len(out.PerImage))
+	}
 	for i := 1; i <= 4; i++ {
 		if _, ok := store.puts[catalogKey("AAA0001", i)]; !ok {
 			t.Errorf("missing upload for slot %d", i)
@@ -131,13 +135,11 @@ func TestIngestCatalogSpecies_NoCandidates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(out.PerImage) != 0 {
+		t.Errorf("no candidates should ingest 0 images, got %d", len(out.PerImage))
+	}
 	if _, ok := store.puts[catalogIndexKey("AAA0001")]; ok {
 		t.Error("index.json must NOT be written when nothing was ingested (so a retrigger retries)")
-	}
-	for _, oc := range out.PerImage {
-		if oc.Status != ImgNoAcceptable {
-			t.Errorf("slot %d status = %q, want no_acceptable_image", oc.Index, oc.Status)
-		}
 	}
 }
 
@@ -150,6 +152,18 @@ func TestIngestCatalogSpecies_PartialFill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(out.PerImage) != 3 {
+		t.Errorf("ingested %d, want 3 (got-what-we-could)", len(out.PerImage))
+	}
+	// contiguous keys 1..3, no 4th
+	for i := 1; i <= 3; i++ {
+		if _, ok := store.puts[catalogKey("AAA0001", i)]; !ok {
+			t.Errorf("missing contiguous slot %d", i)
+		}
+	}
+	if _, ok := store.puts[catalogKey("AAA0001", 4)]; ok {
+		t.Error("should not have a 4th image")
+	}
 	body, ok := store.puts[catalogIndexKey("AAA0001")]
 	if !ok {
 		t.Fatal("index.json should be written with the 3 that succeeded")
@@ -159,10 +173,47 @@ func TestIngestCatalogSpecies_PartialFill(t *testing.T) {
 		t.Fatal(err)
 	}
 	if idx.Count != 3 {
-		t.Errorf("index count = %d, want 3 (got-what-we-could)", idx.Count)
+		t.Errorf("index count = %d, want 3", idx.Count)
 	}
-	if out.PerImage[3].Status != ImgNoAcceptable {
-		t.Errorf("slot 4 status = %q, want no_acceptable_image", out.PerImage[3].Status)
+}
+
+// TestIngestCatalogSpecies_InteriorDownloadFail guards P1: a 404 on a candidate
+// in the MIDDLE of the list must NOT leave a hole (1.png, _, 3.png). Contiguous
+// packing means the gallery + manifest are always 1..count with no gap.
+func TestIngestCatalogSpecies_InteriorDownloadFail(t *testing.T) {
+	src := &mockSource{
+		searchRet:      cc0Cands(4),
+		downloadErrFor: map[string]error{"https://dl/b": errors.New("404")},
+	}
+	store := newMockStore()
+	in := catalogTestIngestor(src, store)
+
+	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", "X species", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.PerImage) != 3 {
+		t.Fatalf("ingested %d, want 3 (one of four 404'd)", len(out.PerImage))
+	}
+	for i := 1; i <= 3; i++ {
+		if _, ok := store.puts[catalogKey("AAA0001", i)]; !ok {
+			t.Errorf("missing contiguous slot %d", i)
+		}
+	}
+	if _, ok := store.puts[catalogKey("AAA0001", 4)]; ok {
+		t.Error("4th image should not exist")
+	}
+	var idx ExternalIndex
+	if err := json.Unmarshal(store.puts[catalogIndexKey("AAA0001")], &idx); err != nil {
+		t.Fatal(err)
+	}
+	if idx.Count != 3 {
+		t.Errorf("index count = %d, want 3", idx.Count)
+	}
+	for k, im := range idx.Images {
+		if im.Index != k+1 {
+			t.Errorf("manifest index gap: images[%d].index = %d, want %d", k, im.Index, k+1)
+		}
 	}
 }
 

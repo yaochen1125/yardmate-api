@@ -60,7 +60,8 @@ type ExternalIndex struct {
 }
 
 // ExternalIndexImage is one supplementary image's positional index + attribution.
-// Index is 1-based, matching the R2 key external/{index}.png.
+// Index is 1-based and CONTIGUOUS (1..count, no gaps), matching the R2 key
+// external/{index}.png — so iOS can iterate either images[].index or 1..count.
 type ExternalIndexImage struct {
 	Index        int    `json:"index"`
 	Source       string `json:"source"`
@@ -71,8 +72,8 @@ type ExternalIndexImage struct {
 }
 
 // BuildExternalIndex assembles the per-species manifest from the ingested image
-// outcomes (callers pass only Status==ImgIngested rows). Built purely from the
-// in-memory ingest result — NO database — so the in-catalog path stays zero-DB.
+// outcomes (callers pass only successfully-stored, contiguous rows). Built purely
+// from the in-memory ingest result — NO database — so the path stays zero-DB.
 func BuildExternalIndex(images []ImageOutcome) ([]byte, error) {
 	idx := ExternalIndex{Count: len(images), Images: make([]ExternalIndexImage, 0, len(images))}
 	for _, oc := range images {
@@ -89,8 +90,9 @@ func BuildExternalIndex(images []ImageOutcome) ([]byte, error) {
 }
 
 // CatalogIngestOutcome is the result of an in-catalog supplementary ingest. Like
-// IngestOutcome but keyed by catalog id (AAA) and surfacing the index.json
-// idempotency signal (AlreadyDone).
+// IngestOutcome but keyed by catalog id (AAA); PerImage holds the successfully
+// stored images with CONTIGUOUS 1-based indices (the manifest source), and
+// AlreadyDone surfaces the index.json idempotency signal.
 type CatalogIngestOutcome struct {
 	CatalogID   string         `json:"catalog_id"`
 	Coalesced   bool           `json:"coalesced,omitempty"`
@@ -118,14 +120,15 @@ func (in *Ingestor) IngestCatalogSpecies(ctx context.Context, catalogID, scienti
 	out := CatalogIngestOutcome{CatalogID: catalogID}
 	// isCatalogID is also a security boundary (catalogID is interpolated into the
 	// R2 key — see HandleCatalog); validate here too as defense in depth for any
-	// non-HTTP caller (batch tooling, tests).
+	// non-HTTP caller (batch tooling, tests). Log so the no-op isn't silent.
 	if !isCatalogID(catalogID) || strings.TrimSpace(scientificName) == "" {
+		log.Printf("imageingest catalog: rejected invalid request id=%q name=%q", catalogID, scientificName)
 		return out, nil
 	}
 
 	// Single-flight keyed by catalog id (prefixed so it can never collide with a
-	// slug key in the shared inflight map). Concurrent detail-page opens of the
-	// same species coalesce — the second caller returns immediately.
+	// slug key in the shared inflight map — Slug() output is [a-z0-9-], never ':').
+	// Concurrent detail-page opens of the same species coalesce.
 	flightKey := "catalog:" + catalogID
 	if !in.acquire(flightKey) {
 		out.Coalesced = true
@@ -146,7 +149,9 @@ func (in *Ingestor) IngestCatalogSpecies(ctx context.Context, catalogID, scienti
 
 	// Idempotency: index.json exists ⇒ this species is already done (it is written
 	// LAST, after every image, so its presence implies a complete gallery). A HEAD
-	// error is non-fatal — fall through and re-fill (Put is idempotent on R2).
+	// error is non-fatal — fall through and re-fill (Put is idempotent on R2; the
+	// trade-off is one extra cascade for a flapping-HEAD species, acceptable for
+	// best-effort enrichment).
 	idxKey := catalogIndexKey(catalogID)
 	if exists, err := in.store.Exists(ctx, idxKey); err != nil {
 		log.Printf("imageingest catalog index head err: id=%s err=%v", catalogID, err)
@@ -157,31 +162,48 @@ func (in *Ingestor) IngestCatalogSpecies(ctx context.Context, catalogID, scienti
 
 	// Gather third-party candidates from the SAME cascade as out-of-catalog.
 	// usedSourceURLs is nil: the whole gallery is built in one shot, so there is
-	// no prior-slot set to dedup against (within-gather dedup still applies). The
-	// BY/SA gate is ON in prod, so `eligible` already includes CC-BY/-SA; `gated`
-	// is only non-empty when the flag is OFF, and the in-catalog path intentionally
-	// ignores it (a curated plant shows fewer supplementary images rather than
-	// parking deferred rows it has no ledger for).
+	// no prior-slot set to dedup against (within-gather DedupKey dedup still
+	// applies). The BY/SA gate is ON in prod, so `eligible` already includes
+	// CC-BY/-SA; `gated` is only non-empty when the flag is OFF, and the in-catalog
+	// path intentionally ignores it (a curated plant shows fewer supplementary
+	// images rather than parking deferred rows it has no ledger for).
 	eligible, _ := in.gatherCandidates(ctx, scientificName, n, nil)
 
+	// Fill up to n CONTIGUOUS slots. Consume eligible candidates in rank order
+	// with download AND upload fall-through; each SUCCESS takes the next
+	// contiguous index (1,2,3…). Keying by the success count (len(PerImage)+1),
+	// NOT a fixed slot position, means a 404 / upload blip on one candidate leaves
+	// NO gap — the manifest's indices are always 1..count, so iOS never derives a
+	// key for a missing object. out.PerImage IS the ingested set (the manifest).
 	out.PerImage = make([]ImageOutcome, 0, n)
-	ingested := make([]ImageOutcome, 0, n)
-	poolIdx := 0
-	for i := 1; i <= n; i++ {
-		oc := in.fillCatalogSlot(ctx, catalogID, i, eligible, &poolIdx)
-		out.PerImage = append(out.PerImage, oc)
-		if oc.Status == ImgIngested {
-			ingested = append(ingested, oc)
+	for poolIdx := 0; len(out.PerImage) < n && poolIdx < len(eligible); poolIdx++ {
+		pick := eligible[poolIdx]
+		data, mime, derr := pick.dl.Download(ctx, pick.cand.DownloadURL)
+		if derr != nil {
+			// rendition may 404 — fall through to the next candidate (SPEC §2.5 #5).
+			log.Printf("imageingest catalog download fall-through: id=%s url=%s err=%v",
+				catalogID, pick.cand.DownloadURL, derr)
+			continue
 		}
+		slot := len(out.PerImage) + 1
+		key := catalogKey(catalogID, slot)
+		if uerr := in.store.Put(ctx, key, data, mime, imageCacheControl); uerr != nil {
+			// transient R2 blip — fall through; don't burn the slot index.
+			log.Printf("imageingest catalog upload fall-through: id=%s slot=%d err=%v",
+				catalogID, slot, uerr)
+			continue
+		}
+		in.pace(ctx)
+		out.PerImage = append(out.PerImage, in.ingestedOutcome(slot, key, pick, mime, int64(len(data))))
 	}
 
-	// Write the manifest LAST (commit marker), and only if we actually stored
-	// images. An empty gallery (no acceptable candidate / all downloads failed)
-	// writes nothing, so a later retrigger re-attempts instead of marking the
-	// species permanently done. "Got 2 of 4" is committed as 2 — supplementary
-	// images are best-effort; iNat genuinely having fewer free photos is normal.
-	if len(ingested) > 0 {
-		body, err := BuildExternalIndex(ingested)
+	// Write the manifest LAST (commit marker), only if ≥1 image was stored. An
+	// empty gallery (no acceptable candidate / all downloads failed) writes
+	// nothing, so a later retrigger re-attempts instead of marking the species
+	// permanently done. "Got 2 of 4" is committed as 2 — supplementary images are
+	// best-effort; iNat genuinely having fewer free photos is normal.
+	if len(out.PerImage) > 0 {
+		body, err := BuildExternalIndex(out.PerImage)
 		if err != nil {
 			return out, fmt.Errorf("imageingest catalog: marshal index %s: %w", catalogID, err)
 		}
@@ -191,40 +213,6 @@ func (in *Ingestor) IngestCatalogSpecies(ctx context.Context, catalogID, scienti
 	}
 
 	return out, nil
-}
-
-// fillCatalogSlot is the zero-ledger analogue of fillSlot: it consumes eligible
-// candidates (rank order, with download fall-through) and uploads the first that
-// succeeds to catalogKey(catalogID, i). On success it returns ingestedOutcome
-// (carrying attribution for the manifest); on pool exhaustion / all-downloads-fail
-// it returns a non-ingested outcome (no DB record — the manifest simply omits it).
-func (in *Ingestor) fillCatalogSlot(ctx context.Context, catalogID string, i int, eligible []scoredCandidate, poolIdx *int) ImageOutcome {
-	oc := ImageOutcome{Index: i}
-	key := catalogKey(catalogID, i)
-
-	for *poolIdx < len(eligible) {
-		pick := eligible[*poolIdx]
-		*poolIdx++
-
-		data, mime, derr := pick.dl.Download(ctx, pick.cand.DownloadURL)
-		if derr != nil {
-			// rendition may 404 — fall through to the next candidate (SPEC §2.5 #5).
-			log.Printf("imageingest catalog download fail (fall-through): id=%s i=%d url=%s err=%v",
-				catalogID, i, pick.cand.DownloadURL, derr)
-			continue
-		}
-		if uerr := in.store.Put(ctx, key, data, mime, imageCacheControl); uerr != nil {
-			oc.Status = ImgUploadError
-			oc.Note = "put failed"
-			return oc
-		}
-		in.pace(ctx)
-		return in.ingestedOutcome(i, key, pick, mime, int64(len(data)))
-	}
-
-	oc.Status = ImgNoAcceptable
-	oc.Note = "no acceptable candidate"
-	return oc
 }
 
 // catalogRequest is the POST /v1/plants/catalog-images body.
@@ -238,7 +226,7 @@ type catalogRequest struct {
 // digits, e.g. AAA0001). This is a SECURITY boundary, not just validation: the id
 // is interpolated straight into the R2 key (catalogKey), so without it an attested
 // client could write arbitrary keys (path traversal / clobbering curated images).
-// The strict charset forbids '/' and '.', so no traversal is possible.
+// Fully anchored + fixed-length: no '/', '.', whitespace, or newline can pass.
 var catalogIDPattern = regexp.MustCompile(`^[A-Z]{3}[0-9]{4}$`)
 
 func isCatalogID(s string) bool { return catalogIDPattern.MatchString(s) }
@@ -261,6 +249,9 @@ func HandleCatalog(svc *Service) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "missing_app_version")
 			return
 		}
+		// App Attest signals: logged only in V1 (SPEC §5), same as HandlePublic.
+		attKeyID := r.Header.Get("X-AppAttest-KeyID")
+		attAssertPresent := r.Header.Get("X-AppAttest-Assertion") != ""
 
 		var body catalogRequest
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10))
@@ -284,8 +275,9 @@ func HandleCatalog(svc *Service) http.HandlerFunc {
 		}
 
 		// Fire-and-forget: the real work runs in a detached goroutine bounded by
-		// single-flight per catalog id (concurrent duplicates coalesce).
-		go func(catalogID, name string, n int) {
+		// single-flight per catalog id (concurrent duplicates coalesce). Args are
+		// passed explicitly (no request-closure capture).
+		go func(catalogID, name string, n int, attestKey string, attestAssert bool) {
 			ctx, cancel := context.WithTimeout(context.Background(), publicWorkTimeout)
 			defer cancel()
 			out, err := svc.ingestor.IngestCatalogSpecies(ctx, catalogID, name, n)
@@ -299,15 +291,10 @@ func HandleCatalog(svc *Service) http.HandlerFunc {
 			case out.AlreadyDone:
 				log.Printf("imageingest catalog already done: id=%s", out.CatalogID)
 			default:
-				ing := 0
-				for _, oc := range out.PerImage {
-					if oc.Status == ImgIngested {
-						ing++
-					}
-				}
-				log.Printf("imageingest catalog ok: id=%s ingested=%d/%d", out.CatalogID, ing, len(out.PerImage))
+				log.Printf("imageingest catalog ok: id=%s ingested=%d/%d attestKey=%q attestAssert=%v",
+					out.CatalogID, len(out.PerImage), n, attestKey, attestAssert)
 			}
-		}(catalogID, name, n)
+		}(catalogID, name, n, attKeyID, attAssertPresent)
 
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"accepted":              true,
