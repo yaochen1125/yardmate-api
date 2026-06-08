@@ -152,8 +152,41 @@ re-deploy. Don't hot-patch the server binary.
 | `aaguid_mismatch` from a known-good production iOS build | `ATTEST_ALLOW_DEV` flipped wrong-way OR Team/Bundle ID drift | Check secrets.env on host + `YARDMATE_API_APP_ID` env in unit file |
 | Client gets 429 immediately | per-IP limit too tight for shared NAT egress | Raise `YARDMATE_API_RL_IP_LIMIT` (env in systemd unit) |
 | BoltDB grows past expected size | challenge sweeper not running | Restart service; bbolt compacts on open (rare path) |
+| `POST /v1/plants/catalog-images` returns `400 unknown_catalog_id` for a real curated plant | embedded `proxy/data/plants_index.json` is stale (a newly-added species is absent from the binary's copy) | Re-sync the copy from `yardmate-swiftui` and rebuild/redeploy (§7) |
 
-## 7. References
+## 7. Embedded catalog data (`proxy/data/`) — cross-repo sync
+
+The binary embeds the plant/disease catalog at **build time** (`proxy/content.go`,
+`//go:embed data/*.json`). The source of truth lives in the **sibling repo**
+`yardmate-swiftui`; the files here are copies that must be re-synced when the
+catalog changes:
+
+| Embedded copy (this repo) | Source of truth (`yardmate-swiftui`) |
+|---|---|
+| `proxy/data/plants_index.json` | `scripts/plants_index.json` |
+| `proxy/data/plants_detail.json` | (same `scripts/` pipeline) |
+| `proxy/data/diseases.json` | (same `scripts/` pipeline) |
+
+**When the catalog changes (species added / renamed / removed), re-sync before deploy:**
+
+```bash
+cp ../yardmate-swiftui/scripts/plants_index.json proxy/data/plants_index.json
+# (+ plants_detail.json / diseases.json if they changed too)
+go build ./... && go test ./...   # embed is compile-time — only a rebuild picks it up
+./deploy/deploy.sh
+```
+
+Why this matters beyond identify/diagnose: `proxy/data/plants_index.json` is also
+the **authoritative `catalog_id → scientific_name` map** for the
+`POST /v1/plants/catalog-images` supplementary-image endpoint (imageingest
+SPEC §2.8, Codex P1 fix). The handler derives the cascade search name from
+`catalog_id` via this embed and **rejects ids not present** with
+`400 unknown_catalog_id`. So a stale copy means a newly-added curated plant's
+supplementary gallery 400s until the copy is re-synced and the binary rebuilt.
+There is exactly **one** in-repo copy (the fix deliberately reuses this embed
+rather than adding a second) — keep it in lockstep with the swiftui source.
+
+## 8. References
 
 - `attest/SPEC.md` — App Attest protocol implementation
 - `secrets/SPEC.md` — env file format + load semantics
