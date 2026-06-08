@@ -100,6 +100,24 @@ type CatalogIngestOutcome struct {
 	PerImage    []ImageOutcome `json:"per_image,omitempty"`
 }
 
+// catalogScientificName returns the AUTHORITATIVE scientific name for a curated
+// catalog id (AAA-id), or ("", false) if the id is not one of the embedded 1522.
+// It is the single source of the cascade search name for the in-catalog path:
+// the name is derived HERE from the server's embedded catalog (Config.CatalogNames,
+// ultimately proxy/data/plants_index.json), never from the client request — the
+// catalog-images P1 fix (SPEC §2.8). An empty/whitespace mapped value is treated
+// as a miss (defensive; the loader already trims + drops empties).
+func (in *Ingestor) catalogScientificName(catalogID string) (string, bool) {
+	name, ok := in.cfg.CatalogNames[catalogID]
+	if !ok {
+		return "", false
+	}
+	if name = strings.TrimSpace(name); name == "" {
+		return "", false
+	}
+	return name, true
+}
+
 // IngestCatalogSpecies fills the `external/` supplementary gallery for an
 // in-catalog (AAA-id) plant with third-party images, reusing the same iNat →
 // Wikimedia cascade + license gate as the out-of-catalog path (gatherCandidates).
@@ -116,13 +134,24 @@ type CatalogIngestOutcome struct {
 //     per-slot ledger to consult, and re-deriving partial-fill attribution
 //     without a ledger would drop captions, so the manifest is the single commit
 //     marker and the whole gallery is re-filled if it is absent.
-func (in *Ingestor) IngestCatalogSpecies(ctx context.Context, catalogID, scientificName string, count int) (CatalogIngestOutcome, error) {
+func (in *Ingestor) IngestCatalogSpecies(ctx context.Context, catalogID string, count int) (CatalogIngestOutcome, error) {
 	out := CatalogIngestOutcome{CatalogID: catalogID}
-	// isCatalogID is also a security boundary (catalogID is interpolated into the
-	// R2 key — see HandleCatalog); validate here too as defense in depth for any
+	// isCatalogID is a security boundary (catalogID is interpolated into the R2
+	// key — see HandleCatalog); validate here too as defense in depth for any
 	// non-HTTP caller (batch tooling, tests). Log so the no-op isn't silent.
-	if !isCatalogID(catalogID) || strings.TrimSpace(scientificName) == "" {
-		log.Printf("imageingest catalog: rejected invalid request id=%q name=%q", catalogID, scientificName)
+	if !isCatalogID(catalogID) {
+		log.Printf("imageingest catalog: rejected invalid id=%q", catalogID)
+		return out, nil
+	}
+	// The cascade search name is the SERVER's authoritative scientific_name for
+	// this catalog id (embedded plants_index.json via Config.CatalogNames), NEVER a
+	// client-supplied value — the catalog-images P1 fix (SPEC §2.8). This function
+	// takes no scientificName parameter precisely so no caller can inject one. An
+	// id outside the curated 1522 has no authoritative name → refuse (the handler
+	// 400s unknown_catalog_id before reaching here; this is defense in depth).
+	scientificName, ok := in.catalogScientificName(catalogID)
+	if !ok {
+		log.Printf("imageingest catalog: rejected non-catalog id=%q", catalogID)
 		return out, nil
 	}
 
@@ -227,10 +256,15 @@ func (in *Ingestor) IngestCatalogSpecies(ctx context.Context, catalogID, scienti
 	return out, nil
 }
 
-// catalogRequest is the POST /v1/plants/catalog-images body.
+// catalogRequest is the POST /v1/plants/catalog-images body. catalog_id is the
+// authoritative key: the server derives the cascade search scientific_name from
+// it (SPEC §2.8). scientific_name, if sent, is ADVISORY only (legacy clients /
+// iOS display) — the backend ignores it for the ingest and merely logs a mismatch
+// as a tamper/drift signal (mirrors the hero_image advisory-metadata stance,
+// §2.1.1).
 type catalogRequest struct {
 	CatalogID      string `json:"catalog_id"`
-	ScientificName string `json:"scientific_name"`
+	ScientificName string `json:"scientific_name"` // advisory; ignored for ingest (see doc)
 	ImageCount     int    `json:"image_count"`
 }
 
@@ -272,10 +306,25 @@ func HandleCatalog(svc *Service) http.HandlerFunc {
 			return
 		}
 		catalogID := strings.TrimSpace(body.CatalogID)
-		name := strings.TrimSpace(body.ScientificName)
-		if !isCatalogID(catalogID) || name == "" {
+		if !isCatalogID(catalogID) {
 			writeError(w, http.StatusBadRequest, "bad_request")
 			return
+		}
+		// Resolve the AUTHORITATIVE scientific name from the server's embedded
+		// catalog (the catalog-images P1 fix, SPEC §2.8). A well-formed id outside
+		// the curated 1522 is rejected here so a tampered client can't seed an
+		// external/ gallery for a non-catalog key; the client's scientific_name is
+		// never used for the search.
+		authName, ok := svc.ingestor.catalogScientificName(catalogID)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "unknown_catalog_id")
+			return
+		}
+		// scientific_name is advisory (legacy/display). Log — but do NOT fail — a
+		// mismatch with the authoritative name: it is a tamper attempt OR a stale
+		// iOS catalog. Failing would break legitimate clients during catalog drift.
+		if cn := strings.TrimSpace(body.ScientificName); cn != "" && !strings.EqualFold(cn, authName) {
+			log.Printf("imageingest catalog: ignoring client scientific_name=%q for id=%s (authoritative=%q)", cn, catalogID, authName)
 		}
 		if body.ImageCount != 0 && (body.ImageCount < minImageCount || body.ImageCount > maxImageCount) {
 			writeError(w, http.StatusBadRequest, "bad_request")
@@ -289,10 +338,10 @@ func HandleCatalog(svc *Service) http.HandlerFunc {
 		// Fire-and-forget: the real work runs in a detached goroutine bounded by
 		// single-flight per catalog id (concurrent duplicates coalesce). Args are
 		// passed explicitly (no request-closure capture).
-		go func(catalogID, name string, n int, attestKey string, attestAssert bool) {
+		go func(catalogID string, n int, attestKey string, attestAssert bool) {
 			ctx, cancel := context.WithTimeout(context.Background(), publicWorkTimeout)
 			defer cancel()
-			out, err := svc.ingestor.IngestCatalogSpecies(ctx, catalogID, name, n)
+			out, err := svc.ingestor.IngestCatalogSpecies(ctx, catalogID, n)
 			if err != nil {
 				log.Printf("imageingest catalog err: id=%s err=%v", catalogID, err)
 				return
@@ -306,7 +355,7 @@ func HandleCatalog(svc *Service) http.HandlerFunc {
 				log.Printf("imageingest catalog ok: id=%s ingested=%d/%d attestKey=%q attestAssert=%v",
 					out.CatalogID, len(out.PerImage), n, attestKey, attestAssert)
 			}
-		}(catalogID, name, n, attKeyID, attAssertPresent)
+		}(catalogID, n, attKeyID, attAssertPresent)
 
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"accepted":              true,

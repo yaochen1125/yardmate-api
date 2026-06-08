@@ -73,6 +73,16 @@ type ContentIndex struct {
 	// resolution (SPEC §2.1): a catalog hit prefers this over iNat / upstream.
 	commonByID map[string]string
 
+	// sciByID maps a curated catalog id (AAA-id) to its authoritative, VERBATIM
+	// scientific_name from plants_index.json — the reverse of the name->id indexes
+	// above (normalization is intentionally NOT applied: the value is fed straight
+	// into the iNat/Wikimedia cascade search). imageingest's /v1/plants/catalog-images
+	// reads it (via CatalogScientificNames) to derive the search name server-side
+	// from catalog_id, ignoring the client-supplied name — so a tampered attested
+	// client cannot pair a real id with an unrelated species to poison that plant's
+	// supplementary external/ gallery (imageingest SPEC §2.8, Codex P1).
+	sciByID map[string]string
+
 	// stepByID / remedyByID are the shared treatment-step (S01–S44) and
 	// home-remedy (K01–K15) pools from diseases.json `shared`. Disease enrichment
 	// back-fills an out-of-catalog disease's generated step/remedy refs from these
@@ -149,9 +159,17 @@ func LoadContent() (*ContentIndex, error) {
 	sci := make(map[string]string, len(plants))
 	sciPrecise := make(map[string]string, len(plants))
 	common := make(map[string]string, len(plants))
+	sciByID := make(map[string]string, len(plants))
 	for _, p := range plants {
 		if p.ID == "" {
 			continue
+		}
+		// Reverse index id -> verbatim scientific_name (catalog-images search name,
+		// SPEC §2.8). Set before the key=="" guard below so it never depends on the
+		// name normalizing to non-empty; catalog ids are unique so a plain assign is
+		// deterministic.
+		if s := strings.TrimSpace(p.ScientificName); s != "" {
+			sciByID[p.ID] = s
 		}
 		if pkey := normalizeScientificNamePrecise(p.ScientificName); pkey != "" {
 			if _, exists := sciPrecise[pkey]; !exists {
@@ -218,6 +236,7 @@ func LoadContent() (*ContentIndex, error) {
 		diseaseByID:               diseaseFile.Diseases,
 		fullPlantByID:             fpd,
 		commonByID:                common,
+		sciByID:                   sciByID,
 		stepByID:                  diseaseFile.Shared.Steps,
 		remedyByID:                diseaseFile.Shared.Remedies,
 	}, nil
@@ -277,6 +296,29 @@ func (c *ContentIndex) LookupCommonName(plantID string) (string, bool) {
 		return name, true
 	}
 	return "", false
+}
+
+// CatalogScientificNames returns a fresh copy of the authoritative catalog-id ->
+// scientific_name map for the curated 1522 (verbatim from the embedded
+// plants_index.json).
+//
+// proxy/imageingest consumes it (injected as imageingest.Config.CatalogNames via
+// main.buildImageIngestService) to derive the SERVER-SIDE search name for
+// POST /v1/plants/catalog-images from catalog_id, ignoring the client-supplied
+// scientific_name. This resolves the catalog-images P1: without it a tampered
+// attested client could pair a real catalog id (AAA0001) with an unrelated
+// species name and poison that curated plant's external/ supplementary gallery
+// (imageingest SPEC §2.8). A copy is returned so the consumer can never mutate
+// the shared, read-only index.
+func (c *ContentIndex) CatalogScientificNames() map[string]string {
+	if c == nil {
+		return nil
+	}
+	out := make(map[string]string, len(c.sciByID))
+	for id, name := range c.sciByID {
+		out[id] = name
+	}
+	return out
 }
 
 // LookupCatalogID maps a Plant.id disease name to a YardMate catalog id

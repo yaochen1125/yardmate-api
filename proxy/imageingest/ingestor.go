@@ -103,6 +103,15 @@ type Config struct {
 	// DefaultImageCount is the gallery size when the request omits image_count
 	// (default 4; requests clamp to [1,6]).
 	DefaultImageCount int
+	// CatalogNames is the authoritative catalog-id (AAA-id) -> scientific_name map
+	// for the curated 1522, injected from proxy.ContentIndex.CatalogScientificNames
+	// (sourced from the embedded plants_index.json). IngestCatalogSpecies derives
+	// the cascade search name from THIS map by catalog_id, NEVER from the client
+	// request — so a tampered attested client cannot pair a real id with an
+	// unrelated name to poison a curated plant's external/ gallery (SPEC §2.8,
+	// Codex P1). nil/empty => every catalog id is unknown and the catalog-images
+	// path no-ops (the handler also 400s unknown_catalog_id).
+	CatalogNames map[string]string
 }
 
 const (

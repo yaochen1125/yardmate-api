@@ -14,16 +14,37 @@ import (
 
 // mockSource implements ImageSource. downloadErrFor lets a specific DownloadURL
 // fail (download fall-through tests); any other url returns downloadBytes/MIME.
+// Search records the LAST query it was called with (mutex-guarded) so tests can
+// assert which scientific name actually drove the cascade — used by the
+// catalog-images tests to prove the SERVER's authoritative name is searched, not
+// a client-supplied one (SPEC §2.8).
 type mockSource struct {
+	mu             sync.Mutex
 	searchRet      []sources.Candidate
 	searchErr      error
+	searchQuery    string
 	downloadErrFor map[string]error
 	downloadBytes  []byte
 	downloadMIME   string
 }
 
-func (m *mockSource) Search(_ context.Context, _ string, _ int) ([]sources.Candidate, error) {
+// Search records the query under mu (read back race-safe via lastQuery, e.g. vs
+// the fire-and-forget catalog goroutine). searchRet/searchErr are read WITHOUT
+// mu: safe only because every test sets them in setup BEFORE launching any
+// goroutine (synchronous tests have none). Do NOT mutate searchRet/searchErr
+// while a background ingest is in flight, or that read becomes an unguarded race.
+func (m *mockSource) Search(_ context.Context, q string, _ int) ([]sources.Candidate, error) {
+	m.mu.Lock()
+	m.searchQuery = q
+	m.mu.Unlock()
 	return m.searchRet, m.searchErr
+}
+
+// lastQuery returns the most recent Search query, race-safe.
+func (m *mockSource) lastQuery() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.searchQuery
 }
 
 func (m *mockSource) Download(_ context.Context, rawURL string) ([]byte, string, error) {
