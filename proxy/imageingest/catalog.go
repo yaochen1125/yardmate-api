@@ -148,14 +148,19 @@ func (in *Ingestor) IngestCatalogSpecies(ctx context.Context, catalogID, scienti
 	}
 
 	// Idempotency: index.json exists ⇒ this species is already done (it is written
-	// LAST, after every image, so its presence implies a complete gallery). A HEAD
-	// error is non-fatal — fall through and re-fill (Put is idempotent on R2; the
-	// trade-off is one extra cascade for a flapping-HEAD species, acceptable for
-	// best-effort enrichment).
+	// LAST, after every image, so its presence implies a complete gallery).
 	idxKey := catalogIndexKey(catalogID)
-	if exists, err := in.store.Exists(ctx, idxKey); err != nil {
-		log.Printf("imageingest catalog index head err: id=%s err=%v", catalogID, err)
-	} else if exists {
+	exists, err := in.store.Exists(ctx, idxKey)
+	if err != nil {
+		// HEAD failed transiently (or a read-permission blip) — skip this trigger
+		// as RETRYABLE rather than re-ingesting a possibly-already-done species
+		// (which would burn a full iNat→Wikimedia cascade on every flapping-HEAD
+		// mount). The next mount retries; a genuinely-absent index.json is filled
+		// then (Codex P2).
+		log.Printf("imageingest catalog index head err (retryable skip): id=%s err=%v", catalogID, err)
+		return out, nil
+	}
+	if exists {
 		out.AlreadyDone = true
 		return out, nil
 	}

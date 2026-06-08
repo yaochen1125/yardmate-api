@@ -228,3 +228,24 @@ func TestIngestCatalogSpecies_RejectBadID(t *testing.T) {
 		t.Error("bad catalog id must never write to R2 (path-injection guard)")
 	}
 }
+
+// TestIngestCatalogSpecies_IndexHeadError asserts a transient HEAD failure on
+// index.json is a RETRYABLE skip (no ingest, nothing written) — not a re-ingest
+// that burns a full cascade on a possibly-already-done species (Codex P2).
+func TestIngestCatalogSpecies_IndexHeadError(t *testing.T) {
+	src := &mockSource{searchRet: cc0Cands(4)}
+	store := newMockStore()
+	store.existsErr = errors.New("head boom")
+	in := catalogTestIngestor(src, store)
+
+	out, err := in.IngestCatalogSpecies(context.Background(), "AAA0001", "X species", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.PerImage) != 0 {
+		t.Errorf("HEAD error should skip ingest, got %d images", len(out.PerImage))
+	}
+	if len(store.puts) != 0 {
+		t.Error("HEAD error must not write to R2 (retryable skip)")
+	}
+}
