@@ -1,8 +1,13 @@
 # `proxy/enrichment` — disease enrichment (V1)
 
-> Status: **draft — SPEC for review; implementation in follow-up PRs.**
+> Status: **draft v2 — SPEC for review; implementation in follow-up PRs.**
 > Companion: `proxy/enrichment/SPEC.md` (plant detail enrichment — same module, shared Supabase / cache / OpenAI plumbing) + parent `proxy/SPEC.md §2.2` (`/v1/diagnose`, whose contract this extends).
-> Background: When `/v1/diagnose` produces a disease whose name maps to **no** entry of the 70-disease curated catalog (`proxy/data/diseases.json`), iOS today shows a slim, image-less detail (empty Treatment — see the "Drought Stress" report that prompted this). disease enrichment keeps the **real disease name**, generates catalog-quality structured content via an LLM that **references the curated `shared.steps` / `shared.remedies` pools — so the treatment steps + images are the SAME human-reviewed assets as in-catalog diseases**, stores it in a Supabase `diseases_pending` table keyed by normalized disease name, and reuses it for everyone who later hits the same disease. The hero image stays the user's own captured photo (client-side). The whole point of the table is to **never re-generate the same disease twice**.
+> Background: When `/v1/diagnose` decides a disease whose name has **no equivalent** in the curated catalog (`diseases.json`: 70 entries, prefixes L/R/ST/FL/FR/P), iOS today shows a slim, image-less detail (empty Treatment — the "Drought Stress" report that prompted this). disease enrichment instead:
+> 1. tries hard to **map** the name to an existing catalog entry — an equivalent like "overwatering" → L08 must NOT spawn a duplicate;
+> 2. only when there is **genuinely no equivalent**, generates catalog-quality structured content via an LLM that **references the curated `shared.steps` / `shared.remedies` pools — the SAME human-reviewed steps + images as in-catalog diseases**;
+> 3. assigns the generated disease a new **`O` (Other) catalog id**, stores it in Supabase `diseases_pending` keyed by normalized name, and reuses it for everyone who later hits the same disease.
+>
+> Hero image stays the user's own captured photo (client-side). The point of the table: **never re-generate the same disease twice**, and let `O` rows graduate into the curated catalog later.
 
 ---
 
@@ -10,189 +15,187 @@
 
 ### 1.1 What this is responsible for
 
-- Inside `/v1/diagnose` (**NOT a new endpoint**), when `mapCatalogID` returns nil for an issue (exact-name + alias + LLM-disambiguation all miss / model answered NONE → genuinely out-of-catalog), **enrich that issue inline** before the 200:
-  1. **Process LRU cache hit** (key = normalized disease name) → return.
-  2. **Supabase `diseases_pending` row hit** (PK = normalized disease name, `status IN ('pending','approved')`) → return stored `data` JSONB.
-  3. **Miss** → call OpenAI `gpt-4o-mini` (`response_format: json_schema, strict`), `INSERT INTO diseases_pending ... ON CONFLICT DO NOTHING`, return generated detail.
-- The LLM outputs **only**: disease prose (`shortDescription`, `symptomAnalysis`, `cause`) + treatment / prevention **group skeletons that reference S-ids** + homeRemedy **K-id refs**. It writes **no** step bodies / titles / images.
-- **Back-fill**: the server resolves each S-id → `{num, title, body, image}` from `shared.steps` and each K-id → `{title, recipe, usage, image}` from `shared.remedies`, inlining them (denormalized — byte-identical to how in-catalog diseases store steps).
-- **Whitelist** AI-returned S-ids / K-ids against the curated pools; silently drop unknown ids (mirror `enrichment.filterCatalogDiseaseIDs`).
-- **Parse `shared.steps` (S01–S44) + `shared.remedies` (K01–K15) into `ContentIndex`** with an id→detail lookup — these are currently NOT parsed by the backend (only 7 slim disease fields are; see `content.go:77-90`).
-- Carry the enriched content back on the existing `HealthIssue` via a new optional structured field. **`catalogId` stays null** (honest out-of-catalog marker).
+- Inside `/v1/diagnose` (**NOT a new endpoint**), when `mapCatalogID` finds **no existing catalog equivalent** for an issue (exact + alias + LLM-disambiguation all miss / model answered NONE), enrich it inline before the 200:
+  1. **Process LRU cache** (key = normalized disease name) → return.
+  2. **Supabase `diseases_pending` hit** (PK = normalized name, `status IN ('pending','approved')`) → return stored detail + its `O` id.
+  3. **Miss** → `gpt-4o-mini` (json_schema strict) generate → **assign next `O` id** → `INSERT ... ON CONFLICT DO NOTHING` → return.
+- LLM outputs **ids only**: prose (`shortDescription` / `symptomAnalysis` / `cause`) + treatment / prevention group skeletons whose `stepRefs` are **enum-constrained to S01–S44** + `homeRemedyRefs` **enum-constrained to K01–K15**. No bodies / titles / images from the LLM.
+- **Back-fill** each S-id/K-id → `{num,title,body,image}` / `{title,recipe,usage,image}` from the curated pools (denormalized — identical to how in-catalog diseases store steps).
+- **Parse `shared.steps` (S01–S44) + `shared.remedies` (K01–K15) into `ContentIndex`** (currently unparsed; only 7 slim disease fields are) with an id→detail lookup.
+- Assign the generated disease an **`O` (Other) catalog id** and return it as `catalogId` (**NOT null**) so client / history / cache / Dashboard can all reference it by id.
 
 ### 1.2 What this is NOT responsible for
 
-- **Identification / the disease decision.** Plant.id / GPT-4o vision upstream decide *which* disease; enrichment only fills *detail* for an already-decided out-of-catalog name. No image upload of its own.
-- **The hero image.** Always the user's captured photo, supplied client-side. Enrichment is text/refs in, structured-text/refs out — no R2 write, no image generation.
-- **In-catalog diseases.** Those have a catalogId; iOS reads their steps from the CDN `diseases.json` (parent SPEC). Enrichment fires **only on `catalogId == nil`**.
-- **Mapping unknown names INTO the catalog.** That is #50's job (alias table + LLM disambiguation). Enrichment is strictly the "truly not in catalog" tail and **does not set catalogId**.
-- **Healthy verdicts / non-plant.** No out-of-catalog disease name exists → enrichment never fires. The "never healthy" force-pick (#49 `forceDiseaseOnHealthyVerdict`) stays an **in-catalog** path and is untouched.
-- **Admin review UI.** V1 review = Yao editing rows in the Supabase Dashboard (same as plant enrichment).
-- **Stampede coalescing.** V1 accepts two concurrent first-callers for the same disease each spend one LLM call; `ON CONFLICT DO NOTHING` keeps one row.
+- **Identification / the disease decision** (upstream Plant.id / GPT-4o vision). No image upload of its own.
+- **The hero image** — always the user's captured photo, supplied client-side. No R2 write, no image generation.
+- **In-catalog diseases** (L/R/ST/FL/FR/P) — render from CDN `diseases.json` by catalogId (parent SPEC), untouched.
+- **Mapping equivalents** — that's #50 (alias + LLM disambiguation). If a name has an existing equivalent (overwatering → L08), it maps there; enrichment does **not** fire and does **not** mint an O id. Enrichment is strictly the "no equivalent exists" tail.
+- **Healthy / non-plant** — no out-of-catalog disease name exists → enrichment never fires (#49 "never healthy" force-pick stays an in-catalog path, untouched).
+- **Admin review UI** — V1 review = Dashboard editing (same as plant enrichment).
+- **Stampede coalescing** — concurrent first-callers each spend one LLM call; `ON CONFLICT DO NOTHING` keeps one row + one O id (the loser's minted O number is discarded — gaps are fine).
 
 ### 1.3 Inputs
 
 | Source | Input |
 |---|---|
-| Within `HandleDiagnose` | the decided out-of-catalog `issue.Name` (free text) + `IdentifiedName` / `PlantID` (prompt context only) |
-| Curated pools | `shared.steps` (S01–S44), `shared.remedies` (K01–K15) from `diseases.json` |
+| Within `HandleDiagnose` | out-of-catalog `issue.Name` + `IdentifiedName` / `PlantID` (prompt context only) |
+| Curated pools | `shared.steps` (S01–S44), `shared.remedies` (K01–K15) |
 | Config | `OPENAI_API_KEY` + `SUPABASE_DB_URL` (same secrets as plant enrichment) |
 
 ### 1.4 Outputs
 
-| Function | Output | Error cases |
-|---|---|---|
-| `DiseaseService.GetOrGenerate(ctx, diseaseName, plantCtx)` | `*StructuredDiseaseDetail` | `ErrDBUnavailable`, `ErrEnrichmentUnavailable`, budget-skip → caller degrades to slim |
-| `/v1/diagnose` 200 | `DiagnoseResult` whose out-of-catalog issue now carries `structuredDetail` (catalogId still null) | never 502 from enrichment — degrades to slim issue |
+| Case | Output |
+|---|---|
+| Enriched | `HealthIssue` with **`catalogId` = O id** (e.g. `"O1"`), `structuredDetail` filled, `isFallback=true` |
+| Generation unavailable (error / timeout / budget / DB-down-and-uncacheable) | degrade to **slim issue: `catalogId = null` + legacy `Treatment` text**. Never 502. |
 
-Wire shape is **identical** whether the enriched detail came from cache / DB / LLM.
+Wire shape is identical regardless of cache / DB / LLM path.
 
 ### 1.5 External dependencies
 
-- **Supabase Postgres** — pgx pool, `SUPABASE_DB_URL` (shared with plant enrichment). **New table `diseases_pending`** (§5).
-- **OpenAI `gpt-4o-mini`** — shared `proxy.VisionClient.post(...)` transport, distinct prompt path.
+- **Supabase Postgres** — pgx pool (shared `SUPABASE_DB_URL`). New table `diseases_pending` + an O-id sequence (§5).
+- **OpenAI `gpt-4o-mini`** — shared `proxy.VisionClient.post(...)`.
 
 ---
 
-## 2. Trigger + cascade (where it sits)
+## 2. Trigger + cascade
 
-Post-#50 `mapCatalogID` cascade (returns a catalog id or nil — **enrichment is NOT inside mapCatalogID**, it runs in `HandleDiagnose` after mapCatalogID returns nil):
+`mapCatalogID` (post-#50) returns an **existing** catalog id or nil; **enrichment runs in `HandleDiagnose` after nil**, and on success the issue's catalogId becomes an `O` id:
 
-1. exact catalog-name match → id
-2. alias table (**narrowed to true synonyms / spelling variants** — e.g. `botrytis`/`gray mold`→L23, `sooty mold`→L21; the causal-name entries like `drought stress` are kept only if you want them mapped, see §8) → id
-3. LLM disambiguation w/ descriptions (**may answer NONE**) → id
-4. **nil (genuinely out-of-catalog)** → `HandleDiagnose` calls disease enrichment (this SPEC): preserve `Name`, fill `structuredDetail`, **catalogId stays null**
-5. enrichment unavailable / errors / budget-skip → **slim issue** (legacy `Treatment` text), never blocks the 200
+1. exact catalog-name match → existing id
+2. alias table (**true equivalents only** — overwatering→L08, botrytis→L23, sooty mold→L21) → existing id
+3. LLM disambiguation w/ descriptions (**may answer NONE**) → existing id
+4. **nil (no equivalent)** → disease enrichment: generate → **assign O id** → `catalogId = O id`, `structuredDetail` filled
+5. generation unavailable → **slim issue** (`catalogId = null`, legacy `Treatment`)
 
-Healthy / non-plant never reach step 4 (no out-of-catalog name to enrich).
+Equivalents map at step 2/3; only genuinely-new diseases reach step 4 and mint an O id. **drought stress**: leaning step 4 → O (symptoms broader than L07 "Underwatering yellowing", and the name is preserved); tunable via alias/LLM + Dashboard. Healthy / non-plant never reach step 4.
 
 ### Budget (critical — diagnose has a hard WriteTimeout)
 
-`/v1/diagnose` runs under a 35s server WriteTimeout; Plant.id + the optional vision fallback already spend budget. Inline enrichment adds **one** `gpt-4o-mini` call. Rules:
+`/v1/diagnose` runs under a 35s WriteTimeout; Plant.id + optional vision fallback already spend budget. Inline enrichment adds **one** `gpt-4o-mini` call.
 
-- Budget the enrichment LLM on **wall-clock from `reqStart`** (mirror `diagnoseFallbackBudget`, parent SPEC §6 pitfall). Too little left → **skip generation → slim issue** (step 5), never 502.
-- Cache / DB lookup is ~ms → always attempted (cheap even when budget is tight).
-- **Only the FIRST out-of-catalog issue per diagnose is enriched** in V1. diagnose returns 1–3 issues; enriching all could blow the budget. Remaining out-of-catalog issues stay slim. (Enrich-all is §9.)
+- Budget the LLM on **wall-clock from `reqStart`** (mirror `diagnoseFallbackBudget`). Too little left → skip → slim issue.
+- cache / DB lookup is ~ms → always attempted.
+- **Only the FIRST out-of-catalog issue per diagnose is enriched** (decision). Remaining out-of-catalog issues stay slim.
 
 ---
 
-## 3. Generation contract (AI selects ids; backend back-fills text + image)
+## 3. Generation contract (AI picks ids; backend back-fills)
 
-LLM (`gpt-4o-mini`, `json_schema` strict) returns **ids only**:
+`gpt-4o-mini`, `json_schema` strict, with **ref values enum-constrained** so the model structurally cannot emit an invalid id:
 
 ```jsonc
 {
-  "name": "Drought Stress",            // echo input name (preserve, NOT remapped)
-  "shortDescription": "...",           // 15–40 words (slim, mirror plant enrichment v2)
-  "symptomAnalysis": "...",
-  "cause": "...",
+  "name": "Drought Stress",          // echo input name (preserve, NOT remapped)
+  "shortDescription": "...",         // 15–40 words (slim, mirror plant enrichment v2)
+  "symptomAnalysis": "...", "cause": "...",
   "treatment":  { "groups": [ { "label": "For mild cases", "stepRefs": ["S04","S12"] } ] },
   "homeRemedyRefs": ["K15"],
   "prevention": { "groups": [ { "label": null, "stepRefs": ["S20"] } ] }
 }
 ```
 
-- `stepRefs` / `homeRemedyRefs` MUST be ids drawn from the whitelisted pools (S01–S44 / K01–K15). **No bodies / titles / images from the AI.** The prompt lists the available S-ids + K-ids with their titles so the model can choose meaningfully (mirror how `common_diseases_list` lists catalog disease ids in plant enrichment `prompt.go:181`).
-- Back-fill: each `stepRef` → `{num (group-local index), title, body, image}` from `shared.steps`; each `homeRemedyRef` → `{title, recipe, usage, image}` from `shared.remedies`. **Unknown ids dropped; a group emptied by dropping is dropped.**
-- `max_tokens` small (~800) — slim output keeps it inside the diagnose budget.
+- `stepRefs` items: JSON-schema `enum: [S01..S44]`; `homeRemedyRefs`: `enum: [K01..K15]`. The prompt lists each id with its title so the model chooses meaningfully (mirror `common_diseases_list` in plant enrichment).
+- **enum makes an "all-invalid refs" outcome structurally impossible**; the only residual is the model returning an **empty** array (it judged no step fits) → keep prose with empty steps.
+- Back-fill ids → `{num (group-local), title, body, image}` / `{title, recipe, usage, image}`. **Defense-in-depth: still whitelist server-side** in case enum is relaxed; drop unknown → drop emptied group.
+- `max_tokens` ~800 (slim output keeps it inside the diagnose budget).
 
 ---
 
-## 4. Wire contract change (`HealthIssue`)
+## 4. Wire contract (`HealthIssue`)
 
 Additive, back-compat — legacy `Treatment` kept:
 
 ```go
 type HealthIssue struct {
     // ...existing fields...
-    Treatment        Treatment                 `json:"treatment"`        // legacy 3×[]string, unchanged
-    StructuredDetail *StructuredDiseaseDetail   `json:"structuredDetail,omitempty"` // NEW — present ONLY for enriched out-of-catalog issues
+    CatalogID        *string                  `json:"catalogId"`        // existing id (L/R/..) OR new "O…" OR null (slim fallback)
+    Treatment        Treatment                `json:"treatment"`        // legacy 3×[]string, unchanged
+    StructuredDetail *StructuredDiseaseDetail `json:"structuredDetail,omitempty"` // present for O-series enriched issues
 }
-
-type StructuredDiseaseDetail struct {
-    ShortDescription string           `json:"shortDescription"`
-    SymptomAnalysis  string           `json:"symptomAnalysis"`
-    Treatment        TreatmentGroups  `json:"treatment"`
-    HomeRemedies     []Remedy         `json:"homeRemedies"`
-    Prevention       TreatmentGroups  `json:"prevention"`
-}
+// StructuredDiseaseDetail{ ShortDescription, SymptomAnalysis string; Treatment, Prevention TreatmentGroups; HomeRemedies []Remedy }
 // TreatmentGroups{ Groups []Group }; Group{ Label string; Steps []Step }
-// Step{ Num int; Title, Body, Image, Ref string; SubSteps []Step }
-// Remedy{ Ref, Title, Recipe, Usage, Image string }
+// Step{ Num int; Title, Body, Image, Ref string; SubSteps []Step }; Remedy{ Ref, Title, Recipe, Usage, Image string }
 ```
 
-- `catalogId` stays **null** (out-of-catalog marker). iOS: **if `structuredDetail` present → render it with the SAME view as in-catalog steps; else slim** (legacy Treatment text).
-- `image` is a **filename** (e.g. `"uoIzi.png"`); iOS applies the **existing CDN-prefix rule** it already uses for in-catalog step images — same asset source.
-- In-catalog issues unchanged: no `structuredDetail`, iOS still reads CDN `diseases.json` by `catalogId`.
+**iOS dispatches by `catalogId`:**
+- prefix `O` → render `structuredDetail` (backend-supplied steps + images)
+- `L / R / ST / FL / FR / P` → read CDN `diseases.json` by id (**existing logic, unchanged**)
+- `null` → slim (legacy `Treatment` text)
+
+`image` is a **filename** (e.g. `"uoIzi.png"`); iOS applies the **existing CDN-prefix rule** it already uses for in-catalog step images — same asset source.
 
 ---
 
 ## 5. Supabase schema (`diseases_pending`)
 
-Mirror `plants_pending`. New table (migration in `proxy/enrichment/migrations/`):
-
 ```sql
+CREATE SEQUENCE diseases_other_seq;            -- mints O numbers
 CREATE TABLE diseases_pending (
-  disease_name_normalized TEXT PRIMARY KEY,  -- normalizeDiseaseName(name); decision §8: name-keyed, plant-agnostic
+  disease_name_normalized TEXT PRIMARY KEY,    -- normalizeDiseaseName(name); name-keyed, plant-agnostic
+  catalog_id              TEXT UNIQUE NOT NULL, -- 'O' || nextval, the minted O id
   disease_name            TEXT NOT NULL,
-  data                    JSONB NOT NULL,    -- StructuredDiseaseDetail, bodies/images ALREADY back-filled (frozen)
+  data                    JSONB NOT NULL,       -- StructuredDiseaseDetail, bodies/images ALREADY back-filled (frozen)
   status                  TEXT NOT NULL DEFAULT 'pending',  -- pending|approved|rejected
-  source                  TEXT,              -- e.g. openai-gpt-4o-mini-2024-07-18
-  source_version          TEXT,              -- PromptVersion
-  generation_request_id   TEXT,
+  source                  TEXT, source_version TEXT, generation_request_id TEXT,
   created_at              TIMESTAMPTZ DEFAULT now()
 );
 -- lookup: WHERE disease_name_normalized=$1 AND status IN ('pending','approved')  (approved preferred)
--- write:  INSERT ... ON CONFLICT (disease_name_normalized) DO NOTHING; race winner re-queried
+-- write:  catalog_id := 'O' || nextval('diseases_other_seq');
+--         INSERT ... ON CONFLICT (disease_name_normalized) DO NOTHING; race winner re-queried
+--         (returns winner's catalog_id; loser's minted number discarded — gaps OK)
 ```
 
-- `data` stores the **back-filled (denormalized)** detail → the row is self-contained, no re-back-fill on read. Trade-off: if `shared.steps` text/images later change, old rows keep old copies until regenerated — **acceptable**, mirrors `diseases.json`'s own denormalization.
+- `data` stores **back-filled (denormalized)** detail → self-contained row, no re-back-fill on read. Trade-off: if `shared.steps` later changes, old rows keep old copies until regenerated — acceptable (mirrors `diseases.json` denormalization).
+- O id is **stable per disease** (one row, one id). Graduating an approved row into curated `diseases.json` later may keep or remap the id (V1.1, §9).
 - Reuses the same pgx pool / `SUPABASE_DB_URL` as plant enrichment.
 
 ---
 
 ## 6. Errors / timeout / fallback
 
-- enrichment LLM error / timeout / budget-skip → **slim issue** (legacy `Treatment`), 200 (never 502).
-- AI returns prose but all refs unknown/dropped → keep the prose (shortDescription / symptomAnalysis) with empty steps — **still better than today's empty Treatment**; do NOT fall all the way back to slim. *(confirm §8)*
-- DB unavailable → still attempt LLM generation (works, just uncached) and return it; only the cache write is skipped. *(confirm §8)*
+- LLM error / timeout / budget-skip → **slim issue** (`catalogId=null`, legacy `Treatment`), 200 (never 502).
+- **DB unavailable → still generate & return (experience-first), but DON'T persist.** Your question answered: when DB recovers, the next caller generates + persists the durable row. **No data conflict** — `ON CONFLICT DO NOTHING` means the first post-recovery writer wins one row + one id; later INSERTs are ignored; nothing is overwritten. The only costs are (a) repeat LLM spend during the outage, (b) the during-outage user got an unsaved version that may differ slightly (LLM nondeterminism) from the eventually-persisted one. (Open: what `catalogId` the transient response carries — see §8.)
+- All refs empty (enum makes "invalid" impossible; only "model chose none") → keep prose, empty steps.
 
 ---
 
 ## 7. Pitfalls (don't re-rediscover)
 
-- **DON'T enrich in-catalog issues** (`catalogId != nil`) — wasted LLM + would override curated content.
-- **DON'T let enrichment block or 502 the diagnose** — it is a tail enhancement; always degrade to the slim issue.
+- **DON'T enrich when an equivalent exists** — it must map at step 2/3; minting an O for "overwatering" duplicates L08.
+- **DON'T mint an O id for in-catalog issues** (catalogId already set).
+- **DON'T let enrichment block or 502 diagnose** — tail enhancement; always degrade to slim.
 - **Back-fill images via the SAME CDN rule** as in-catalog step images, or they 404.
-- `normalizeDiseaseName` is the **single SOT** for the cache key + DB PK + #50's alias key.
-- **Whitelist refs BEFORE persist** — the model will sometimes emit `S99` / `K99`.
-- **Budget from `reqStart`, not `ctx`** (parent SPEC §6 fallback-budget pitfall).
-- Store **back-filled** data, not raw refs, so a read needs no pool access and is robust to pool reshuffles.
+- `normalizeDiseaseName` is the **single SOT** for cache key + DB PK + #50 alias key.
+- **enum-constrain refs AND whitelist server-side** (defense in depth).
+- **Budget from `reqStart`, not `ctx`** (parent SPEC fallback-budget pitfall).
+- Store **back-filled** data (not raw refs) → reads need no pool access.
 
 ---
 
-## 8. Resolved decisions (with the open ones flagged for your review)
+## 8. Resolved decisions
 
-Locked (per your calls):
-- **Synchronous, inline in `/v1/diagnose`** ("识别过程多等几秒"), not async/background.
-- **Cache/PK = normalized disease name, plant-agnostic** (same disease → same content everywhere).
-- **AI selects step ids; backend back-fills text + image from curated pools** (reuse human-reviewed assets; fast; cheap).
-- **catalogId stays null for enriched issues** (honest out-of-catalog; Name preserved; no L08 mis-mapping — this replaces #50's dropped forced/L08 net).
-- **pending 即上线 + Dashboard 审核** (mirror plant enrichment).
-- **#50 keeps ①② (narrowed alias) + ③; drops ④forced + ⑤L08.**
+**Locked (per your calls):**
+- Synchronous, inline in `/v1/diagnose` ("识别过程多等几秒").
+- Cache / PK = normalized disease name, plant-agnostic.
+- AI picks step ids (**enum-constrained** S01–S44 / K01–K15); backend back-fills text + image from curated pools.
+- **Only the first out-of-catalog issue enriched per diagnose** (budget).
+- **Out-of-catalog generated diseases get an `O` (Other) catalog id (not null); equivalents map to existing L/R/.. and do NOT mint O** (overwatering → L08).
+- **iOS dispatches by catalogId prefix** (O → structuredDetail; L/R/.. → CDN; null → slim).
+- **DB-down → generate-uncached (experience-first); no data conflict on recovery.**
+- pending 即上线 + Dashboard 审核; approved O rows can graduate to the curated catalog later.
+- **#50** keeps ① descriptions + ② alias (**equivalents only**) + ③ LLM (NONE allowed); drops ④ forced + ⑤ L08.
 
-⚠️ **Need your confirmation:**
-1. **Only first out-of-catalog issue enriched per diagnose** (budget) — OK? (alt: enrich all 1–3, risk budget)
-2. **All-refs-unknown fallback** (§6): keep prose with empty steps, vs full slim?
-3. **DB-down behavior** (§6): generate-uncached vs skip-to-slim?
-4. **`drought stress` itself**: under "尽量映射 + ② narrowed", does it map to L07 (shows "Underwatering yellowing") or do you want causal names like it to ALWAYS enrich+preserve-name? (decides whether `drought stress`→L07 stays in the alias table)
+⚠️ **Minor opens (non-blocking, can settle at implementation):**
+1. During a DB outage, does the transient response carry a placeholder id (e.g. `O0`) or `null`? (Leaning: a temp marker since it isn't persisted; iOS renders `structuredDetail` regardless of the id.)
+2. All-refs-empty handling: keep prose + empty steps — confirmed.
 
 ---
 
 ## 9. Out of scope (V1.1+)
 
 - Enriching all 1–3 issues in one diagnose.
-- Promoting approved disease rows back into curated `diseases.json`.
+- **Graduating approved `O` rows into curated `diseases.json`** (+ optional id remap).
 - Stampede coalescing.
 - Per-plant disease variants (V1 is name-keyed only).
 - Regenerating rows when `shared.steps` changes.
@@ -201,6 +204,6 @@ Locked (per your calls):
 
 ## 10. #50 relationship + phasing
 
-- **#50 (`diagnose-catalog-fallback`)** narrows to "mapping-recall boost": keep ① descriptions in the disambiguation prompt + ② narrowed alias table; **DROP ③ forced pass + ④ L08 net**; step 4 returns `catalogId=null` (slim) until enrichment ships. Update `proxy/SPEC.md §2.2` to match (the P1 SPEC drift the #50 review flagged).
-- **Phase 1 (backend, this SPEC):** parse `shared.steps`/`shared.remedies` → `ContentIndex`; `diseases_pending` table + DB layer; prompt + whitelist + back-fill; `HealthIssue.StructuredDetail`; wire into `HandleDiagnose` step 4.
-- **Phase 2 (iOS, `yardmate-swiftui`):** render `structuredDetail` (reuse the in-catalog step view) for `catalogId==null` enriched issues; hero = captured photo. Doc/SPEC under `app/YardMate/YardMate/Diagnose/`.
+- **#50 (`diagnose-catalog-fallback`)** narrows to "mapping-recall boost": keep ① descriptions in the disambiguation prompt + ② alias table (**equivalents only** — overwatering→L08, spelling variants; NOT causal-but-distinct names like drought stress); ③ LLM (NONE allowed). **DROP ④ forced + ⑤ L08.** Step 4 returns nil → slim until enrichment ships. Update `proxy/SPEC.md §2.2` to match (the P1 SPEC drift the #50 review flagged).
+- **Phase 1 (backend, this SPEC):** parse `shared.steps`/`shared.remedies` → `ContentIndex`; `diseases_pending` table + O-id sequence + DB layer; prompt (enum) + back-fill; `HealthIssue.StructuredDetail` + `catalogId=O`; wire into `HandleDiagnose` step 4.
+- **Phase 2 (iOS, `yardmate-swiftui`):** dispatch by catalogId prefix; render `structuredDetail` (reuse the in-catalog step view) for O-series; hero = captured photo. Doc/SPEC under `app/YardMate/YardMate/Diagnose/`.
