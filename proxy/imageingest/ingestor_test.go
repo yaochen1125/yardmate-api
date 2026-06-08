@@ -28,6 +28,11 @@ type mockSource struct {
 	downloadMIME   string
 }
 
+// Search records the query under mu (read back race-safe via lastQuery, e.g. vs
+// the fire-and-forget catalog goroutine). searchRet/searchErr are read WITHOUT
+// mu: safe only because every test sets them in setup BEFORE launching any
+// goroutine (synchronous tests have none). Do NOT mutate searchRet/searchErr
+// while a background ingest is in flight, or that read becomes an unguarded race.
 func (m *mockSource) Search(_ context.Context, q string, _ int) ([]sources.Candidate, error) {
 	m.mu.Lock()
 	m.searchQuery = q
