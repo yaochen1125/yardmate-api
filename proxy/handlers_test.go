@@ -1745,7 +1745,7 @@ func newDiagnoseHandler(t *testing.T, upstream http.HandlerFunc, vision *VisionC
 	if err != nil {
 		t.Fatalf("LoadContent: %v", err)
 	}
-	return HandleDiagnose(c, content, vision), srv
+	return HandleDiagnose(c, content, vision, nil), srv
 }
 
 // cannedDiagnoseHealthy mimics Plant.id when the plant is healthy.

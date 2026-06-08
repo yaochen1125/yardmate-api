@@ -797,7 +797,7 @@ const minDiagnoseFallbackBudget = 6 * time.Second
 // healthy"). content / vision may be nil — both are graceful no-ops (plantId
 // stays null, catalogId falls back to name-match only); even with both nil the
 // force-pick still ships the generic Leaf-spot tail, so issues is never empty.
-func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *VisionClient) http.HandlerFunc {
+func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *VisionClient, enricher DiseaseEnricher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		reqStart := time.Now() // WriteTimeout wall-clock start, for the AI fallback budget (mirrors HandleIdentify)
 		r.Body = http.MaxBytesReader(w, r.Body, diagnoseMaxBody)
@@ -915,7 +915,7 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 				if budget := diagnoseFallbackBudget(reqStart); budget >= minDiagnoseFallbackBudget {
 					fbCtx, fbCancel := context.WithTimeout(r.Context(), budget)
 					defer fbCancel()
-					result, viaVision := buildDiagnoseResultViaVision(fbCtx, imgBytes, mime, content, vision)
+					result, viaVision := buildDiagnoseResultViaVision(fbCtx, imgBytes, mime, content, vision, enricher, reqStart)
 					// Distinct prefix from the "diagnose fallback ai" disease-pick
 					// layer (buildFallbackIssue) so the two AI paths stay separable
 					// in logs. viaVision=false means the vision call itself failed
@@ -944,7 +944,7 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 			return
 		}
 
-		result := buildDiagnoseResult(ctx, api, content, vision)
+		result := buildDiagnoseResult(ctx, api, content, vision, enricher, reqStart)
 		log.Printf("diagnose ok: deviceID=%s appVer=%s isHealthy=%v issues=%d plantIdResolved=%v",
 			deviceID, appVer, result.IsHealthy, len(result.Issues), result.PlantID != nil)
 		writeJSON(w, http.StatusOK, result)
@@ -962,7 +962,7 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 // unhealthy but returns zero suggestions, an AI layer picks the single most
 // likely disease (candidate set narrows when plantId resolves), with the
 // static common_diseases_list[0] → L08 chain as the graceful safety net.
-func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, content *ContentIndex, vision *VisionClient) *DiagnoseResult {
+func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, content *ContentIndex, vision *VisionClient, enricher DiseaseEnricher, reqStart time.Time) *DiagnoseResult {
 	res := &DiagnoseResult{Issues: []HealthIssue{}}
 
 	if len(api.Result.Classification.Suggestions) > 0 {
@@ -998,6 +998,7 @@ func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, cont
 		return res
 	}
 
+	var enrichUsed bool
 	for _, s := range api.Result.Disease.Suggestions {
 		issue := HealthIssue{
 			Name:        s.Name,
@@ -1012,6 +1013,7 @@ func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, cont
 			},
 		}
 		issue.CatalogID = mapCatalogID(ctx, s.Name, content, vision)
+		maybeEnrichIssue(ctx, &issue, res.IdentifiedName, enricher, reqStart, &enrichUsed)
 		res.Issues = append(res.Issues, issue)
 		if len(res.Issues) >= 3 {
 			break
@@ -1059,7 +1061,7 @@ func diagnoseStaticNetResult(ctx context.Context, content *ContentIndex, vision 
 // 200 result rather than a 502 (diagnose 不全废). The bool reports whether the AI
 // diagnosis succeeded (true) or the safety net was used (false), for the
 // handler's observability log.
-func buildDiagnoseResultViaVision(ctx context.Context, image []byte, mime string, content *ContentIndex, vision *VisionClient) (*DiagnoseResult, bool) {
+func buildDiagnoseResultViaVision(ctx context.Context, image []byte, mime string, content *ContentIndex, vision *VisionClient, enricher DiseaseEnricher, reqStart time.Time) (*DiagnoseResult, bool) {
 	vr, err := vision.DiagnosePlant(ctx, image, mime)
 	if err != nil {
 		// Vision unavailable too — no plant/disease context to ground on, so
@@ -1067,7 +1069,7 @@ func buildDiagnoseResultViaVision(ctx context.Context, image []byte, mime string
 		log.Printf("diagnose vision fallback err: err=%v", err)
 		return diagnoseStaticNetResult(ctx, content, vision), false
 	}
-	return diagnoseResultFromVision(ctx, vr, content, vision), true
+	return diagnoseResultFromVision(ctx, vr, content, vision, enricher, reqStart), true
 }
 
 // diagnoseResultFromVision maps a successful GPT-4o vision diagnosis into the
@@ -1082,7 +1084,7 @@ func buildDiagnoseResultViaVision(ctx context.Context, image []byte, mime string
 // the Plant.id path ("Never healthy", SPEC §2.2 — forceDiseaseOnHealthyVerdict
 // sets IsHealthy=false with a forced issue); on unhealthy-but-no-usable-issue it
 // falls to the same static safety net.
-func diagnoseResultFromVision(ctx context.Context, vr *visionDiagnoseResult, content *ContentIndex, vision *VisionClient) *DiagnoseResult {
+func diagnoseResultFromVision(ctx context.Context, vr *visionDiagnoseResult, content *ContentIndex, vision *VisionClient, enricher DiseaseEnricher, reqStart time.Time) *DiagnoseResult {
 	res := &DiagnoseResult{Issues: []HealthIssue{}}
 
 	name := strings.TrimSpace(vr.ScientificName)
@@ -1113,6 +1115,7 @@ func diagnoseResultFromVision(ctx context.Context, vr *visionDiagnoseResult, con
 		return res
 	}
 
+	var enrichUsed bool
 	for _, iss := range vr.Issues {
 		nm := strings.TrimSpace(iss.Name)
 		if nm == "" {
@@ -1131,6 +1134,7 @@ func diagnoseResultFromVision(ctx context.Context, vr *visionDiagnoseResult, con
 			},
 		}
 		issue.CatalogID = mapCatalogID(ctx, nm, content, vision)
+		maybeEnrichIssue(ctx, &issue, res.IdentifiedName, enricher, reqStart, &enrichUsed)
 		res.Issues = append(res.Issues, issue)
 		if len(res.Issues) >= 3 {
 			break
@@ -1142,6 +1146,35 @@ func diagnoseResultFromVision(ctx context.Context, vr *visionDiagnoseResult, con
 		res.Issues = []HealthIssue{buildFallbackIssue(ctx, res.PlantID, res.IdentifiedName, res.HealthProbability, content, vision)}
 	}
 	return res
+}
+
+// maybeEnrichIssue fills an out-of-catalog issue (CatalogID==nil) with generated
+// structured detail via the disease enricher, mutating issue in place. It
+// enriches at most the FIRST out-of-catalog issue per result (budget) and only
+// when enough wall clock remains (budget from reqStart, like the vision
+// fallback). Any failure leaves the issue slim — disease enrichment never 502s
+// the diagnose (SPEC_disease §6). *used guards the one-shot per result.
+func maybeEnrichIssue(ctx context.Context, issue *HealthIssue, plantName string, enricher DiseaseEnricher, reqStart time.Time, used *bool) {
+	if enricher == nil || issue == nil || issue.CatalogID != nil || *used {
+		return
+	}
+	budget := diagnoseFallbackBudget(reqStart)
+	if budget < minDiagnoseFallbackBudget {
+		return // too little clock left; leave the issue slim
+	}
+	*used = true
+	ectx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	detail, catalogID, err := enricher.GetOrGenerate(ectx, issue.Name, plantName)
+	if err != nil || detail == nil {
+		log.Printf("diagnose enrich skip: name=%q err=%v", issue.Name, err)
+		return
+	}
+	issue.StructuredDetail = detail
+	if catalogID != "" {
+		id := catalogID
+		issue.CatalogID = &id
+	}
 }
 
 // mapCatalogID resolves an upstream disease name to a catalog id:

@@ -133,7 +133,12 @@ func main() {
 	// (proxy/enrichment/SPEC.md). Requires SUPABASE_DB_URL (Session Pooler
 	// DSN per SPEC §9 #15) + OPENAI_API_KEY. Gracefully disabled with a
 	// WARN log if either is missing or the DB ping fails.
-	enrichSvc := buildEnrichmentService(vault, content, inat)
+	enrichSvc, enrichDB := buildEnrichmentService(vault, content, inat)
+
+	// Disease enrichment — inline in /v1/diagnose for out-of-catalog diseases
+	// (proxy/enrichment/SPEC_disease.md). REUSES the plant-enrichment pgx pool;
+	// nil (out-of-catalog issues stay slim) if that pool / OPENAI_API_KEY absent.
+	diseaseSvc := buildDiseaseEnrichmentService(vault, content, enrichDB)
 
 	// Image-ingest service — fills out-of-catalog plant galleries on R2 via the
 	// on-demand iNat→Wikimedia cascade (proxy/imageingest/SPEC.md). Requires R2
@@ -142,7 +147,7 @@ func main() {
 	// POST /v1/plants/imageingest nor the internal route is registered.
 	ingestSvc := buildImageIngestService(vault)
 
-	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, ingestSvc)
+	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc)
 
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream). Headroom 5 s.
@@ -168,29 +173,46 @@ func main() {
 // The DB pool's lifetime is the process lifetime; no graceful Close() on
 // shutdown in V1 (systemd SIGTERM kills the process; Postgres reclaims
 // connections via idle timeout).
-func buildEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex, inat *proxy.INatClient) *enrichment.Service {
+func buildEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex, inat *proxy.INatClient) (*enrichment.Service, *enrichment.DB) {
 	dsn := vault.Get("SUPABASE_DB_URL")
 	openaiKey := vault.Get("OPENAI_API_KEY")
 	if dsn == "" || openaiKey == "" {
 		log.Printf("WARN: SUPABASE_DB_URL or OPENAI_API_KEY missing; /v1/plants/enrichment disabled")
-		return nil
+		return nil, nil
 	}
 	initCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	db, err := enrichment.NewDB(initCtx, dsn)
 	if err != nil {
 		log.Printf("WARN: enrichment DB init failed: %v; /v1/plants/enrichment disabled", err)
-		return nil
+		return nil, nil
 	}
 	if err := db.Ping(initCtx); err != nil {
 		log.Printf("WARN: enrichment DB ping failed: %v; /v1/plants/enrichment disabled", err)
 		db.Close()
-		return nil
+		return nil, nil
 	}
 	llm := enrichment.NewLLMClient(openaiKey)
 	cache := enrichment.NewCache(0, 0) // defaults: 10k entries, 30 min TTL
 	log.Printf("enrichment service ready: db pool + LRU cache + LLM %s", enrichment.SourceTag)
-	return enrichment.NewService(content, db, llm, cache, inat)
+	return enrichment.NewService(content, db, llm, cache, inat), db
+}
+
+// buildDiseaseEnrichmentService wires the inline disease enrichment used by
+// /v1/diagnose for out-of-catalog diseases (proxy/enrichment/SPEC_disease.md).
+// REUSES the plant-enrichment pgx pool (db) — no second pool. Returns a nil
+// interface (diagnose leaves out-of-catalog issues slim, never errors) when that
+// pool is absent (no SUPABASE_DB_URL / ping failed) or OPENAI_API_KEY is missing.
+func buildDiseaseEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex, db *enrichment.DB) proxy.DiseaseEnricher {
+	openaiKey := vault.Get("OPENAI_API_KEY")
+	if db == nil || openaiKey == "" {
+		log.Printf("WARN: disease enrichment disabled (sharedDB=%v, openaiKey=%v); out-of-catalog diagnoses stay slim", db != nil, openaiKey != "")
+		return nil
+	}
+	llm := enrichment.NewDiseaseLLMClient(openaiKey)
+	cache := enrichment.NewDiseaseCache(0, 0) // defaults: 10k entries, 30 min TTL
+	log.Printf("disease enrichment ready: shared db pool + LRU cache + LLM %s", enrichment.DiseaseSourceTag)
+	return enrichment.NewDiseaseService(content, db, llm, cache)
 }
 
 // buildImageIngestService wires the proxy/imageingest dependencies: R2 client
