@@ -41,10 +41,27 @@ if [[ "$mode" != "600" ]]; then
 fi
 
 # Required keys must all be present and non-empty.
-for key in ATTEST_ALLOW_DEV OPENAI_API_KEY PLANT_ID_API_KEY SUPABASE_DB_URL; do
+#
+# SUPABASE_URL / SUPABASE_JWT_SECRET / SUPABASE_SERVICE_ROLE_KEY +
+# APPLE_TEAM_ID / APPLE_KEY_ID / APPLE_BUNDLE_ID back POST /v1/account/delete
+# (Supabase account+data deletion + Sign in with Apple token revoke). The Apple
+# private key is checked separately below (PEM OR path).
+for key in ATTEST_ALLOW_DEV OPENAI_API_KEY PLANT_ID_API_KEY SUPABASE_DB_URL \
+           SUPABASE_URL SUPABASE_JWT_SECRET SUPABASE_SERVICE_ROLE_KEY \
+           APPLE_TEAM_ID APPLE_KEY_ID APPLE_BUNDLE_ID; do
     val=$(grep -E "^${key}=" "$SECRETS" | head -1 | cut -d= -f2-)
     [[ -n "$val" ]] || die "missing or empty key '$key' in $SECRETS"
 done
+
+# Apple private key: exactly one of APPLE_PRIVATE_KEY (the .p8 PEM inline) or
+# APPLE_PRIVATE_KEY_PATH (path to the .p8 on the server) must be set. Both empty
+# means the Sign in with Apple revoke step can't run (App Store deletion
+# requirement), so refuse to ship.
+apple_pem=$(grep -E '^APPLE_PRIVATE_KEY=' "$SECRETS" | head -1 | cut -d= -f2-)
+apple_pem_path=$(grep -E '^APPLE_PRIVATE_KEY_PATH=' "$SECRETS" | head -1 | cut -d= -f2-)
+if [[ -z "$apple_pem" && -z "$apple_pem_path" ]]; then
+    die "set APPLE_PRIVATE_KEY (.p8 PEM contents) OR APPLE_PRIVATE_KEY_PATH (path to .p8) in $SECRETS — Sign in with Apple revoke (POST /v1/account/delete) needs the signing key."
+fi
 
 allow_dev=$(grep -E '^ATTEST_ALLOW_DEV=' "$SECRETS" | head -1 | cut -d= -f2-)
 if [[ "$allow_dev" == "true" && "$STAGE" == "prod" ]]; then

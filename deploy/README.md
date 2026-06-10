@@ -24,6 +24,25 @@ ls -la /etc/systemd/system/yardmate-api.service 2>/dev/null || \
     echo "Will be installed by deploy.sh"
 ```
 
+### Sign in with Apple `.p8` key (one-time, for `POST /v1/account/delete`)
+
+`deploy.sh` ships the binary + `secrets.env` but **does NOT ship the Apple `.p8`
+private key**. If you use `APPLE_PRIVATE_KEY_PATH` (recommended over the inline
+`APPLE_PRIVATE_KEY` for a multi-line PEM), copy the `.p8` to the host once and
+lock it down:
+
+```bash
+# From your Mac (the .p8 is the file you downloaded from the Apple Developer
+# portal: Certificates, Identifiers & Profiles → Keys → your Sign in with Apple key).
+scp AuthKey_XXXXXXXXXX.p8 root@5.78.183.252:/tmp/apple.p8.new
+ssh root@5.78.183.252 'install -o yardmate-api -g yardmate-api -m 0600 \
+    /tmp/apple.p8.new /etc/yardmate-api/AuthKey_XXXXXXXXXX.p8 && shred -u /tmp/apple.p8.new'
+```
+
+Then point `APPLE_PRIVATE_KEY_PATH=/etc/yardmate-api/AuthKey_XXXXXXXXXX.p8` in
+your local `secrets.env.prod` and deploy. (Skip this if you instead inline the
+key as a single-line `APPLE_PRIVATE_KEY` with `\n` escapes.)
+
 ## 1. `secrets.env` — format + lifecycle
 
 Lives at `/etc/yardmate-api/secrets.env` on the server, `chmod 600`, owned by
@@ -47,6 +66,22 @@ PLANT_ID_API_KEY=...
 - `ATTEST_ALLOW_DEV` — `true` or `false`, no implicit default. See §3.
 - `OPENAI_API_KEY` — OpenAI GPT-4o-mini key for AI features.
 - `PLANT_ID_API_KEY` — Plant.id API key for plant identification.
+- `SUPABASE_DB_URL` — Supabase Session Pooler DSN (enrichment + account-delete row deletes).
+
+Account-deletion endpoint (`POST /v1/account/delete` — Supabase account+data
+deletion + Sign in with Apple revoke). All SERVER-ONLY (never vended/logged):
+
+- `SUPABASE_URL` — project base URL, `https://<ref>.supabase.co` (no trailing slash).
+- `SUPABASE_JWT_SECRET` — HS256 JWT secret (verifies the client access-token).
+- `SUPABASE_SERVICE_ROLE_KEY` — service_role key (admin auth-user + Storage delete).
+- `APPLE_TEAM_ID` — Apple Developer Team ID (10 chars).
+- `APPLE_KEY_ID` — the Sign in with Apple .p8 key's Key ID.
+- `APPLE_BUNDLE_ID` — app bundle id (== OAuth client_id).
+- `APPLE_PRIVATE_KEY` **or** `APPLE_PRIVATE_KEY_PATH` — the .p8 EC private key.
+  deploy.sh requires exactly one. Because `secrets.env` is line-based, an inline
+  `APPLE_PRIVATE_KEY` must be ONE line with literal `\n` escapes between PEM
+  lines (the server un-escapes them); for a real multi-line PEM use
+  `APPLE_PRIVATE_KEY_PATH` and deploy the .p8 to the host manually (see §0).
 
 Adding a new key:
 
