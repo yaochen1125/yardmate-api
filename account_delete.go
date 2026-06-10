@@ -43,6 +43,22 @@ import (
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
 
+const (
+	// bestEffortTimeout caps EACH best-effort phase (Apple revoke, Storage
+	// cleanup) on its own child of context.Background(). It must comfortably
+	// cover that phase's own HTTP client timeout (Apple/Supabase use 10 s) so
+	// the cap is a backstop, not the primary limit. Crucially it is per-phase
+	// and Background-derived, so a slow phase can't bleed its budget into the
+	// load-bearing deletes below.
+	bestEffortTimeout = 10 * time.Second
+
+	// hardDeleteTimeout bounds the load-bearing deletes (DeleteUserRows +
+	// deleteAuthUser) on their OWN fresh context, untouched by the best-effort
+	// phases. Generous enough for two sequential round-trips, capped so a hung
+	// DB/Admin API can't wedge the handler past the server's 35 s WriteTimeout.
+	hardDeleteTimeout = 15 * time.Second
+)
+
 // accountDeleteRequest is the JSON body. The Authorization header carries the
 // Supabase access token (not the body). apple_authorization_code is the
 // short-lived ASAuthorizationAppleIDCredential.authorizationCode from iOS; it
@@ -129,16 +145,27 @@ func handleAccountDelete(vault *secrets.Vault, enrichDB *enrichment.DB) http.Han
 			return
 		}
 
-		// Bound the whole deletion (Apple round-trips + storage list/delete +
-		// SQL + admin delete) so a stuck upstream can't pin the request past the
-		// server's 35 s write timeout.
-		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
-		defer cancel()
+		// Context strategy (Codex #55): the best-effort phases (Apple revoke,
+		// Storage cleanup) and the load-bearing deletes run on SEPARATE contexts
+		// so a slow/hung best-effort dependency can NEVER starve the deletes into
+		// a spurious 500. Each best-effort phase gets its own capped child of
+		// context.Background() (NOT the request ctx) — its slowness is contained
+		// and a client disconnect doesn't abort a delete mid-flight. The
+		// load-bearing deletes get their own fresh, adequate deadline that the
+		// best-effort phases have not consumed. Every context derives from
+		// Background (not r.Context()) because deletion must complete regardless
+		// of client disconnect; the per-phase caps keep a hung upstream/DB from
+		// wedging the handler past the server's 35 s WriteTimeout. Worst case is
+		// ~10 (Apple) + ~10 (Storage) + ~15 (deletes) = ~35 s of wall clock, and
+		// in practice each phase's own HTTP client timeout (10 s) trips first.
 
 		// ---- 2. revoke Apple token (BEST-EFFORT: log + continue) ----
 		if code := strings.TrimSpace(req.AppleAuthorizationCode); code != "" {
 			if cfg.apple.valid() {
-				if err := revokeAppleToken(ctx, cfg.apple, code); err != nil {
+				appleCtx, appleCancel := context.WithTimeout(context.Background(), bestEffortTimeout)
+				err := revokeAppleToken(appleCtx, cfg.apple, code)
+				appleCancel()
+				if err != nil {
 					// Never log `code`, the client_secret, or upstream token values.
 					log.Printf("account/delete: apple revoke failed (best-effort, continuing): %v", err)
 				}
@@ -148,19 +175,25 @@ func handleAccountDelete(vault *secrets.Vault, enrichDB *enrichment.DB) http.Han
 		}
 
 		// ---- 3. delete Storage objects diary-images/{userID}/ (BEST-EFFORT) ----
-		if err := deleteUserStorageObjects(ctx, cfg.supabaseURL, cfg.serviceRoleKey, userID); err != nil {
+		storageCtx, storageCancel := context.WithTimeout(context.Background(), bestEffortTimeout)
+		err = deleteUserStorageObjects(storageCtx, cfg.supabaseURL, cfg.serviceRoleKey, userID)
+		storageCancel()
+		if err != nil {
 			log.Printf("account/delete: storage cleanup failed (best-effort, continuing): %v", err)
 		}
 
-		// ---- 4. delete DB rows (load-bearing: 500 on failure) ----
-		if err := enrichDB.DeleteUserRows(ctx, userID); err != nil {
+		// ---- 4 & 5. load-bearing deletes on a FRESH deadline the best-effort
+		// phases above did not touch (rows then auth user; both 500 on failure). ----
+		deleteCtx, deleteCancel := context.WithTimeout(context.Background(), hardDeleteTimeout)
+		defer deleteCancel()
+
+		if err := enrichDB.DeleteUserRows(deleteCtx, userID); err != nil {
 			log.Printf("account/delete: delete user rows failed: %v", err)
 			writeError(w, http.StatusInternalServerError, "server_error")
 			return
 		}
 
-		// ---- 5. delete the auth user (load-bearing: 500 on failure) ----
-		if err := deleteAuthUser(ctx, cfg.supabaseURL, cfg.serviceRoleKey, userID); err != nil {
+		if err := deleteAuthUser(deleteCtx, cfg.supabaseURL, cfg.serviceRoleKey, userID); err != nil {
 			log.Printf("account/delete: delete auth user failed: %v", err)
 			writeError(w, http.StatusInternalServerError, "server_error")
 			return

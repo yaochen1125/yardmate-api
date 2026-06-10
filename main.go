@@ -129,14 +129,23 @@ func main() {
 	}
 	log.Printf("content loaded: catalog ready")
 
+	// Shared Supabase pgx pool — opened ONCE from SUPABASE_DB_URL, independent
+	// of OpenAI/enrichment gating. Consumed by the enrichment service (only when
+	// OPENAI_API_KEY is also present), the inline disease enrichment, AND the
+	// account-delete route. Opening it here (not inside buildEnrichmentService)
+	// means POST /v1/account/delete registers whenever SUPABASE_DB_URL is
+	// configured even if OPENAI_API_KEY is absent (Codex #55: account deletion is
+	// compliance-critical and must not 404 for an unrelated OpenAI config reason).
+	// nil (with a WARN) when SUPABASE_DB_URL is missing or the ping fails.
+	enrichDB := buildSupabaseDB(vault)
+
 	// Enrichment service — V1 plant-detail enrichment endpoint
-	// (proxy/enrichment/SPEC.md). Requires SUPABASE_DB_URL (Session Pooler
-	// DSN per SPEC §9 #15) + OPENAI_API_KEY. Gracefully disabled with a
-	// WARN log if either is missing or the DB ping fails.
-	enrichSvc, enrichDB := buildEnrichmentService(vault, content, inat)
+	// (proxy/enrichment/SPEC.md). Requires the shared Supabase pool (above) +
+	// OPENAI_API_KEY. Gracefully disabled with a WARN log if either is missing.
+	enrichSvc := buildEnrichmentService(vault, content, inat, enrichDB)
 
 	// Disease enrichment — inline in /v1/diagnose for out-of-catalog diseases
-	// (proxy/enrichment/SPEC_disease.md). REUSES the plant-enrichment pgx pool;
+	// (proxy/enrichment/SPEC_disease.md). REUSES the shared Supabase pgx pool;
 	// nil (out-of-catalog issues stay slim) if that pool / OPENAI_API_KEY absent.
 	diseaseSvc := buildDiseaseEnrichmentService(vault, content, enrichDB)
 
@@ -167,44 +176,63 @@ func main() {
 	}
 }
 
-// buildEnrichmentService wires the /v1/plants/enrichment dependencies:
-// pgx pool against Supabase, OpenAI LLM client, and the in-process LRU cache.
-// Returns nil (with a WARN log) if required secrets are missing or the
-// initial DB ping fails — in that case the route stays unregistered.
+// buildSupabaseDB opens the shared Supabase pgx pool from SUPABASE_DB_URL
+// (Session Pooler DSN per SPEC §9 #15), INDEPENDENT of OpenAI/enrichment
+// gating. This single pool is shared by every Supabase consumer — the
+// enrichment service, inline disease enrichment, and the account-delete route —
+// so it is opened exactly once. Returns nil (with a WARN log) when
+// SUPABASE_DB_URL is missing or the initial ping fails; consumers degrade
+// gracefully on nil (their routes stay unregistered).
 //
-// The DB pool's lifetime is the process lifetime; no graceful Close() on
-// shutdown in V1 (systemd SIGTERM kills the process; Postgres reclaims
-// connections via idle timeout).
-func buildEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex, inat *proxy.INatClient) (*enrichment.Service, *enrichment.DB) {
+// The pool's lifetime is the process lifetime; no graceful Close() on shutdown
+// in V1 (systemd SIGTERM kills the process; Postgres reclaims connections via
+// idle timeout).
+func buildSupabaseDB(vault *secrets.Vault) *enrichment.DB {
 	dsn := vault.Get("SUPABASE_DB_URL")
-	openaiKey := vault.Get("OPENAI_API_KEY")
-	if dsn == "" || openaiKey == "" {
-		log.Printf("WARN: SUPABASE_DB_URL or OPENAI_API_KEY missing; /v1/plants/enrichment disabled")
-		return nil, nil
+	if dsn == "" {
+		log.Printf("WARN: SUPABASE_DB_URL missing; enrichment + disease enrichment + /v1/account/delete disabled")
+		return nil
 	}
 	initCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	db, err := enrichment.NewDB(initCtx, dsn)
 	if err != nil {
-		log.Printf("WARN: enrichment DB init failed: %v; /v1/plants/enrichment disabled", err)
-		return nil, nil
+		log.Printf("WARN: Supabase DB init failed: %v; enrichment + disease enrichment + /v1/account/delete disabled", err)
+		return nil
 	}
 	if err := db.Ping(initCtx); err != nil {
-		log.Printf("WARN: enrichment DB ping failed: %v; /v1/plants/enrichment disabled", err)
+		log.Printf("WARN: Supabase DB ping failed: %v; enrichment + disease enrichment + /v1/account/delete disabled", err)
 		db.Close()
-		return nil, nil
+		return nil
+	}
+	log.Printf("Supabase DB pool ready (shared by enrichment / disease enrichment / account-delete)")
+	return db
+}
+
+// buildEnrichmentService wires the /v1/plants/enrichment dependencies: the
+// shared Supabase pool (db, opened by buildSupabaseDB), OpenAI LLM client, and
+// the in-process LRU cache. Returns nil (with a WARN log) if db is nil (no
+// SUPABASE_DB_URL / ping failed) or OPENAI_API_KEY is missing — in that case
+// the route stays unregistered. Does NOT own the pool's lifetime (main does),
+// so it never opens or closes it.
+func buildEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex, inat *proxy.INatClient, db *enrichment.DB) *enrichment.Service {
+	openaiKey := vault.Get("OPENAI_API_KEY")
+	if db == nil || openaiKey == "" {
+		log.Printf("WARN: shared Supabase pool or OPENAI_API_KEY missing (sharedDB=%v, openaiKey=%v); /v1/plants/enrichment disabled", db != nil, openaiKey != "")
+		return nil
 	}
 	llm := enrichment.NewLLMClient(openaiKey)
 	cache := enrichment.NewCache(0, 0) // defaults: 10k entries, 30 min TTL
-	log.Printf("enrichment service ready: db pool + LRU cache + LLM %s", enrichment.SourceTag)
-	return enrichment.NewService(content, db, llm, cache, inat), db
+	log.Printf("enrichment service ready: shared db pool + LRU cache + LLM %s", enrichment.SourceTag)
+	return enrichment.NewService(content, db, llm, cache, inat)
 }
 
 // buildDiseaseEnrichmentService wires the inline disease enrichment used by
 // /v1/diagnose for out-of-catalog diseases (proxy/enrichment/SPEC_disease.md).
-// REUSES the plant-enrichment pgx pool (db) — no second pool. Returns a nil
-// interface (diagnose leaves out-of-catalog issues slim, never errors) when that
-// pool is absent (no SUPABASE_DB_URL / ping failed) or OPENAI_API_KEY is missing.
+// REUSES the shared Supabase pgx pool (db, from buildSupabaseDB) — no second
+// pool. Returns a nil interface (diagnose leaves out-of-catalog issues slim,
+// never errors) when that pool is absent (no SUPABASE_DB_URL / ping failed) or
+// OPENAI_API_KEY is missing.
 func buildDiseaseEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex, db *enrichment.DB) proxy.DiseaseEnricher {
 	openaiKey := vault.Get("OPENAI_API_KEY")
 	if db == nil || openaiKey == "" {
