@@ -63,6 +63,12 @@ func TestVerifySupabaseToken_Errors(t *testing.T) {
 		"sub": "",
 		"exp": now.Add(time.Hour).Unix(),
 	})
+	// Valid signature + valid sub but NO exp claim must be rejected: an
+	// account-destroying endpoint refuses non-expiring tokens
+	// (WithExpirationRequired). Without that option jwt/v5 would accept this.
+	noExp := signHS256(t, jwt.MapClaims{
+		"sub": "11111111-2222-3333-4444-555555555555",
+	})
 
 	// A token signed with a DIFFERENT secret must fail signature verification.
 	wrongTok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
@@ -93,6 +99,7 @@ func TestVerifySupabaseToken_Errors(t *testing.T) {
 		{"expired", expired},
 		{"missing sub", noSub},
 		{"empty sub", emptySub},
+		{"missing exp", noExp},
 		{"wrong signature", wrongSig},
 		{"alg none", noneStr},
 	}

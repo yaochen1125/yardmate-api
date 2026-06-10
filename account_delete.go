@@ -190,7 +190,10 @@ func bearerToken(r *http.Request) string {
 //     algorithm-confusion attacks where an attacker forges a token with a
 //     different alg against our symmetric secret),
 //   - signature validity against SUPABASE_JWT_SECRET,
-//   - expiry (exp) — jwt/v5 validates exp by default,
+//   - expiry (exp) — REQUIRED + enforced (jwt/v5 only checks exp when present
+//     unless WithExpirationRequired is set; for an account-destroying endpoint
+//     we refuse any token that omits exp so a leaked token can never be
+//     non-expiring),
 //   - a present, non-empty `sub`.
 //
 // Any failure returns an error (the handler maps all of them to a single 401
@@ -215,6 +218,10 @@ func verifySupabaseToken(tokenStr, secret string) (string, error) {
 			return []byte(secret), nil
 		},
 		jwt.WithValidMethods([]string{"HS256"}),
+		// Reject tokens with no exp claim. jwt/v5 validates exp only when it is
+		// present by default; for account deletion we require it so a token can
+		// never be effectively non-expiring.
+		jwt.WithExpirationRequired(),
 	)
 	if err != nil {
 		return "", err // covers bad signature, expired, malformed, wrong alg
