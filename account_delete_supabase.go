@@ -60,11 +60,16 @@ type supabaseListItem struct {
 // diary-images bucket. BEST-EFFORT: returns an error that the caller logs +
 // swallows. It walks the known two-level layout ({userID}/{folder}/{file}) and
 // also deletes any stray files directly under "{userID}/".
+//
+// NOTE on the folder argument: Supabase's list `prefix` is a folder PATH with NO
+// trailing slash (it mirrors the official storage-js `from(bucket).list(path)`,
+// which posts `prefix: path` verbatim). The returned `name` is the LEAF only
+// (e.g. "covers" or "<uuid>.jpg"), so we rebuild the full object key by joining
+// the folder path + "/" + name ourselves.
 func deleteUserStorageObjects(ctx context.Context, supabaseURL, serviceRoleKey, userID string) error {
-	root := userID + "/"
-	children, err := storageList(ctx, supabaseURL, serviceRoleKey, diaryImagesBucket, root)
+	children, err := storageList(ctx, supabaseURL, serviceRoleKey, diaryImagesBucket, userID)
 	if err != nil {
-		return fmt.Errorf("list %q: %w", root, err)
+		return fmt.Errorf("list %q: %w", userID, err)
 	}
 
 	var keys []string
@@ -75,12 +80,14 @@ func deleteUserStorageObjects(ctx context.Context, supabaseURL, serviceRoleKey, 
 		if c.ID != nil {
 			// A real object sitting directly under "{userID}/" (defensive — the
 			// app nests everything one level deeper, but tolerate flat files).
-			keys = append(keys, root+c.Name)
+			keys = append(keys, userID+"/"+c.Name)
 			continue
 		}
 		// A folder ({entryID} or "covers"): list its files one level down.
-		sub := root + c.Name + "/"
-		files, err := storageList(ctx, supabaseURL, serviceRoleKey, diaryImagesBucket, sub)
+		// folder = "{userID}/{name}" (slash-free at the leaf, per the list API);
+		// keys are rebuilt as "{folder}/{file}".
+		folder := userID + "/" + c.Name
+		files, err := storageList(ctx, supabaseURL, serviceRoleKey, diaryImagesBucket, folder)
 		if err != nil {
 			// Don't abort the whole wipe on one folder; record + continue.
 			// (Best-effort overall, but maximise what we do remove.)
@@ -90,7 +97,7 @@ func deleteUserStorageObjects(ctx context.Context, supabaseURL, serviceRoleKey, 
 			if f.Name == "" || f.ID == nil {
 				continue // skip empty names + any deeper folders (layout is 2-level)
 			}
-			keys = append(keys, sub+f.Name)
+			keys = append(keys, folder+"/"+f.Name)
 		}
 	}
 
@@ -100,16 +107,20 @@ func deleteUserStorageObjects(ctx context.Context, supabaseURL, serviceRoleKey, 
 	return storageDelete(ctx, supabaseURL, serviceRoleKey, diaryImagesBucket, keys)
 }
 
-// storageList pages through POST /storage/v1/object/list/{bucket} for a prefix,
-// returning all items (files + synthetic folder prefixes) at that level.
-func storageList(ctx context.Context, supabaseURL, serviceRoleKey, bucket, prefix string) ([]supabaseListItem, error) {
+// storageList pages through POST /storage/v1/object/list/{bucket} for a folder
+// path (NO trailing slash), returning all items (files + synthetic folder
+// prefixes) at that level. The body mirrors the official storage-js client's
+// DEFAULT_SEARCH_OPTIONS (limit/offset/sortBy) so the server never rejects a
+// missing field — `sortBy` is included for byte-for-byte parity.
+func storageList(ctx context.Context, supabaseURL, serviceRoleKey, bucket, folder string) ([]supabaseListItem, error) {
 	endpoint := fmt.Sprintf("%s/storage/v1/object/list/%s", supabaseURL, bucket)
 	var all []supabaseListItem
 	for offset := 0; ; offset += storageListPageSize {
 		reqBody, err := json.Marshal(map[string]any{
-			"prefix": prefix,
+			"prefix": folder,
 			"limit":  storageListPageSize,
 			"offset": offset,
+			"sortBy": map[string]string{"column": "name", "order": "asc"},
 		})
 		if err != nil {
 			return nil, err
