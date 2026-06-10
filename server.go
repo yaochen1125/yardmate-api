@@ -28,6 +28,7 @@ type Server struct {
 	vision   *proxy.VisionClient   // optional; nil disables ai_enhance + LLM catalog disambiguation
 	content  *proxy.ContentIndex   // optional; nil disables plantId/catalogId lookups in /v1/diagnose
 	enrich   *enrichment.Service   // optional; nil disables /v1/plants/enrichment
+	enrichDB *enrichment.DB        // optional; shared Supabase pgx pool. nil disables POST /v1/account/delete
 	ingest   *imageingest.Service  // optional; nil disables POST /v1/plants/imageingest + /internal/imageingest/run
 	router   chi.Router
 }
@@ -51,6 +52,7 @@ func newServer(
 	enrich *enrichment.Service,
 	diseaseEnricher proxy.DiseaseEnricher,
 	ingest *imageingest.Service,
+	enrichDB *enrichment.DB,
 ) *Server {
 	// Rose cultivar rerank is ON by default; ROSE_RERANK_ENABLED=false kill-switches it.
 	roseEnabled := vault.GetBool("ROSE_RERANK_ENABLED", true)
@@ -97,7 +99,10 @@ func newServer(
 		// All per-device endpoints share the per-device rate-limit middleware.
 		// /v1/plants/enrichment joins the same group as identify/diagnose so
 		// an attacker rotating IPs is still bounded per-device (SPEC §4.1).
-		if plantNet != nil || plantID != nil || enrich != nil || ingest != nil {
+		// /v1/account/delete also joins this group: it carries the same per-IP
+		// limit, passes through the per-device middleware (no device id → no-op,
+		// ratelimit/SPEC), and only needs the shared Supabase pool (enrichDB).
+		if plantNet != nil || plantID != nil || enrich != nil || ingest != nil || enrichDB != nil {
 			r.Group(func(r chi.Router) {
 				r.Use(ratelimit.PerDeviceMiddleware(lim.PerDevice, "rate_limit_device"))
 				// /v1/identify cascades Pl@ntNet (primary) → Plant.id
@@ -123,6 +128,12 @@ func newServer(
 					// index.json; proxy/imageingest/SPEC.md §"catalog external").
 					r.Post("/plants/catalog-images", imageingest.HandleCatalog(ingest))
 				}
+				// /v1/account/delete — Supabase account + data deletion + Apple
+				// token revoke (account_delete.go). Registered only when the
+				// shared Supabase pool is present (row deletes need it).
+				if enrichDB != nil {
+					r.Post("/account/delete", handleAccountDelete(vault, enrichDB))
+				}
 			})
 		}
 	})
@@ -130,7 +141,7 @@ func newServer(
 	return &Server{
 		verifier: verifier, vault: vault, limiter: lim,
 		plantNet: plantNet, plantID: plantID, vision: vision, content: content,
-		enrich: enrich, ingest: ingest, router: r,
+		enrich: enrich, enrichDB: enrichDB, ingest: ingest, router: r,
 	}
 }
 

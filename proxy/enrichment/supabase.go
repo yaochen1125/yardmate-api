@@ -96,6 +96,34 @@ func (d *DB) Lookup(ctx context.Context, normalized string) (*proxy.PlantDetail,
 	return &pd, nil
 }
 
+// DeleteUserRows deletes all of a user's account data from the Supabase
+// Postgres tables that are keyed on the auth user id (auth.uid() == user_id):
+// diary_entries then garden_records. Used by POST /v1/account/delete (account
+// deletion). Both DELETEs run on the shared pgx pool; the user id is the
+// Supabase JWT `sub` (a UUID string) so it is passed as a bind param, never
+// interpolated.
+//
+// Returns the first DELETE error wrapped in ErrDBUnavailable — the handler
+// maps that to 500 (the auth user is NOT removed unless the rows are gone, so
+// the caller can safely retry without orphaning storage/auth). Tables are
+// deleted child-first (diary_entries before garden_records) defensively in case
+// a FK is ever added; today they are independent.
+func (d *DB) DeleteUserRows(ctx context.Context, userID string) error {
+	if d == nil || d.pool == nil {
+		return ErrDBUnavailable
+	}
+	if userID == "" {
+		return errors.New("enrichment/db: delete user rows: empty user id")
+	}
+	if _, err := d.pool.Exec(ctx, `DELETE FROM diary_entries WHERE user_id = $1`, userID); err != nil {
+		return fmt.Errorf("%w: delete diary_entries: %v", ErrDBUnavailable, err)
+	}
+	if _, err := d.pool.Exec(ctx, `DELETE FROM garden_records WHERE user_id = $1`, userID); err != nil {
+		return fmt.Errorf("%w: delete garden_records: %v", ErrDBUnavailable, err)
+	}
+	return nil
+}
+
 // InsertParams bundles the columns for a new plants_pending row.
 type InsertParams struct {
 	Normalized      string             // PK, == NormalizeScientificName(ScientificName)

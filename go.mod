@@ -9,6 +9,7 @@ require (
 	github.com/aws/smithy-go v1.25.1
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/go-chi/chi/v5 v5.2.5
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jackc/pgx/v5 v5.9.2
 	go.etcd.io/bbolt v1.4.3
