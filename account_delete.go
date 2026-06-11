@@ -5,7 +5,7 @@ package main
 // Deletes a Supabase user's account end-to-end and revokes their Sign in with
 // Apple token. Contract (locked with the iOS side):
 //
-//	Request : Authorization: Bearer <supabase access-token JWT> (HS256)
+//	Request : Authorization: Bearer <supabase access-token JWT> (ES256, verified via the project JWKS)
 //	          Content-Type: application/json
 //	          body { "apple_authorization_code": "<string, may be empty>" }
 //	Success : 200 { "success": true }
@@ -25,12 +25,14 @@ package main
 // and can safely retry (the operations are idempotent: re-deleting already-gone
 // rows / a missing auth user is a no-op-ish 404 we tolerate, see deleteAuthUser).
 //
-// SECURITY: the service_role key, Supabase JWT secret, and Apple signing key
-// come ONLY from the secrets vault (never hardcoded). No token, secret, code,
+// SECURITY: the service_role key and Apple signing key come ONLY from the
+// secrets vault (never hardcoded). Access tokens are verified against the
+// project's public JWKS (ES256), not a shared secret. No token, secret, code,
 // or signed JWT value is ever logged — only opaque event/status strings.
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"errors"
 	"log"
 	"net/http"
@@ -80,7 +82,6 @@ type accountDeleteResponse struct {
 // not a client one).
 type accountDeleteSecrets struct {
 	supabaseURL    string // SUPABASE_URL, e.g. https://<ref>.supabase.co (no trailing slash)
-	jwtSecret      string // SUPABASE_JWT_SECRET (HS256 verification key)
 	serviceRoleKey string // SUPABASE_SERVICE_ROLE_KEY (admin auth + storage)
 	apple          appleRevokeConfig
 }
@@ -92,7 +93,6 @@ type accountDeleteSecrets struct {
 func loadAccountDeleteSecrets(vault *secrets.Vault) (accountDeleteSecrets, bool) {
 	s := accountDeleteSecrets{
 		supabaseURL:    strings.TrimRight(vault.Get("SUPABASE_URL"), "/"),
-		jwtSecret:      vault.Get("SUPABASE_JWT_SECRET"),
 		serviceRoleKey: vault.Get("SUPABASE_SERVICE_ROLE_KEY"),
 		apple: appleRevokeConfig{
 			teamID:   vault.Get("APPLE_TEAM_ID"),
@@ -104,7 +104,7 @@ func loadAccountDeleteSecrets(vault *secrets.Vault) (accountDeleteSecrets, bool)
 			privateKeyPath: vault.Get("APPLE_PRIVATE_KEY_PATH"),
 		},
 	}
-	if s.supabaseURL == "" || s.jwtSecret == "" || s.serviceRoleKey == "" {
+	if s.supabaseURL == "" || s.serviceRoleKey == "" {
 		return s, false
 	}
 	return s, true
@@ -115,11 +115,14 @@ func loadAccountDeleteSecrets(vault *secrets.Vault) (accountDeleteSecrets, bool)
 // be nil if the DB was never configured — in that case account deletion can't
 // run its row deletes, so we 500 (server_error) rather than silently skipping.
 func handleAccountDelete(vault *secrets.Vault, enrichDB *enrichment.DB) http.HandlerFunc {
+	// Build the JWKS verifier once (long-lived cache) from SUPABASE_URL. Access
+	// tokens are ES256, verified against the project's public JWKS.
+	jwks := newJWKSCache(strings.TrimRight(vault.Get("SUPABASE_URL"), "/"))
 	return func(w http.ResponseWriter, r *http.Request) {
 		// ---- 0. config preconditions (operator faults => 500) ----
 		cfg, ok := loadAccountDeleteSecrets(vault)
 		if !ok {
-			log.Printf("account/delete: missing Supabase config (SUPABASE_URL / SUPABASE_JWT_SECRET / SUPABASE_SERVICE_ROLE_KEY)")
+			log.Printf("account/delete: missing Supabase config (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)")
 			writeError(w, http.StatusInternalServerError, "server_error")
 			return
 		}
@@ -136,7 +139,7 @@ func handleAccountDelete(vault *secrets.Vault, enrichDB *enrichment.DB) http.Han
 		}
 
 		// ---- 1. verify Supabase JWT -> userID (401 on any failure) ----
-		userID, err := verifySupabaseToken(bearerToken(r), cfg.jwtSecret)
+		userID, err := verifySupabaseToken(r.Context(), bearerToken(r), jwks.keyForKID)
 		if err != nil {
 			// Do not echo the token or the parse error detail to the client; a
 			// generic code is enough and avoids leaking which check failed.
@@ -216,13 +219,13 @@ func bearerToken(r *http.Request) string {
 	return ""
 }
 
-// verifySupabaseToken validates a Supabase access token (HS256) and returns the
-// `sub` claim (the auth user id, a UUID string). It enforces:
-//   - non-empty token + secret,
-//   - HS256 algorithm ONLY (rejects alg=none and any asymmetric alg — prevents
-//     algorithm-confusion attacks where an attacker forges a token with a
-//     different alg against our symmetric secret),
-//   - signature validity against SUPABASE_JWT_SECRET,
+// verifySupabaseToken validates a Supabase access token (ES256, asymmetric) and
+// returns the `sub` claim (the auth user id, a UUID string). It enforces:
+//   - non-empty token,
+//   - ES256 algorithm ONLY (rejects alg=none, HS*, and RS* before the signature
+//     is checked — closes algorithm-confusion vectors),
+//   - signature validity against the project's JWKS public key matching the
+//     token's `kid` (resolved via keyForKID),
 //   - expiry (exp) — REQUIRED + enforced (jwt/v5 only checks exp when present
 //     unless WithExpirationRequired is set; for an account-destroying endpoint
 //     we refuse any token that omits exp so a leaked token can never be
@@ -231,33 +234,31 @@ func bearerToken(r *http.Request) string {
 //
 // Any failure returns an error (the handler maps all of them to a single 401
 // without leaking which check failed).
-func verifySupabaseToken(tokenStr, secret string) (string, error) {
+func verifySupabaseToken(ctx context.Context, tokenStr string, keyForKID func(context.Context, string) (*ecdsa.PublicKey, error)) (string, error) {
 	if tokenStr == "" {
 		return "", errors.New("missing bearer token")
-	}
-	if secret == "" {
-		return "", errors.New("empty jwt secret")
 	}
 	claims := jwt.MapClaims{}
 	_, err := jwt.ParseWithClaims(
 		tokenStr,
 		claims,
 		func(t *jwt.Token) (any, error) {
-			// Pin the algorithm: only HMAC-SHA256 is accepted. This rejects
-			// alg=none and RS/ES tokens before the signature is checked.
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			// Pin the algorithm: only ES256 is accepted. This rejects alg=none,
+			// HS*, and RS* before the signature is checked.
+			if _, ok := t.Method.(*jwt.SigningMethodECDSA); !ok {
 				return nil, errors.New("unexpected signing method")
 			}
-			return []byte(secret), nil
+			kid, _ := t.Header["kid"].(string)
+			return keyForKID(ctx, kid)
 		},
-		jwt.WithValidMethods([]string{"HS256"}),
+		jwt.WithValidMethods([]string{"ES256"}),
 		// Reject tokens with no exp claim. jwt/v5 validates exp only when it is
 		// present by default; for account deletion we require it so a token can
 		// never be effectively non-expiring.
 		jwt.WithExpirationRequired(),
 	)
 	if err != nil {
-		return "", err // covers bad signature, expired, malformed, wrong alg
+		return "", err // covers bad signature, expired, malformed, wrong alg, unknown kid
 	}
 	sub, err := claims.GetSubject()
 	if err != nil {
