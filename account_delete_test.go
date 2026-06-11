@@ -7,11 +7,13 @@ package main
 // exercised here — they are best-effort / integration-level.
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -19,28 +21,51 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-const testJWTSecret = "super-secret-hs256-key-for-tests"
-
-// signHS256 builds a Supabase-style HS256 token with the given claims signed by
-// testJWTSecret.
-func signHS256(t *testing.T, claims jwt.MapClaims) string {
+// testES256Key generates a fresh P-256 signing key for a test.
+func testES256Key(t *testing.T) *ecdsa.PrivateKey {
 	t.Helper()
-	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	s, err := tok.SignedString([]byte(testJWTSecret))
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		t.Fatalf("sign HS256: %v", err)
+		t.Fatalf("gen EC key: %v", err)
+	}
+	return k
+}
+
+// signES256 builds a Supabase-style ES256 token with the given claims + kid,
+// signed by key.
+func signES256(t *testing.T, key *ecdsa.PrivateKey, kid string, claims jwt.MapClaims) string {
+	t.Helper()
+	tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	if kid != "" {
+		tok.Header["kid"] = kid
+	}
+	s, err := tok.SignedString(key)
+	if err != nil {
+		t.Fatalf("sign ES256: %v", err)
 	}
 	return s
 }
 
+// resolverFor returns a keyForKID func serving key's public key for kid only.
+func resolverFor(kid string, key *ecdsa.PrivateKey) func(context.Context, string) (*ecdsa.PublicKey, error) {
+	return func(_ context.Context, k string) (*ecdsa.PublicKey, error) {
+		if k == kid {
+			return &key.PublicKey, nil
+		}
+		return nil, errors.New("unknown kid")
+	}
+}
+
 func TestVerifySupabaseToken_Valid(t *testing.T) {
+	key := testES256Key(t)
+	const kid = "k1"
 	const sub = "11111111-2222-3333-4444-555555555555"
-	tok := signHS256(t, jwt.MapClaims{
+	tok := signES256(t, key, kid, jwt.MapClaims{
 		"sub": sub,
 		"exp": time.Now().Add(time.Hour).Unix(),
 		"iat": time.Now().Unix(),
 	})
-	got, err := verifySupabaseToken(tok, testJWTSecret)
+	got, err := verifySupabaseToken(context.Background(), tok, resolverFor(kid, key))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -51,33 +76,36 @@ func TestVerifySupabaseToken_Valid(t *testing.T) {
 
 func TestVerifySupabaseToken_Errors(t *testing.T) {
 	now := time.Now()
+	key := testES256Key(t)
+	const kid = "k1"
+	resolver := resolverFor(kid, key)
 
-	expired := signHS256(t, jwt.MapClaims{
+	expired := signES256(t, key, kid, jwt.MapClaims{
 		"sub": "u",
 		"exp": now.Add(-time.Minute).Unix(),
 	})
-	noSub := signHS256(t, jwt.MapClaims{
+	noSub := signES256(t, key, kid, jwt.MapClaims{
 		"exp": now.Add(time.Hour).Unix(),
 	})
-	emptySub := signHS256(t, jwt.MapClaims{
+	emptySub := signES256(t, key, kid, jwt.MapClaims{
 		"sub": "",
 		"exp": now.Add(time.Hour).Unix(),
 	})
 	// Valid signature + valid sub but NO exp claim must be rejected: an
 	// account-destroying endpoint refuses non-expiring tokens
-	// (WithExpirationRequired). Without that option jwt/v5 would accept this.
-	noExp := signHS256(t, jwt.MapClaims{
+	// (WithExpirationRequired).
+	noExp := signES256(t, key, kid, jwt.MapClaims{
 		"sub": "11111111-2222-3333-4444-555555555555",
 	})
-
-	// A token signed with a DIFFERENT secret must fail signature verification.
-	wrongTok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+	// Signed with a DIFFERENT key but the SAME kid → the resolver returns the
+	// first key, so signature verification must fail.
+	wrongSig := signES256(t, testES256Key(t), kid, jwt.MapClaims{
 		"sub": "u", "exp": now.Add(time.Hour).Unix(),
 	})
-	wrongSig, err := wrongTok.SignedString([]byte("a-totally-different-secret"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Valid ES256 token but an UNKNOWN kid → the resolver returns an error.
+	unknownKID := signES256(t, key, "other-kid", jwt.MapClaims{
+		"sub": "u", "exp": now.Add(time.Hour).Unix(),
+	})
 
 	// alg=none token (the classic JWT downgrade). jwt/v5 requires
 	// jwt.UnsafeAllowNoneSignatureType as the key for "none"; we craft it so the
@@ -101,43 +129,34 @@ func TestVerifySupabaseToken_Errors(t *testing.T) {
 		{"empty sub", emptySub},
 		{"missing exp", noExp},
 		{"wrong signature", wrongSig},
+		{"unknown kid", unknownKID},
 		{"alg none", noneStr},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := verifySupabaseToken(tc.token, testJWTSecret); err == nil {
+			if _, err := verifySupabaseToken(context.Background(), tc.token, resolver); err == nil {
 				t.Fatalf("expected error for %s, got nil", tc.name)
 			}
 		})
 	}
 }
 
-func TestVerifySupabaseToken_EmptySecret(t *testing.T) {
-	tok := signHS256(t, jwt.MapClaims{"sub": "u", "exp": time.Now().Add(time.Hour).Unix()})
-	if _, err := verifySupabaseToken(tok, ""); err == nil {
-		t.Fatal("expected error with empty secret, got nil")
-	}
-}
-
-// TestVerifySupabaseToken_RejectsESWithHMACSecret guards the algorithm-confusion
-// vector: a token presented as ES256 must not be accepted by the HS256 verifier
-// even though our function holds an HMAC secret. (We can't sign a real ES256
-// token with the HMAC secret, so we assert that an ES256-headed token built from
-// a real EC key is rejected because the verifier only accepts HMAC.)
-func TestVerifySupabaseToken_RejectsESAlg(t *testing.T) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	esTok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+// TestVerifySupabaseToken_RejectsHS256 guards the algorithm-confusion vector: an
+// HS256 token must be rejected by the ES256-only verifier (we never fall back to
+// a symmetric secret).
+func TestVerifySupabaseToken_RejectsHS256(t *testing.T) {
+	key := testES256Key(t)
+	const kid = "k1"
+	hsTok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub": "u", "exp": time.Now().Add(time.Hour).Unix(),
 	})
-	esStr, err := esTok.SignedString(key)
+	hsTok.Header["kid"] = kid
+	hsStr, err := hsTok.SignedString([]byte("some-hmac-secret"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := verifySupabaseToken(esStr, testJWTSecret); err == nil {
-		t.Fatal("expected ES256 token to be rejected by HS256-only verifier")
+	if _, err := verifySupabaseToken(context.Background(), hsStr, resolverFor(kid, key)); err == nil {
+		t.Fatal("expected HS256 token to be rejected by ES256-only verifier")
 	}
 }
 

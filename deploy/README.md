@@ -72,7 +72,7 @@ Account-deletion endpoint (`POST /v1/account/delete` — Supabase account+data
 deletion + Sign in with Apple revoke). All SERVER-ONLY (never vended/logged):
 
 - `SUPABASE_URL` — project base URL, `https://<ref>.supabase.co` (no trailing slash).
-- `SUPABASE_JWT_SECRET` — HS256 JWT secret (verifies the client access-token).
+- _(No JWT secret needed — the client access-token is verified against the project's public JWKS, ES256, at `{SUPABASE_URL}/auth/v1/.well-known/jwks.json`.)_
 - `SUPABASE_SERVICE_ROLE_KEY` — service_role key (admin auth-user + Storage delete).
 - `APPLE_TEAM_ID` — Apple Developer Team ID (10 chars).
 - `APPLE_KEY_ID` — the Sign in with Apple .p8 key's Key ID.

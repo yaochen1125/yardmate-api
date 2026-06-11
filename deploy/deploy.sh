@@ -42,12 +42,13 @@ fi
 
 # Required keys must all be present and non-empty.
 #
-# SUPABASE_URL / SUPABASE_JWT_SECRET / SUPABASE_SERVICE_ROLE_KEY +
-# APPLE_TEAM_ID / APPLE_KEY_ID / APPLE_BUNDLE_ID back POST /v1/account/delete
-# (Supabase account+data deletion + Sign in with Apple token revoke). The Apple
+# SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY + APPLE_TEAM_ID / APPLE_KEY_ID /
+# APPLE_BUNDLE_ID back POST /v1/account/delete (Supabase account+data deletion +
+# Sign in with Apple token revoke). The access-token is verified against the
+# project's public JWKS (ES256), so no SUPABASE_JWT_SECRET is needed. The Apple
 # private key is checked separately below (PEM OR path).
 for key in ATTEST_ALLOW_DEV OPENAI_API_KEY PLANT_ID_API_KEY SUPABASE_DB_URL \
-           SUPABASE_URL SUPABASE_JWT_SECRET SUPABASE_SERVICE_ROLE_KEY \
+           SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY \
            APPLE_TEAM_ID APPLE_KEY_ID APPLE_BUNDLE_ID; do
     val=$(grep -E "^${key}=" "$SECRETS" | head -1 | cut -d= -f2-)
     [[ -n "$val" ]] || die "missing or empty key '$key' in $SECRETS"
