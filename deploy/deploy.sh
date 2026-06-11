@@ -58,8 +58,8 @@ done
 # APPLE_PRIVATE_KEY_PATH (path to the .p8 on the server) must be set. Both empty
 # means the Sign in with Apple revoke step can't run (App Store deletion
 # requirement), so refuse to ship.
-apple_pem=$(grep -E '^APPLE_PRIVATE_KEY=' "$SECRETS" | head -1 | cut -d= -f2-)
-apple_pem_path=$(grep -E '^APPLE_PRIVATE_KEY_PATH=' "$SECRETS" | head -1 | cut -d= -f2-)
+apple_pem=$(grep -E '^APPLE_PRIVATE_KEY=' "$SECRETS" | head -1 | cut -d= -f2- || true)
+apple_pem_path=$(grep -E '^APPLE_PRIVATE_KEY_PATH=' "$SECRETS" | head -1 | cut -d= -f2- || true)
 if [[ -z "$apple_pem" && -z "$apple_pem_path" ]]; then
     die "set APPLE_PRIVATE_KEY (.p8 PEM contents) OR APPLE_PRIVATE_KEY_PATH (path to .p8) in $SECRETS — Sign in with Apple revoke (POST /v1/account/delete) needs the signing key."
 fi
