@@ -26,6 +26,7 @@ type requestPayload struct {
 	ScientificName string `json:"scientificName"`
 	CommonName     string `json:"commonName"`
 	PlantID        string `json:"plantId"`
+	Lang           string `json:"lang"` // optional; server normalizes via NormalizeLang (empty → en)
 }
 
 // HandleEnrichment returns the http.HandlerFunc for POST /v1/plants/enrichment.
@@ -69,6 +70,7 @@ func HandleEnrichment(svc *Service) http.HandlerFunc {
 			ScientificName: req.ScientificName,
 			CommonName:     req.CommonName,
 			PlantIDHint:    req.PlantID,
+			Lang:           req.Lang,
 		})
 		if err != nil {
 			handleServiceError(w, r, err, deviceID, appVer, req.ScientificName, attKeyID, attAssertPresent)
@@ -78,9 +80,9 @@ func HandleEnrichment(svc *Service) http.HandlerFunc {
 		// 6. Success — single-line structured log (parent SPEC §5.2 forensics).
 		// Log scientific name + source path + latency for forensics; never the
 		// response body (SPEC §9 #10).
-		log.Printf("enrichment ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v sciName=%q source=%s latencyMs=%d hadCommonName=%v cacheLen=%d",
+		log.Printf("enrichment ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v sciName=%q reqLang=%q lang=%s source=%s latencyMs=%d hadCommonName=%v cacheLen=%d",
 			deviceID, appVer, attKeyID, attAssertPresent,
-			req.ScientificName, source, time.Since(start).Milliseconds(),
+			req.ScientificName, req.Lang, NormalizeLang(req.Lang), source, time.Since(start).Milliseconds(),
 			req.CommonName != "", svc.CacheLen(),
 		)
 		writeJSON(w, http.StatusOK, result)

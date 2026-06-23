@@ -30,6 +30,7 @@ const (
 	SourceCache                          = "cache"
 	SourceCatalog                        = "catalog"
 	SourceSupabaseHit                    = "supabase_hit"
+	SourceSupabaseFallbackEn             = "supabase_fallback_en" // requested lang missing, served English (§7)
 	SourceSupabaseMissGenerate           = "supabase_miss_generate"
 	SourceSupabaseMissGenerateRaceWinner = "supabase_miss_generate_race_winner"
 )
@@ -39,19 +40,21 @@ type Request struct {
 	ScientificName string // required; trimmed length 1..200; contains at least one letter
 	CommonName     string // optional; passed to the LLM prompt as context
 	PlantIDHint    string // optional, ignored in V1 (server re-derives via ContentIndex)
+	Lang           string // optional; normalized via NormalizeLang (empty/unsupported → "en")
 }
 
 // ServiceDB is the small interface Service needs from the DB layer.
 // *DB satisfies it; tests substitute a stub.
 type ServiceDB interface {
-	Lookup(ctx context.Context, normalized string) (*proxy.PlantDetail, error)
+	Lookup(ctx context.Context, normalized, lang string) (*proxy.PlantDetail, error)
 	Insert(ctx context.Context, p InsertParams) (bool, error)
 }
 
 // ServiceLLM is the small interface Service needs from the LLM layer.
 // *LLMClient satisfies it; tests substitute a stub.
 type ServiceLLM interface {
-	Generate(ctx context.Context, scientificName, commonName string) (*proxy.PlantDetail, string, error)
+	Generate(ctx context.Context, scientificName, commonName, lang string) (*proxy.PlantDetail, string, error)
+	Translate(ctx context.Context, source *proxy.PlantDetail, toLang string) (*proxy.PlantDetail, string, error)
 }
 
 // Service orchestrates the three-tier lookup (catalog -> Supabase -> LLM)
@@ -65,7 +68,16 @@ type Service struct {
 	llm        ServiceLLM
 	cache      *Cache
 	inat       *proxy.INatClient   // optional iNat client; nil → skip name override (PR #24 follow-up, library-internal stays curated)
+	backfill   *Backfiller         // optional; nil → no async translation backfill (tests / DB-less mode)
 	diseaseIDs map[string]struct{} // for common_diseases_list whitelist
+}
+
+// SetBackfiller attaches the async translation backfiller (SPEC §7). Wired by
+// main after the Service + DB + LLM exist; nil-safe so tests can skip it.
+func (s *Service) SetBackfiller(b *Backfiller) {
+	if s != nil {
+		s.backfill = b
+	}
 }
 
 // NewService builds a Service with the given dependencies. content may not
@@ -95,14 +107,15 @@ func NewService(content *proxy.ContentIndex, db ServiceDB, llm ServiceLLM, cache
 	}
 }
 
-// GetOrGenerate runs the three-tier lookup per SPEC §2.1.
+// GetOrGenerate runs the multi-tier, language-aware lookup per SPEC §2.1.
 //
-// Order: cache -> embedded catalog -> Supabase plants_pending -> OpenAI LLM
-// (with INSERT ON CONFLICT DO NOTHING + re-Lookup on race). The cache is
-// written on every successful path so subsequent calls skip lower tiers.
+// Order: cache -> embedded catalog -> Supabase (exact lang) -> Supabase English
+// fallback -> OpenAI LLM master generation (INSERT ON CONFLICT DO NOTHING +
+// re-Lookup on race) -> async translation backfill. The cache is keyed by
+// (precise scientific name, lang) and written on every successful row path.
 //
-// Returns the result plus a Source* string identifying which lookup tier
-// produced it (SPEC §9 #10 forensic logging). On error the source is "".
+// Returns the result plus a Source* string identifying which tier produced it
+// (SPEC §9 #10 forensic logging). On error the source is "".
 func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantDetail, string, error) {
 	name := strings.TrimSpace(req.ScientificName)
 	if name == "" || !hasLetter(name) {
@@ -115,24 +128,23 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	if normalized == "" {
 		return nil, "", ErrInvalidScientificName
 	}
-	// Cache key is the PRECISE (infraspecific-preserving) normalization, NOT the
-	// species-level Supabase PK `normalized`. The catalog (Step 1) resolves
-	// distinct plantIds for sibling varieties via scientificNameToIDPrecise — the
-	// five Brassica oleracea cultivars all fold to "brassica oleracea" under
-	// NormalizeScientificName but to distinct keys here — so a species-level cache
-	// key would alias one variety's *PlantDetail onto its siblings within the TTL.
-	// The cache must be at least as fine-grained as the catalog's precise index.
-	// Supabase Lookup/Insert below keep using `normalized` (SPEC §8 + §9 #1 —
-	// intentional cross-variety row sharing at the species-level PK).
-	cacheKey := proxy.NormalizeScientificNamePrecise(name)
+	lang := NormalizeLang(req.Lang)
 
-	// iNat preferred_common_name lookup (best-effort; never blocks). Used
-	// BOTH as the LLM hint (so a newly-generated row writes the iNat name)
-	// AND as a post-return override of CommonName / CommonNameSource on
-	// cache / DB / LLM results — but NOT on catalog hits, which keep their
-	// curated common_name (PR #24 priority: catalog > iNat > upstream).
+	// Cache key is the PRECISE (infraspecific-preserving) normalization PLUS the
+	// language (SPEC §9 #16 + #19). The catalog (Step 1) resolves distinct
+	// plantIds for sibling varieties via scientificNameToIDPrecise, and each
+	// language is a distinct entry — a species-level OR lang-less key would alias
+	// one variety/language's *PlantDetail onto another within the TTL. Supabase
+	// Lookup/Insert keep the species-level `normalized` as the PK first component,
+	// with `lang` as the second.
+	preciseName := proxy.NormalizeScientificNamePrecise(name)
+	cacheKey := preciseName + "|" + lang
+
+	// iNat preferred_common_name override applies to ENGLISH rows only (SPEC §7
+	// common_name B): the iNat name is English, so injecting it into a localized
+	// row would force English back in. Skip the lookup entirely for non-English.
 	iNatName := ""
-	if s.inat != nil {
+	if lang == "en" && s.inat != nil {
 		if n, ok := s.inat.PreferredCommonName(ctx, name); ok {
 			iNatName = n
 		}
@@ -152,30 +164,29 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		return overrideINat(cached, SourceCache), SourceCache, nil
 	}
 
-	// Step 1: embedded 1522 catalog. ContentIndex.LookupPlantID re-normalizes
-	// internally; we pass the trimmed user form.
+	// Step 1: embedded 1522 catalog. Lang-agnostic today — the curated catalog is
+	// English; its multi-language is the separate offline plants_detail.json
+	// pipeline (SPEC §7). A non-English request for a catalog plant returns the
+	// English curated text, which is exactly the display-fallback behavior.
 	if s.content != nil {
 		if plantID, ok := s.content.LookupPlantID(name); ok {
 			if full, ok := s.content.LookupFullDetail(plantID); ok {
-				// NOTE: do NOT cache catalog hits. The LRU has no source tag,
-				// so a SourceCatalog write would come back as SourceCache on
-				// the next call and become eligible for the iNat override —
-				// silently violating the catalog > iNat > upstream priority
-				// (PR #26 self-review P0). Catalog is already an O(1)
-				// in-memory map lookup, the LRU saved nothing here.
+				// Do NOT cache catalog hits (PR #26 self-review P0): the LRU has
+				// no source tag, so it would come back as SourceCache and become
+				// eligible for the iNat override. Catalog is already an O(1)
+				// in-memory map lookup.
 				return full, SourceCatalog, nil
 			}
-			// Index inconsistency (LookupPlantID hit but LookupFullDetail miss).
-			// Fall through; treat as miss rather than crash.
+			// Index inconsistency — fall through; treat as miss rather than crash.
 		}
 	}
 
-	// Step 2: Supabase plants_pending.
+	// Step 2: Supabase plants_pending, exact (normalized, lang).
 	if s.db == nil {
 		// No DB configured AND not in the catalog -> enrichment unavailable.
 		return nil, "", ErrEnrichmentUnavailable
 	}
-	row, err := s.db.Lookup(ctx, normalized)
+	row, err := s.db.Lookup(ctx, normalized, lang)
 	if err != nil {
 		return nil, "", err
 	}
@@ -184,17 +195,30 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		return overrideINat(row, SourceSupabaseHit), SourceSupabaseHit, nil
 	}
 
-	// Step 3: LLM generation.
+	// Step 3: display fallback — exact lang missing, serve the English row if it
+	// exists (SPEC §7). Cache it under the ENGLISH key only, NEVER the requested
+	// lang key (SPEC §9 #20) so the real lang row is not masked once backfilled.
+	if lang != "en" {
+		enRow, err := s.db.Lookup(ctx, normalized, "en")
+		if err != nil {
+			return nil, "", err
+		}
+		if enRow != nil {
+			s.cache.Set(preciseName+"|en", enRow)
+			return enRow, SourceSupabaseFallbackEn, nil
+		}
+		// English also missing → fall through and generate the master in `lang`.
+	}
+
+	// Step 4: LLM master generation in `lang`.
 	if s.llm == nil {
 		return nil, "", ErrEnrichmentUnavailable
 	}
-	// LLM hint: iNat name overrides the upstream hint when present so the
-	// LLM ideally returns the iNat name directly (and the persisted row has it).
 	hint := req.CommonName
-	if iNatName != "" {
+	if iNatName != "" { // only non-empty for English (gated above)
 		hint = iNatName
 	}
-	generated, requestID, err := s.llm.Generate(ctx, name, hint)
+	generated, requestID, err := s.llm.Generate(ctx, name, hint, lang)
 	if err != nil {
 		return nil, "", err
 	}
@@ -202,19 +226,21 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	// Whitelist common_diseases_list against the catalog (SPEC §1.1 + §7).
 	generated.CommonDiseasesList = s.filterCatalogDiseaseIDs(generated.CommonDiseasesList)
 
-	// Patch generated with iNat name too — the LLM may ignore the hint, and
-	// we want the persisted row + cache + response to all surface iNat.
+	// Patch the English master with the iNat name (the LLM may ignore the hint).
+	// Non-English masters keep their localized LLM common_name (iNatName == "").
 	if iNatName != "" {
 		generated.CommonName = iNatName
 		generated.CommonNameSource = "inaturalist"
 	}
 
-	// Step 4: INSERT ON CONFLICT DO NOTHING. On conflict, re-Lookup to pick
-	// up the row another concurrent caller just wrote (SPEC §2.1 step 5).
+	// Step 5: INSERT ON CONFLICT (normalized, lang) DO NOTHING. On conflict,
+	// re-Lookup to pick up the master another concurrent caller just wrote — and
+	// let them own the backfill (SPEC §2.1 step 5).
 	inserted, err := s.db.Insert(ctx, InsertParams{
 		Normalized:      normalized,
+		Lang:            lang,
 		ScientificName:  name,
-		CommonName:      hint, // iNat-resolved hint when iNat hit, else upstream
+		CommonName:      hint, // iNat-resolved hint when iNat hit (en), else upstream
 		Data:            generated,
 		Source:          SourceTag,
 		SourceVersion:   PromptVersion,
@@ -226,18 +252,31 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 
 	if !inserted {
 		// Concurrent race resolved by ON CONFLICT. The conflicting writer's
-		// row is now available — return that to keep all callers consistent.
-		if row, lookupErr := s.db.Lookup(ctx, normalized); lookupErr == nil && row != nil {
+		// master is now available — return that to keep all callers consistent.
+		if row, lookupErr := s.db.Lookup(ctx, normalized, lang); lookupErr == nil && row != nil {
 			s.cache.Set(cacheKey, row)
 			return overrideINat(row, SourceSupabaseMissGenerateRaceWinner), SourceSupabaseMissGenerateRaceWinner, nil
 		}
 		// Race re-Lookup also failed — return our generated copy. Same shape,
-		// just a different LLM sample.
+		// just a different LLM sample. The conflicting writer owns the backfill.
 		s.cache.Set(cacheKey, generated)
 		return generated, SourceSupabaseMissGenerate, nil
 	}
 
 	s.cache.Set(cacheKey, generated)
+
+	// Step 6: async backfill the other languages from this master (English
+	// first), translate-only-prose, ON CONFLICT DO NOTHING (SPEC §7 + §9 #18).
+	if s.backfill != nil {
+		s.backfill.Enqueue(BackfillJob{
+			Normalized:     normalized,
+			ScientificName: name,
+			CommonHint:     hint,
+			SourceLang:     lang,
+			Master:         generated,
+		})
+	}
+
 	return generated, SourceSupabaseMissGenerate, nil
 }
 

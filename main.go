@@ -223,8 +223,11 @@ func buildEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex, i
 	}
 	llm := enrichment.NewLLMClient(openaiKey)
 	cache := enrichment.NewCache(0, 0) // defaults: 10k entries, 30 min TTL
-	log.Printf("enrichment service ready: shared db pool + LRU cache + LLM %s", enrichment.SourceTag)
-	return enrichment.NewService(content, db, llm, cache, inat)
+	svc := enrichment.NewService(content, db, llm, cache, inat)
+	svc.SetBackfiller(enrichment.NewBackfiller(db, llm)) // async multi-language translation backfill (SPEC §7)
+	log.Printf("enrichment service ready: shared db pool + LRU cache + LLM %s + %d-language backfill",
+		enrichment.SourceTag, len(enrichment.SupportedLangs))
+	return svc
 }
 
 // buildDiseaseEnrichmentService wires the inline disease enrichment used by
