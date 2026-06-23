@@ -7,14 +7,14 @@ import (
 )
 
 func TestBuildResponseSchema_NotNil(t *testing.T) {
-	s := buildResponseSchema()
+	s := buildResponseSchema("en")
 	if s == nil {
 		t.Fatal("nil schema")
 	}
 }
 
 func TestBuildResponseSchema_RootObjectAndStrictModeShape(t *testing.T) {
-	s := buildResponseSchema()
+	s := buildResponseSchema("en")
 	if got := s["type"]; got != "object" {
 		t.Errorf("root type should be object, got %v", got)
 	}
@@ -41,7 +41,7 @@ func TestBuildResponseSchema_RootObjectAndStrictModeShape(t *testing.T) {
 }
 
 func TestBuildResponseSchema_KeyFieldsPresent(t *testing.T) {
-	s := buildResponseSchema()
+	s := buildResponseSchema("en")
 	bs, err := json.Marshal(s)
 	if err != nil {
 		t.Fatalf("schema not JSON-serializable: %v", err)
@@ -72,7 +72,7 @@ func TestBuildResponseSchema_KeyFieldsPresent(t *testing.T) {
 // safety/liability, the rest for latency). A regression that re-adds any of
 // them — to properties OR required — must fail here. See SPEC §7.
 func TestBuildResponseSchema_SlimmedFieldsAbsent(t *testing.T) {
-	s := buildResponseSchema()
+	s := buildResponseSchema("en")
 	props, ok := s["properties"].(map[string]any)
 	if !ok {
 		t.Fatalf("properties should be map, got %T", s["properties"])
@@ -108,7 +108,7 @@ func TestBuildResponseSchema_SlimmedFieldsAbsent(t *testing.T) {
 // TestBuildResponseSchema_DescriptionShortened pins the 15-40 word concise
 // description (was 80-120w; shortened for latency — SPEC §7).
 func TestBuildResponseSchema_DescriptionShortened(t *testing.T) {
-	s := buildResponseSchema()
+	s := buildResponseSchema("en")
 	props := s["properties"].(map[string]any)
 	desc, ok := props["description"].(map[string]any)
 	if !ok {
@@ -132,7 +132,7 @@ func TestBuildResponseSchema_DescriptionShortened(t *testing.T) {
 // A regression that reverts either (back to type:null watering_note, or the
 // old desert-sun wording) must fail here.
 func TestBuildResponseSchema_CareScaleAligned(t *testing.T) {
-	s := buildResponseSchema()
+	s := buildResponseSchema("en")
 	props, ok := s["properties"].(map[string]any)
 	if !ok {
 		t.Fatalf("properties should be map, got %T", s["properties"])
@@ -224,7 +224,7 @@ func TestSystemPrompt_HasEnglishOnlyAndInjectionGuard(t *testing.T) {
 }
 
 func TestUserPrompt_IncludesBothFieldsWhenPresent(t *testing.T) {
-	p := userPrompt("Monstera deliciosa", "Swiss cheese plant")
+	p := userPrompt("Monstera deliciosa", "Swiss cheese plant", "en")
 	if !strings.Contains(p, "Monstera deliciosa") {
 		t.Error("user prompt should include scientific_name")
 	}
@@ -234,7 +234,7 @@ func TestUserPrompt_IncludesBothFieldsWhenPresent(t *testing.T) {
 }
 
 func TestUserPrompt_OmitsCommonNameWhenEmpty(t *testing.T) {
-	p := userPrompt("Monstera deliciosa", "")
+	p := userPrompt("Monstera deliciosa", "", "en")
 	if strings.Contains(p, "common_name") {
 		t.Error("user prompt should NOT mention common_name when empty")
 	}

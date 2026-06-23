@@ -179,6 +179,32 @@ func TestBuildTranslateSchema(t *testing.T) {
 	}
 }
 
+// TestBuildResponseSchema_NonEnglishEmbedsLangInProse is the prod-bug fix: under
+// strict json_schema the per-field descriptions dominate, so the request language
+// must be embedded in the PROSE field descriptions (not just the system prompt).
+// Enum / number fields must NOT carry it.
+func TestBuildResponseSchema_NonEnglishEmbedsLangInProse(t *testing.T) {
+	props := buildResponseSchema("de")["properties"].(map[string]any)
+	for _, f := range []string{"common_name", "description", "name_origin", "bloom_tip", "fruit_tip", "bloom_period_short", "fruit_period_short"} {
+		desc := props[f].(map[string]any)["description"].(string)
+		if !strings.Contains(desc, "German") {
+			t.Errorf("prose field %q must embed the target language for non-en, got: %q", f, desc)
+		}
+	}
+	// Non-prose fields must NOT get the language directive.
+	for _, f := range []string{"sunlight", "soil", "locations", "flower_color"} {
+		desc, _ := props[f].(map[string]any)["description"].(string)
+		if strings.Contains(desc, "Write this field in German") {
+			t.Errorf("non-prose field %q must not carry the language directive, got: %q", f, desc)
+		}
+	}
+	// English schema carries no directive.
+	enDesc := buildResponseSchema("en")["properties"].(map[string]any)["description"].(map[string]any)["description"].(string)
+	if strings.Contains(enDesc, "Write this field in") {
+		t.Errorf("English schema must not carry a language directive, got: %q", enDesc)
+	}
+}
+
 // TestSystemPrompt_NonEnglish names the target language and keeps color keys English.
 func TestSystemPrompt_NonEnglish(t *testing.T) {
 	p := systemPrompt("ja")
