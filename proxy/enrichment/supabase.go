@@ -98,6 +98,41 @@ func (d *DB) Lookup(ctx context.Context, normalized, lang string) (*proxy.PlantD
 	return &pd, nil
 }
 
+// LookupAny returns ANY stored master for a plant regardless of language, plus
+// the language it found, or (nil, "", nil) on miss. Used to avoid generating a
+// second independent master when one already exists in another language and the
+// caller is racing its backfill (SPEC §7 one-master invariant). Prefers approved
+// rows, then English (the best translation source). Only status IN
+// ('pending','approved') rows are considered.
+//
+// pgx.ErrNoRows collapses to (nil, "", nil). Real failures wrap ErrDBUnavailable.
+func (d *DB) LookupAny(ctx context.Context, normalized string) (*proxy.PlantDetail, string, error) {
+	if d == nil || d.pool == nil {
+		return nil, "", ErrDBUnavailable
+	}
+	const q = `
+		SELECT data, lang
+		FROM plants_pending
+		WHERE scientific_name_normalized = $1
+		  AND status IN ('pending', 'approved')
+		ORDER BY (status = 'approved') DESC, (lang = 'en') DESC
+		LIMIT 1`
+	var raw []byte
+	var lang string
+	err := d.pool.QueryRow(ctx, q, normalized).Scan(&raw, &lang)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, "", nil
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: lookup any: %v", ErrDBUnavailable, err)
+	}
+	var pd proxy.PlantDetail
+	if err := json.Unmarshal(raw, &pd); err != nil {
+		return nil, "", fmt.Errorf("%w: decode row data: %v", ErrDBUnavailable, err)
+	}
+	return &pd, lang, nil
+}
+
 // DeleteUserRows deletes all of a user's account data from the Supabase
 // Postgres tables that are keyed on the auth user id (auth.uid() == user_id):
 // diary_entries then garden_records. Used by POST /v1/account/delete (account

@@ -13,11 +13,15 @@ import (
 // stubDB is a sequence-aware ServiceDB stub. Lookups and Inserts pop queued
 // responses; running off the end returns zero values (miss / inserted=true).
 type stubDB struct {
-	lookupCalls []string
-	lookupLangs []string
-	lookupQ     []dbLookupResult
-	insertCalls []InsertParams
-	insertQ     []dbInsertResult
+	lookupCalls   []string
+	lookupLangs   []string
+	lookupQ       []dbLookupResult
+	insertCalls   []InsertParams
+	insertQ       []dbInsertResult
+	lookupAnyPD   *proxy.PlantDetail // returned by LookupAny (nil → miss → first-caller generate)
+	lookupAnyLang string
+	lookupAnyErr  error
+	lookupAnyHits int
 }
 
 type dbLookupResult struct {
@@ -39,6 +43,11 @@ func (s *stubDB) Lookup(_ context.Context, normalized, lang string) (*proxy.Plan
 	r := s.lookupQ[0]
 	s.lookupQ = s.lookupQ[1:]
 	return r.pd, r.err
+}
+
+func (s *stubDB) LookupAny(_ context.Context, normalized string) (*proxy.PlantDetail, string, error) {
+	s.lookupAnyHits++
+	return s.lookupAnyPD, s.lookupAnyLang, s.lookupAnyErr
 }
 
 func (s *stubDB) Insert(_ context.Context, p InsertParams) (bool, error) {

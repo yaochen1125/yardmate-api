@@ -296,6 +296,39 @@ func TestGetOrGenerate_NonEnglishSkipsINatOverride(t *testing.T) {
 	}
 }
 
+// TestGetOrGenerate_RaceWindow_TranslatesExistingMasterNotGenerate is the Codex
+// P2 fix (SPEC §7 one-master invariant): when a master exists in another
+// language but neither the exact lang nor English is present yet (racing the
+// backfill), the request TRANSLATES the existing master rather than generating
+// an independent second master that could carry divergent care facts.
+func TestGetOrGenerate_RaceWindow_TranslatesExistingMasterNotGenerate(t *testing.T) {
+	jaMaster := &proxy.PlantDetail{ScientificName: "Madeup", CommonName: "日本語名", Description: "説明"}
+	db := &stubDB{
+		// Lookup(en) misses (en not backfilled yet); LookupAny finds the ja master.
+		lookupAnyPD:   jaMaster,
+		lookupAnyLang: "ja",
+	}
+	llm := &stubLLM{} // Generate must NOT be called
+	svc := NewService(nil, db, llm, NewCache(10, time.Hour), nil)
+
+	_, source, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Madeup", Lang: "en"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if source != SourceSupabaseTranslatedOnDemand {
+		t.Errorf("source = %q, want %q", source, SourceSupabaseTranslatedOnDemand)
+	}
+	if len(llm.calls) != 0 {
+		t.Error("must NOT generate an independent master when one exists in another language (Codex P2)")
+	}
+	if len(llm.translateCalls) != 1 || llm.translateCalls[0] != "en" {
+		t.Errorf("must translate the existing master into en, got %v", llm.translateCalls)
+	}
+	if len(db.insertCalls) != 1 || db.insertCalls[0].Lang != "en" || db.insertCalls[0].Source != TranslatedSourceTag {
+		t.Errorf("must insert a translated en row, got %+v", db.insertCalls)
+	}
+}
+
 // TestBackfiller_RunTranslatesAllTargetsEnglishFirst: run() translates the
 // master into every target language (English first) and persists each with the
 // translated source tag + the right lang.

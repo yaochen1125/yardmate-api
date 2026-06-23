@@ -30,7 +30,8 @@ const (
 	SourceCache                          = "cache"
 	SourceCatalog                        = "catalog"
 	SourceSupabaseHit                    = "supabase_hit"
-	SourceSupabaseFallbackEn             = "supabase_fallback_en" // requested lang missing, served English (§7)
+	SourceSupabaseFallbackEn             = "supabase_fallback_en"           // requested lang missing, served English (§7)
+	SourceSupabaseTranslatedOnDemand     = "supabase_translated_on_demand"  // requested lang missing + no English yet, translated an existing other-language master (§7)
 	SourceSupabaseMissGenerate           = "supabase_miss_generate"
 	SourceSupabaseMissGenerateRaceWinner = "supabase_miss_generate_race_winner"
 )
@@ -47,6 +48,7 @@ type Request struct {
 // *DB satisfies it; tests substitute a stub.
 type ServiceDB interface {
 	Lookup(ctx context.Context, normalized, lang string) (*proxy.PlantDetail, error)
+	LookupAny(ctx context.Context, normalized string) (*proxy.PlantDetail, string, error)
 	Insert(ctx context.Context, p InsertParams) (bool, error)
 }
 
@@ -210,7 +212,6 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		// English also missing → fall through and generate the master in `lang`.
 	}
 
-	// Step 4: LLM master generation in `lang`.
 	if s.llm == nil {
 		return nil, "", ErrEnrichmentUnavailable
 	}
@@ -218,6 +219,50 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	if iNatName != "" { // only non-empty for English (gated above)
 		hint = iNatName
 	}
+
+	// Step 4: before generating a fresh master, check whether a master already
+	// exists for this plant in ANOTHER language — i.e. we are racing this plant's
+	// backfill (neither the exact lang nor English is present yet). If so,
+	// translate that master into `lang` rather than generating an independent
+	// second master, which would let care facts diverge across language rows
+	// (Codex P2 — the SPEC §7 one-master invariant). Only a true first-caller
+	// (no row in ANY language) reaches the Generate call below. The remaining
+	// concurrent-double-first-caller race (two langs generated at once) is the
+	// pre-existing accepted §7 race.
+	if existing, _, lookErr := s.db.LookupAny(ctx, normalized); lookErr != nil {
+		return nil, "", lookErr
+	} else if existing != nil {
+		if translated, reqID, tErr := s.llm.Translate(ctx, existing, lang); tErr == nil && translated != nil {
+			inserted, insErr := s.db.Insert(ctx, InsertParams{
+				Normalized:      normalized,
+				Lang:            lang,
+				ScientificName:  name,
+				CommonName:      hint,
+				Data:            translated,
+				Source:          TranslatedSourceTag,
+				SourceVersion:   PromptVersion,
+				GenerationReqID: reqID,
+			})
+			if insErr != nil {
+				return nil, "", insErr
+			}
+			if !inserted {
+				// Another caller wrote this lang first — return their row.
+				if row, _ := s.db.Lookup(ctx, normalized, lang); row != nil {
+					s.cache.Set(cacheKey, row)
+					return overrideINat(row, SourceSupabaseHit), SourceSupabaseHit, nil
+				}
+			}
+			s.cache.Set(cacheKey, translated)
+			return overrideINat(translated, SourceSupabaseTranslatedOnDemand), SourceSupabaseTranslatedOnDemand, nil
+		}
+		// Translation failed (rare) → fall through to generate a master in `lang`.
+		// This is the only path that can produce a second independent master, and
+		// only on translation failure.
+	}
+
+	// Step 5: true first-caller (or translation-failure fallback) — generate the
+	// master in `lang`.
 	generated, requestID, err := s.llm.Generate(ctx, name, hint, lang)
 	if err != nil {
 		return nil, "", err
@@ -233,7 +278,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		generated.CommonNameSource = "inaturalist"
 	}
 
-	// Step 5: INSERT ON CONFLICT (normalized, lang) DO NOTHING. On conflict,
+	// Step 6: INSERT ON CONFLICT (normalized, lang) DO NOTHING. On conflict,
 	// re-Lookup to pick up the master another concurrent caller just wrote — and
 	// let them own the backfill (SPEC §2.1 step 5).
 	inserted, err := s.db.Insert(ctx, InsertParams{
@@ -265,7 +310,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 
 	s.cache.Set(cacheKey, generated)
 
-	// Step 6: async backfill the other languages from this master (English
+	// Step 7: async backfill the other languages from this master (English
 	// first), translate-only-prose, ON CONFLICT DO NOTHING (SPEC §7 + §9 #18).
 	if s.backfill != nil {
 		s.backfill.Enqueue(BackfillJob{
