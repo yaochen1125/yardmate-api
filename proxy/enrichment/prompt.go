@@ -158,14 +158,14 @@ func (c *LLMClient) Generate(ctx context.Context, scientificName, commonName, la
 		"max_tokens": 2000,
 		"messages": []map[string]any{
 			{"role": "system", "content": systemPrompt(lang)},
-			{"role": "user", "content": userPrompt(scientificName, commonName)},
+			{"role": "user", "content": userPrompt(scientificName, commonName, lang)},
 		},
 		"response_format": map[string]any{
 			"type": "json_schema",
 			"json_schema": map[string]any{
 				"name":   "plant_detail",
 				"strict": true,
-				"schema": buildResponseSchema(),
+				"schema": buildResponseSchema(lang),
 			},
 		},
 	}
@@ -254,7 +254,7 @@ Output a single JSON object matching the schema. No prose before or after.`, lan
 }
 
 // userPrompt — input is data; phrased to discourage instruction-style interpretation.
-func userPrompt(scientificName, commonName string) string {
+func userPrompt(scientificName, commonName, lang string) string {
 	var sb strings.Builder
 	sb.WriteString("Plant scientific_name (DATA): ")
 	sb.WriteString(scientificName)
@@ -265,6 +265,11 @@ func userPrompt(scientificName, commonName string) string {
 		sb.WriteByte('\n')
 	}
 	sb.WriteString("\nProduce the detail entry for the named plant.")
+	if lang != "en" {
+		sb.WriteString(" Write every free-text field (common_name, description, name_origin, tips, period ranges) in ")
+		sb.WriteString(langDisplayName(lang))
+		sb.WriteString("; keep enums, color keys and numbers exactly as the schema specifies.")
+	}
 	return sb.String()
 }
 
@@ -273,8 +278,18 @@ func userPrompt(scientificName, commonName string) string {
 // enum / $ref / $defs / anyOf only — keywords like minLength / minimum are
 // silently ignored. We use enum where it tightens output, and put length /
 // range hints in descriptions (the model honors them as soft guidance).
-func buildResponseSchema() map[string]any {
+func buildResponseSchema(lang string) map[string]any {
 	nullableString := []any{"string", "null"}
+
+	// Prose fields must be written in the request language (SPEC §7). Under strict
+	// json_schema the per-field descriptions dominate the model's output, so the
+	// language directive has to live in the descriptions themselves — a single
+	// system-prompt line is NOT enough (observed in prod: gpt-4o-mini returned
+	// English prose for lang=de despite the system "write in German" rule).
+	proseLang := ""
+	if lang != "en" {
+		proseLang = " Write this field in " + langDisplayName(lang) + " (localize fully — do not leave it in English)."
+	}
 
 	colorArray := func(desc string) map[string]any {
 		return map[string]any{
@@ -349,7 +364,7 @@ func buildResponseSchema() map[string]any {
 			},
 			"common_name": map[string]any{
 				"type":        "string",
-				"description": "Most widely used English common name. If a common_name hint was provided, prefer it unless it is inaccurate.",
+				"description": "Most widely used common name." + proseLang + " If a common_name hint was provided, prefer it (translate / localize the hint into the target language if needed) unless it is inaccurate.",
 			},
 			"common_name_source": map[string]any{
 				"type":        "string",
@@ -361,12 +376,12 @@ func buildResponseSchema() map[string]any {
 			"foliage_color":        colorArray("Lowercased English color names for the foliage like \"green\", \"bronze\", \"variegated\". 1-3 entries."),
 			"fruit_color":          colorArray("Lowercased English color names for prominent fruit. Empty array when there is no notable fruit."),
 			"fruit_color_primary":  map[string]any{"type": nullableString, "description": "Dominant fruit color, or null when no notable fruit."},
-			"bloom_tip":            map[string]any{"type": "string", "description": "One sentence on flowers + bloom timing, 8-25 words. Empty string for non-flowering plants."},
+			"bloom_tip":            map[string]any{"type": "string", "description": "One sentence on flowers + bloom timing, 8-25 words. Empty string for non-flowering plants." + proseLang},
 			"bloom_months_north":   monthArray("Northern-hemisphere bloom months as integers 1-12 (Jan=1). Empty array for non-flowering plants."),
-			"bloom_period_short":   map[string]any{"type": "string", "description": "Short bloom range like \"Jul → Oct\" using the Unicode arrow. Empty string for non-flowering plants."},
-			"fruit_tip":            map[string]any{"type": "string", "description": "One sentence on fruit ornamental value. Empty string when no notable fruit."},
+			"bloom_period_short":   map[string]any{"type": "string", "description": "Short bloom range like \"Jul → Oct\" using the Unicode arrow (localize the month abbreviations). Empty string for non-flowering plants." + proseLang},
+			"fruit_tip":            map[string]any{"type": "string", "description": "One sentence on fruit ornamental value. Empty string when no notable fruit." + proseLang},
 			"fruit_months_north":   monthArray("Northern-hemisphere months when fruit is visible, integers 1-12. Empty array when no notable fruit."),
-			"fruit_period_short":   map[string]any{"type": nullableString, "description": "Short fruit range like \"Aug → Nov\", or null when no notable fruit."},
+			"fruit_period_short":   map[string]any{"type": nullableString, "description": "Short fruit range like \"Aug → Nov\" (localize the month abbreviations), or null when no notable fruit." + proseLang},
 			"difficulty":           map[string]any{"type": "integer", "description": "Care difficulty integer 0..5: 0=very easy, 5=very challenging."},
 			"sunlight":             map[string]any{"type": "integer", "description": "Sun preference integer 0..5 (YardMate scale): 0=Full sun (6+ hrs direct), 1=Part sun (4–6 hrs direct), 2=Part shade (2–4 hrs direct), 3=Full shade (<2 hrs direct), 4=Indirect (filtered light, typical houseplant), 5=Low light (dim corners)."},
 			"hardiness_zones": map[string]any{
@@ -406,8 +421,8 @@ func buildResponseSchema() map[string]any {
 			"native_region":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Geographic regions of origin, e.g. [\"East Asia\"] or [\"Mediterranean\", \"North Africa\"]. 1-3 entries."},
 			"locations":            map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"Yard", "Patio", "Indoor", "Bedroom", "Bathroom", "Kitchen", "Office", "Greenhouse", "Balcony"}}, "description": "Where the plant is typically grown. 1-3 entries."},
 			"weed_level":           map[string]any{"type": "integer", "description": "Invasiveness risk integer 0..5: 0=none, 1=mild self-seeder, 3=naturalized, 5=aggressive invasive."},
-			"description":          map[string]any{"type": "string", "description": "Concise overview: growth habit, key features, native habitat and ornamental value. 15-40 words. Plain text only."},
-			"name_origin":          map[string]any{"type": "string", "description": "Etymology of the binomial name, 15-40 words."},
+			"description":          map[string]any{"type": "string", "description": "Concise overview: growth habit, key features, native habitat and ornamental value. 15-40 words. Plain text only." + proseLang},
+			"name_origin":          map[string]any{"type": "string", "description": "Etymology of the binomial name, 15-40 words." + proseLang},
 			"attributes":           map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"fragrant", "cold-hardy", "drought-tolerant", "evergreen", "deciduous", "long-blooming", "fast-growing", "slow-growing", "compact", "climbing", "spreading", "pollinator-friendly", "edible", "showy-fruit", "shade-tolerant", "container-friendly"}}, "description": "Up to 6 keyword tags from the enum."},
 			"height":               dimensionSchema,
 			"spread":               dimensionSchema,
