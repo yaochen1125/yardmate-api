@@ -36,8 +36,8 @@
 
 | Layer | Input |
 |---|---|
-| HTTP `POST /v1/plants/enrichment` | JSON body `{scientificName: string, commonName?: string, plantId?: string\|null}`. Required headers `X-Device-Install-Id: <UUID>` + `X-App-Version: <semver>`; optional `X-AppAttest-*` (logged only). |
-| `Service.GetOrGenerate(ctx, scientificName, commonName, plantIDHint)` | Already-validated args; returns `*PlantDetail` or typed error. |
+| HTTP `POST /v1/plants/enrichment` | JSON body `{scientificName: string, commonName?: string, plantId?: string\|null, lang?: string}`. Required headers `X-Device-Install-Id: <UUID>` + `X-App-Version: <semver>`; optional `X-AppAttest-*` (logged only). |
+| `Service.GetOrGenerate(ctx, Request{ScientificName, CommonName, PlantIDHint, Lang})` | Already-validated args; returns `*PlantDetail` (best-available language per the §7 fallback chain) + `Source` tag or typed error. |
 | Server config | `OPENAI_API_KEY` + `SUPABASE_DB_URL` (Postgres DSN) from `secrets.Vault`. |
 
 Field validation:
@@ -45,6 +45,7 @@ Field validation:
 - `scientificName` — required, trimmed length **1–200** chars, must contain at least one letter (not all whitespace / digits / punctuation). Server normalizes via `proxy.normalizeScientificName` before lookup or DB write.
 - `commonName` — optional. Length ≤ 200; longer values are ignored (no 4xx). Used as LLM-prompt context only; not stored as a separate column (already inside generated `data.common_name`).
 - `plantId` — optional, **not trusted**. Server re-derives via `ContentIndex.LookupPlantID(scientificName)`. The field exists for future use (e.g. the client wants to assert a specific id); V1 ignores it.
+- `lang` — optional. Normalized to the nearest supported code — the 11 iOS `Localizable.xcstrings` languages: `en`, `de`, `es`, `fr`, `it`, `ja`, `ko`, `pt`, `vi`, `zh-Hans`, `zh-Hant`. Region subtags drop for single-variant languages (`pt-BR`→`pt`, `en-US`→`en`); **Chinese script is preserved** (`zh-Hans`/`zh-CN`→`zh-Hans`; `zh-Hant`/`zh-TW`/`zh-HK`→`zh-Hant`; bare `zh`→`zh-Hans`). Absent / empty / unsupported → `en`. Used as the second component of the composite key `(scientific_name_normalized, lang)` for both the LRU and Supabase (§7 multi-language).
 
 ### 1.4 Outputs
 
@@ -84,7 +85,8 @@ X-AppAttest-Challenge: <base64-std>   (optional, logged only)
 {
   "scientificName": "Monstera adansonii",
   "commonName":     "Swiss cheese vine",
-  "plantId":        null
+  "plantId":        null,
+  "lang":           "ja"
 }
 ```
 
@@ -94,7 +96,7 @@ Body cap: **64 KB** (JSON-only endpoint; enforced by `http.MaxBytesReader`). Dis
 
 Full PlantDetail entry mirroring one entry of `yardmate-content/plants_detail.json`. Field table below; type column is the JSON wire form (Go `*string` → JSON `string|null`, etc.).
 
-**All string-valued fields are English-only.** Per the `app_language` memory, server responses always ship English text — the curated catalog is English; the LLM is constrained via system prompt + per-field json_schema descriptions to reply in English regardless of input language (e.g. a Chinese-named scientific input still produces English `description` / `symbolism_story` / etc.).
+**String fields are in the request `lang` (path 2/3), with English fallback.** Per §7 multi-language: the LLM generates the master copy's prose fields in the requested language; non-prose fields (enums / color keys / numbers / catalog disease IDs) stay canonical (English / numeric) because iOS localizes them itself. A request for a language not yet backfilled falls back to the English row. Path-1 catalog responses are still the embedded curated text (English today; the offline `plants_detail.json` pipeline owns catalog translation).
 
 | Field | JSON type | Path 1 (catalog) | Paths 2 / 3 (Supabase / LLM) |
 |---|---|---|---|
@@ -146,31 +148,53 @@ Full PlantDetail entry mirroring one entry of `yardmate-content/plants_detail.js
 **Server lookup flow (single conceptual flow, no DB transaction needed):**
 
 ```
-1. normalized := normalizeScientificName(req.ScientificName)
+0. lang := normalizeLang(req.Lang)               // base subtag; unsupported/empty → "en"
+   normalized := normalizeScientificName(req.ScientificName)
    if normalized == "" → 400 missing_scientific_name
 
-2. content.LookupPlantID(normalized) → (plantId, ok)
+1. content.LookupPlantID(normalized) → (plantId, ok)
    if ok:
      full := content.LookupFullDetail(plantId)   // new method, see §1.5
-     return 200 (full)                            // path 1: catalog
+     return 200 (full)                            // path 1: catalog (lang-agnostic today; English)
 
-3. row := supabase.SELECT data FROM plants_pending
-            WHERE scientific_name_normalized = $1
-            LIMIT 1
+2. row := supabase.SELECT data FROM plants_pending
+            WHERE scientific_name_normalized = $1 AND lang = $2
+            AND status IN ('pending','approved') LIMIT 1
    if row != nil:
-     return 200 (row.data)                        // path 2: supabase hit
+     return 200 (row.data)                        // path 2: supabase hit (exact lang)
    on DB error → 502 db_unavailable
 
-4. generated, err := llm.Generate(scientificName, commonName)
+3. // display fallback — exact lang missing, try English
+   if lang != "en":
+     enRow := supabase.SELECT ... WHERE normalized=$1 AND lang='en' ...
+     if enRow != nil:
+       return 200 (enRow.data)                    // English fallback; do NOT cache under `lang` key
+     // (English also missing → fall through and generate the master in `lang`)
+
+3c. // one-master invariant — a master exists in ANOTHER language but neither the
+    //   exact lang nor English is present yet (racing the backfill). Translate it
+    //   into `lang` instead of generating a 2nd independent master that could carry
+    //   divergent care facts (Codex P2 / §7).
+   existing, existingLang := supabase.LookupAny(normalized)   // any-language master, prefers approved then en
+   if existing != nil:
+     translated, err := llm.Translate(existing, lang)
+     if err == nil:
+       INSERT (lang, translated, SourceTag+"-translated") ON CONFLICT (normalized, lang) DO NOTHING
+       return 200 (translated)                      // on-demand translation (no 2nd master)
+     // translate failed (rare) → fall through to generate
+
+4. generated, err := llm.Generate(scientificName, commonName, lang)   // master IN lang (TRUE first caller)
    if err → 502 enrichment_unavailable             // no DB write on LLM failure
 
-5. supabase.INSERT INTO plants_pending (...)
-     VALUES (..., 'pending', 'openai-gpt-4o-mini-2024-07-18', ...)
-     ON CONFLICT (scientific_name_normalized) DO NOTHING
-   if 0 rows affected (conflict — someone else wrote first):
-     re-SELECT step-3 query; return that row.data instead   // path 3 collapsed to path 2
+5. supabase.INSERT INTO plants_pending (..., lang, 'pending', SourceTag, ...)
+     ON CONFLICT (scientific_name_normalized, lang) DO NOTHING
+     // master row uses SourceTag; backfilled rows use TranslatedSourceTag
+   if 0 rows affected (conflict — someone else wrote this lang first):
+     re-SELECT step-2 query; return that row.data instead   // collapse to path 2
 
-6. return 200 (generated)                          // path 3: fresh
+6. enqueueBackfill(normalized, lang, generated)   // async, bounded worker, English FIRST,
+                                                   // translate-only-prose, ON CONFLICT DO NOTHING
+   return 200 (generated)                          // path 3: fresh master
 ```
 
 **Why the embedded catalog is checked BEFORE Supabase:** the 1522 catalog is curated + canonical. Supabase rows are best-effort LLM output. If a plant later joins the catalog (1522 → 1700), the embedded check short-circuits any stale Supabase row for the same normalized name. Yao's curated data always wins.
@@ -230,11 +254,12 @@ Inherits parent SPEC §5 threat model. Enrichment-specific notes:
 
 ## 6. Supabase schema
 
-See `proxy/enrichment/migrations/001_plants_pending.sql` for the canonical DDL.
+See `proxy/enrichment/migrations/001_plants_pending.sql` for the original DDL and `003_plants_pending_lang.sql` for the multi-language migration (adds `lang`, swaps the PK to composite — `002` is `diseases_pending`). Post-003 canonical shape:
 
 ```sql
 CREATE TABLE plants_pending (
-  scientific_name_normalized TEXT PRIMARY KEY,
+  scientific_name_normalized TEXT NOT NULL,
+  lang                       TEXT NOT NULL DEFAULT 'en',  -- 003: supported xcstrings code
   scientific_name            TEXT NOT NULL,
   common_name                TEXT,
   data                       JSONB NOT NULL,
@@ -247,16 +272,25 @@ CREATE TABLE plants_pending (
   updated_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   reviewed_at                TIMESTAMPTZ,
   reviewed_by                TEXT,
-  notes                      TEXT
+  notes                      TEXT,
+  PRIMARY KEY (scientific_name_normalized, lang)          -- 003: was (scientific_name_normalized)
 );
 
 CREATE INDEX idx_plants_pending_status     ON plants_pending (status);
 CREATE INDEX idx_plants_pending_created_at ON plants_pending (created_at DESC);
 ```
 
+`003_plants_pending_lang.sql` outline (existing rows are the English master, so `DEFAULT 'en'` backfills them correctly):
+
+```sql
+ALTER TABLE plants_pending ADD COLUMN lang TEXT NOT NULL DEFAULT 'en';
+ALTER TABLE plants_pending DROP CONSTRAINT plants_pending_pkey;
+ALTER TABLE plants_pending ADD PRIMARY KEY (scientific_name_normalized, lang);
+```
+
 Column notes:
 
-- **`scientific_name_normalized` (PK)** — derived by Go-side `normalizeScientificName(...)` before SELECT/INSERT. **The Go normalizer is the single source of truth**; if its rules change, an offline migration must re-normalize the PK column on existing rows.
+- **`scientific_name_normalized` + `lang` (composite PK)** — `scientific_name_normalized` derived by Go-side `normalizeScientificName(...)` before SELECT/INSERT (**the Go normalizer is the single source of truth**; if its rules change, an offline migration must re-normalize the PK column on existing rows). **`lang`** is the normalized base subtag (§1.3); one plant has up to N rows, one per supported language. The English row is the fallback pivot (§7) and the master copy when the first caller's language is English.
 - **`data` (JSONB)** — the full PlantDetail entry shipped in the response. The PK + audit metadata get columns; the payload stays JSONB so V1.x schema evolution doesn't require ALTER TABLE.
 - **`status`** — enum:
   - `pending` — LLM-generated, not yet reviewed (V1 default).
@@ -291,11 +325,22 @@ Column notes:
 - **No stampede coalescer in V1.** `ON CONFLICT DO NOTHING` is the only defense; concurrent first-callers may each spend one LLM call. Expected waste at projected V1 traffic: < $1 / year. Adding a coalescer is a half-day's work but provides no V1 ROI.
 - **`common_diseases_list` LLM output is whitelisted** against the 70 catalog disease IDs (same pattern as `proxy/handlers.go::mapCatalogID`). Hallucinated IDs (`ZZ99`) are dropped silently; the resulting list may be shorter than expected, never longer.
 - **Approved rows stay in Supabase indefinitely** in V1. No batch migration to `yardmate-content/plants_detail.json` (§8 candidate). Server-side fetch from Supabase is fast enough.
-- **`scientific_name_normalized` is the single unique key.** Inputs that normalize to the same string (e.g. `Abelia × grandiflora` ↔ `Abelia x grandiflora`) intentionally share one row. The first-stored un-normalized form is preserved for audit but does not affect lookup.
+- **`(scientific_name_normalized, lang)` is the unique key** (was `scientific_name_normalized` alone pre-multi-language — §7). Inputs that normalize to the same string (e.g. `Abelia × grandiflora` ↔ `Abelia x grandiflora`) intentionally share one row *per language*. The first-stored un-normalized form is preserved for audit but does not affect lookup.
 - **The embedded catalog is the path-1 source** (not a jsDelivr fetch). Adding a CDN dependency to the request path would couple us to jsDelivr availability for every catalog-hit lookup.
 - **pgx direct TCP connection, not Supabase PostgREST.** Investment-scale traffic (10k+ DAU at launch peaks) can burst 5000+ req/min; PostgREST is rate-limited at the Supabase Cloudflare layer with opaque thresholds, while pgx hits Postgres directly (bounded only by our pool size × DB capacity). Direct TCP also avoids the HTTPS handshake + JSON serialization overhead per request.
 - **In-process LRU cache included in V1 (not deferred).** Bounded ~10k entries, 30 min TTL. Written after EVERY successful 200 response: path-1 catalog hit, path-2 Supabase hit, AND path-3 fresh LLM generation (fresh row enters cache atomically after the Supabase write returns). Hot plants (top ~100 in any given period) absorb the majority of traffic without touching DB. Sized for 10k+ DAU bursts of 5000+ req/min; cache invalidation on `status` changes via the Dashboard is handled per pitfall §9 #13.
-- **All LLM string output is English only**, per the `app_language` memory. The system prompt + per-field json_schema descriptions force English regardless of input language (Chinese / Spanish / etc. scientific names still resolve via the same Latin name; the generated `description` / `history_text_*` / `symbolism_story` / etc. stay English).
+- **Multi-language enrichment (path 2/3): generate the master copy in the request language, then async-backfill the rest by translation.** V1's English-only constraint is lifted. Design (don't re-debate):
+  - **Request carries `lang`** (e.g. `en` / `ja` / `zh-Hant`). The supported set is the 11 iOS `Localizable.xcstrings` languages (`en`, `de`, `es`, `fr`, `it`, `ja`, `ko`, `pt`, `vi`, `zh-Hans`, `zh-Hant`); unknown / empty `lang` defaults to `en`. `normalizeLang` maps an incoming tag to the nearest supported code — region dropped for single-variant languages, but **Chinese script preserved** (simplified ≠ traditional) — before use as a key.
+  - **Composite key `(scientific_name_normalized, lang)`** — both the Supabase PK and the in-process LRU key gain the lang dimension (LRU key = `NormalizeScientificNamePrecise(name) + "|" + lang`). Each language is a separate row / cache entry. The §9 #16 precise-vs-PK normalization split is unchanged; lang is appended to both.
+  - **Master copy = the request language, generated natively (one LLM call), returned immediately.** No translation hop on the synchronous path — the first caller of a plant in their language pays only generation latency. This is why the request blocks on generation, never on translation.
+  - **The other languages are TRANSLATIONS of the master copy, NOT independent generations.** Independent per-language generation lets facts diverge across languages (one says "part shade", another "full sun"). A single master translated into N languages guarantees factual consistency. New `LLMClient.Translate(ctx, source *PlantDetail, toLang)` path.
+  - **Only free-text prose fields are translated; everything else is copied verbatim.** Translate: `common_name`, `description`, `name_origin`, `bloom_tip`, `fruit_tip`, `bloom_period_short`, `fruit_period_short`. Copy verbatim — these are controlled vocab / keys / numbers iOS localizes itself, so translating them breaks the iOS enum→localized-string mapping: `flower_color` / `foliage_color` / `fruit_color` (+ `_primary`), `locations`, `attributes`, `soil`, `unit`, all integers (`difficulty` / `sunlight` / `watering_note` / `weed_level` / `*_days` / `hardiness_zones` / `indoor_temp_f` / `*_months_north`), `common_diseases_list` (catalog IDs), `genus`, `scientific_name`, `id`, `common_name_source`.
+  - **Backfill runs in a bounded background worker, English FIRST.** After the master row is persisted, a job is enqueued (own `context.Background()` + timeout; bounded worker pool to cap concurrent translation fan-out — NOT one goroutine per request). Order: translate master → English first (the universal fallback pivot — see display fallback below), then the remaining supported languages. Each target language `INSERT ON CONFLICT DO NOTHING` (idempotent: re-triggered backfill for an already-filled plant no-ops) + LRU write.
+  - **Display fallback: requested `lang` → English → master/any.** On a Supabase miss for the requested lang, re-`Lookup(normalized, "en")` and serve English if present. English-not-yet-backfilled (the brief window right after a non-English master) is the only case the ultimate master fallback is hit. **Cross-lang fallback results are NOT written under the requested-lang LRU key** — otherwise a 30-min-TTL English entry would mask the requested-lang row once backfill lands.
+  - **One-master invariant — never generate a second independent master while one exists (Codex P2 fix).** When the exact lang AND English are both missing but a master exists in some OTHER language (the window right after a non-English master, before English backfill lands — or any lang whose backfill was dropped), the request **translates the existing master** into `lang` synchronously (`LookupAny` → `Translate` → INSERT, source `…-translated`) rather than calling `Generate`. Independent per-language generation would let care facts diverge across rows — the exact thing the translate-not-regenerate design prevents. `Generate` is reached ONLY when NO row exists in ANY language (a true first caller). The remaining concurrent-double-first-caller race (two languages generated in the same instant, before either row lands) is the pre-existing accepted §7 race — `ON CONFLICT` only dedups within a language; at V1 scale this is sub-$1/year waste. Translation failure (rare) falls through to `Generate` as a best-effort correct-language result.
+  - **`common_name` IS localized (option B).** It joins the translated prose set, so each language row carries its own localized common name (master: LLM-generated in-language; backfill: translated). The existing iNat `preferred_common_name` override is **gated to English-language rows only** — for non-English rows the localized LLM / translated name stands (the iNat override would otherwise force the English name back in). iNat locale-aware common names (`&locale=` on the taxa API) are a quality follow-up, out of scope here.
+  - **`PromptVersion` bumped v3 → v4** (lang param + new translate path). Translated rows record `source = "<model>-translated"` to distinguish the master from derived rows for forensics / future regeneration. The `lang` column + composite PK arrive via migration `003_plants_pending_lang.sql` (existing rows default `lang='en'`, which is correct — they were the English master).
+  - **Path-1 catalog is unaffected by this feature.** Curated 1522-catalog multi-language is the separate offline `plants_detail.json` translation pipeline (CDN). The enrichment endpoint's path-1 returns the embedded catalog as-is; until the server embeds translated catalogs, a non-English request for a catalog plant returns English — which is exactly the display-fallback behavior. No path-1 change here.
 
 ---
 
@@ -306,7 +351,7 @@ Column notes:
 - **Promotion of approved rows back into curated 1522 catalog.** Batch job that diffs `status='approved'` into `yardmate-content/plants_detail.json` → re-embeds at next server deploy. Currently approved data lives only in Supabase.
 - **Stampede coalescer.** Single-node: Go `sync.Mutex + map[string]chan struct{}`. Multi-node: Redis `SETNX` lock. ~3 hours of work; worth doing once concurrent first-callers / hour exceed ~5.
 - **Re-generation of approved rows** without manual Dashboard delete-and-re-call. Could be `POST /v1/plants/enrichment/regenerate` with admin-only auth.
-- **Multi-language enrichment.** V1 is English-only per `app_language` memory. V1.x may add `?lang=zh-CN` with composite PK `(scientific_name_normalized, lang)`.
+- ~~**Multi-language enrichment.**~~ **Implemented** (path 2/3): request `lang` + composite PK `(scientific_name_normalized, lang)` + master-copy-in-request-language + async translate-backfill (English first) + English display fallback. See §7. Curated 1522-catalog multi-language remains the separate offline `plants_detail.json` pipeline (out of scope for enrichment). Remaining follow-ups: iNat locale-aware common names; making on-demand synchronous translation the default even when English IS present (today English is served as a fast display fallback when available, and on-demand translation only kicks in when no English row exists yet — see §7 one-master invariant); backfill retry/repair for languages whose translation failed.
 - **User feedback "this is wrong"** path. iOS lets users flag a row; server records flag counts; Yao reviews high-flag rows first.
 - **RLS + iOS direct read.** Eliminates the server round-trip for users B/C/D once a row exists. Requires Supabase Auth + JWT + RLS policies.
 
@@ -330,6 +375,11 @@ Column notes:
 14. **DSN secrecy.** `SUPABASE_DB_URL` contains the Postgres password in cleartext (e.g. `postgresql://postgres.abc:examplepw@aws-0-eu-central-1.pooler.supabase.com:5432/postgres`). Treat the whole DSN as a secret — never log it, never echo it in error messages, never include it in test fixtures or commits.
 15. **Use Session Pooler, not Direct connection.** Supabase's "Direct connection" DSN (`db.<ref>.supabase.co:5432`, user `postgres`) resolves to **IPv6-only** addresses; outbound IPv6 from the Hetzner box is not always reliable and the failure mode is silent (TCP timeout, no DNS error). The "Session Pooler" DSN (`aws-0-<region>.pooler.supabase.com:5432`, user `postgres.<ref>`) is IPv4-routable and runs the same Postgres wire protocol — pgx connects identically and prepared statements work. The "Transaction Pooler" (port 6543) is also IPv4 but disables session-scoped features (prepared statements, LISTEN/NOTIFY); pgx's auto-prepared-statement caching will break against it, so avoid for this package.
 16. **The in-process cache key is the PRECISE normalization, NOT the Supabase PK.** `Service.GetOrGenerate` keys the LRU on `proxy.NormalizeScientificNamePrecise` (infraspecific-preserving), while the Supabase `plants_pending` PK and its `Lookup`/`Insert` calls stay on the species-level `proxy.NormalizeScientificName` (§9 #1). The two diverge for multi-variety species: the five curated Brassica oleracea cultivars (AAA0203–AAA0207) all fold to `brassica oleracea` under the PK normalizer but resolve to **distinct** plantIds via the catalog's `scientificNameToIDPrecise` index. If you "simplify" the cache to reuse the PK `normalized` key, the second cultivar queried within the 30-min TTL returns the FIRST cultivar's cached `*PlantDetail` from `SourceCache` — a silent cross-variety mix-up that masks the correct per-variety plantId. **Rule: the cache must be at least as fine-grained as the finest layer that returns distinct results (here, the catalog).** Guarded by `TestService_Path1_MultiVarietyCatalog_NoCacheCollision`. The intentional species-level Supabase row sharing (§7 / §8) is unaffected — path-2/3 rows still collapse on the PK; a precise cache key merely costs each new cultivar one redundant (correct) Supabase round-trip before it serves the shared row. This collision is reachable in production: Pl@ntNet emits `scientificNameWithoutAuthor` (e.g. `Brassica oleracea var. italica`), the identify Suggestion carries it to the iOS detail page, which POSTs it verbatim to `/v1/plants/enrichment` (`plantId` is not trusted — §1.3).
+17. **Translation must copy non-prose fields verbatim — never translate enum / key / number fields.** `flower_color` / `foliage_color` / `fruit_color`, `locations`, `attributes`, `soil`, `unit`, every integer, `common_diseases_list` (catalog IDs), `genus` are controlled vocabularies or numbers that iOS maps to localized UI strings. A translated `"loamy"` → `"limoso"` breaks the iOS enum lookup → the chip renders blank or crashes the Codable enum decode. `Translate()` feeds the LLM ONLY the prose fields (`common_name` / `description` / `name_origin` / `bloom_tip` / `fruit_tip` / `bloom_period_short` / `fruit_period_short`) and structurally copies the rest from the master. Guard with a test asserting a translated row's enum/int fields byte-equal the master's.
+18. **Backfill goroutines must NOT use the request context.** The handler's `ctx` is cancelled when the 200 response is written; a backfill translation started on it dies mid-flight. Use `context.Background()` with an independent timeout. Bound concurrency with a worker pool (buffered job channel + N workers) — do NOT spawn one goroutine per request, or a traffic spike of first-callers fans out into thousands of concurrent OpenAI calls.
+19. **The LRU cache key MUST include `lang`.** `NormalizeScientificNamePrecise(name) + "|" + lang`. Omitting lang aliases one language's `*PlantDetail` onto every other language within the 30-min TTL — the same class of bug as §9 #16, one axis over. Guard with a test that two langs of the same plant don't collide in the cache.
+20. **Do NOT cache the English display-fallback under the requested-lang key.** When a `ja` request misses and serves the `en` row, writing that `en` data under the `ja` LRU key pins English for 30 min — so even after backfill writes the real `ja` row, `ja` callers keep seeing English until the TTL expires. Serve the fallback without caching it under `ja` (the `en` key may still be cached on its own).
+21. **`normalizeLang` is the lang source-of-truth, mirroring `normalizeScientificName`.** Maps an incoming tag to the nearest supported code; region dropped for single-variant languages but **Chinese script preserved** (`zh-Hans` ≠ `zh-Hant` — collapsing them to `zh` is a data-loss bug: simplified and traditional are distinct rows). Unsupported → `en`. The supported set must match the iOS `Localizable.xcstrings` languages exactly (`en`, `de`, `es`, `fr`, `it`, `ja`, `ko`, `pt`, `vi`, `zh-Hans`, `zh-Hant`); a lang iOS sends that the server doesn't recognize silently becomes `en` (acceptable fallback, but log it so a missing language is visible). Pin the mapping with a unit test (incl. `zh-CN`→`zh-Hans`, `zh-TW`→`zh-Hant`, `pt-BR`→`pt`).
 
 ---
 

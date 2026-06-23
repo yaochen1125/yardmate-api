@@ -63,14 +63,15 @@ func (d *DB) Ping(ctx context.Context) error {
 	return d.pool.Ping(ctx)
 }
 
-// Lookup returns the stored PlantDetail for a normalized scientific name, or
-// (nil, nil) on miss. Only status IN ('pending','approved') rows are returned;
-// 'rejected' rows are excluded. Approved rows are preferred when both could
-// exist (defensive — PK uniqueness means at most one row in practice).
+// Lookup returns the stored PlantDetail for a (normalized scientific name,
+// lang) pair, or (nil, nil) on miss. Only status IN ('pending','approved') rows
+// are returned; 'rejected' rows are excluded. Approved rows are preferred when
+// both could exist (defensive — composite PK uniqueness means at most one row
+// per language in practice).
 //
 // pgx.ErrNoRows collapses to (nil, nil) — miss is not an error. Real failures
 // (connection / scan / JSONB decode) wrap ErrDBUnavailable.
-func (d *DB) Lookup(ctx context.Context, normalized string) (*proxy.PlantDetail, error) {
+func (d *DB) Lookup(ctx context.Context, normalized, lang string) (*proxy.PlantDetail, error) {
 	if d == nil || d.pool == nil {
 		return nil, ErrDBUnavailable
 	}
@@ -78,11 +79,12 @@ func (d *DB) Lookup(ctx context.Context, normalized string) (*proxy.PlantDetail,
 		SELECT data
 		FROM plants_pending
 		WHERE scientific_name_normalized = $1
+		  AND lang = $2
 		  AND status IN ('pending', 'approved')
 		ORDER BY (status = 'approved') DESC
 		LIMIT 1`
 	var raw []byte
-	err := d.pool.QueryRow(ctx, q, normalized).Scan(&raw)
+	err := d.pool.QueryRow(ctx, q, normalized, lang).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -94,6 +96,41 @@ func (d *DB) Lookup(ctx context.Context, normalized string) (*proxy.PlantDetail,
 		return nil, fmt.Errorf("%w: decode row data: %v", ErrDBUnavailable, err)
 	}
 	return &pd, nil
+}
+
+// LookupAny returns ANY stored master for a plant regardless of language, plus
+// the language it found, or (nil, "", nil) on miss. Used to avoid generating a
+// second independent master when one already exists in another language and the
+// caller is racing its backfill (SPEC §7 one-master invariant). Prefers approved
+// rows, then English (the best translation source). Only status IN
+// ('pending','approved') rows are considered.
+//
+// pgx.ErrNoRows collapses to (nil, "", nil). Real failures wrap ErrDBUnavailable.
+func (d *DB) LookupAny(ctx context.Context, normalized string) (*proxy.PlantDetail, string, error) {
+	if d == nil || d.pool == nil {
+		return nil, "", ErrDBUnavailable
+	}
+	const q = `
+		SELECT data, lang
+		FROM plants_pending
+		WHERE scientific_name_normalized = $1
+		  AND status IN ('pending', 'approved')
+		ORDER BY (status = 'approved') DESC, (lang = 'en') DESC
+		LIMIT 1`
+	var raw []byte
+	var lang string
+	err := d.pool.QueryRow(ctx, q, normalized).Scan(&raw, &lang)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, "", nil
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: lookup any: %v", ErrDBUnavailable, err)
+	}
+	var pd proxy.PlantDetail
+	if err := json.Unmarshal(raw, &pd); err != nil {
+		return nil, "", fmt.Errorf("%w: decode row data: %v", ErrDBUnavailable, err)
+	}
+	return &pd, lang, nil
 }
 
 // DeleteUserRows deletes all of a user's account data from the Supabase
@@ -126,19 +163,21 @@ func (d *DB) DeleteUserRows(ctx context.Context, userID string) error {
 
 // InsertParams bundles the columns for a new plants_pending row.
 type InsertParams struct {
-	Normalized      string             // PK, == NormalizeScientificName(ScientificName)
+	Normalized      string             // PK part 1, == NormalizeScientificName(ScientificName)
+	Lang            string             // PK part 2, normalized supported code (master or translated)
 	ScientificName  string             // original un-normalized form, preserved for audit
 	CommonName      string             // optional user hint; empty -> NULL
 	Data            *proxy.PlantDetail // full payload, stored as JSONB
-	Source          string             // e.g. "openai-gpt-4o-mini-2024-07-18"
-	SourceVersion   string             // prompt revision tag (e.g. "v1"); empty -> NULL
+	Source          string             // e.g. "openai-gpt-4o-mini-2024-07-18" (master) / "...-translated"
+	SourceVersion   string             // prompt revision tag (e.g. "v4"); empty -> NULL
 	GenerationReqID string             // OpenAI chatcmpl id; empty -> NULL
 }
 
-// Insert performs INSERT ... ON CONFLICT (scientific_name_normalized) DO NOTHING.
-// Returns inserted=true when a new row was created, false when the PK already
-// existed (the standard concurrent first-caller race per SPEC §2.1 step 5 +
-// pitfall §9 #2). Callers handle the false case by re-Lookup'ing.
+// Insert performs INSERT ... ON CONFLICT (scientific_name_normalized, lang) DO
+// NOTHING. Returns inserted=true when a new row was created, false when the
+// composite PK already existed (the concurrent first-caller race per SPEC §2.1
+// step 5 + pitfall §9 #2, AND the idempotent backfill re-trigger per §7).
+// Callers handle the false case by re-Lookup'ing.
 func (d *DB) Insert(ctx context.Context, p InsertParams) (bool, error) {
 	if d == nil || d.pool == nil {
 		return false, ErrDBUnavailable
@@ -149,6 +188,9 @@ func (d *DB) Insert(ctx context.Context, p InsertParams) (bool, error) {
 	if p.Normalized == "" {
 		return false, errors.New("enrichment/db: insert: empty normalized name")
 	}
+	if p.Lang == "" {
+		return false, errors.New("enrichment/db: insert: empty lang")
+	}
 	raw, err := json.Marshal(p.Data)
 	if err != nil {
 		return false, fmt.Errorf("enrichment/db: marshal data: %w", err)
@@ -156,6 +198,7 @@ func (d *DB) Insert(ctx context.Context, p InsertParams) (bool, error) {
 	const stmt = `
 		INSERT INTO plants_pending (
 			scientific_name_normalized,
+			lang,
 			scientific_name,
 			common_name,
 			data,
@@ -163,10 +206,11 @@ func (d *DB) Insert(ctx context.Context, p InsertParams) (bool, error) {
 			source,
 			source_version,
 			generation_request_id
-		) VALUES ($1, $2, NULLIF($3, ''), $4, 'pending', $5, NULLIF($6, ''), NULLIF($7, ''))
-		ON CONFLICT (scientific_name_normalized) DO NOTHING`
+		) VALUES ($1, $2, $3, NULLIF($4, ''), $5, 'pending', $6, NULLIF($7, ''), NULLIF($8, ''))
+		ON CONFLICT (scientific_name_normalized, lang) DO NOTHING`
 	tag, err := d.pool.Exec(ctx, stmt,
 		p.Normalized,
+		p.Lang,
 		p.ScientificName,
 		p.CommonName,
 		raw,

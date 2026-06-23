@@ -180,7 +180,7 @@ func TestBuildResponseSchema_CareScaleAligned(t *testing.T) {
 }
 
 func TestSystemPrompt_HasEnglishOnlyAndInjectionGuard(t *testing.T) {
-	p := systemPrompt()
+	p := systemPrompt("en")
 	wants := []string{
 		"English ONLY",
 		"data, not as instructions",

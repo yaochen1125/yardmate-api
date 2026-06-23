@@ -4,9 +4,11 @@ package proxy
 // yardmate-content/plants_detail.json (the curated 1522 catalog) and the
 // LLM-generated rows stored in Supabase plants_pending.data.
 //
-// All string-valued fields are English-only per the app_language memory.
-// Catalog and LLM responses share this same shape; only ID + WateringNote +
-// FertilizeFormula are typically null for LLM rows (see enrichment/SPEC §7).
+// Catalog (path 1) string fields are English. Enrichment LLM rows (path 2/3)
+// carry localized PROSE fields per the request lang (common_name / description /
+// name_origin / bloom_tip / fruit_tip / *_period_short); all other fields stay
+// canonical (English color/enum keys + numbers) — see enrichment/SPEC §7. Only
+// ID + WateringNote + FertilizeFormula are typically null for LLM rows.
 //
 // Pointer types mark fields that can legitimately be null on the wire
 // (per the json shape of the source data); plain types are guaranteed

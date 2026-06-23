@@ -13,10 +13,15 @@ import (
 // stubDB is a sequence-aware ServiceDB stub. Lookups and Inserts pop queued
 // responses; running off the end returns zero values (miss / inserted=true).
 type stubDB struct {
-	lookupCalls []string
-	lookupQ     []dbLookupResult
-	insertCalls []InsertParams
-	insertQ     []dbInsertResult
+	lookupCalls   []string
+	lookupLangs   []string
+	lookupQ       []dbLookupResult
+	insertCalls   []InsertParams
+	insertQ       []dbInsertResult
+	lookupAnyPD   *proxy.PlantDetail // returned by LookupAny (nil → miss → first-caller generate)
+	lookupAnyLang string
+	lookupAnyErr  error
+	lookupAnyHits int
 }
 
 type dbLookupResult struct {
@@ -29,14 +34,20 @@ type dbInsertResult struct {
 	err      error
 }
 
-func (s *stubDB) Lookup(_ context.Context, normalized string) (*proxy.PlantDetail, error) {
+func (s *stubDB) Lookup(_ context.Context, normalized, lang string) (*proxy.PlantDetail, error) {
 	s.lookupCalls = append(s.lookupCalls, normalized)
+	s.lookupLangs = append(s.lookupLangs, lang)
 	if len(s.lookupQ) == 0 {
 		return nil, nil
 	}
 	r := s.lookupQ[0]
 	s.lookupQ = s.lookupQ[1:]
 	return r.pd, r.err
+}
+
+func (s *stubDB) LookupAny(_ context.Context, normalized string) (*proxy.PlantDetail, string, error) {
+	s.lookupAnyHits++
+	return s.lookupAnyPD, s.lookupAnyLang, s.lookupAnyErr
 }
 
 func (s *stubDB) Insert(_ context.Context, p InsertParams) (bool, error) {
@@ -51,14 +62,32 @@ func (s *stubDB) Insert(_ context.Context, p InsertParams) (bool, error) {
 
 // stubLLM is a ServiceLLM stub.
 type stubLLM struct {
-	calls []struct{ Sci, Common string }
-	ret   *proxy.PlantDetail
-	err   error
+	calls          []struct{ Sci, Common, Lang string }
+	ret            *proxy.PlantDetail
+	err            error
+	translateCalls []string           // toLang values, in order
+	translateRet   *proxy.PlantDetail // when set, returned instead of a copy of source
+	translateErr   error
 }
 
-func (s *stubLLM) Generate(_ context.Context, sci, common string) (*proxy.PlantDetail, string, error) {
-	s.calls = append(s.calls, struct{ Sci, Common string }{sci, common})
+func (s *stubLLM) Generate(_ context.Context, sci, common, lang string) (*proxy.PlantDetail, string, error) {
+	s.calls = append(s.calls, struct{ Sci, Common, Lang string }{sci, common, lang})
 	return s.ret, "stub-chatcmpl-id", s.err
+}
+
+func (s *stubLLM) Translate(_ context.Context, source *proxy.PlantDetail, toLang string) (*proxy.PlantDetail, string, error) {
+	s.translateCalls = append(s.translateCalls, toLang)
+	if s.translateErr != nil {
+		return nil, "", s.translateErr
+	}
+	if source == nil {
+		return nil, "", nil
+	}
+	cp := *source
+	if s.translateRet != nil {
+		cp = *s.translateRet
+	}
+	return &cp, "stub-translate-id", nil
 }
 
 func loadTestContent(t *testing.T) *proxy.ContentIndex {
@@ -92,7 +121,7 @@ func TestService_ScientificNameTooLong(t *testing.T) {
 func TestService_Path0_CacheHit_ShortCircuitsEverything(t *testing.T) {
 	cache := NewCache(10, time.Hour)
 	cached := &proxy.PlantDetail{ScientificName: "Cached species"}
-	key := proxy.NormalizeScientificName("Cached species")
+	key := proxy.NormalizeScientificNamePrecise("Cached species") + "|en"
 	cache.Set(key, cached)
 
 	db := &stubDB{}
