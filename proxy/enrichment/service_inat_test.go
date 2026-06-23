@@ -41,7 +41,7 @@ func TestGetOrGenerate_INatOverridesCacheHit(t *testing.T) {
 
 	cache := NewCache(10, time.Hour)
 	pre := &proxy.PlantDetail{CommonName: "Ixia", CommonNameSource: "plantnet"}
-	cache.Set("triteleia ixioides", pre)
+	cache.Set("triteleia ixioides|en", pre)
 
 	svc := NewService(nil, nil, nil, cache, inat)
 	got, src, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Triteleia ixioides"})
@@ -61,7 +61,7 @@ func TestGetOrGenerate_INatOverridesCacheHit(t *testing.T) {
 	// The cached row must NOT have been mutated — overrideINat copies before
 	// writing. If this fails, every other caller reading the same pointer
 	// would see the override leaked back.
-	cached, ok := cache.Get("triteleia ixioides")
+	cached, ok := cache.Get("triteleia ixioides|en")
 	if !ok {
 		t.Fatal("cached row vanished after GetOrGenerate")
 	}
@@ -116,7 +116,7 @@ func TestGetOrGenerate_INatMissKeepsCachedName(t *testing.T) {
 
 	cache := NewCache(10, time.Hour)
 	pre := &proxy.PlantDetail{CommonName: "Original", CommonNameSource: "plantnet"}
-	cache.Set("triteleia ixioides", pre)
+	cache.Set("triteleia ixioides|en", pre)
 
 	svc := NewService(nil, nil, nil, cache, inat)
 	got, src, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Triteleia ixioides"})
@@ -185,7 +185,7 @@ func TestGetOrGenerate_INatNoOverrideOnSecondCatalogCall(t *testing.T) {
 func TestGetOrGenerate_NilINatIsNoOp(t *testing.T) {
 	cache := NewCache(10, time.Hour)
 	pre := &proxy.PlantDetail{CommonName: "Original", CommonNameSource: "plantnet"}
-	cache.Set("triteleia ixioides", pre)
+	cache.Set("triteleia ixioides|en", pre)
 
 	svc := NewService(nil, nil, nil, cache, nil) // nil inat
 	got, src, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Triteleia ixioides"})
