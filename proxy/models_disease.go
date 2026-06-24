@@ -62,6 +62,9 @@ type DiseaseRemedy struct {
 // (no OpenAI key / no DB configured) means diagnose simply leaves out-of-catalog
 // issues slim; callers MUST treat any error as "keep the issue slim" and never
 // surface it (disease enrichment never 502s the diagnose — SPEC_disease §6).
+// lang is the normalized-on-entry display language (NormalizeLang maps empty /
+// unsupported tags to "en"); free-text fields (shortDescription / symptomAnalysis
+// / cause) are written in it, while step/remedy refs + ids stay canonical.
 type DiseaseEnricher interface {
-	GetOrGenerate(ctx context.Context, diseaseName, plantContext string) (*StructuredDiseaseDetail, string, error)
+	GetOrGenerate(ctx context.Context, diseaseName, plantContext, lang string) (*StructuredDiseaseDetail, string, error)
 }
