@@ -26,16 +26,29 @@ type mockDiseaseDB struct {
 	insertErr          error
 	lookupCalls        int
 	insertCalls        int
+	lookupAnyCalls     int
 	secondLookupDetail *proxy.StructuredDiseaseDetail
 	secondLookupID     string
 }
 
-func (m *mockDiseaseDB) LookupDisease(_ context.Context, _ string) (*proxy.StructuredDiseaseDetail, string, error) {
+func (m *mockDiseaseDB) LookupDisease(_ context.Context, _, _ string) (*proxy.StructuredDiseaseDetail, string, error) {
 	m.lookupCalls++
 	if m.lookupCalls >= 2 && m.secondLookupDetail != nil {
 		return m.secondLookupDetail, m.secondLookupID, nil
 	}
 	return m.lookupDetail, m.lookupID, m.lookupErr
+}
+
+// LookupDiseaseAny defaults to a miss (no other-language master) so the existing
+// tests exercise the generate path; the en-fallback / race tests rely on the
+// exact-lang LookupDisease above. lookupErr (DB-down) is surfaced here too so
+// "DB down still generates" continues to fall through to Generate.
+func (m *mockDiseaseDB) LookupDiseaseAny(_ context.Context, _ string) (*proxy.StructuredDiseaseDetail, string, string, error) {
+	m.lookupAnyCalls++
+	if m.lookupErr != nil {
+		return nil, "", "", m.lookupErr
+	}
+	return nil, "", "", nil
 }
 
 func (m *mockDiseaseDB) InsertDisease(_ context.Context, _ DiseaseInsertParams) (string, bool, error) {
@@ -49,9 +62,17 @@ type mockDiseaseLLM struct {
 	calls  int
 }
 
-func (m *mockDiseaseLLM) Generate(_ context.Context, _, _ string, _, _ []proxy.DiseaseNameRef) (*diseaseGenResult, string, error) {
+func (m *mockDiseaseLLM) Generate(_ context.Context, _, _, _ string, _, _ []proxy.DiseaseNameRef) (*diseaseGenResult, string, error) {
 	m.calls++
 	return m.result, "req-1", m.err
+}
+
+func (m *mockDiseaseLLM) DiseaseTranslate(_ context.Context, source *proxy.StructuredDiseaseDetail, _ string) (*proxy.StructuredDiseaseDetail, string, error) {
+	if source == nil {
+		return nil, "", nil
+	}
+	cp := *source
+	return &cp, "req-tr", nil
 }
 
 // sampleGen references real S/K ids plus one bogus id each (dropped on back-fill).
@@ -75,7 +96,7 @@ func TestDiseaseService_GenerateBackfillInsert(t *testing.T) {
 	llm := &mockDiseaseLLM{result: sampleGen()}
 	svc := NewDiseaseService(content, db, llm, NewDiseaseCache(0, 0))
 
-	detail, catalogID, err := svc.GetOrGenerate(context.Background(), "Drought Stress", "Rosa")
+	detail, catalogID, err := svc.GetOrGenerate(context.Background(), "Drought Stress", "Rosa", "en")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -115,11 +136,11 @@ func TestDiseaseService_CacheHit(t *testing.T) {
 	llm := &mockDiseaseLLM{result: sampleGen()}
 	svc := NewDiseaseService(content, db, llm, NewDiseaseCache(0, 0))
 
-	if _, _, err := svc.GetOrGenerate(context.Background(), "Drought Stress", ""); err != nil {
+	if _, _, err := svc.GetOrGenerate(context.Background(), "Drought Stress", "", "en"); err != nil {
 		t.Fatalf("first: %v", err)
 	}
 	llmAfter1, lookupAfter1 := llm.calls, db.lookupCalls
-	_, id, err := svc.GetOrGenerate(context.Background(), "Drought Stress", "")
+	_, id, err := svc.GetOrGenerate(context.Background(), "Drought Stress", "", "en")
 	if err != nil {
 		t.Fatalf("second: %v", err)
 	}
@@ -138,7 +159,7 @@ func TestDiseaseService_DBHit(t *testing.T) {
 	llm := &mockDiseaseLLM{result: sampleGen()}
 	svc := NewDiseaseService(content, db, llm, NewDiseaseCache(0, 0))
 
-	detail, id, err := svc.GetOrGenerate(context.Background(), "Some Disease", "")
+	detail, id, err := svc.GetOrGenerate(context.Background(), "Some Disease", "", "en")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -157,7 +178,7 @@ func TestDiseaseService_RaceLoser(t *testing.T) {
 	llm := &mockDiseaseLLM{result: sampleGen()}
 	svc := NewDiseaseService(content, db, llm, NewDiseaseCache(0, 0))
 
-	detail, id, err := svc.GetOrGenerate(context.Background(), "Race Disease", "")
+	detail, id, err := svc.GetOrGenerate(context.Background(), "Race Disease", "", "en")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -172,7 +193,7 @@ func TestDiseaseService_DBDownStillGenerates(t *testing.T) {
 	llm := &mockDiseaseLLM{result: sampleGen()}
 	svc := NewDiseaseService(content, db, llm, NewDiseaseCache(0, 0))
 
-	detail, id, err := svc.GetOrGenerate(context.Background(), "Drought Stress", "")
+	detail, id, err := svc.GetOrGenerate(context.Background(), "Drought Stress", "", "en")
 	if err != nil {
 		t.Fatalf("DB down must not fail: %v", err)
 	}
@@ -187,7 +208,7 @@ func TestDiseaseService_DBDownStillGenerates(t *testing.T) {
 func TestDiseaseService_InvalidName(t *testing.T) {
 	content := diseaseTestContent(t)
 	svc := NewDiseaseService(content, &mockDiseaseDB{}, &mockDiseaseLLM{result: sampleGen()}, NewDiseaseCache(0, 0))
-	if _, _, err := svc.GetOrGenerate(context.Background(), "   ", ""); !errors.Is(err, ErrInvalidDiseaseName) {
+	if _, _, err := svc.GetOrGenerate(context.Background(), "   ", "", "en"); !errors.Is(err, ErrInvalidDiseaseName) {
 		t.Errorf("err = %v, want ErrInvalidDiseaseName", err)
 	}
 }

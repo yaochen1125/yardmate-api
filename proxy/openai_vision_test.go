@@ -586,7 +586,7 @@ func TestDiagnosePlant_Success(t *testing.T) {
 	})
 	defer srv.Close()
 
-	vr, err := c.DiagnosePlant(context.Background(), []byte("\xff\xd8img"), "image/jpeg")
+	vr, err := c.DiagnosePlant(context.Background(), []byte("\xff\xd8img"), "image/jpeg", "")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -622,12 +622,59 @@ func TestDiagnosePlant_Success(t *testing.T) {
 	}
 }
 
+// TestDiagnosePlant_LangLocalizesProseOnly verifies the i18n wiring: a non-English
+// lang puts the target-language directive into BOTH the system prompt and the
+// prose-field schema descriptions (cause/description/treatment), while the
+// scientific_name + issue `name` descriptions explicitly pin canonical English
+// (the downstream catalog-mapping / dedup keys must NOT be localized).
+func TestDiagnosePlant_LangLocalizesProseOnly(t *testing.T) {
+	var gotBody string
+	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Rosa chinensis\",\"common_names\":[],\"confidence\":0.8,\"is_healthy\":false,\"health_probability\":0.2,\"issues\":[]}"}}]}`)
+	})
+	defer srv.Close()
+
+	if _, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg", "de"); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !strings.Contains(gotBody, "German") {
+		t.Errorf("request body missing German directive: %s", gotBody)
+	}
+	// Name fields must demand canonical English so dedup / catalog keys stay stable.
+	if !strings.Contains(gotBody, "never localize") {
+		t.Errorf("request body missing English-pin for name fields: %s", gotBody)
+	}
+}
+
+// TestDiagnosePlant_EmptyLangNoLocalization confirms an empty / English lang adds
+// no language directive — byte-for-byte the pre-i18n behavior.
+func TestDiagnosePlant_EmptyLangNoLocalization(t *testing.T) {
+	for _, code := range []string{"", "en", "en-US"} {
+		var gotBody string
+		c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Rosa chinensis\",\"common_names\":[],\"confidence\":0.8,\"is_healthy\":true,\"health_probability\":0.9,\"issues\":[]}"}}]}`)
+		})
+		if _, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg", code); err != nil {
+			srv.Close()
+			t.Fatalf("lang=%q err: %v", code, err)
+		}
+		if strings.Contains(gotBody, "localize fully") || strings.Contains(gotBody, "do not translate") {
+			t.Errorf("lang=%q leaked a localization directive: %s", code, gotBody)
+		}
+		srv.Close()
+	}
+}
+
 func TestDiagnosePlant_HealthyEmptyIssues(t *testing.T) {
 	c, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Monstera deliciosa\",\"common_names\":[],\"confidence\":0.9,\"is_healthy\":true,\"health_probability\":0.95,\"issues\":[]}"}}]}`)
 	})
 	defer srv.Close()
-	vr, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg")
+	vr, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg", "")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -642,7 +689,7 @@ func TestDiagnosePlant_Non200_SentinelError(t *testing.T) {
 		_, _ = io.WriteString(w, `{"error":"server"}`)
 	})
 	defer srv.Close()
-	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg")
+	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg", "")
 	if err == nil || !errors.Is(err, ErrVisionDiagnoseUnavailable) {
 		t.Errorf("err = %v, want ErrVisionDiagnoseUnavailable", err)
 	}
@@ -653,7 +700,7 @@ func TestDiagnosePlant_MalformedJSON_SentinelError(t *testing.T) {
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"not json at all"}}]}`)
 	})
 	defer srv.Close()
-	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg")
+	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg", "")
 	if err == nil || !errors.Is(err, ErrVisionDiagnoseUnavailable) {
 		t.Errorf("err = %v, want ErrVisionDiagnoseUnavailable (decode failure)", err)
 	}
@@ -664,7 +711,7 @@ func TestDiagnosePlant_Refusal_EmptyContent_SentinelError(t *testing.T) {
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":""}}]}`)
 	})
 	defer srv.Close()
-	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg")
+	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg", "")
 	if err == nil || !errors.Is(err, ErrVisionDiagnoseUnavailable) {
 		t.Errorf("err = %v, want ErrVisionDiagnoseUnavailable (refusal)", err)
 	}
@@ -675,7 +722,7 @@ func TestDiagnosePlant_EmptyScientificName_SentinelError(t *testing.T) {
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"   \",\"common_names\":[],\"confidence\":0.3,\"is_healthy\":false,\"health_probability\":0.4,\"issues\":[]}"}}]}`)
 	})
 	defer srv.Close()
-	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg")
+	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg", "")
 	if err == nil || !errors.Is(err, ErrVisionDiagnoseUnavailable) {
 		t.Errorf("err = %v, want ErrVisionDiagnoseUnavailable (blank scientific_name)", err)
 	}
@@ -683,7 +730,7 @@ func TestDiagnosePlant_EmptyScientificName_SentinelError(t *testing.T) {
 
 func TestDiagnosePlant_NilReceiver_SentinelError(t *testing.T) {
 	var c *VisionClient
-	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg")
+	_, err := c.DiagnosePlant(context.Background(), []byte("img"), "image/jpeg", "")
 	if err == nil || !errors.Is(err, ErrVisionDiagnoseUnavailable) {
 		t.Errorf("err = %v, want ErrVisionDiagnoseUnavailable (nil receiver)", err)
 	}
@@ -691,7 +738,7 @@ func TestDiagnosePlant_NilReceiver_SentinelError(t *testing.T) {
 
 func TestDiagnosePlant_EmptyImage_SentinelError(t *testing.T) {
 	c := &VisionClient{}
-	_, err := c.DiagnosePlant(context.Background(), nil, "image/jpeg")
+	_, err := c.DiagnosePlant(context.Background(), nil, "image/jpeg", "")
 	if err == nil || !errors.Is(err, ErrVisionDiagnoseUnavailable) {
 		t.Errorf("err = %v, want ErrVisionDiagnoseUnavailable (empty image)", err)
 	}

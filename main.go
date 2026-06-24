@@ -244,8 +244,11 @@ func buildDiseaseEnrichmentService(vault *secrets.Vault, content *proxy.ContentI
 	}
 	llm := enrichment.NewDiseaseLLMClient(openaiKey)
 	cache := enrichment.NewDiseaseCache(0, 0) // defaults: 10k entries, 30 min TTL
-	log.Printf("disease enrichment ready: shared db pool + LRU cache + LLM %s", enrichment.DiseaseSourceTag)
-	return enrichment.NewDiseaseService(content, db, llm, cache)
+	svc := enrichment.NewDiseaseService(content, db, llm, cache)
+	svc.SetBackfiller(enrichment.NewDiseaseBackfiller(db, llm)) // async multi-language translation backfill (SPEC §7)
+	log.Printf("disease enrichment ready: shared db pool + LRU cache + LLM %s + %d-language backfill",
+		enrichment.DiseaseSourceTag, len(enrichment.SupportedLangs))
+	return svc
 }
 
 // buildImageIngestService wires the proxy/imageingest dependencies: R2 client

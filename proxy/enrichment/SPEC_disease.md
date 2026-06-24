@@ -38,9 +38,11 @@
 
 | Source | Input |
 |---|---|
-| Within `HandleDiagnose` | out-of-catalog `issue.Name` + `IdentifiedName` / `PlantID` (prompt context only) |
+| Within `HandleDiagnose` | out-of-catalog `issue.Name` + `IdentifiedName` / `PlantID` (prompt context only); optional `lang` display-language hint (from the `/v1/diagnose` multipart `lang` form field) |
 | Curated pools | `shared.steps` (S01–S44), `shared.remedies` (K01–K15) |
 | Config | `OPENAI_API_KEY` + `SUPABASE_DB_URL` (same secrets as plant enrichment) |
+
+- `lang` — optional. Normalized (`NormalizeLang`, **shared with plant enrichment**) to the nearest of the 11 iOS `Localizable.xcstrings` codes: `en`, `de`, `es`, `fr`, `it`, `ja`, `ko`, `pt`, `vi`, `zh-Hans`, `zh-Hant`. Region subtags drop for single-variant languages (`pt-BR`→`pt`); **Chinese script is preserved** (`zh-CN`→`zh-Hans`; `zh-TW`/`zh-HK`→`zh-Hant`; bare `zh`→`zh-Hans`). Absent / empty / unsupported → `en`. Second component of the composite key `(disease_name_normalized, lang)` for both the in-process cache and Supabase (§6 multi-language).
 
 ### 1.4 Outputs
 
@@ -49,7 +51,7 @@
 | Enriched | `HealthIssue` with **`catalogId` = O id** (e.g. `"O1"`), `structuredDetail` filled, `isFallback=true` |
 | Generation unavailable (error / timeout / budget / DB-down-and-uncacheable) | degrade to **slim issue: `catalogId = null` + legacy `Treatment` text**. Never 502. |
 
-Wire shape is identical regardless of cache / DB / LLM path.
+Wire shape is identical regardless of cache / DB / LLM / language path. Prose is returned in the requested `lang` (best-available, English-fallback per §6); non-prose (ids / enums) stays canonical (§3).
 
 ### 1.5 External dependencies
 
@@ -99,6 +101,7 @@ Equivalents map at step 2/3; only genuinely-new diseases reach step 4 and mint a
 - **enum makes an "all-invalid refs" outcome structurally impossible**; the only residual is the model returning an **empty** array (it judged no step fits) → keep prose with empty steps.
 - Back-fill ids → `{num (group-local), title, body, image}` / `{title, recipe, usage, image}`. **Defense-in-depth: still whitelist server-side** in case enum is relaxed; drop unknown → drop emptied group.
 - `max_tokens` ~800 (slim output keeps it inside the diagnose budget).
+- **Lang-aware (`buildDiseaseSchema(…, lang)`, `DiseasePromptVersion` v2).** For non-English `lang`, the strict `json_schema` `description` of each **prose** field (`shortDescription`, `symptomAnalysis`, `cause`, each group `label`) is suffixed `"Write this field in <Language>…"`, and `diseaseSystemPrompt(lang)` carries the same rule. The schema description is what actually drives localization under strict mode (the `#59` lesson from plant enrichment — a one-line system prompt alone is not enough). Refs / enums / `name` (echo) stay canonical English.
 
 ---
 
@@ -130,24 +133,28 @@ type HealthIssue struct {
 ## 5. Supabase schema (`diseases_pending`)
 
 ```sql
-CREATE SEQUENCE diseases_other_seq;            -- mints O numbers
+CREATE SEQUENCE diseases_other_seq;             -- mints O numbers
 CREATE TABLE diseases_pending (
-  disease_name_normalized TEXT PRIMARY KEY,    -- normalizeDiseaseName(name); name-keyed, plant-agnostic
-  catalog_id              TEXT UNIQUE NOT NULL, -- 'O' || nextval, the minted O id
+  disease_name_normalized TEXT NOT NULL,        -- normalizeDiseaseName(name); name-keyed, plant-agnostic
+  lang                    TEXT NOT NULL DEFAULT 'en', -- supported code (en/de/.../zh-Hans/zh-Hant); added in 004
+  catalog_id              TEXT NOT NULL,         -- 'O' || nextval; SHARED across a disease's language rows (004 dropped UNIQUE)
   disease_name            TEXT NOT NULL,
-  data                    JSONB NOT NULL,       -- StructuredDiseaseDetail, bodies/images ALREADY back-filled (frozen)
+  data                    JSONB NOT NULL,        -- StructuredDiseaseDetail, bodies/images ALREADY back-filled (frozen)
   status                  TEXT NOT NULL DEFAULT 'pending',  -- pending|approved|rejected
   source                  TEXT, source_version TEXT, generation_request_id TEXT,
-  created_at              TIMESTAMPTZ DEFAULT now()
+  created_at              TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (disease_name_normalized, lang)    -- composite (004); one row per (disease, language)
 );
--- lookup: WHERE disease_name_normalized=$1 AND status IN ('pending','approved')  (approved preferred)
--- write:  catalog_id := 'O' || nextval('diseases_other_seq');
---         INSERT ... ON CONFLICT (disease_name_normalized) DO NOTHING; race winner re-queried
---         (returns winner's catalog_id; loser's minted number discarded — gaps OK)
+-- lookup (exact):   WHERE disease_name_normalized=$1 AND lang=$2 AND status IN ('pending','approved')  (approved preferred)
+-- lookupAny (race): WHERE disease_name_normalized=$1 AND status IN ('pending','approved')
+--                   ORDER BY (status='approved') DESC, (lang='en') DESC  -- any-language master, prefers approved then en
+-- write:  catalog_id := COALESCE(passed-through master O id, 'O' || nextval('diseases_other_seq'));
+--         INSERT ... (lang, catalog_id, ...) ON CONFLICT (disease_name_normalized, lang) DO NOTHING; race winner re-queried
+--         (master mints the O id; translated rows REUSE it; loser's minted number discarded — gaps OK)
 ```
 
 - `data` stores **back-filled (denormalized)** detail → self-contained row, no re-back-fill on read. Trade-off: if `shared.steps` later changes, old rows keep old copies until regenerated — acceptable (mirrors `diseases.json` denormalization).
-- O id is **stable per disease** (one row, one id). Graduating an approved row into curated `diseases.json` later may keep or remap the id (V1.1, §9).
+- O id is **stable per disease and SHARED across that disease's language rows** — the master row mints it, translated rows reuse it (iOS keys its detail page on `catalog_id`, so it must be byte-identical across languages). 004 dropped the global `UNIQUE` on `catalog_id` to allow this; it stays unique *per disease* (one O id per normalized name). Graduating an approved row into curated `diseases.json` later may keep or remap the id (V1.1, §9).
 - Reuses the same pgx pool / `SUPABASE_DB_URL` as plant enrichment.
 
 ---
@@ -157,6 +164,18 @@ CREATE TABLE diseases_pending (
 - LLM error / timeout / budget-skip → **slim issue** (`catalogId=null`, legacy `Treatment`), 200 (never 502).
 - **DB unavailable → still generate & return (experience-first), but DON'T persist.** Your question answered: when DB recovers, the next caller generates + persists the durable row. **No data conflict** — `ON CONFLICT DO NOTHING` means the first post-recovery writer wins one row + one id; later INSERTs are ignored; nothing is overwritten. The only costs are (a) repeat LLM spend during the outage, (b) the during-outage user got an unsaved version that may differ slightly (LLM nondeterminism) from the eventually-persisted one. (Open: what `catalogId` the transient response carries — see §8.)
 - All refs empty (enum makes "invalid" impossible; only "model chose none") → keep prose, empty steps.
+
+### Multi-language fallback chain (mirrors plant `SPEC.md §7`)
+
+English-pivoted, one-master-per-disease. `GetOrGenerate(ctx, name, plantContext, lang)`:
+
+0. `lang := NormalizeLang(lang)` (unsupported / empty → `en`).
+1. in-process cache `(normalized|lang)` or Supabase exact `(normalized, lang)` hit → return it.
+2. exact `lang` missing and `lang != en` → try the English row → return it (**English fallback**; not re-cached under the `lang` key).
+3. **one-master invariant** — a master exists in ANOTHER language but neither exact `lang` nor English yet (racing the backfill): `LookupDiseaseAny(normalized)` (prefers approved, then `en`) → `DiseaseTranslate` it into `lang` + INSERT (**reuse the master's O id**, `…-translated` source) rather than minting a 2nd independent master that could carry a different O id.
+4. nothing yet → generate the master **in `lang`** → INSERT (mints the O id) → `enqueue` async backfill (**English FIRST**, then the rest; translate-only-prose; `ON CONFLICT DO NOTHING`).
+- **Only prose is localized**: `shortDescription` / `symptomAnalysis` / `cause` + each treatment/prevention group `label`. `name` (echo), step/remedy ref ids, and the offline `shared.steps` / `shared.remedies` step+remedy text stay canonical (iOS localizes catalog text via its own offline pipeline). `DiseaseTranslate` copies every non-prose field byte-for-byte.
+- DB-down (§6 bullet 2) still applies per-language: generate + return in `lang`, don't persist.
 
 ---
 
