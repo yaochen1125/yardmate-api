@@ -1076,7 +1076,7 @@ func diagnoseStaticNetResult(ctx context.Context, content *ContentIndex, vision 
 // diagnosis succeeded (true) or the safety net was used (false), for the
 // handler's observability log.
 func buildDiagnoseResultViaVision(ctx context.Context, image []byte, mime string, content *ContentIndex, vision *VisionClient, enricher DiseaseEnricher, reqStart time.Time, lang string) (*DiagnoseResult, bool) {
-	vr, err := vision.DiagnosePlant(ctx, image, mime)
+	vr, err := vision.DiagnosePlant(ctx, image, mime, lang)
 	if err != nil {
 		// Vision unavailable too — no plant/disease context to ground on, so
 		// fall straight to the static net (same instant L08 the budget-skip path uses).

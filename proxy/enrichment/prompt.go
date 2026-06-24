@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yaochen1125/yardmate-api/proxy"
+	"github.com/yaochen1125/yardmate-api/proxy/lang"
 )
 
 // ErrEnrichmentUnavailable is returned to the handler when the LLM call fails
@@ -76,48 +77,18 @@ const (
 // the universal display fallback, and the first backfill target (SPEC §7 / §1.3).
 var SupportedLangs = []string{"en", "de", "es", "fr", "it", "ja", "ko", "pt", "vi", "zh-Hans", "zh-Hant"}
 
-// langNames maps a supported code to its English display name for LLM prompts.
-var langNames = map[string]string{
-	"en": "English", "de": "German", "es": "Spanish", "fr": "French",
-	"it": "Italian", "ja": "Japanese", "ko": "Korean", "pt": "Portuguese",
-	"vi": "Vietnamese", "zh-Hans": "Simplified Chinese", "zh-Hant": "Traditional Chinese",
-}
-
 // langDisplayName returns the English name of a supported code (defaults to
-// English for unknown codes — callers should NormalizeLang first).
-func langDisplayName(code string) string {
-	if n, ok := langNames[code]; ok {
-		return n
-	}
-	return "English"
-}
+// English for unknown codes — callers should NormalizeLang first). The table +
+// rule live in the stdlib-only proxy/lang leaf package so the proxy diagnose
+// path (which can't import enrichment — that would cycle) shares one source of
+// truth; this wrapper keeps the package-internal name unchanged.
+func langDisplayName(code string) string { return lang.DisplayName(code) }
 
 // NormalizeLang maps an incoming BCP-47 tag to the nearest supported code
 // (SPEC §1.3 + §9 #21). Region subtags drop for single-variant languages, but
 // Chinese script is preserved (zh-Hans ≠ zh-Hant). Unsupported / empty → "en".
-func NormalizeLang(tag string) string {
-	t := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(tag), "_", "-"))
-	if t == "" {
-		return "en"
-	}
-	// Chinese: preserve simplified vs traditional (collapsing to "zh" loses data).
-	if t == "zh" || strings.HasPrefix(t, "zh-") {
-		if strings.Contains(t, "hant") || strings.Contains(t, "-tw") ||
-			strings.Contains(t, "-hk") || strings.Contains(t, "-mo") {
-			return "zh-Hant"
-		}
-		return "zh-Hans" // zh, zh-hans, zh-cn, zh-sg, …
-	}
-	base := t
-	if i := strings.IndexByte(t, '-'); i > 0 {
-		base = t[:i]
-	}
-	switch base {
-	case "en", "de", "es", "fr", "it", "ja", "ko", "pt", "vi":
-		return base
-	}
-	return "en"
-}
+// Delegates to proxy/lang (single source of truth — see langDisplayName).
+func NormalizeLang(tag string) string { return lang.Normalize(tag) }
 
 // LLMClient drives the OpenAI chat-completions endpoint with json_schema
 // strict mode, generating a PlantDetail JSON.
