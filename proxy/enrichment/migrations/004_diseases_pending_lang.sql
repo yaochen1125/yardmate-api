@@ -74,6 +74,6 @@ BEGIN
   END IF;
 END $$;
 
--- Helper index for LookupAny (find any language row of a disease fast).
-CREATE INDEX IF NOT EXISTS idx_diseases_pending_name_norm
-  ON diseases_pending (disease_name_normalized);
+-- No extra index needed: LookupAny filters on disease_name_normalized, which the
+-- composite PK (disease_name_normalized, lang) already serves via its leftmost
+-- prefix (matches plant-side 003, which adds no secondary index).
