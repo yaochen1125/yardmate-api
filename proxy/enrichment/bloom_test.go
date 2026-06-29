@@ -46,6 +46,7 @@ func TestRenderPeriodShort_Localized(t *testing.T) {
 		{"ja", []int{7, 8, 9, 10}, "7月 → 10月"},
 		{"de", []int{3, 4, 5, 9, 10, 11}, "Mär–Mai / Sep–Nov"},
 		{"fr", []int{6, 7, 8}, "Juin → Août"},
+		{"vi", []int{5, 6, 7, 8}, "Tháng 5 → Tháng 8"},
 		{"zh-Hant", []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, "全年"},
 	}
 	for _, c := range cases {
