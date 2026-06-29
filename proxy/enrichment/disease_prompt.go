@@ -37,10 +37,23 @@ const (
 	// v3 = each severity-labeled group carries a language-independent `severity`
 	// enum ("mild"|"severe"|"") alongside its localized label, so iOS badges
 	// MILD/SEVERE off the structured field instead of sniffing the localized label
-	// (matches in-catalog CDN diseases.json + iOS PR #661). Forward-stamping only —
-	// no disease-side sweeper queries source_version yet, but a future oneshot
-	// backfill can target `source_version < 'v3'` to fill severity on pre-v3 rows
-	// (mirrors the plant side's native_region v5 convention).
+	// (matches in-catalog CDN diseases.json + iOS PR #661).
+	//
+	// CAUTION — the version only tags "what schema GENERATED this master", it is
+	// NOT a severity-present guarantee: DiseaseTranslate copies the source master's
+	// groups verbatim (prose-only translation), so a row translated from a pre-v3
+	// master — via the race window (disease_service.go) or the periodic backfiller
+	// (disease_backfill.go), both of which stamp DiseasePromptVersion — is stamped
+	// v3 yet still has nil severity. So a future severity backfill must NOT select
+	// by `source_version < 'v3'` (it would skip those v3-stamped, severity-less
+	// rows). It must select by CONTENT — a severity-labeled group missing the field
+	// — deriving each group's severity by sniffing the ENGLISH row's label (reliable
+	// for English) and stamping it onto every language row positionally (severity is
+	// language-independent), using source_version only as the post-patch idempotency
+	// marker. This mirrors the native_region backfill, whose query pairs a content
+	// predicate with the version check (supabase.go). Content disambiguation is also
+	// required, not optional: "no severity" alone is ambiguous between a pre-v3 row
+	// and a legitimately ungrouped v3 row (single group, severity "").
 	DiseasePromptVersion = "v3"
 	DiseaseSourceTag     = "openai-" + diseaseLLMModel
 	// DiseaseTranslatedSourceTag marks rows produced by translating the master
