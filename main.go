@@ -222,11 +222,14 @@ func buildSupabaseDB(vault *secrets.Vault) *enrichment.DB {
 // the env var is unset. Requires the shared Supabase pool + OPENAI_API_KEY; if
 // either is missing it logs and exits non-zero so the operator notices.
 //
-// Exit code reflects the OUTCOME: 0 only when no row failed; 1 when the list
-// query errored OR any per-row translate/update failed (rep.Failed > 0). Per-row
-// failures are non-fatal to the run (best-effort, logged + skipped) but MUST NOT
-// surface as a clean exit, or an operator would believe a half-failed run
-// (e.g. OpenAI rate-limited) finished and remove the env flag prematurely.
+// Exit code reflects the OUTCOME: 0 only when the run is COMPLETE; 1 when the
+// list query errored OR any row is left unlocalized — both rep.Failed (transient
+// translate/update error) AND rep.Skipped (model returned a wrong element count,
+// row deliberately left English for a later retry). Either MUST NOT surface as a
+// clean exit, or an operator/automation would believe a half-finished run
+// (OpenAI rate-limited, or a region the model keeps mangling) completed and
+// remove the env flag while non-English rows still hold English regions.
+// rep.Vanished (row deleted between list and update) is benign and does not block.
 func maybeRunNativeRegionBackfill(vault *secrets.Vault, db *enrichment.DB) {
 	if vault.Get("ENRICH_BACKFILL_NATIVE_REGION") != "1" {
 		return
@@ -249,8 +252,8 @@ func maybeRunNativeRegionBackfill(vault *secrets.Vault, db *enrichment.DB) {
 	}
 	log.Printf("native_region backfill report: total=%d updated=%d skipped=%d vanished=%d failed=%d",
 		rep.Total, rep.Updated, rep.Skipped, rep.Vanished, rep.Failed)
-	if rep.Failed > 0 {
-		log.Printf("ERROR: native_region backfill had %d per-row failure(s); re-run to retry them", rep.Failed)
+	if rep.Failed > 0 || rep.Skipped > 0 {
+		log.Printf("ERROR: native_region backfill INCOMPLETE: %d failed, %d skipped (arity mismatch); re-run to retry before clearing ENRICH_BACKFILL_NATIVE_REGION", rep.Failed, rep.Skipped)
 		os.Exit(1)
 	}
 	os.Exit(0)
