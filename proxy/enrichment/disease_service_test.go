@@ -83,10 +83,10 @@ func sampleGen() *diseaseGenResult {
 		SymptomAnalysis:  "Browning, wilting leaves.",
 		Cause:            "Underwatering.",
 		Treatment: diseaseGenGroups{Groups: []diseaseGenGroup{
-			{Label: "For mild cases", StepRefs: []string{"S01", "S99", "S02"}}, // S99 bogus
+			{Label: "For mild cases", Severity: "mild", StepRefs: []string{"S01", "S99", "S02"}}, // S99 bogus
 		}},
 		HomeRemedyRefs: []string{"K01", "K99"}, // K99 bogus
-		Prevention:     diseaseGenGroups{Groups: []diseaseGenGroup{{Label: "", StepRefs: []string{"S03"}}}},
+		Prevention:     diseaseGenGroups{Groups: []diseaseGenGroup{{Label: "", Severity: "", StepRefs: []string{"S03"}}}},
 	}
 }
 
@@ -117,6 +117,14 @@ func TestDiseaseService_GenerateBackfillInsert(t *testing.T) {
 	s1 := detail.Treatment.Groups[0].Steps[1]
 	if s1.Ref != "S02" || s1.Num != 2 {
 		t.Errorf("step1 = %+v (want ref S02, num 2)", s1)
+	}
+	// severity is carried verbatim from the gen result (language-independent badge
+	// key); the ungrouped prevention group ("" severity) backfills to nil.
+	if sv := detail.Treatment.Groups[0].Severity; sv == nil || *sv != "mild" {
+		t.Errorf("treatment severity = %v, want \"mild\"", sv)
+	}
+	if sv := detail.Prevention.Groups[0].Severity; sv != nil {
+		t.Errorf("prevention severity = %v, want nil (ungrouped)", sv)
 	}
 	// home remedies: K99 dropped → only K01 (with pool fields).
 	if len(detail.HomeRemedies) != 1 || detail.HomeRemedies[0].Ref != "K01" || detail.HomeRemedies[0].Title == "" {
@@ -210,5 +218,41 @@ func TestDiseaseService_InvalidName(t *testing.T) {
 	svc := NewDiseaseService(content, &mockDiseaseDB{}, &mockDiseaseLLM{result: sampleGen()}, NewDiseaseCache(0, 0))
 	if _, _, err := svc.GetOrGenerate(context.Background(), "   ", "", "en"); !errors.Is(err, ErrInvalidDiseaseName) {
 		t.Errorf("err = %v, want ErrInvalidDiseaseName", err)
+	}
+}
+
+// The translation pass localizes group LABELS but must leave SEVERITY untouched
+// (it's a language-independent badge key, like step refs). Guards the iOS PR #661
+// invariant on the enrichment translate path (applyDiseaseProse → applyGroupLabels).
+func TestApplyDiseaseProse_TranslatesLabelKeepsSeverity(t *testing.T) {
+	mild, severe := "mild", "severe"
+	enMild, enSevere := "For mild cases", "For severe cases"
+	src := &proxy.StructuredDiseaseDetail{
+		ShortDescription: "Leaves wilt from drought.",
+		Treatment: proxy.DiseaseStepGroups{Groups: []proxy.DiseaseStepGroup{
+			{Label: &enMild, Severity: &mild, Steps: []proxy.DiseaseStep{{Ref: "S01"}}},
+			{Label: &enSevere, Severity: &severe, Steps: []proxy.DiseaseStep{{Ref: "S02"}}},
+		}},
+	}
+	tr := map[string]string{
+		diseaseProseShort:                    "Las hojas se marchitan.",
+		diseaseGroupLabelKey("treatment", 0): "Para casos leves",
+		diseaseGroupLabelKey("treatment", 1): "Para casos graves",
+	}
+
+	out := applyDiseaseProse(src, tr)
+
+	if out.Treatment.Groups[0].Label == nil || *out.Treatment.Groups[0].Label != "Para casos leves" {
+		t.Errorf("label[0] = %v, want translated 'Para casos leves'", out.Treatment.Groups[0].Label)
+	}
+	if sv := out.Treatment.Groups[0].Severity; sv == nil || *sv != "mild" {
+		t.Errorf("severity[0] = %v, want \"mild\" (untouched by translation)", sv)
+	}
+	if sv := out.Treatment.Groups[1].Severity; sv == nil || *sv != "severe" {
+		t.Errorf("severity[1] = %v, want \"severe\" (untouched by translation)", sv)
+	}
+	// The master's in-memory copy must not be mutated by the translate.
+	if *src.Treatment.Groups[0].Label != "For mild cases" {
+		t.Errorf("source label mutated: %q", *src.Treatment.Groups[0].Label)
 	}
 }

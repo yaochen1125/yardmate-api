@@ -33,7 +33,28 @@ const (
 	// stay canonical ids. A new DiseaseTranslate() path produces the other
 	// languages from the master copy. The `lang` dimension + composite PK arrive
 	// via migration 004.
-	DiseasePromptVersion = "v2"
+	//
+	// v3 = each severity-labeled group carries a language-independent `severity`
+	// enum ("mild"|"severe"|"") alongside its localized label, so iOS badges
+	// MILD/SEVERE off the structured field instead of sniffing the localized label
+	// (matches in-catalog CDN diseases.json + iOS PR #661).
+	//
+	// CAUTION — the version only tags "what schema GENERATED this master", it is
+	// NOT a severity-present guarantee: DiseaseTranslate copies the source master's
+	// groups verbatim (prose-only translation), so a row translated from a pre-v3
+	// master — via the race window (disease_service.go) or the periodic backfiller
+	// (disease_backfill.go), both of which stamp DiseasePromptVersion — is stamped
+	// v3 yet still has nil severity. So a future severity backfill must NOT select
+	// by `source_version < 'v3'` (it would skip those v3-stamped, severity-less
+	// rows). It must select by CONTENT — a severity-labeled group missing the field
+	// — deriving each group's severity by sniffing the ENGLISH row's label (reliable
+	// for English) and stamping it onto every language row positionally (severity is
+	// language-independent), using source_version only as the post-patch idempotency
+	// marker. This mirrors the native_region backfill, whose query pairs a content
+	// predicate with the version check (supabase.go). Content disambiguation is also
+	// required, not optional: "no severity" alone is ambiguous between a pre-v3 row
+	// and a legitimately ungrouped v3 row (single group, severity "").
+	DiseasePromptVersion = "v3"
 	DiseaseSourceTag     = "openai-" + diseaseLLMModel
 	// DiseaseTranslatedSourceTag marks rows produced by translating the master
 	// copy, distinguishing them from the master for forensics (mirrors the plant
@@ -58,7 +79,13 @@ type diseaseGenGroups struct {
 }
 
 type diseaseGenGroup struct {
-	Label    string   `json:"label"`
+	Label string `json:"label"`
+	// Severity is the LLM-emitted, language-independent badge key keyed off the
+	// group's INTENT, not its (localized) label prose: "mild" | "severe" | "" when
+	// not severity-specific. backfillGroups copies it onto DiseaseStepGroup so iOS
+	// can badge MILD/SEVERE regardless of display language (the label is localized,
+	// so sniffing it is unreliable — exactly the bug iOS PR #661 fixed).
+	Severity string   `json:"severity"`
 	StepRefs []string `json:"stepRefs"`
 }
 
@@ -164,9 +191,17 @@ func buildDiseaseSchema(stepIDs, remedyIDs []string, lang string) map[string]any
 					"items": map[string]any{
 						"type":                 "object",
 						"additionalProperties": false,
-						"required":             []string{"label", "stepRefs"},
+						"required":             []string{"label", "severity", "stepRefs"},
 						"properties": map[string]any{
 							"label": map[string]any{"type": "string", "description": "Group label, e.g. 'For mild cases'. Empty string if ungrouped." + proseLang},
+							"severity": map[string]any{
+								"type": "string",
+								"enum": []any{"mild", "severe", ""},
+								// Language-independent enum keyed off the group's INTENT, NOT
+								// its label prose — deliberately carries no proseLang directive
+								// so it stays canonical across languages (iOS PR #661).
+								"description": "Severity bucket for this group, keyed off its intent: \"mild\" for the early/limited-spread group, \"severe\" for the advanced/widespread group, \"\" when the group is not severity-specific (a single ungrouped group). Canonical enum — never translate or localize it.",
+							},
 							"stepRefs": map[string]any{
 								"type":        "array",
 								"description": "Ordered step ids from the STEP LIST, most important first.",
@@ -216,6 +251,7 @@ func diseaseSystemPrompt(lang string) string {
 		"- Echo the input disease name verbatim in \"name\".",
 		"- shortDescription: 15-40 words, plain text. symptomAnalysis and cause: plain text, no markdown.",
 		"- For treatment.groups[].stepRefs and prevention.groups[].stepRefs, use ONLY step ids from the provided STEP LIST; pick the relevant ones, ordered most important first. Use severity groups (e.g. mild vs severe) only when helpful; otherwise a single group with an empty label.",
+		"- Set each group's \"severity\" to \"mild\" or \"severe\" to match the group's intent when you split by severity; use \"\" for a single, non-severity group. \"severity\" is a fixed canonical enum — set it from the group's meaning, never localize it, even when the label is written in another language.",
 		"- For homeRemedyRefs, use ONLY ids from the provided REMEDY LIST; pick relevant ones (may be empty).",
 		"- Never invent ids. Never output step/remedy text — only ids; the server fills the text from its library.",
 		"Output a single JSON object matching the schema. No prose outside the JSON.",
@@ -424,7 +460,7 @@ func applyDiseaseProse(src *proxy.StructuredDiseaseDetail, tr map[string]string)
 func applyGroupLabels(section string, g proxy.DiseaseStepGroups, tr map[string]string) proxy.DiseaseStepGroups {
 	groups := make([]proxy.DiseaseStepGroup, len(g.Groups))
 	for i := range g.Groups {
-		grp := g.Groups[i] // copy; Steps slice is shared verbatim (refs/titles untouched)
+		grp := g.Groups[i] // copy; Steps slice + Severity shared verbatim (refs/titles/severity untouched — severity is language-independent, like step refs)
 		if grp.Label != nil {
 			if v, ok := tr[diseaseGroupLabelKey(section, i)]; ok && v != "" {
 				vv := v

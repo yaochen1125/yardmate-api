@@ -101,7 +101,7 @@ Equivalents map at step 2/3; only genuinely-new diseases reach step 4 and mint a
 - **enum makes an "all-invalid refs" outcome structurally impossible**; the only residual is the model returning an **empty** array (it judged no step fits) → keep prose with empty steps.
 - Back-fill ids → `{num (group-local), title, body, image}` / `{title, recipe, usage, image}`. **Defense-in-depth: still whitelist server-side** in case enum is relaxed; drop unknown → drop emptied group.
 - `max_tokens` ~800 (slim output keeps it inside the diagnose budget).
-- **Lang-aware (`buildDiseaseSchema(…, lang)`, `DiseasePromptVersion` v2).** For non-English `lang`, the strict `json_schema` `description` of each **prose** field (`shortDescription`, `symptomAnalysis`, `cause`, each group `label`) is suffixed `"Write this field in <Language>…"`, and `diseaseSystemPrompt(lang)` carries the same rule. The schema description is what actually drives localization under strict mode (the `#59` lesson from plant enrichment — a one-line system prompt alone is not enough). Refs / enums / `name` (echo) stay canonical English.
+- **Lang-aware (`buildDiseaseSchema(…, lang)`, `DiseasePromptVersion` v3).** For non-English `lang`, the strict `json_schema` `description` of each **prose** field (`shortDescription`, `symptomAnalysis`, `cause`, each group `label`) is suffixed `"Write this field in <Language>…"`, and `diseaseSystemPrompt(lang)` carries the same rule. The schema description is what actually drives localization under strict mode (the `#59` lesson from plant enrichment — a one-line system prompt alone is not enough). Refs / enums / `name` (echo) stay canonical English.
 
 ---
 
@@ -117,7 +117,7 @@ type HealthIssue struct {
     StructuredDetail *StructuredDiseaseDetail `json:"structuredDetail,omitempty"` // present for O-series enriched issues
 }
 // StructuredDiseaseDetail{ ShortDescription, SymptomAnalysis, Cause string; Treatment, Prevention DiseaseStepGroups; HomeRemedies []DiseaseRemedy }
-// DiseaseStepGroups{ Groups []DiseaseStepGroup }; DiseaseStepGroup{ Label *string (null=ungrouped, matches diseases.json); Steps []DiseaseStep }
+// DiseaseStepGroups{ Groups []DiseaseStepGroup }; DiseaseStepGroup{ Label *string (null=ungrouped, matches diseases.json); Severity *string ("mild"|"severe", omitempty; language-independent badge key, iOS PR #661); Steps []DiseaseStep }
 // DiseaseStep{ Num int; Title, Body, Image, Ref string; SubSteps []DiseaseStep }; DiseaseRemedy{ Ref, Title, Recipe, Usage, Image string }
 ```
 
