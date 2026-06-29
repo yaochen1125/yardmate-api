@@ -141,11 +141,14 @@ type DiseaseSweepItem struct {
 	MissingLangs []string
 }
 
-// IncompleteDiseaseMasters returns every enriched disease (status
-// pending/approved) whose distinct-language count is below the full supported
-// set, paired with the languages it still lacks. Read half of the periodic
-// Sweeper's disease pass — mirrors IncompletePlantMasters. The master pivot
-// prefers English; the carried catalog_id is reused by every translated row.
+// IncompleteDiseaseMasters returns every enriched disease whose language coverage
+// is below the full supported set, paired with the languages it still lacks. Read
+// half of the periodic Sweeper's disease pass — mirrors IncompletePlantMasters,
+// including the rejected-status handling: presence (the agg CTE) is counted across
+// ALL statuses so a 'rejected' translation (whose PK blocks ON CONFLICT
+// re-insert) is left alone rather than re-translated every tick forever, while the
+// pivot is still chosen only from pending/approved rows. The pivot prefers
+// English; the carried catalog_id is reused by every translated row.
 func (d *DB) IncompleteDiseaseMasters(ctx context.Context) ([]DiseaseSweepItem, error) {
 	if d == nil || d.pool == nil {
 		return nil, ErrDBUnavailable
@@ -154,7 +157,6 @@ func (d *DB) IncompleteDiseaseMasters(ctx context.Context) ([]DiseaseSweepItem, 
 		WITH agg AS (
 			SELECT disease_name_normalized, array_agg(DISTINCT lang) AS langs
 			FROM diseases_pending
-			WHERE status IN ('pending', 'approved')
 			GROUP BY disease_name_normalized
 			HAVING count(DISTINCT lang) < $1
 		)

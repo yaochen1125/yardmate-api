@@ -330,17 +330,26 @@ type PlantSweepItem struct {
 	MissingLangs   []string
 }
 
-// IncompletePlantMasters returns every enriched plant (status pending/approved)
-// whose distinct-language count is below the full supported set, paired with the
-// languages it still lacks. It is the read half of the periodic Sweeper: the
-// in-request backfill is fire-and-forget with no retry, so legacy rows (from
-// before multilingual support) and jobs lost to queue saturation / restarts /
-// transient LLM errors never self-heal without this. Read-only.
+// IncompletePlantMasters returns every enriched plant whose language coverage is
+// below the full supported set, paired with the languages it still lacks. It is
+// the read half of the periodic Sweeper: the in-request backfill is
+// fire-and-forget with no retry, so legacy rows (from before multilingual
+// support) and jobs lost to queue saturation / restarts / transient LLM errors
+// never self-heal without this. Read-only.
 //
-// The master pivot prefers English (the best translation source); for the rare
-// plant with no English row yet, the lexically-first available language is used.
-// totalLangs is the full supported-language count (len(SupportedLangs)); a plant
-// at that count is complete and excluded.
+// Language presence (the agg CTE) is counted across ALL statuses, INCLUDING
+// 'rejected'. A rejected translation keeps its (normalized, lang) primary key, so
+// Insert's ON CONFLICT DO NOTHING would silently drop any re-translation —
+// counting a rejected language as "missing" would make the sweep re-pay an LLM
+// call for it on every tick forever with no progress. A reviewer's rejection is
+// deliberate; leave it. The master PIVOT, by contrast, is still chosen only from
+// pending/approved rows (a rejected row must never be a translation source), so a
+// plant whose only rows are rejected yields no pivot and is correctly skipped.
+//
+// The pivot prefers English (the best translation source); for the rare plant
+// with no English row yet, the lexically-first available language is used. $1 is
+// the full supported-language count (len(SupportedLangs)); a plant with that many
+// distinct language rows (in any status) is complete and excluded.
 func (d *DB) IncompletePlantMasters(ctx context.Context) ([]PlantSweepItem, error) {
 	if d == nil || d.pool == nil {
 		return nil, ErrDBUnavailable
@@ -349,7 +358,6 @@ func (d *DB) IncompletePlantMasters(ctx context.Context) ([]PlantSweepItem, erro
 		WITH agg AS (
 			SELECT scientific_name_normalized, array_agg(DISTINCT lang) AS langs
 			FROM plants_pending
-			WHERE status IN ('pending', 'approved')
 			GROUP BY scientific_name_normalized
 			HAVING count(DISTINCT lang) < $1
 		)
