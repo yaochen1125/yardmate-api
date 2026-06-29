@@ -1787,7 +1787,7 @@
               },
               {
                 "num": 4,
-                "title": "If a mosaic virus is suspected: [S43](../shared/treatment-steps.md#s43-discard-the-severely-infected-plant)",
+                "title": "If a mosaic virus is suspected: discard the severely infected plant",
                 "ref": null,
                 "body": "Viruses don't recover.",
                 "image": null,
@@ -2119,7 +2119,7 @@
                 "num": 2,
                 "title": "Identify the cause:",
                 "ref": null,
-                "body": "- Pests visible → see [02_pests/](../02_pests/) and treat - All plants in a row affected → herbicide drift; eliminate exposure - Only after a frost → cold damage; wait it out - With yellowing → see [L10 — General chlorosis](chlorosis-fertilizer.md)",
+                "body": "- Pests visible → identify and treat the pest - All plants in a row affected → herbicide drift; eliminate exposure - Only after a frost → cold damage; wait it out - With yellowing → see [L10 — General chlorosis](chlorosis-fertilizer.md)",
                 "image": null,
                 "subSteps": []
               },
@@ -2728,7 +2728,7 @@
             "steps": [
               {
                 "num": 1,
-                "title": "**Identify and treat the underlying pest** — see the relevant entry in [02_pests/](../02_pests/):",
+                "title": "**Identify and treat the underlying pest**:",
                 "ref": null,
                 "body": "- Aphids → [P02](../02_pests/aphids.md) - Whiteflies → [P15](../02_pests/whiteflies.md) - Scale → [P03](../02_pests/scale-insects.md) - Mealybugs → [P04](../02_pests/mealybugs.md)",
                 "image": null,
@@ -3057,7 +3057,7 @@
       "name": "Sap-sucking damage",
       "fullName": "L24 — Sap-Sucking Damage (Stippling)",
       "shortDescription": "Tiny dense yellow or white stippling spots",
-      "symptomAnalysis": "Caused by sap-sucking insects — aphids, whiteflies, leafhoppers, lace bugs, mites, mealybugs, thrips — piercing leaf tissue and sucking out cell contents. Each puncture leaves a tiny pale dot (\"stippling\"). With many feeders, the dots merge into a bronzed or silvered look.\n\nThe leaves don't kill the plant directly, but stippling weakens it and many of these insects also spread plant viruses.\n\nThis entry covers the leaf symptom. For the specific pest causing it, see [02_pests/](../02_pests/).",
+      "symptomAnalysis": "Caused by sap-sucking insects — aphids, whiteflies, leafhoppers, lace bugs, mites, mealybugs, thrips — piercing leaf tissue and sucking out cell contents. Each puncture leaves a tiny pale dot (\"stippling\"). With many feeders, the dots merge into a bronzed or silvered look.\n\nThe leaves don't kill the plant directly, but stippling weakens it and many of these insects also spread plant viruses.\n\nThis entry covers the leaf symptom.",
       "heroImage": null,
       "crossReferences": [
         "P02",
@@ -4357,7 +4357,7 @@
               },
               {
                 "num": 3,
-                "title": "For severe infestations on small plants: [S04](../shared/treatment-steps.md#s04-prune-infected-leaves-and-stems) — prune and burn heavily affected limbs",
+                "title": "For severe infestations on small plants: prune and burn heavily affected limbs",
                 "ref": null,
                 "body": "",
                 "image": null,
@@ -5644,7 +5644,7 @@
                 "num": 3,
                 "title": "Determine the cause:",
                 "ref": null,
-                "body": "- Rust fungus → *Apply Copper Fungicide* (see 3.1) - Mites or insects → see [02_pests/](../02_pests/) - Mistletoe → physically remove the parasite",
+                "body": "- Rust fungus → *Apply Copper Fungicide* (see 3.1) - Mites or insects → identify and treat the pest - Mistletoe → physically remove the parasite",
                 "image": null,
                 "subSteps": [
                   {
@@ -5753,7 +5753,7 @@
               },
               {
                 "num": 4,
-                "title": "For young or heavily infected plants: [S43](../shared/treatment-steps.md#s43-discard-the-severely-infected-plant) — Remove and destroy",
+                "title": "For young or heavily infected plants: remove and destroy the plant",
                 "ref": null,
                 "body": "Do not compost.",
                 "image": null,
@@ -5845,7 +5845,7 @@
                 "num": 1,
                 "title": "Address the underlying cause:",
                 "ref": null,
-                "body": "- Pets/kids/tools → install a barrier or move plant. - Pests → identify the insect and treat. See [02_pests/](../02_pests/). - Sunburn → *Move to a Shaded Location* (see 1.1) Move out of harsh sun. - Frequent leaf loss → check light, water, and nutrients.",
+                "body": "- Pets/kids/tools → install a barrier or move plant. - Pests → identify the insect and treat. - Sunburn → *Move to a Shaded Location* (see 1.1) Move out of harsh sun. - Frequent leaf loss → check light, water, and nutrients.",
                 "image": null,
                 "subSteps": [
                   {
@@ -6241,7 +6241,7 @@
                 "num": 5,
                 "title": "Check for insect damage on developing fruit",
                 "ref": null,
-                "body": "See [02_pests/](../02_pests/).",
+                "body": "Identify and treat any insects feeding on developing fruit.",
                 "image": null,
                 "subSteps": []
               }
@@ -7716,7 +7716,7 @@
             "steps": [
               {
                 "num": 1,
-                "title": "Test the soil with a finger: if dry → [S17](../shared/treatment-steps.md#s17-water-deeply-but-less-often)",
+                "title": "Test the soil with a finger: if dry → water deeply but less often",
                 "ref": null,
                 "body": "If wet → *Reduce Watering Frequency* (see 1.1).",
                 "image": null,
@@ -7817,7 +7817,7 @@
       "name": "Bud drop",
       "fullName": "FL04 — Bud Drop",
       "shortDescription": "Flower buds form then fall before opening",
-      "symptomAnalysis": "A stress response, not a disease. The plant is conserving energy by aborting buds it cannot support. Common triggers:\n\n- **Sudden environmental change** — moved indoors/outdoors, draft, sudden temperature shift.\n- **Inconsistent watering** — letting soil dry too far, then flooding it.\n- **Low humidity** — common indoors; tropical bloomers (gardenias, hibiscus) are sensitive.\n- **Insufficient light** — buds form but don't get the energy to open.\n- **Over-fertilizing** — too much nitrogen pushes leaf growth at the cost of flowers.\n- **Pest pressure** — thrips and aphids feeding inside developing buds. See [02_pests/](../02_pests/).",
+      "symptomAnalysis": "A stress response, not a disease. The plant is conserving energy by aborting buds it cannot support. Common triggers:\n\n- **Sudden environmental change** — moved indoors/outdoors, draft, sudden temperature shift.\n- **Inconsistent watering** — letting soil dry too far, then flooding it.\n- **Low humidity** — common indoors; tropical bloomers (gardenias, hibiscus) are sensitive.\n- **Insufficient light** — buds form but don't get the energy to open.\n- **Over-fertilizing** — too much nitrogen pushes leaf growth at the cost of flowers.\n- **Pest pressure** — thrips and aphids feeding inside developing buds.",
       "heroImage": null,
       "crossReferences": [],
       "treatment": {
