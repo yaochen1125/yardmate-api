@@ -143,13 +143,16 @@ func TestApplyProse_CopiesNonProseVerbatim(t *testing.T) {
 	}
 }
 
-// TestCollectProse only gathers the 7 prose fields and skips empty ones.
+// TestCollectProse gathers the 5 translatable prose fields, skips empty ones,
+// and NEVER collects the *_period_short labels (server-derived, not translated).
 func TestCollectProse(t *testing.T) {
+	bps := "Apr → Nov"
 	p := &proxy.PlantDetail{
-		CommonName:  "Name",
-		Description: "Desc",
-		BloomTip:    "", // empty → skipped
-		// FruitPeriodShort nil → skipped
+		CommonName:       "Name",
+		Description:      "Desc",
+		BloomTip:         "", // empty → skipped
+		BloomPeriodShort: bps,
+		FruitPeriodShort: &bps,
 	}
 	got := collectProse(p)
 	if _, ok := got["common_name"]; !ok {
@@ -161,8 +164,12 @@ func TestCollectProse(t *testing.T) {
 	if _, ok := got["bloom_tip"]; ok {
 		t.Error("empty bloom_tip should be skipped")
 	}
+	// Derived fields must never be sent to the translator, even when populated.
+	if _, ok := got["bloom_period_short"]; ok {
+		t.Error("bloom_period_short must not be collected (server-derived)")
+	}
 	if _, ok := got["fruit_period_short"]; ok {
-		t.Error("nil fruit_period_short should be skipped")
+		t.Error("fruit_period_short must not be collected (server-derived)")
 	}
 }
 
@@ -209,10 +216,18 @@ func TestBuildTranslateSchema_WithRegions(t *testing.T) {
 // Enum / number fields must NOT carry it.
 func TestBuildResponseSchema_NonEnglishEmbedsLangInProse(t *testing.T) {
 	props := buildResponseSchema("de")["properties"].(map[string]any)
-	for _, f := range []string{"common_name", "description", "name_origin", "bloom_tip", "fruit_tip", "bloom_period_short", "fruit_period_short"} {
+	for _, f := range []string{"common_name", "description", "name_origin", "bloom_tip", "fruit_tip"} {
 		desc := props[f].(map[string]any)["description"].(string)
 		if !strings.Contains(desc, "German") {
 			t.Errorf("prose field %q must embed the target language for non-en, got: %q", f, desc)
+		}
+	}
+	// *_period_short are NO LONGER localized prose: the server derives them from
+	// the month arrays (reconcilePeriods), so they must NOT carry the directive.
+	for _, f := range []string{"bloom_period_short", "fruit_period_short"} {
+		desc := props[f].(map[string]any)["description"].(string)
+		if strings.Contains(desc, "Write this field in German") {
+			t.Errorf("derived field %q must not carry the language directive, got: %q", f, desc)
 		}
 	}
 	// Non-prose fields must NOT get the language directive.

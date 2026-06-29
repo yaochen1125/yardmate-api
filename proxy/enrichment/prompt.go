@@ -160,6 +160,9 @@ func (c *LLMClient) Generate(ctx context.Context, scientificName, commonName, la
 	if err := json.Unmarshal([]byte(raw), &pd); err != nil {
 		return nil, requestID, fmt.Errorf("%w: decode: %v", ErrEnrichmentUnavailable, err)
 	}
+	// Derive *_period_short from *_months_north so the header always agrees with
+	// the per-month chart (see bloom.go). The LLM's own period_short is discarded.
+	reconcilePeriods(&pd, lang)
 	return &pd, requestID, nil
 }
 
@@ -360,11 +363,11 @@ func buildResponseSchema(lang string) map[string]any {
 			"fruit_color":          colorArray("Lowercased English color names for prominent fruit. Empty array when there is no notable fruit."),
 			"fruit_color_primary":  map[string]any{"type": nullableString, "description": "Dominant fruit color, or null when no notable fruit."},
 			"bloom_tip":            map[string]any{"type": "string", "description": "One sentence on flowers + bloom timing, 8-25 words. Empty string for non-flowering plants." + proseLang},
-			"bloom_months_north":   monthArray("Northern-hemisphere bloom months as integers 1-12 (Jan=1). Empty array for non-flowering plants."),
-			"bloom_period_short":   map[string]any{"type": "string", "description": "Short bloom range like \"Jul → Oct\" using the Unicode arrow (localize the month abbreviations). Empty string for non-flowering plants." + proseLang},
+			"bloom_months_north":   monthArray("Northern-hemisphere bloom months as integers 1-12 (Jan=1). Empty array for non-flowering plants. Be accurate: this array is the single source of truth — the server derives the displayed range label from it."),
+			"bloom_period_short":   map[string]any{"type": "string", "description": "Short bloom range like \"Jul → Oct\". The server OVERWRITES this from bloom_months_north, so it need not be exact; emit \"\" for non-flowering plants."},
 			"fruit_tip":            map[string]any{"type": "string", "description": "One sentence on fruit ornamental value. Empty string when no notable fruit." + proseLang},
-			"fruit_months_north":   monthArray("Northern-hemisphere months when fruit is visible, integers 1-12. Empty array when no notable fruit."),
-			"fruit_period_short":   map[string]any{"type": nullableString, "description": "Short fruit range like \"Aug → Nov\" (localize the month abbreviations), or null when no notable fruit." + proseLang},
+			"fruit_months_north":   monthArray("Northern-hemisphere months when fruit is visible, integers 1-12. Empty array when no notable fruit. Be accurate: the server derives the displayed range label from this array."),
+			"fruit_period_short":   map[string]any{"type": nullableString, "description": "Short fruit range like \"Aug → Nov\". The server OVERWRITES this from fruit_months_north, so it need not be exact; emit null when no notable fruit."},
 			"difficulty":           map[string]any{"type": "integer", "description": "Care difficulty integer 0..5: 0=very easy, 5=very challenging."},
 			"sunlight":             map[string]any{"type": "integer", "description": "Sun preference integer 0..5 (YardMate scale): 0=Full sun (6+ hrs direct), 1=Part sun (4–6 hrs direct), 2=Part shade (2–4 hrs direct), 3=Full shade (<2 hrs direct), 4=Indirect (filtered light, typical houseplant), 5=Low light (dim corners)."},
 			"hardiness_zones": map[string]any{
@@ -487,6 +490,10 @@ func (c *LLMClient) Translate(ctx context.Context, source *proxy.PlantDetail, to
 		log.Printf("enrichment translate: native_region arity mismatch toLang=%s want=%d got=%d — kept source regions",
 			toLang, len(regions), len(trRegions))
 	}
+	// Re-derive *_period_short for the target language from the (unchanged) month
+	// arrays, rather than trusting the translator to keep the range intact. The
+	// label stays in lock-step with the chart across every language (bloom.go).
+	reconcilePeriods(out, toLang)
 	return out, requestID, nil
 }
 
@@ -530,10 +537,8 @@ func collectProse(p *proxy.PlantDetail) map[string]string {
 	add("name_origin", p.NameOrigin)
 	add("bloom_tip", p.BloomTip)
 	add("fruit_tip", p.FruitTip)
-	add("bloom_period_short", p.BloomPeriodShort)
-	if p.FruitPeriodShort != nil {
-		add("fruit_period_short", *p.FruitPeriodShort)
-	}
+	// bloom_period_short / fruit_period_short are NOT translated: they are derived
+	// from the month arrays per target language by reconcilePeriods (bloom.go).
 	return m
 }
 
@@ -557,13 +562,8 @@ func applyProse(src *proxy.PlantDetail, tr map[string]string) *proxy.PlantDetail
 	if v := tr["fruit_tip"]; v != "" {
 		out.FruitTip = v
 	}
-	if v := tr["bloom_period_short"]; v != "" {
-		out.BloomPeriodShort = v
-	}
-	if v := tr["fruit_period_short"]; v != "" {
-		vv := v
-		out.FruitPeriodShort = &vv
-	}
+	// bloom_period_short / fruit_period_short are derived from the month arrays
+	// by reconcilePeriods after this call, not translated here (bloom.go).
 	return &out
 }
 
