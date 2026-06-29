@@ -139,6 +139,13 @@ func main() {
 	// nil (with a WARN) when SUPABASE_DB_URL is missing or the ping fails.
 	enrichDB := buildSupabaseDB(vault)
 
+	// One-time native_region localization backfill (SPEC §7 v5). Operator sets
+	// ENRICH_BACKFILL_NATIVE_REGION=1 for a single run; the process localizes the
+	// legacy non-English rows and exits WITHOUT starting the HTTP server. Removing
+	// the env var restores normal serving. Gated here so it has the shared pool +
+	// OPENAI_API_KEY already resolved.
+	maybeRunNativeRegionBackfill(vault, enrichDB)
+
 	// Enrichment service — V1 plant-detail enrichment endpoint
 	// (proxy/enrichment/SPEC.md). Requires the shared Supabase pool (above) +
 	// OPENAI_API_KEY. Gracefully disabled with a WARN log if either is missing.
@@ -207,6 +214,46 @@ func buildSupabaseDB(vault *secrets.Vault) *enrichment.DB {
 	}
 	log.Printf("Supabase DB pool ready (shared by enrichment / disease enrichment / account-delete)")
 	return db
+}
+
+// maybeRunNativeRegionBackfill runs the one-time native_region localization
+// backfill (SPEC §7 v5) when ENRICH_BACKFILL_NATIVE_REGION=1, then exits the
+// process — it is a maintenance task, not part of normal serving. A no-op when
+// the env var is unset. Requires the shared Supabase pool + OPENAI_API_KEY; if
+// either is missing it logs and exits non-zero so the operator notices.
+//
+// Exit code reflects the OUTCOME: 0 only when no row failed; 1 when the list
+// query errored OR any per-row translate/update failed (rep.Failed > 0). Per-row
+// failures are non-fatal to the run (best-effort, logged + skipped) but MUST NOT
+// surface as a clean exit, or an operator would believe a half-failed run
+// (e.g. OpenAI rate-limited) finished and remove the env flag prematurely.
+func maybeRunNativeRegionBackfill(vault *secrets.Vault, db *enrichment.DB) {
+	if vault.Get("ENRICH_BACKFILL_NATIVE_REGION") != "1" {
+		return
+	}
+	openaiKey := vault.Get("OPENAI_API_KEY")
+	if db == nil || openaiKey == "" {
+		log.Printf("ERROR: native_region backfill requested but shared db (%v) or OPENAI_API_KEY (%v) missing", db != nil, openaiKey != "")
+		os.Exit(1)
+	}
+	llm := enrichment.NewLLMClient(openaiKey)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rep, err := enrichment.RunNativeRegionBackfill(ctx, db, llm)
+	// Release the shared pool explicitly: os.Exit below skips main's deferred
+	// cleanup, and this maintenance path never starts the HTTP server.
+	db.Close()
+	if err != nil {
+		log.Printf("ERROR: native_region backfill failed: %v", err)
+		os.Exit(1)
+	}
+	log.Printf("native_region backfill report: total=%d updated=%d skipped=%d vanished=%d failed=%d",
+		rep.Total, rep.Updated, rep.Skipped, rep.Vanished, rep.Failed)
+	if rep.Failed > 0 {
+		log.Printf("ERROR: native_region backfill had %d per-row failure(s); re-run to retry them", rep.Failed)
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
 // buildEnrichmentService wires the /v1/plants/enrichment dependencies: the

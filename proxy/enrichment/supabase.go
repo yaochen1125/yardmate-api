@@ -161,6 +161,88 @@ func (d *DB) DeleteUserRows(ctx context.Context, userID string) error {
 	return nil
 }
 
+// NativeRegionRow identifies one legacy non-English row whose native_region is
+// still canonical English and needs localizing (SPEC §7 v5 backfill).
+type NativeRegionRow struct {
+	Normalized   string   // PK part 1
+	Lang         string   // PK part 2 (always != "en")
+	NativeRegion []string // current (English) native_region from data JSONB
+}
+
+// ListNativeRegionBackfillRows returns every non-English row written before v5
+// (source_version IS NULL OR < 'v5') whose native_region is a non-empty array —
+// the legacy rows carrying English place names that v5 localizes. English rows
+// are excluded (their native_region stays English by design). Rows with an empty
+// native_region are excluded (nothing to translate). status IN
+// ('pending','approved') only. Read-only; safe to call repeatedly.
+//
+// The comparison is lexicographic `< 'v5'` (the codebase's established
+// stale-row-targeting convention — see prompt.go PromptVersion history), NOT
+// `<> 'v5'`: not-equal would re-select rows already advanced to a FUTURE version
+// (v6+) on a re-run and needlessly re-translate them. `< 'v5'` is forward-safe —
+// only genuinely older rows (v1..v4, NULL) match.
+func (d *DB) ListNativeRegionBackfillRows(ctx context.Context) ([]NativeRegionRow, error) {
+	if d == nil || d.pool == nil {
+		return nil, ErrDBUnavailable
+	}
+	const q = `
+		SELECT scientific_name_normalized, lang, data->'native_region'
+		FROM plants_pending
+		WHERE lang <> 'en'
+		  AND status IN ('pending', 'approved')
+		  AND (source_version IS NULL OR source_version < 'v5')
+		  AND jsonb_typeof(data->'native_region') = 'array'
+		  AND jsonb_array_length(data->'native_region') > 0
+		ORDER BY scientific_name_normalized, lang`
+	rows, err := d.pool.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("%w: list native_region backfill: %v", ErrDBUnavailable, err)
+	}
+	defer rows.Close()
+	var out []NativeRegionRow
+	for rows.Next() {
+		var r NativeRegionRow
+		var raw []byte
+		if err := rows.Scan(&r.Normalized, &r.Lang, &raw); err != nil {
+			return nil, fmt.Errorf("%w: scan native_region row: %v", ErrDBUnavailable, err)
+		}
+		if err := json.Unmarshal(raw, &r.NativeRegion); err != nil {
+			return nil, fmt.Errorf("%w: decode native_region: %v", ErrDBUnavailable, err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: iterate native_region rows: %v", ErrDBUnavailable, err)
+	}
+	return out, nil
+}
+
+// UpdateNativeRegion patches just data->'native_region' on one (normalized, lang)
+// row via jsonb_set and stamps source_version to mark the row v5-conformant. It
+// touches NOTHING else — the row's already-localized prose is preserved. The
+// source_version bump makes the backfill idempotent (a re-run's WHERE clause
+// excludes rows already at v5). Returns the number of rows updated (0 if the row
+// vanished between list and update — benign).
+func (d *DB) UpdateNativeRegion(ctx context.Context, normalized, lang string, regions []string, version string) (int64, error) {
+	if d == nil || d.pool == nil {
+		return 0, ErrDBUnavailable
+	}
+	raw, err := json.Marshal(regions)
+	if err != nil {
+		return 0, fmt.Errorf("enrichment/db: marshal native_region: %w", err)
+	}
+	const stmt = `
+		UPDATE plants_pending
+		SET data = jsonb_set(data, '{native_region}', $3::jsonb, true),
+		    source_version = NULLIF($4, '')
+		WHERE scientific_name_normalized = $1 AND lang = $2`
+	tag, err := d.pool.Exec(ctx, stmt, normalized, lang, raw, version)
+	if err != nil {
+		return 0, fmt.Errorf("%w: update native_region: %v", ErrDBUnavailable, err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // InsertParams bundles the columns for a new plants_pending row.
 type InsertParams struct {
 	Normalized      string             // PK part 1, == NormalizeScientificName(ScientificName)
