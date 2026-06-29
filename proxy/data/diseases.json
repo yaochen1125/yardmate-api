@@ -6031,7 +6031,7 @@
       "name": "Fruit rot",
       "fullName": "FR02 — Fruit Rot",
       "shortDescription": "Sunken brown rot, blossom-end blackening, fungal mush",
-      "symptomAnalysis": "Three common patterns:\n\n1. **Blossom-end rot** — sunken black crater at the bottom of tomatoes, peppers, squash. Caused by calcium deficiency in the fruit, not a disease. Inconsistent watering disrupts calcium uptake.\n2. **Brown rot (fungal)** — small brown spots that expand and may grow tan-gray fuzzy spore clumps. Affects stone fruits (peach, plum, cherry).\n3. **Overripe rot** — fruit left on the plant past ripening, attracting insects and fungi.",
+      "symptomAnalysis": "Three common patterns:\n1. **Blossom-end rot** — sunken black crater at the bottom of tomatoes, peppers, squash. Caused by calcium deficiency in the fruit, not a disease. Inconsistent watering disrupts calcium uptake.\n2. **Brown rot (fungal)** — small brown spots that expand and may grow tan-gray fuzzy spore clumps. Affects stone fruits (peach, plum, cherry).\n3. **Overripe rot** — fruit left on the plant past ripening, attracting insects and fungi.",
       "heroImage": null,
       "crossReferences": [],
       "treatment": {
