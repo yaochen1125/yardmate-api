@@ -27,8 +27,14 @@ type DiseaseStepGroups struct {
 }
 
 type DiseaseStepGroup struct {
-	Label *string       `json:"label"` // e.g. "For mild cases"; null when ungrouped (matches diseases.json)
-	Steps []DiseaseStep `json:"steps"`
+	Label *string `json:"label"` // e.g. "For mild cases"; null when ungrouped (matches diseases.json)
+	// Severity is the language-independent badge key ("mild" | "severe"); nil when
+	// the group is not severity-specific. iOS reads this instead of sniffing the
+	// (localized) label, so the MILD/SEVERE badge survives in non-English languages
+	// (iOS PR #661). Marshaled right after label to match the in-catalog CDN wire
+	// shape (the CDN diseases.json group puts "severity" right after "label").
+	Severity *string       `json:"severity,omitempty"`
+	Steps    []DiseaseStep `json:"steps"`
 }
 
 // DiseaseStep is a back-filled treatment/prevention step. Ref is the S-id it was

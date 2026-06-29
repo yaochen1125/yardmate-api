@@ -261,7 +261,14 @@ func (s *DiseaseService) backfillGroups(g diseaseGenGroups) proxy.DiseaseStepGro
 		if l := strings.TrimSpace(grp.Label); l != "" {
 			label = &l
 		}
-		out.Groups = append(out.Groups, proxy.DiseaseStepGroup{Label: label, Steps: steps})
+		// Severity is language-independent; whitelist to the known enum (defense
+		// beyond the schema, same posture as dropping unknown step ids) so a stray
+		// value never reaches the wire. nil when ungrouped / not severity-specific.
+		var severity *string
+		if sv := strings.TrimSpace(grp.Severity); sv == "mild" || sv == "severe" {
+			severity = &sv
+		}
+		out.Groups = append(out.Groups, proxy.DiseaseStepGroup{Label: label, Severity: severity, Steps: steps})
 	}
 	return out
 }
