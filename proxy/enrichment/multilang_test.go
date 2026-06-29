@@ -169,13 +169,37 @@ func TestCollectProse(t *testing.T) {
 // TestBuildTranslateSchema is strict, string-typed, sorted, and requires exactly
 // the prose keys present.
 func TestBuildTranslateSchema(t *testing.T) {
-	sch := buildTranslateSchema(map[string]string{"description": "y", "common_name": "x"})
+	sch := buildTranslateSchema(map[string]string{"description": "y", "common_name": "x"}, false)
 	if sch["additionalProperties"] != false {
 		t.Error("schema must be strict (additionalProperties:false)")
 	}
 	req, _ := sch["required"].([]string)
 	if !reflect.DeepEqual(req, []string{"common_name", "description"}) {
 		t.Errorf("required must be sorted prose keys, got %v", req)
+	}
+}
+
+// TestBuildTranslateSchema_WithRegions: when withRegions is set, native_region
+// is added as a REQUIRED array<string> field (SPEC §7 v5), sorted into the keys.
+func TestBuildTranslateSchema_WithRegions(t *testing.T) {
+	sch := buildTranslateSchema(map[string]string{"description": "y"}, true)
+	req, _ := sch["required"].([]string)
+	if !reflect.DeepEqual(req, []string{"description", "native_region"}) {
+		t.Errorf("required must include native_region, sorted, got %v", req)
+	}
+	props := sch["properties"].(map[string]any)
+	nr, ok := props["native_region"].(map[string]any)
+	if !ok || nr["type"] != "array" {
+		t.Errorf("native_region must be an array property, got %v", props["native_region"])
+	}
+	items, _ := nr["items"].(map[string]any)
+	if items["type"] != "string" {
+		t.Errorf("native_region items must be string, got %v", items)
+	}
+	// Region-only schema (prose nil): native_region is the sole required key.
+	only := buildTranslateSchema(nil, true)
+	if r, _ := only["required"].([]string); !reflect.DeepEqual(r, []string{"native_region"}) {
+		t.Errorf("region-only schema must require exactly native_region, got %v", r)
 	}
 }
 
