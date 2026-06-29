@@ -82,6 +82,15 @@ func (s *Service) SetBackfiller(b *Backfiller) {
 	}
 }
 
+// Backfiller returns the attached async backfiller (nil if none / nil service).
+// Used by main to hand the worker pool to the periodic Sweeper.
+func (s *Service) Backfiller() *Backfiller {
+	if s == nil {
+		return nil
+	}
+	return s.backfill
+}
+
 // NewService builds a Service with the given dependencies. content may not
 // be nil in production (path-1 catalog hit relies on it); db + llm + cache +
 // inat may legitimately be nil during partial-degradation tests. inat is the

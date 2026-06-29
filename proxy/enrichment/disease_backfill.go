@@ -17,6 +17,11 @@ type DiseaseBackfillJob struct {
 	CatalogID   string // the master's O id; every translated row reuses it (§7)
 	SourceLang  string // the master's language; excluded from the target set
 	Master      *proxy.StructuredDiseaseDetail
+	// OnlyLangs, when non-nil, restricts the job to exactly these target
+	// languages instead of every supported language minus SourceLang. The
+	// periodic Sweeper uses it to translate ONLY the languages a disease is
+	// actually missing. nil → full backfill (the request-path default).
+	OnlyLangs []string
 }
 
 // DiseaseBackfiller runs translation backfill on a bounded worker pool, decoupled
@@ -71,7 +76,11 @@ func (b *DiseaseBackfiller) worker() {
 // translation never blocks the others, and the missing language simply falls
 // back to English on read.
 func (b *DiseaseBackfiller) run(job DiseaseBackfillJob) {
-	for _, lang := range backfillTargets(job.SourceLang) {
+	targets := job.OnlyLangs
+	if targets == nil {
+		targets = backfillTargets(job.SourceLang)
+	}
+	for _, lang := range targets {
 		ctx, cancel := context.WithTimeout(context.Background(), backfillTimeout)
 		translated, reqID, err := b.llm.DiseaseTranslate(ctx, job.Master, lang)
 		if err != nil {
