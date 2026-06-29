@@ -20,10 +20,17 @@ import (
 // translation path the range could drift again.
 //
 // Fix: the months array is the single source of truth. We sanitize it (1..12,
-// deduped, sorted) and DERIVE the label from it on every LLM output path
-// (Generate + Translate), reproducing the curated catalog's exact format so new
-// rows look identical to the 1522 hand-authored ones. The chart and the header
-// can no longer disagree because both come from the same array.
+// deduped, sorted) and DERIVE the label from it, reproducing the curated
+// catalog's exact format so new rows look identical to the 1522 hand-authored
+// ones. The chart and the header can no longer disagree because both come from
+// the same array.
+//
+// reconcilePeriods runs on every path that produces a served row: fresh LLM
+// output (Generate + Translate) AND stored rows on read (DB.Lookup /
+// DB.LookupAny), so rows persisted before this existed are corrected at serve
+// time too — correctness does not depend on the one-shot backfill
+// (cmd/backfill-periods), which only cleans the stored bytes. The operation is
+// idempotent, so re-running it on an already-consistent row is a no-op.
 
 // reconcilePeriods sanitizes the month arrays in place and overwrites the
 // period_short labels so they always agree with the months. langCode must be a

@@ -95,6 +95,13 @@ func (d *DB) Lookup(ctx context.Context, normalized, lang string) (*proxy.PlantD
 	if err := json.Unmarshal(raw, &pd); err != nil {
 		return nil, fmt.Errorf("%w: decode row data: %v", ErrDBUnavailable, err)
 	}
+	// Reconcile on read: rows persisted before period-derivation existed can
+	// carry a *_period_short that disagrees with *_months_north. Deriving here
+	// makes EVERY served row consistent regardless of when it was written, so
+	// correctness no longer depends on running the backfill (cmd/backfill-periods
+	// still cleans the stored bytes). Idempotent for already-consistent rows;
+	// lang is the normalized requested code (bloom.go).
+	reconcilePeriods(&pd, lang)
 	return &pd, nil
 }
 
@@ -130,6 +137,10 @@ func (d *DB) LookupAny(ctx context.Context, normalized string) (*proxy.PlantDeta
 	if err := json.Unmarshal(raw, &pd); err != nil {
 		return nil, "", fmt.Errorf("%w: decode row data: %v", ErrDBUnavailable, err)
 	}
+	// Reconcile on read using the row's own language (see Lookup). Keeps the
+	// master consistent before it is served directly or used as a translation
+	// source. Idempotent for already-consistent rows (bloom.go).
+	reconcilePeriods(&pd, lang)
 	return &pd, lang, nil
 }
 
