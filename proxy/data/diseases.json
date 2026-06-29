@@ -813,7 +813,7 @@
       "name": "Leaf blight & scorch",
       "fullName": "L03 — Leaf Blight & Scorch",
       "shortDescription": "Tips and edges dry brown, yellow halo",
-      "symptomAnalysis": "Three causes:\n\n1. **Heat and sun stress** — leaves lose water faster than roots can supply. Sun-facing leaves brown first.\n2. **Poor root function** — compacted soil, root damage, or excess fertilizer prevents roots from absorbing enough water. The plant looks scorched even on a normal day.\n3. **Bacterial leaf scorch** (*Xylella fastidiosa*) — chronic disease that recurs each year. Affects older leaves first; newer leaves stay clean. Permanent.\n\nOnce leaves brown, they don't recover. Goal is to save the rest of the plant.",
+      "symptomAnalysis": "Three causes:\n1. **Heat and sun stress** — leaves lose water faster than roots can supply. Sun-facing leaves brown first.\n2. **Poor root function** — compacted soil, root damage, or excess fertilizer prevents roots from absorbing enough water. The plant looks scorched even on a normal day.\n3. **Bacterial leaf scorch** (*Xylella fastidiosa*) — chronic disease that recurs each year. Affects older leaves first; newer leaves stay clean. Permanent.\n\nOnce leaves brown, they don't recover. Goal is to save the rest of the plant.",
       "heroImage": null,
       "crossReferences": [],
       "treatment": {
