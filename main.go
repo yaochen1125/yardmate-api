@@ -157,6 +157,14 @@ func main() {
 	// nil (out-of-catalog issues stay slim) if that pool / OPENAI_API_KEY absent.
 	diseaseSvc := buildDiseaseEnrichmentService(vault, content, enrichDB)
 
+	// Translation self-heal sweep — the in-request backfill is fire-and-forget
+	// (no retry; drops on queue saturation / restart / transient LLM error), so
+	// legacy masters and lost jobs never re-translate on their own. This periodic
+	// sweep re-enqueues just the missing languages for both plants and diseases.
+	// Disabled by ENRICHMENT_SWEEP_INTERVAL="off"; cadence overridable with any
+	// Go duration (e.g. "12h"); default 6h.
+	startEnrichmentSweep(vault, enrichDB, enrichSvc, diseaseSvc)
+
 	// Image-ingest service — fills out-of-catalog plant galleries on R2 via the
 	// on-demand iNat→Wikimedia cascade (proxy/imageingest/SPEC.md). Requires R2
 	// creds + SUPABASE_DB_URL + IMAGEINGEST_ADMIN_TOKEN; gracefully disabled
@@ -270,6 +278,37 @@ func maybeRunNativeRegionBackfill(vault *secrets.Vault) {
 		os.Exit(1)
 	}
 	os.Exit(0)
+}
+
+// startEnrichmentSweep wires and launches the periodic translation self-heal
+// sweep (proxy/enrichment/sweep.go) for both plants and diseases. Unlike
+// maybeRunNativeRegionBackfill (a one-shot that exits the process), this runs
+// for the process lifetime as a background goroutine sharing the serving pool +
+// the already-built backfiller worker pools, so it never contends for its own
+// resources. No-op when the shared pool is absent or neither enrichment side is
+// enabled. Cadence comes from the ENRICHMENT_SWEEP_INTERVAL env var: "off"
+// disables it, any Go duration overrides the default; an unset/garbage value
+// falls back to the package default (6h).
+func startEnrichmentSweep(vault *secrets.Vault, db *enrichment.DB, enrichSvc *enrichment.Service, diseaseSvc proxy.DiseaseEnricher) {
+	if db == nil {
+		return
+	}
+	raw := os.Getenv("ENRICHMENT_SWEEP_INTERVAL")
+	if raw == "off" {
+		log.Printf("enrichment sweep: disabled by ENRICHMENT_SWEEP_INTERVAL=off")
+		return
+	}
+	interval, err := time.ParseDuration(raw) // raw=="" → err, interval==0 → NewSweeper default
+	if raw != "" && err != nil {
+		log.Printf("WARN: ENRICHMENT_SWEEP_INTERVAL=%q not a valid duration; using default", raw)
+		interval = 0
+	}
+	plantBF := enrichSvc.Backfiller() // nil-safe accessor (nil service → nil)
+	var diseaseBF *enrichment.DiseaseBackfiller
+	if ds, ok := diseaseSvc.(*enrichment.DiseaseService); ok {
+		diseaseBF = ds.Backfiller()
+	}
+	enrichment.NewSweeper(db, plantBF, diseaseBF, interval).Start(context.Background())
 }
 
 // buildEnrichmentService wires the /v1/plants/enrichment dependencies: the

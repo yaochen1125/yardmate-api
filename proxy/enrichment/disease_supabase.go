@@ -128,3 +128,67 @@ func (d *DB) InsertDisease(ctx context.Context, p DiseaseInsertParams) (string, 
 	}
 	return catalogID, true, nil
 }
+
+// DiseaseSweepItem is one enriched disease missing at least one supported
+// language. Mirrors PlantSweepItem on the plant side; CatalogID is the master's
+// O id, which every translated row must reuse (§7 one-id invariant).
+type DiseaseSweepItem struct {
+	Normalized   string
+	DiseaseName  string
+	CatalogID    string
+	SourceLang   string // the chosen master's language (the pivot for translation)
+	Master       *proxy.StructuredDiseaseDetail
+	MissingLangs []string
+}
+
+// IncompleteDiseaseMasters returns every enriched disease (status
+// pending/approved) whose distinct-language count is below the full supported
+// set, paired with the languages it still lacks. Read half of the periodic
+// Sweeper's disease pass — mirrors IncompletePlantMasters. The master pivot
+// prefers English; the carried catalog_id is reused by every translated row.
+func (d *DB) IncompleteDiseaseMasters(ctx context.Context) ([]DiseaseSweepItem, error) {
+	if d == nil || d.pool == nil {
+		return nil, ErrDBUnavailable
+	}
+	const q = `
+		WITH agg AS (
+			SELECT disease_name_normalized, array_agg(DISTINCT lang) AS langs
+			FROM diseases_pending
+			WHERE status IN ('pending', 'approved')
+			GROUP BY disease_name_normalized
+			HAVING count(DISTINCT lang) < $1
+		)
+		SELECT DISTINCT ON (p.disease_name_normalized)
+			p.disease_name_normalized, p.disease_name, p.catalog_id, p.lang, p.data, a.langs
+		FROM diseases_pending p
+		JOIN agg a USING (disease_name_normalized)
+		WHERE p.status IN ('pending', 'approved')
+		ORDER BY p.disease_name_normalized, (p.lang = 'en') DESC, p.lang`
+	rows, err := d.pool.Query(ctx, q, len(SupportedLangs))
+	if err != nil {
+		return nil, fmt.Errorf("%w: list incomplete diseases: %v", ErrDBUnavailable, err)
+	}
+	defer rows.Close()
+	var out []DiseaseSweepItem
+	for rows.Next() {
+		var it DiseaseSweepItem
+		var raw []byte
+		var have []string
+		if err := rows.Scan(&it.Normalized, &it.DiseaseName, &it.CatalogID, &it.SourceLang, &raw, &have); err != nil {
+			return nil, fmt.Errorf("%w: scan incomplete disease: %v", ErrDBUnavailable, err)
+		}
+		var detail proxy.StructuredDiseaseDetail
+		if err := json.Unmarshal(raw, &detail); err != nil {
+			return nil, fmt.Errorf("%w: decode incomplete disease: %v", ErrDBUnavailable, err)
+		}
+		it.Master = &detail
+		it.MissingLangs = missingLangs(have)
+		if len(it.MissingLangs) > 0 {
+			out = append(out, it)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: iterate incomplete diseases: %v", ErrDBUnavailable, err)
+	}
+	return out, nil
+}

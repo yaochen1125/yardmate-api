@@ -316,3 +316,91 @@ func (d *DB) Insert(ctx context.Context, p InsertParams) (bool, error) {
 	}
 	return tag.RowsAffected() == 1, nil
 }
+
+// PlantSweepItem is one enriched plant that is missing at least one supported
+// language. Master is the preferred pivot row (English when present, else the
+// lexically-first language) and MissingLangs is exactly the set still absent —
+// the Sweeper translates only those, off this master.
+type PlantSweepItem struct {
+	Normalized     string
+	ScientificName string
+	CommonHint     string
+	SourceLang     string // the chosen master's language (the pivot for translation)
+	Master         *proxy.PlantDetail
+	MissingLangs   []string
+}
+
+// IncompletePlantMasters returns every enriched plant (status pending/approved)
+// whose distinct-language count is below the full supported set, paired with the
+// languages it still lacks. It is the read half of the periodic Sweeper: the
+// in-request backfill is fire-and-forget with no retry, so legacy rows (from
+// before multilingual support) and jobs lost to queue saturation / restarts /
+// transient LLM errors never self-heal without this. Read-only.
+//
+// The master pivot prefers English (the best translation source); for the rare
+// plant with no English row yet, the lexically-first available language is used.
+// totalLangs is the full supported-language count (len(SupportedLangs)); a plant
+// at that count is complete and excluded.
+func (d *DB) IncompletePlantMasters(ctx context.Context) ([]PlantSweepItem, error) {
+	if d == nil || d.pool == nil {
+		return nil, ErrDBUnavailable
+	}
+	const q = `
+		WITH agg AS (
+			SELECT scientific_name_normalized, array_agg(DISTINCT lang) AS langs
+			FROM plants_pending
+			WHERE status IN ('pending', 'approved')
+			GROUP BY scientific_name_normalized
+			HAVING count(DISTINCT lang) < $1
+		)
+		SELECT DISTINCT ON (p.scientific_name_normalized)
+			p.scientific_name_normalized, p.scientific_name,
+			COALESCE(p.common_name, ''), p.lang, p.data, a.langs
+		FROM plants_pending p
+		JOIN agg a USING (scientific_name_normalized)
+		WHERE p.status IN ('pending', 'approved')
+		ORDER BY p.scientific_name_normalized, (p.lang = 'en') DESC, p.lang`
+	rows, err := d.pool.Query(ctx, q, len(SupportedLangs))
+	if err != nil {
+		return nil, fmt.Errorf("%w: list incomplete plants: %v", ErrDBUnavailable, err)
+	}
+	defer rows.Close()
+	var out []PlantSweepItem
+	for rows.Next() {
+		var it PlantSweepItem
+		var raw []byte
+		var have []string
+		if err := rows.Scan(&it.Normalized, &it.ScientificName, &it.CommonHint, &it.SourceLang, &raw, &have); err != nil {
+			return nil, fmt.Errorf("%w: scan incomplete plant: %v", ErrDBUnavailable, err)
+		}
+		var pd proxy.PlantDetail
+		if err := json.Unmarshal(raw, &pd); err != nil {
+			return nil, fmt.Errorf("%w: decode incomplete plant: %v", ErrDBUnavailable, err)
+		}
+		it.Master = &pd
+		it.MissingLangs = missingLangs(have)
+		if len(it.MissingLangs) > 0 {
+			out = append(out, it)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: iterate incomplete plants: %v", ErrDBUnavailable, err)
+	}
+	return out, nil
+}
+
+// missingLangs returns the supported languages absent from have, preserving
+// SupportedLangs order (English first). Shared by the plant + disease sweeps.
+func missingLangs(have []string) []string {
+	present := make(map[string]bool, len(have))
+	for _, l := range have {
+		present[l] = true
+	}
+	var missing []string
+	for _, l := range SupportedLangs {
+		if !present[l] {
+			missing = append(missing, l)
+		}
+	}
+	return missing
+}

@@ -52,6 +52,16 @@ func (s *DiseaseService) SetBackfiller(b *DiseaseBackfiller) {
 	}
 }
 
+// Backfiller returns the attached async backfiller (nil if none / nil service).
+// Used by main to hand the worker pool to the periodic Sweeper (mirrors
+// Service.Backfiller on the plant side).
+func (s *DiseaseService) Backfiller() *DiseaseBackfiller {
+	if s == nil {
+		return nil
+	}
+	return s.backfiller
+}
+
 // Compile-time assertions: DiseaseService satisfies the proxy injection point,
 // and the concrete DB / LLM clients satisfy the service's collaborators.
 var (

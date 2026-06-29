@@ -27,6 +27,13 @@ type BackfillJob struct {
 	CommonHint     string
 	SourceLang     string // the master's language; excluded from the target set
 	Master         *proxy.PlantDetail
+	// OnlyLangs, when non-nil, restricts the job to exactly these target
+	// languages instead of every supported language minus SourceLang. The
+	// periodic Sweeper uses it to translate ONLY the languages a plant is
+	// actually missing, so a plant short one language costs one LLM call, not
+	// ten (ON CONFLICT DO NOTHING would dedupe the rest at the DB but still pay
+	// the translate). nil → full backfill (the request-path default).
+	OnlyLangs []string
 }
 
 // Backfiller runs translation backfill on a bounded worker pool, decoupled from
@@ -79,7 +86,11 @@ func (b *Backfiller) worker() {
 // are logged and skipped per-language — one bad translation never blocks the
 // others, and the missing language simply falls back to English on read.
 func (b *Backfiller) run(job BackfillJob) {
-	for _, lang := range backfillTargets(job.SourceLang) {
+	targets := job.OnlyLangs
+	if targets == nil {
+		targets = backfillTargets(job.SourceLang)
+	}
+	for _, lang := range targets {
 		ctx, cancel := context.WithTimeout(context.Background(), backfillTimeout)
 		translated, reqID, err := b.llm.Translate(ctx, job.Master, lang)
 		if err != nil {
