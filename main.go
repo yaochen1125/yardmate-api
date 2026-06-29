@@ -60,6 +60,14 @@ func main() {
 	log.Printf("config: addr=%s db=%s secrets=%s appID=%s allowDev=%v",
 		addr, dbPath, secretsPath, appID, allowDev)
 
+	// One-time native_region localization backfill (SPEC §7 v5). Handled FIRST —
+	// before the attest store, rate limiter, or HTTP wiring — so a one-shot
+	// invocation (ENRICH_BACKFILL_NATIVE_REGION=1) running alongside the live
+	// service stays minimal and never opens the attest credentials.db (no SQLite
+	// contention with the serving process). It builds its own short-lived Supabase
+	// pool, runs, and exits without starting the HTTP server. A no-op otherwise.
+	maybeRunNativeRegionBackfill(vault)
+
 	store, err := attest.OpenStore(dbPath)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
@@ -139,13 +147,6 @@ func main() {
 	// nil (with a WARN) when SUPABASE_DB_URL is missing or the ping fails.
 	enrichDB := buildSupabaseDB(vault)
 
-	// One-time native_region localization backfill (SPEC §7 v5). Operator sets
-	// ENRICH_BACKFILL_NATIVE_REGION=1 for a single run; the process localizes the
-	// legacy non-English rows and exits WITHOUT starting the HTTP server. Removing
-	// the env var restores normal serving. Gated here so it has the shared pool +
-	// OPENAI_API_KEY already resolved.
-	maybeRunNativeRegionBackfill(vault, enrichDB)
-
 	// Enrichment service — V1 plant-detail enrichment endpoint
 	// (proxy/enrichment/SPEC.md). Requires the shared Supabase pool (above) +
 	// OPENAI_API_KEY. Gracefully disabled with a WARN log if either is missing.
@@ -218,34 +219,46 @@ func buildSupabaseDB(vault *secrets.Vault) *enrichment.DB {
 
 // maybeRunNativeRegionBackfill runs the one-time native_region localization
 // backfill (SPEC §7 v5) when ENRICH_BACKFILL_NATIVE_REGION=1, then exits the
-// process — it is a maintenance task, not part of normal serving. A no-op when
-// the env var is unset. Requires the shared Supabase pool + OPENAI_API_KEY; if
-// either is missing it logs and exits non-zero so the operator notices.
+// process — it is a maintenance task, not part of normal serving, and never
+// starts the HTTP server. A no-op when the env var is unset. It is intentionally
+// SELF-CONTAINED: it builds its own short-lived Supabase pool (closed before
+// exit) and requires only SUPABASE_DB_URL + OPENAI_API_KEY, so a one-shot run can
+// sit beside the live service without sharing or contending for its resources.
+// Run it via the dedicated `yardmate-api-backfill.service` (Type=oneshot) or a
+// manual `ENRICH_BACKFILL_NATIVE_REGION=1 /usr/local/bin/yardmate-api` — NEVER by
+// baking the env var into the long-running service (it would exit after the
+// backfill and take the HTTP server down, or loop under Restart=on-failure).
 //
-// Exit code reflects the OUTCOME: 0 only when the run is COMPLETE; 1 when the
-// list query errored OR any row is left unlocalized — both rep.Failed (transient
-// translate/update error) AND rep.Skipped (model returned a wrong element count,
-// row deliberately left English for a later retry). Either MUST NOT surface as a
-// clean exit, or an operator/automation would believe a half-finished run
-// (OpenAI rate-limited, or a region the model keeps mangling) completed and
-// remove the env flag while non-English rows still hold English regions.
-// rep.Vanished (row deleted between list and update) is benign and does not block.
-func maybeRunNativeRegionBackfill(vault *secrets.Vault, db *enrichment.DB) {
-	if vault.Get("ENRICH_BACKFILL_NATIVE_REGION") != "1" {
+// Exit code reflects the OUTCOME: 0 only when the run is COMPLETE; 1 when deps
+// are missing, the list query errored, OR any row is left unlocalized — both
+// rep.Failed (transient translate/update error) AND rep.Skipped (model returned a
+// wrong element count, row deliberately left English for a later retry). Either
+// MUST NOT surface as a clean exit, or an operator/automation would believe a
+// half-finished run (OpenAI rate-limited, or a region the model keeps mangling)
+// completed and clear the env flag while non-English rows still hold English
+// regions. rep.Vanished (row deleted between list and update) is benign.
+func maybeRunNativeRegionBackfill(vault *secrets.Vault) {
+	// Trigger is an OS ENV var (like the other YARDMATE_API_* config read via
+	// envOr), NOT a secrets-file key: vault.Get reads only the secrets file, and
+	// putting the flag there is unsafe — the long-running service reads the SAME
+	// file and would run the backfill + exit on its next restart. Reading os.Getenv
+	// lets a dedicated one-shot (yardmate-api-backfill.service Environment=, or a
+	// manual `ENRICH_BACKFILL_NATIVE_REGION=1 /usr/local/bin/yardmate-api`) trigger
+	// it in isolation while the serving unit, which never sets it, stays unaffected.
+	if os.Getenv("ENRICH_BACKFILL_NATIVE_REGION") != "1" {
 		return
 	}
 	openaiKey := vault.Get("OPENAI_API_KEY")
+	db := buildSupabaseDB(vault) // own pool; independent of the serving path's enrichDB
 	if db == nil || openaiKey == "" {
-		log.Printf("ERROR: native_region backfill requested but shared db (%v) or OPENAI_API_KEY (%v) missing", db != nil, openaiKey != "")
+		log.Printf("ERROR: native_region backfill requested but Supabase pool (%v) or OPENAI_API_KEY (%v) missing", db != nil, openaiKey != "")
 		os.Exit(1)
 	}
 	llm := enrichment.NewLLMClient(openaiKey)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rep, err := enrichment.RunNativeRegionBackfill(ctx, db, llm)
-	// Release the shared pool explicitly: os.Exit below skips main's deferred
-	// cleanup, and this maintenance path never starts the HTTP server.
-	db.Close()
+	db.Close() // os.Exit below skips deferred cleanup; release the pool explicitly
 	if err != nil {
 		log.Printf("ERROR: native_region backfill failed: %v", err)
 		os.Exit(1)

@@ -1,0 +1,66 @@
+# yardmate-api-backfill.service — one-shot native_region localization backfill
+# (proxy/enrichment/SPEC.md §7 v5). Localizes legacy non-English plants_pending
+# rows whose native_region is still canonical English, then exits. It NEVER
+# starts the HTTP server (the binary's ENRICH_BACKFILL_NATIVE_REGION=1 path runs
+# before any HTTP/attest wiring and os.Exit()s when done).
+#
+# This is a SEPARATE unit from the long-running yardmate-api.service so the
+# trigger env var lives only here — baking it into the serving unit would make
+# that service run the backfill and exit on every restart.
+#
+# Usage (after deploying a v5+ binary to /usr/local/bin/yardmate-api):
+#   sudo cp deploy/yardmate-api-backfill.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl start yardmate-api-backfill      # runs once, in the foreground of systemd
+#   journalctl -u yardmate-api-backfill -n 50 --no-pager   # read the report
+#
+# Exit status (systemctl status / `is-failed`): success = run COMPLETE; failed =
+# missing deps, a query error, OR any row left unlocalized (failed/skipped) —
+# re-run `systemctl start yardmate-api-backfill` until it succeeds. Idempotent:
+# already-localized rows (source_version >= v5) are not re-selected.
+#
+# It is NOT enabled at boot (no [Install]); start it manually on demand.
+
+[Unit]
+Description=YardMate API — one-time native_region localization backfill (SPEC §7 v5)
+Documentation=https://github.com/yaochen1125/yardmate-api/blob/main/proxy/enrichment/SPEC.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=yardmate-api
+Group=yardmate-api
+
+# Same secrets file as the serving unit (SUPABASE_DB_URL + OPENAI_API_KEY). The
+# backfill trigger is an OS env var here — read via os.Getenv, never the vault.
+Environment=YARDMATE_API_SECRETS_PATH=/etc/yardmate-api/secrets.env
+Environment=ENRICH_BACKFILL_NATIVE_REGION=1
+
+ExecStart=/usr/local/bin/yardmate-api
+
+# No Restart: a oneshot must not loop. A failed/incomplete run is surfaced via the
+# unit's failed state; the operator re-runs `systemctl start` explicitly.
+
+# Security hardening — mirrors yardmate-api.service. The backfill only reads the
+# secrets file and talks to Supabase + OpenAI; it does NOT open the attest
+# credentials.db, so no ReadWritePaths is needed.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+
+LimitNOFILE=4096
+MemoryMax=512M
