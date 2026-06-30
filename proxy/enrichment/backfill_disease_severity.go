@@ -4,10 +4,19 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
+	"regexp"
 	"time"
 
 	"github.com/yaochen1125/yardmate-api/proxy"
+)
+
+// Whole-WORD severity keywords. \b boundaries stop a disease term from leaking a
+// false signal: "mildew" (powdery/downy mildew) must NOT read as "mild", and
+// "For severe mildew cases" must read as severe (not ambiguous) — a bare substring
+// check would set both flags and drop the badge. Case-insensitive.
+var (
+	mildKeywordRe   = regexp.MustCompile(`(?i)\bmild\b`)
+	severeKeywordRe = regexp.MustCompile(`(?i)\bsevere\b`)
 )
 
 // One-time disease-severity backfill (DiseasePromptVersion v3).
@@ -68,9 +77,8 @@ func sniffSeverity(label *string) string {
 	if label == nil {
 		return ""
 	}
-	l := strings.ToLower(*label)
-	hasMild := strings.Contains(l, "mild")
-	hasSevere := strings.Contains(l, "severe")
+	hasMild := mildKeywordRe.MatchString(*label)
+	hasSevere := severeKeywordRe.MatchString(*label)
 	switch {
 	case hasSevere && !hasMild:
 		return "severe"
