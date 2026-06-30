@@ -68,6 +68,12 @@ func main() {
 	// pool, runs, and exits without starting the HTTP server. A no-op otherwise.
 	maybeRunNativeRegionBackfill(vault)
 
+	// One-time disease-severity backfill (DiseasePromptVersion v3). Same one-shot
+	// posture as above (own short-lived pool, exits before the HTTP server). A
+	// no-op unless ENRICH_BACKFILL_DISEASE_SEVERITY=1. Deterministic — needs only
+	// SUPABASE_DB_URL (severity is derived from the English row's labels, no OpenAI).
+	maybeRunDiseaseSeverityBackfill(vault)
+
 	store, err := attest.OpenStore(dbPath)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
@@ -275,6 +281,61 @@ func maybeRunNativeRegionBackfill(vault *secrets.Vault) {
 		rep.Total, rep.Updated, rep.Skipped, rep.Vanished, rep.Failed)
 	if rep.Failed > 0 || rep.Skipped > 0 {
 		log.Printf("ERROR: native_region backfill INCOMPLETE: %d failed, %d skipped (arity mismatch); re-run to retry before clearing ENRICH_BACKFILL_NATIVE_REGION", rep.Failed, rep.Skipped)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+// maybeRunDiseaseSeverityBackfill runs the one-time disease-severity backfill
+// (DiseasePromptVersion v3) when ENRICH_BACKFILL_DISEASE_SEVERITY=1, then exits
+// the process. Like maybeRunNativeRegionBackfill it is a self-contained one-shot
+// (own short-lived Supabase pool, never starts the HTTP server), but it is
+// DETERMINISTIC and needs ONLY SUPABASE_DB_URL — severity is derived from each
+// disease's English row labels, with no OpenAI call. A no-op when the env var is
+// unset. Trigger it the same way (the dedicated yardmate-api-backfill.service
+// one-shot, or a manual `ENRICH_BACKFILL_DISEASE_SEVERITY=1 /usr/local/bin/yardmate-api`),
+// NEVER by baking the flag into the long-running serving unit.
+//
+// Exit code reflects the OUTCOME and distinguishes re-run-fixable from not:
+//   - exit 1 (re-run after resolving): pool missing, list query errored, any row
+//     update Failed (transient), any disease skipped for no English row (run the
+//     translation sweep first), or any Mismatch (a row's group count diverged from
+//     English — a data anomaly to investigate). The strict code stops automation
+//     from clearing the flag while these remain.
+//   - exit 0 with a loud WARN: Undetermined diseases (severity-graded but their
+//     English labels lack the mild/severe keyword, so the deterministic sniff
+//     can't classify them). These are NOT re-run-fixable — forcing exit 1 would
+//     mean the unit can never go green — so they are surfaced as a warning with a
+//     count and per-disease log lines (from the runner) for manual/LLM follow-up.
+//   - Vanished (row deleted between list and update) is benign.
+//
+// Note: if BOTH ENRICH_BACKFILL_NATIVE_REGION=1 and ENRICH_BACKFILL_DISEASE_SEVERITY=1
+// are set in one invocation, only native_region runs (it os.Exit()s first, above).
+// Run the two one-shots separately (that is the dedicated-unit pattern anyway).
+func maybeRunDiseaseSeverityBackfill(vault *secrets.Vault) {
+	if os.Getenv("ENRICH_BACKFILL_DISEASE_SEVERITY") != "1" {
+		return
+	}
+	db := buildSupabaseDB(vault) // own pool; independent of the serving path's enrichDB
+	if db == nil {
+		log.Printf("ERROR: disease severity backfill requested but Supabase pool missing (SUPABASE_DB_URL)")
+		os.Exit(1)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rep, err := enrichment.RunDiseaseSeverityBackfill(ctx, db)
+	db.Close() // os.Exit below skips deferred cleanup; release the pool explicitly
+	if err != nil {
+		log.Printf("ERROR: disease severity backfill failed: %v", err)
+		os.Exit(1)
+	}
+	log.Printf("disease severity backfill report: diseases=%d noEnglish=%d updated=%d alreadyOK=%d undetermined=%d mismatch=%d vanished=%d failed=%d",
+		rep.Diseases, rep.NoEnglish, rep.Updated, rep.AlreadyOK, rep.Undetermined, rep.Mismatch, rep.Vanished, rep.Failed)
+	if rep.Undetermined > 0 {
+		log.Printf("WARN: disease severity backfill: %d disease(s) are severity-graded but their English labels lack a mild/severe keyword (logged above); they remain unbadged and need manual/LLM classification — re-running will NOT fix them", rep.Undetermined)
+	}
+	if rep.Failed > 0 || rep.NoEnglish > 0 || rep.Mismatch > 0 {
+		log.Printf("ERROR: disease severity backfill INCOMPLETE: %d failed, %d skipped (no English row), %d mismatch (data anomaly); resolve and re-run before clearing ENRICH_BACKFILL_DISEASE_SEVERITY", rep.Failed, rep.NoEnglish, rep.Mismatch)
 		os.Exit(1)
 	}
 	os.Exit(0)

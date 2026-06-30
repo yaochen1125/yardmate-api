@@ -194,3 +194,89 @@ func (d *DB) IncompleteDiseaseMasters(ctx context.Context) ([]DiseaseSweepItem, 
 	}
 	return out, nil
 }
+
+// DiseaseSeverityRow is one pending/approved disease row the v3 severity backfill
+// inspects: the language-independent O id, its language, and the decoded detail.
+// (See backfill_disease_severity.go.)
+type DiseaseSeverityRow struct {
+	Normalized    string
+	Lang          string
+	CatalogID     string
+	Detail        *proxy.StructuredDiseaseDetail
+	SourceVersion string
+}
+
+// ListDiseaseSeverityBackfillRows returns every pending/approved disease row with
+// its decoded detail, English-first within each disease so the backfill can find
+// the severity source quickly. Volume is small (out-of-catalog enriched diseases
+// only — a tail feature), so the whole set is loaded and grouped in memory rather
+// than filtered in SQL: whether a row "needs severity" can only be decided after
+// sniffing its English sibling's label, which SQL cannot do.
+func (d *DB) ListDiseaseSeverityBackfillRows(ctx context.Context) ([]DiseaseSeverityRow, error) {
+	if d == nil || d.pool == nil {
+		return nil, ErrDBUnavailable
+	}
+	const q = `
+		SELECT disease_name_normalized, lang, catalog_id, data, COALESCE(source_version, '')
+		FROM diseases_pending
+		WHERE status IN ('pending', 'approved')
+		ORDER BY disease_name_normalized, (lang = 'en') DESC, lang`
+	rows, err := d.pool.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("%w: list disease severity rows: %v", ErrDBUnavailable, err)
+	}
+	defer rows.Close()
+	var out []DiseaseSeverityRow
+	for rows.Next() {
+		var r DiseaseSeverityRow
+		var raw []byte
+		if err := rows.Scan(&r.Normalized, &r.Lang, &r.CatalogID, &raw, &r.SourceVersion); err != nil {
+			return nil, fmt.Errorf("%w: scan disease severity row: %v", ErrDBUnavailable, err)
+		}
+		var detail proxy.StructuredDiseaseDetail
+		if err := json.Unmarshal(raw, &detail); err != nil {
+			return nil, fmt.Errorf("%w: decode disease severity row: %v", ErrDBUnavailable, err)
+		}
+		r.Detail = &detail
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: iterate disease severity rows: %v", ErrDBUnavailable, err)
+	}
+	return out, nil
+}
+
+// UpdateDiseaseSeverity rewrites one row's data with the severity-patched detail
+// and stamps source_version. The FULL data is rewritten (not jsonb_set) because
+// severity lives at a variable set of nested group positions; the patched detail
+// is a round-trip of the stored value with only nil severities filled. This is
+// VALUE-equivalent for every other field (jsonb itself normalizes whitespace/key
+// order, so byte-equality is neither possible nor meaningful) and is lossless
+// ONLY because this struct is the sole writer of the column — InsertDisease
+// marshals the same *StructuredDiseaseDetail, so there are no unmodeled jsonb keys
+// a round-trip could silently drop. The status filter matches the list query so a
+// row that flipped to 'rejected' between list and update is not patched. Returns
+// rows affected (0 if the row vanished/changed between list and update — benign).
+func (d *DB) UpdateDiseaseSeverity(ctx context.Context, normalized, lang string, detail *proxy.StructuredDiseaseDetail, version string) (int64, error) {
+	if d == nil || d.pool == nil {
+		return 0, ErrDBUnavailable
+	}
+	if detail == nil {
+		return 0, fmt.Errorf("%w: nil disease detail", ErrDBUnavailable)
+	}
+	raw, err := json.Marshal(detail)
+	if err != nil {
+		return 0, fmt.Errorf("%w: marshal disease detail: %v", ErrDBUnavailable, err)
+	}
+	const stmt = `
+		UPDATE diseases_pending
+		SET data = $3::jsonb,
+		    source_version = NULLIF($4, '')
+		WHERE disease_name_normalized = $1 AND lang = $2
+		  AND status IN ('pending', 'approved')`
+	tag, err := d.pool.Exec(ctx, stmt, normalized, lang, raw, version)
+	if err != nil {
+		return 0, fmt.Errorf("%w: update disease severity: %v", ErrDBUnavailable, err)
+	}
+	return tag.RowsAffected(), nil
+}

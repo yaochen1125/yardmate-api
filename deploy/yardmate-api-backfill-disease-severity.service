@@ -1,0 +1,80 @@
+# yardmate-api-backfill-disease-severity.service — one-shot disease-severity
+# backfill (DiseasePromptVersion v3). Fills the language-independent `severity`
+# field on enriched out-of-catalog disease rows (diseases_pending) written before
+# v3, so iOS can badge MILD/SEVERE in every language, then exits. It NEVER starts
+# the HTTP server (the binary's ENRICH_BACKFILL_DISEASE_SEVERITY=1 path runs
+# before any HTTP/attest wiring and os.Exit()s when done).
+#
+# DETERMINISTIC — no OpenAI. severity is derived from each disease's English row
+# labels (a keyword sniff for "mild"/"severe", or the row's own severity field if
+# it is already a v3 row) and stamped onto all languages positionally, so this unit
+# needs only SUPABASE_DB_URL (OPENAI_API_KEY is not required).
+#
+# Separate unit from the long-running yardmate-api.service so the trigger env var
+# lives only here — baking it into the serving unit would make that service run
+# the backfill and exit on every restart. Do NOT also set ENRICH_BACKFILL_NATIVE_REGION
+# in the same invocation — that one runs first and exits, skipping this backfill.
+#
+# Usage (after deploying a v3+ binary to /usr/local/bin/yardmate-api):
+#   sudo cp deploy/yardmate-api-backfill-disease-severity.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl start yardmate-api-backfill-disease-severity   # runs once
+#   journalctl -u yardmate-api-backfill-disease-severity -n 50 --no-pager  # read the report
+#
+# Exit status (systemctl status / `is-failed`): success (0) = run did everything
+# the deterministic sniff can. Read the report line either way — a SUCCESS can
+# still carry `undetermined=N`: diseases that ARE severity-graded but whose English
+# labels lack a "mild"/"severe" keyword, so they can't be auto-classified and stay
+# unbadged (each is logged; classify manually/via LLM if needed — re-running won't
+# fix them, which is why they don't fail the unit). FAILED (1) = missing pool, a
+# query error, any row update failed, any disease skipped for lack of an English
+# row (run the translation sweep first, then re-run), or any `mismatch` (a row's
+# group count diverged from English — a data anomaly to investigate). Idempotent:
+# a re-run re-derives the same targets and writes nothing once every classifiable
+# group is filled.
+#
+# It is NOT enabled at boot (no [Install]); start it manually on demand.
+
+[Unit]
+Description=YardMate API — one-time disease-severity backfill (DiseasePromptVersion v3)
+Documentation=https://github.com/yaochen1125/yardmate-api/blob/main/proxy/enrichment/SPEC_disease.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=yardmate-api
+Group=yardmate-api
+
+# Same secrets file as the serving unit (SUPABASE_DB_URL). The backfill trigger is
+# an OS env var here — read via os.Getenv, never the vault.
+Environment=YARDMATE_API_SECRETS_PATH=/etc/yardmate-api/secrets.env
+Environment=ENRICH_BACKFILL_DISEASE_SEVERITY=1
+
+ExecStart=/usr/local/bin/yardmate-api
+
+# No Restart: a oneshot must not loop. A failed/incomplete run is surfaced via the
+# unit's failed state; the operator re-runs `systemctl start` explicitly.
+
+# Security hardening — mirrors yardmate-api.service. The backfill only reads the
+# secrets file and talks to Supabase; it does NOT open the attest credentials.db,
+# so no ReadWritePaths is needed.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+
+LimitNOFILE=4096
+MemoryMax=512M
