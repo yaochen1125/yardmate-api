@@ -136,6 +136,17 @@ func newServer(
 				}
 			})
 		}
+
+		// /v1/plants/signal — cheap fire-and-forget interest counter for
+		// library-outside plants (search / garden-add), deduped per device install
+		// id, feeding the catalog review tool's promotion-priority badges.
+		// Deliberately OUTSIDE the per-device group above: it only needs the per-IP
+		// limit (this /v1 scope), and must NOT consume the per-device expensive-call
+		// bucket that protects identify / diagnose / enrichment (Codex api#73). The
+		// handler still requires + validates X-Device-Install-Id itself.
+		if enrichDB != nil {
+			r.Post("/plants/signal", enrichment.HandleSignal(enrichDB))
+		}
 	})
 
 	return &Server{
