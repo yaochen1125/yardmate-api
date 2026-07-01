@@ -133,6 +133,11 @@ func newServer(
 				// shared Supabase pool is present (row deletes need it).
 				if enrichDB != nil {
 					r.Post("/account/delete", handleAccountDelete(vault, enrichDB))
+					// /v1/plants/signal — fire-and-forget interest counter for
+					// library-outside plants (search / garden-add), deduped per
+					// device install id. Feeds the catalog review tool's promotion
+					// priority badges. Reuses the shared Supabase pool.
+					r.Post("/plants/signal", enrichment.HandleSignal(enrichDB))
 				}
 			})
 		}
