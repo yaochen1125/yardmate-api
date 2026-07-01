@@ -14,8 +14,12 @@ import (
 // signalRequestPayload is the wire shape of POST /v1/plants/signal.
 type signalRequestPayload struct {
 	ScientificName string `json:"scientificName"`
-	Kind           string `json:"kind"` // "search" | "garden"
+	Kind           string `json:"kind"` // "search" | "garden" | "identify"
 }
+
+// signalKinds is the allowed set of interest-signal kinds. Kept in sync with the
+// plant_signals.kind CHECK constraint (migrations 006 + 007).
+var signalKinds = map[string]bool{"search": true, "garden": true, "identify": true}
 
 // HandleSignal returns the handler for POST /v1/plants/signal — a lightweight,
 // fire-and-forget interest counter. It records that ONE device searched (opened
@@ -55,7 +59,7 @@ func HandleSignal(db *DB) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "missing_scientific_name")
 			return
 		}
-		if req.Kind != "search" && req.Kind != "garden" {
+		if !signalKinds[req.Kind] {
 			writeError(w, http.StatusBadRequest, "invalid_kind")
 			return
 		}
