@@ -219,7 +219,7 @@ func buildDiseaseSchema(stepIDs, remedyIDs []string, lang string) map[string]any
 		"required":             []string{"name", "shortDescription", "symptomAnalysis", "cause", "treatment", "homeRemedyRefs", "prevention"},
 		"properties": map[string]any{
 			"name":             map[string]any{"type": "string", "description": "Echo the input disease name verbatim (keep it in the original language; do NOT translate it)."},
-			"shortDescription": map[string]any{"type": "string", "description": "15-40 words, plain text: what the issue is." + proseLang},
+			"shortDescription": map[string]any{"type": "string", "description": "A concise symptom phrase in the catalog style — at most 12 words, symptom-first (e.g. 'Roots black, mushy, smelly; plant wilted despite wet soil'). Plain text; do NOT use 'X occurs when/is a...' explanatory sentence framing." + proseLang},
 			"symptomAnalysis":  map[string]any{"type": "string", "description": "Plain text: the visible symptoms." + proseLang},
 			"cause":            map[string]any{"type": "string", "description": "Plain text: the likely cause." + proseLang},
 			"treatment":        stepGroups(),
@@ -249,7 +249,7 @@ func diseaseSystemPrompt(lang string) string {
 		"Hard rules (non-negotiable):",
 		langRule,
 		"- Echo the input disease name verbatim in \"name\".",
-		"- shortDescription: 15-40 words, plain text. symptomAnalysis and cause: plain text, no markdown.",
+		"- shortDescription: a concise symptom phrase, at most 12 words, symptom-first, plain text — NO 'X occurs when/is a...' framing (match catalog style like 'Roots black, mushy, smelly; plant wilted despite wet soil'). symptomAnalysis and cause: plain text, no markdown.",
 		"- For treatment.groups[].stepRefs and prevention.groups[].stepRefs, use ONLY step ids from the provided STEP LIST; pick the relevant ones, ordered most important first. Use severity groups (e.g. mild vs severe) only when helpful; otherwise a single group with an empty label.",
 		"- Set each group's \"severity\" to \"mild\" or \"severe\" to match the group's intent when you split by severity; use \"\" for a single, non-severity group. \"severity\" is a fixed canonical enum — set it from the group's meaning, never localize it, even when the label is written in another language.",
 		"- For homeRemedyRefs, use ONLY ids from the provided REMEDY LIST; pick relevant ones (may be empty).",
