@@ -205,13 +205,23 @@ func main() {
 	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim)
 
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
-	// streams to Plant.id, up to ~30 s upstream). Headroom 5 s.
+	// streams to Plant.id, up to ~30 s upstream) with 5 s headroom = 35 s base.
+	//
+	// PLUS the in-flight limiter's queue wait (up to inflightWait): Go anchors
+	// both deadlines at header-read, but the limiter makes an overflow request
+	// wait AFTER header-read and BEFORE the handler sets reqStart. The handlers'
+	// wall-clock budgets (identify rose budget / diagnose upstream + AI-fallback,
+	// anchored at reqStart to fit under this WriteTimeout — proxy/handlers.go,
+	// Codex #48 P2) assume a full 35 s window FROM reqStart. Adding inflightWait
+	// here means that after the queue wait elapses, exactly 35 s remains from
+	// reqStart, so a request that queued the full budget still gets its whole
+	// downstream window instead of being cut off mid-response (PR #76 review).
 	httpSrv := &http.Server{
 		Addr:              addr,
 		Handler:           srv,
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       35 * time.Second,
-		WriteTimeout:      35 * time.Second,
+		ReadTimeout:       35*time.Second + inflightWait,
+		WriteTimeout:      35*time.Second + inflightWait,
 		IdleTimeout:       60 * time.Second,
 	}
 	log.Printf("yardmate-api listening on %s", addr)

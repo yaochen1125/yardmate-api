@@ -56,6 +56,15 @@ Layering (outermost → innermost): per-IP rate limit (`/v1`) → per-device rat
 limit → **inflight concurrency bound** → handler. The rate limiters bound
 long-run abuse per key; this limiter bounds instantaneous concurrency (memory).
 
+**Server-timeout interaction:** the queue wait elapses *after* the request
+header is read but *before* the handler sets `reqStart`, and Go anchors
+`ReadTimeout`/`WriteTimeout` at header-read. The identify/diagnose handlers
+budget their upstream + fallback calls against a full 35 s window from
+`reqStart` (proxy/handlers.go, Codex #48 P2), so `main.go` sets both server
+deadlines to `35 s + waitBudget` — after the wait, exactly 35 s remains from
+`reqStart` and the handlers' budgets hold. If `waitBudget` is retuned, those
+server deadlines track it automatically (both derive from the same value).
+
 ## 5. Response shape
 
 On shed: `503 Service Unavailable`, `Retry-After: <waitBudget seconds>`, body
