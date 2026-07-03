@@ -453,3 +453,25 @@ func TestPlantNetClient_Identify_UnexpectedStatus_BadResponse(t *testing.T) {
 		t.Errorf("err = %v, want ErrPlantNetBadResponse (unmapped status)", err)
 	}
 }
+
+func TestPlantNetQuotaWarnThreshold(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		want int
+	}{
+		{"unset → default", "", 50},
+		{"valid override", "200", 200},
+		{"zero is valid", "0", 0},
+		{"invalid → default", "abc", 50},
+		{"negative → default", "-5", 50},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PLANTNET_QUOTA_WARN_THRESHOLD", tc.env)
+			if got := plantNetQuotaWarnThreshold(); got != tc.want {
+				t.Errorf("env=%q → %d, want %d", tc.env, got, tc.want)
+			}
+		})
+	}
+}
