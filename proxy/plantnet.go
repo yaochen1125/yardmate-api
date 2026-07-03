@@ -11,8 +11,6 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
-	"os"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -40,36 +38,28 @@ type PlantNetClient struct {
 	HTTP      *http.Client
 	// QuotaWarnThreshold: when Pl@ntNet's remaining daily-quota count drops
 	// below this, each identify WARN-logs instead of INFO-logs, so the
-	// server-side watcher can email before the quota is exhausted. Set from
-	// env PLANTNET_QUOTA_WARN_THRESHOLD (default 50) in NewPlantNetClient.
+	// server-side watcher can email before the quota is exhausted. main.go
+	// resolves it from env YARDMATE_API_PLANTNET_QUOTA_WARN (default 50),
+	// grouped with the other operational tuning knobs, and passes it in.
 	QuotaWarnThreshold int
 }
 
 // NewPlantNetClient returns a PlantNetClient with production defaults.
 // apiKey comes from secrets.Vault (env PLANTNET_API_KEY) at startup —
 // never exposed to clients. A missing key disables the primary engine
-// (caller passes nil → Plant.id-only, SPEC §1.5).
-func NewPlantNetClient(apiKey string) *PlantNetClient {
+// (caller passes nil → Plant.id-only, SPEC §1.5). quotaWarnThreshold is the
+// remaining-daily-quota count below which each identify WARN-logs; main.go
+// resolves it from env YARDMATE_API_PLANTNET_QUOTA_WARN (default 50), grouped
+// with the other tuning knobs, so it is settable via the shipped deploy flow.
+func NewPlantNetClient(apiKey string, quotaWarnThreshold int) *PlantNetClient {
 	return &PlantNetClient{
 		APIKey:             apiKey,
 		Endpoint:           defaultPlantNetEndpoint,
 		Lang:               "en",
 		NbResults:          10,
 		HTTP:               &http.Client{Timeout: defaultPlantNetTimeout},
-		QuotaWarnThreshold: plantNetQuotaWarnThreshold(),
+		QuotaWarnThreshold: quotaWarnThreshold,
 	}
-}
-
-// plantNetQuotaWarnThreshold reads PLANTNET_QUOTA_WARN_THRESHOLD (default 50):
-// the remaining-daily-quota count below which each identify WARN-logs, so the
-// server can alert before Pl@ntNet's daily quota is exhausted.
-func plantNetQuotaWarnThreshold() int {
-	if v := os.Getenv("PLANTNET_QUOTA_WARN_THRESHOLD"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			return n
-		}
-	}
-	return 50
 }
 
 // logQuota surfaces Pl@ntNet's per-response remaining daily-quota count. The API

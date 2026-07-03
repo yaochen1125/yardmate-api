@@ -205,7 +205,7 @@ func TestPlantNetClient_Identify_Success(t *testing.T) {
 // (catalog-preference cascade, SPEC §2.1 — request 10 candidates so the
 // handler can evaluate the full set for a curated-catalog match).
 func TestPlantNetClient_NewClient_NbResults10(t *testing.T) {
-	c := NewPlantNetClient("k")
+	c := NewPlantNetClient("k", 50)
 	if c.NbResults != 10 {
 		t.Errorf("NewPlantNetClient().NbResults = %d, want 10", c.NbResults)
 	}
@@ -451,27 +451,5 @@ func TestPlantNetClient_Identify_UnexpectedStatus_BadResponse(t *testing.T) {
 	_, err := c.Identify(context.Background(), strings.NewReader("x"), "image/jpeg", "leaf")
 	if !errors.Is(err, ErrPlantNetBadResponse) {
 		t.Errorf("err = %v, want ErrPlantNetBadResponse (unmapped status)", err)
-	}
-}
-
-func TestPlantNetQuotaWarnThreshold(t *testing.T) {
-	cases := []struct {
-		name string
-		env  string
-		want int
-	}{
-		{"unset → default", "", 50},
-		{"valid override", "200", 200},
-		{"zero is valid", "0", 0},
-		{"invalid → default", "abc", 50},
-		{"negative → default", "-5", 50},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("PLANTNET_QUOTA_WARN_THRESHOLD", tc.env)
-			if got := plantNetQuotaWarnThreshold(); got != tc.want {
-				t.Errorf("env=%q → %d, want %d", tc.env, got, tc.want)
-			}
-		})
 	}
 }
