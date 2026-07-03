@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yaochen1125/yardmate-api/attest"
+	"github.com/yaochen1125/yardmate-api/inflight"
 	"github.com/yaochen1125/yardmate-api/proxy"
 	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
 	"github.com/yaochen1125/yardmate-api/proxy/imageingest"
@@ -44,6 +45,16 @@ const (
 	defaultDeviceLimit   = 100
 	defaultDeviceWindow  = time.Hour
 	defaultSweepInterval = time.Minute
+
+	// In-flight concurrency bound for /v1/identify + /v1/diagnose (inflight/SPEC).
+	// maxInflight is the memory guard (each request buffers a ≤8 MB image);
+	// 30 × ~16 MB ≈ 480 MB, well under the 4 GB cgroup cap. maxWait bounds
+	// queued waiters (each ~KB). waitBudget is kept under the client request
+	// timeout (identify 30 s / diagnose 20 s) so overflow usually resolves into
+	// a served 200 rather than a 503.
+	defaultMaxInflight     = 30
+	defaultInflightMaxWait = 200
+	defaultInflightWait    = 5 * time.Second
 )
 
 func main() {
@@ -180,7 +191,21 @@ func main() {
 	// the /v1/plants/catalog-images server-side name resolution (SPEC §2.8).
 	ingestSvc := buildImageIngestService(vault, content)
 
-	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB)
+	// In-flight concurrency bound for the two image-buffering endpoints
+	// (inflight/SPEC). Caps peak memory so a burst sheds cleanly (503) instead
+	// of OOM-killing the process; overflow first waits up to waitBudget for a
+	// slot, so most of it is served (a slightly slower 200) rather than shed.
+	inflightLim := inflight.New(
+		envIntOr("YARDMATE_API_MAX_INFLIGHT", defaultMaxInflight),
+		envIntOr("YARDMATE_API_INFLIGHT_MAX_WAIT", defaultInflightMaxWait),
+		envDurationOr("YARDMATE_API_INFLIGHT_WAIT", defaultInflightWait),
+	)
+	log.Printf("inflight: maxConcurrent=%d maxWait=%d waitBudget=%s",
+		envIntOr("YARDMATE_API_MAX_INFLIGHT", defaultMaxInflight),
+		envIntOr("YARDMATE_API_INFLIGHT_MAX_WAIT", defaultInflightMaxWait),
+		envDurationOr("YARDMATE_API_INFLIGHT_WAIT", defaultInflightWait))
+
+	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim)
 
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream). Headroom 5 s.

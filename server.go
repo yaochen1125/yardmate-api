@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/yaochen1125/yardmate-api/attest"
+	"github.com/yaochen1125/yardmate-api/inflight"
 	"github.com/yaochen1125/yardmate-api/proxy"
 	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
 	"github.com/yaochen1125/yardmate-api/proxy/imageingest"
@@ -53,6 +54,7 @@ func newServer(
 	diseaseEnricher proxy.DiseaseEnricher,
 	ingest *imageingest.Service,
 	enrichDB *enrichment.DB,
+	inflightLim *inflight.Limiter,
 ) *Server {
 	// Rose cultivar rerank is ON by default; ROSE_RERANK_ENABLED=false kill-switches it.
 	roseEnabled := vault.GetBool("ROSE_RERANK_ENABLED", true)
@@ -105,17 +107,26 @@ func newServer(
 		if plantNet != nil || plantID != nil || enrich != nil || ingest != nil || enrichDB != nil {
 			r.Group(func(r chi.Router) {
 				r.Use(ratelimit.PerDeviceMiddleware(lim.PerDevice, "rate_limit_device"))
-				// /v1/identify cascades Pl@ntNet (primary) → Plant.id
-				// (fallback); register when EITHER engine is present
-				// (SPEC §1.1 / §7).
-				if plantNet != nil || plantID != nil {
-					r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, roseEnabled))
-				}
-				// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
-				// assessment, SPEC §1.5) — still requires plantID.
-				if plantID != nil {
-					r.Post("/diagnose", proxy.HandleDiagnose(plantID, content, vision, diseaseEnricher))
-				}
+				// /v1/identify + /v1/diagnose each buffer the uploaded image
+				// (≤8 MB) in memory, so they share a concurrency bound — a burst
+				// otherwise risks OOM-killing the whole process (inflight/SPEC).
+				// Nested sub-group so ONLY these two carry the bound; enrichment
+				// (text) / account-delete / signal below stay unbounded. A nil
+				// inflightLim (bound disabled / tests) is a pass-through.
+				r.Group(func(r chi.Router) {
+					r.Use(inflight.Middleware(inflightLim, "server_busy"))
+					// /v1/identify cascades Pl@ntNet (primary) → Plant.id
+					// (fallback); register when EITHER engine is present
+					// (SPEC §1.1 / §7).
+					if plantNet != nil || plantID != nil {
+						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, roseEnabled))
+					}
+					// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
+					// assessment, SPEC §1.5) — still requires plantID.
+					if plantID != nil {
+						r.Post("/diagnose", proxy.HandleDiagnose(plantID, content, vision, diseaseEnricher))
+					}
+				})
 				if enrich != nil {
 					r.Post("/plants/enrichment", enrichment.HandleEnrichment(enrich))
 				}
