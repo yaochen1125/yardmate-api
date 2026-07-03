@@ -195,15 +195,12 @@ func main() {
 	// (inflight/SPEC). Caps peak memory so a burst sheds cleanly (503) instead
 	// of OOM-killing the process; overflow first waits up to waitBudget for a
 	// slot, so most of it is served (a slightly slower 200) rather than shed.
-	inflightLim := inflight.New(
-		envIntOr("YARDMATE_API_MAX_INFLIGHT", defaultMaxInflight),
-		envIntOr("YARDMATE_API_INFLIGHT_MAX_WAIT", defaultInflightMaxWait),
-		envDurationOr("YARDMATE_API_INFLIGHT_WAIT", defaultInflightWait),
-	)
+	maxInflight := envIntOr("YARDMATE_API_INFLIGHT_MAX", defaultMaxInflight)
+	inflightMaxWait := envIntOr("YARDMATE_API_INFLIGHT_MAX_WAIT", defaultInflightMaxWait)
+	inflightWait := envDurationOr("YARDMATE_API_INFLIGHT_WAIT_BUDGET", defaultInflightWait)
+	inflightLim := inflight.New(maxInflight, inflightMaxWait, inflightWait)
 	log.Printf("inflight: maxConcurrent=%d maxWait=%d waitBudget=%s",
-		envIntOr("YARDMATE_API_MAX_INFLIGHT", defaultMaxInflight),
-		envIntOr("YARDMATE_API_INFLIGHT_MAX_WAIT", defaultInflightMaxWait),
-		envDurationOr("YARDMATE_API_INFLIGHT_WAIT", defaultInflightWait))
+		maxInflight, inflightMaxWait, inflightWait)
 
 	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim)
 

@@ -37,9 +37,9 @@ immediately:
 
 | param | env override | default | meaning |
 |---|---|---|---|
-| `maxInflight` | `YARDMATE_API_MAX_INFLIGHT` | `30` | concurrency cap = memory guard (30 × ~16 MB ≈ 480 MB, well under the 4 GB cgroup) |
+| `maxInflight` | `YARDMATE_API_INFLIGHT_MAX` | `30` | concurrency cap = memory guard (30 × ~16 MB ≈ 480 MB, well under the 4 GB cgroup) |
 | `maxWait` | `YARDMATE_API_INFLIGHT_MAX_WAIT` | `200` | max queued waiters; bounds goroutine/connection growth (200 × ~KB ≈ negligible) |
-| `waitBudget` | `YARDMATE_API_INFLIGHT_WAIT` | `5s` | how long overflow waits for a slot before 503; kept `<` client timeout so most overflow resolves to a served 200 |
+| `waitBudget` | `YARDMATE_API_INFLIGHT_WAIT_BUDGET` | `5s` | how long overflow waits for a slot before 503; kept `<` client timeout so most overflow resolves to a served 200 |
 
 Throughput at defaults: 30 slots × (1 completion / ~5 s) ≈ 6 identify/s ≈
 ~21 k/hr — far above realistic load, and aligned with what the upstream
