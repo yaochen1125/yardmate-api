@@ -186,6 +186,7 @@ re-deploy. Don't hot-patch the server binary.
 | `open store: open /var/lib/yardmate-api/credentials.db: permission denied` | `/var/lib/yardmate-api` owner ≠ `yardmate-api` | `chown -R yardmate-api:yardmate-api /var/lib/yardmate-api` |
 | `aaguid_mismatch` from a known-good production iOS build | `ATTEST_ALLOW_DEV` flipped wrong-way OR Team/Bundle ID drift | Check secrets.env on host + `YARDMATE_API_APP_ID` env in unit file |
 | Client gets 429 immediately | per-IP limit too tight for shared NAT egress | Raise `YARDMATE_API_RL_IP_LIMIT` (env in systemd unit) |
+| `WARN plantnet quota LOW` in journal / daily "PlantNet quota low" email | Pl@ntNet's daily identify quota is nearly exhausted (falls back to Plant.id credits then GPT-4o vision at 0) | Upgrade the Pl@ntNet plan; tune the alert point via `YARDMATE_API_PLANTNET_QUOTA_WARN` (default 50, env in systemd unit) |
 | BoltDB grows past expected size | challenge sweeper not running | Restart service; bbolt compacts on open (rare path) |
 | `POST /v1/plants/catalog-images` returns `400 unknown_catalog_id` for a real curated plant | embedded `proxy/data/plants_index.json` is stale (a newly-added species is absent from the binary's copy) | Re-sync the copy from `yardmate-swiftui` and rebuild/redeploy (§7) |
 

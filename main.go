@@ -55,6 +55,12 @@ const (
 	defaultMaxInflight     = 30
 	defaultInflightMaxWait = 200
 	defaultInflightWait    = 5 * time.Second
+
+	// Below this many remaining Pl@ntNet daily-quota requests, each identify
+	// WARN-logs so the server-side watcher can email before exhaustion
+	// (proxy.PlantNetClient.logQuota). Override via env in the systemd unit,
+	// like the YARDMATE_API_RL_* / _INFLIGHT_* knobs (see deploy/README.md).
+	defaultPlantNetQuotaWarn = 50
 )
 
 func main() {
@@ -116,7 +122,7 @@ func main() {
 	// then /v1/identify degrades to Plant.id-only (graceful, warn-logged).
 	var plantNet *proxy.PlantNetClient
 	if v := vault.Get("PLANTNET_API_KEY"); v != "" {
-		plantNet = proxy.NewPlantNetClient(v)
+		plantNet = proxy.NewPlantNetClient(v, envIntOr("YARDMATE_API_PLANTNET_QUOTA_WARN", defaultPlantNetQuotaWarn))
 	} else {
 		log.Printf("WARN: PLANTNET_API_KEY missing; /v1/identify primary engine disabled (Plant.id-only fallback)")
 	}
