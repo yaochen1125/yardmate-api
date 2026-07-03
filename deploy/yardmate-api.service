@@ -42,9 +42,13 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallArchitectures=native
 ReadWritePaths=/var/lib/yardmate-api
 
-# Resource caps. yardmate-api is a small Go server; these are room-with-spare.
+# Resource caps. The box is dedicated to YardMate (8 GB). MemoryMax is the
+# in-flight ceiling for /v1/identify + /v1/diagnose, which each buffer the
+# uploaded image (≤8 MB) in memory: 4 GB → a few hundred concurrent uploads
+# before the cgroup cap kicks in, while still capping so a flood can't OOM the
+# whole box (nginx + catalog-promote share it). Raised from 512M (2026-07-03).
 LimitNOFILE=4096
-MemoryMax=512M
+MemoryMax=4G
 
 [Install]
 WantedBy=multi-user.target
