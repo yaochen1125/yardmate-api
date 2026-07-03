@@ -122,7 +122,17 @@ func main() {
 	// then /v1/identify degrades to Plant.id-only (graceful, warn-logged).
 	var plantNet *proxy.PlantNetClient
 	if v := vault.Get("PLANTNET_API_KEY"); v != "" {
-		plantNet = proxy.NewPlantNetClient(v, envIntOr("YARDMATE_API_PLANTNET_QUOTA_WARN", defaultPlantNetQuotaWarn))
+		// Reject a negative quota-warn threshold (a typo like "-5"): logQuota
+		// WARNs on `remaining < threshold`, so a negative value never fires for
+		// any real remaining count (incl. 0) and silently loses the exhaustion
+		// signal. Fall back to the default, matching the pre-config-path parser's
+		// non-negative validation (PR #78 review).
+		quotaWarn := envIntOr("YARDMATE_API_PLANTNET_QUOTA_WARN", defaultPlantNetQuotaWarn)
+		if quotaWarn < 0 {
+			log.Printf("WARN: YARDMATE_API_PLANTNET_QUOTA_WARN=%d is negative; using default %d", quotaWarn, defaultPlantNetQuotaWarn)
+			quotaWarn = defaultPlantNetQuotaWarn
+		}
+		plantNet = proxy.NewPlantNetClient(v, quotaWarn)
 	} else {
 		log.Printf("WARN: PLANTNET_API_KEY missing; /v1/identify primary engine disabled (Plant.id-only fallback)")
 	}
