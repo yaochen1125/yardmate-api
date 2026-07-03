@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -35,6 +38,11 @@ type PlantNetClient struct {
 	Lang      string // language for common names (default "en")
 	NbResults int    // max results requested from Pl@ntNet (default 10)
 	HTTP      *http.Client
+	// QuotaWarnThreshold: when Pl@ntNet's remaining daily-quota count drops
+	// below this, each identify WARN-logs instead of INFO-logs, so the
+	// server-side watcher can email before the quota is exhausted. Set from
+	// env PLANTNET_QUOTA_WARN_THRESHOLD (default 50) in NewPlantNetClient.
+	QuotaWarnThreshold int
 }
 
 // NewPlantNetClient returns a PlantNetClient with production defaults.
@@ -43,11 +51,38 @@ type PlantNetClient struct {
 // (caller passes nil → Plant.id-only, SPEC §1.5).
 func NewPlantNetClient(apiKey string) *PlantNetClient {
 	return &PlantNetClient{
-		APIKey:    apiKey,
-		Endpoint:  defaultPlantNetEndpoint,
-		Lang:      "en",
-		NbResults: 10,
-		HTTP:      &http.Client{Timeout: defaultPlantNetTimeout},
+		APIKey:             apiKey,
+		Endpoint:           defaultPlantNetEndpoint,
+		Lang:               "en",
+		NbResults:          10,
+		HTTP:               &http.Client{Timeout: defaultPlantNetTimeout},
+		QuotaWarnThreshold: plantNetQuotaWarnThreshold(),
+	}
+}
+
+// plantNetQuotaWarnThreshold reads PLANTNET_QUOTA_WARN_THRESHOLD (default 50):
+// the remaining-daily-quota count below which each identify WARN-logs, so the
+// server can alert before Pl@ntNet's daily quota is exhausted.
+func plantNetQuotaWarnThreshold() int {
+	if v := os.Getenv("PLANTNET_QUOTA_WARN_THRESHOLD"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 50
+}
+
+// logQuota surfaces Pl@ntNet's per-response remaining daily-quota count. The API
+// returns it on every identify (plantNetAPIResponse.RemainingIdentificationRequests)
+// but it was previously decoded and discarded. INFO every call for visibility
+// (grep "plantnet quota"); WARN below QuotaWarnThreshold so the server-side
+// watcher can email before exhaustion. remaining==0 is a real "quota used up"
+// state and still warns.
+func (c *PlantNetClient) logQuota(remaining int) {
+	if remaining < c.QuotaWarnThreshold {
+		log.Printf("WARN plantnet quota LOW: remaining=%d threshold=%d", remaining, c.QuotaWarnThreshold)
+	} else {
+		log.Printf("plantnet quota: remaining=%d", remaining)
 	}
 }
 
@@ -247,6 +282,7 @@ func (c *PlantNetClient) Identify(ctx context.Context, image io.Reader, mime, or
 		if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
 			return nil, fmt.Errorf("%w: decode: %v", ErrPlantNetBadResponse, err)
 		}
+		c.logQuota(apiResp.RemainingIdentificationRequests)
 		return apiResp.toIdentifyResult(), nil
 	case resp.StatusCode == http.StatusNotFound:
 		// Pl@ntNet "Species not found" — a VALID empty result, NOT an engine
