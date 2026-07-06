@@ -64,16 +64,16 @@ const cannedPlantNetOK = `{
     {
       "score": 0.03,
       "species": {
-        "scientificNameWithoutAuthor": "Third",
-        "scientificName": "Third Auth.",
+        "scientificNameWithoutAuthor": "Ficus lyrata",
+        "scientificName": "Ficus lyrata Warb.",
         "commonNames": null
       }
     },
     {
       "score": 0.01,
       "species": {
-        "scientificNameWithoutAuthor": "Fourth (kept by client; top-3 trim is the handler's job now)",
-        "scientificName": "Fourth Auth.",
+        "scientificNameWithoutAuthor": "Epipremnum aureum",
+        "scientificName": "Epipremnum aureum (Linden & André) G.S.Bunting",
         "commonNames": []
       }
     }
@@ -222,7 +222,10 @@ func TestPlantNetClient_Identify_ReturnsUpTo10(t *testing.T) {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		fmt.Fprintf(&sb, `{"score":%f,"species":{"scientificNameWithoutAuthor":"R%d","scientificName":"R%d Auth.","commonNames":[]}}`,
+		// Structurally-valid binomials (genus carries the index, fixed
+		// lowercase-Latin epithet) so each passes hasUsableScientificName —
+		// the point of this test is the up-to-10 cap, not name filtering.
+		fmt.Fprintf(&sb, `{"score":%f,"species":{"scientificNameWithoutAuthor":"Genus%d speciosa","scientificName":"Genus%d speciosa Auth.","commonNames":[]}}`,
 			1.0-float64(i)*0.05, i, i)
 	}
 	sb.WriteString(`],"remainingIdentificationRequests":50}`)
@@ -242,8 +245,8 @@ func TestPlantNetClient_Identify_ReturnsUpTo10(t *testing.T) {
 		t.Errorf("len(Suggestions) = %d, want %d (toIdentifyResult cap raised 3→10)", got, want)
 	}
 	// Order preserved (no client-side reorder; the handler selects).
-	if result.Suggestions[0].Name != "R0" || result.Suggestions[9].Name != "R9" {
-		t.Errorf("first/last = %q/%q, want R0/R9 (input order, first 10 kept)",
+	if result.Suggestions[0].Name != "Genus0 speciosa" || result.Suggestions[9].Name != "Genus9 speciosa" {
+		t.Errorf("first/last = %q/%q, want Genus0 speciosa/Genus9 speciosa (input order, first 10 kept)",
 			result.Suggestions[0].Name, result.Suggestions[9].Name)
 	}
 }
@@ -253,21 +256,21 @@ func TestPlantNetClient_Identify_ReturnsUpTo10(t *testing.T) {
 // non-http(s) url being rejected (nil) — all in one upstream response.
 func TestPlantNetClient_Identify_ImageURLFallbackAndAbsent(t *testing.T) {
 	const canned = `{
-  "bestMatch": "A",
+  "bestMatch": "Acer palmatum",
   "results": [
     {
       "score": 0.9,
-      "species": {"scientificNameWithoutAuthor": "A", "scientificName": "A Auth.", "commonNames": []},
+      "species": {"scientificNameWithoutAuthor": "Acer palmatum", "scientificName": "Acer palmatum Thunb.", "commonNames": []},
       "images": [ { "url": { "o": "https://bs.plantnet.org/o/a.jpg", "m": "", "s": "https://bs.plantnet.org/s/a.jpg" } } ]
     },
     {
       "score": 0.5,
-      "species": {"scientificNameWithoutAuthor": "B", "scientificName": "B Auth.", "commonNames": []},
+      "species": {"scientificNameWithoutAuthor": "Betula pendula", "scientificName": "Betula pendula Roth", "commonNames": []},
       "images": []
     },
     {
       "score": 0.3,
-      "species": {"scientificNameWithoutAuthor": "C", "scientificName": "C Auth.", "commonNames": []},
+      "species": {"scientificNameWithoutAuthor": "Carex flagellifera", "scientificName": "Carex flagellifera Colenso", "commonNames": []},
       "images": [ { "url": { "o": "ftp://bad/c.jpg", "m": "  ", "s": "not-a-url" } } ]
     }
   ],
