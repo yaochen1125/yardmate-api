@@ -150,6 +150,14 @@ func unknownSentinelResult() *IdentifyResult {
 //     or, when the engine also returned nothing, the unchanged "can't
 //     identify" empty result). This subsumes the old tier-3 "zero suggestions
 //     → AI" block.
+//
+// visionArbiterResult carries the parallel GPT-4o open-world identify result
+// (identify-gpt-arbiter) back to the reconciliation switch.
+type visionArbiterResult struct {
+	sug *Suggestion
+	err error
+}
+
 func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, roseEnabled bool) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
@@ -197,9 +205,8 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//    client encoding order. multipart.Part doesn't support skip-then-
 		//    rewind, so each part is fully consumed when found.
 		var (
-			imgBytes  []byte
-			aiEnhance bool
-			organ     = "auto"
+			imgBytes []byte
+			organ    = "auto"
 		)
 		for {
 			part, perr := mr.NextPart()
@@ -231,14 +238,6 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					return
 				}
 				imgBytes = b
-			case "ai_enhance":
-				b, err := io.ReadAll(io.LimitReader(part, 16))
-				if err == nil {
-					switch strings.TrimSpace(string(b)) {
-					case "true", "1", "yes":
-						aiEnhance = true
-					}
-				}
 			case "organ":
 				// Pl@ntNet organ hint (SPEC §2.1). Accept only the known
 				// set case-insensitively; anything else / absent → "auto"
@@ -273,6 +272,23 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 
 		ctx, cancel := context.WithTimeout(r.Context(), identifyUpstreamTimeout)
 		defer cancel()
+
+		// --- Parallel GPT-4o open-world arbiter (identify-gpt-arbiter). Fire the
+		//     vision identify CONCURRENTLY with the engine cascade so its latency
+		//     hides behind the engine's (wall clock ≈ max, not sum). Its guess is
+		//     reconciled against the engine in the switch below. Buffered (cap 1)
+		//     so the goroutine never blocks if we bail before reading it (cascade
+		//     error path); ctx-cancel on return aborts an in-flight call. GPT runs
+		//     for EVERY identify now — the arbiter is universal, no ai_enhance /
+		//     free-vs-paid branch (free is gated only by request count). ---
+		var gptCh chan visionArbiterResult
+		if vision != nil {
+			gptCh = make(chan visionArbiterResult, 1)
+			go func() {
+				s, e := vision.IdentifyPlant(ctx, imgBytes, mime)
+				gptCh <- visionArbiterResult{sug: s, err: e}
+			}()
+		}
 
 		// --- Two-engine cascade (SPEC §1.1 / §7). Single attempt per engine,
 		//     no per-engine retry. Pl@ntNet primary → Plant.id fallback. ---
@@ -337,8 +353,11 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//          plantnetConfidentSkipAIConfidence → the engine is sure of a
 		//          specific out-of-catalog plant; use the engine top as-is
 		//          (out-of-catalog → iOS enrichment) and DO NOT call vision —
-		//          a curated match is unlikely and the AI probe is not worth
-		//          the latency/cost (engine=<base>-confident-oob). Edge: zero
+		//          EXCEPT for one GPT-4o vision cross-check that OVERRIDES the
+		//          engine only on a curated catalog hit at >= engine confidence
+		//          (engine=ai-catalog-override), else keeps the engine top
+		//          out-of-catalog (engine=<base>-confident-oob). AI not-a-plant
+		//          / low-conf never displaces it. Edge: zero
 		//          candidates ⇒ no top ⇒ treated as < the gate ⇒ fall to
 		//          step 3 (do NOT skip AI on an empty set).
 		//       3. Else (0 in catalog, engine NOT confident) if vision != nil
@@ -366,6 +385,16 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     case is covered by branch 3/4 above; the confident-oob skip in
 		//     branch 2 never applies to an empty set). ---
 		if err == nil {
+			// Await the parallel GPT arbiter fired at cascade start (gptSug is nil
+			// when vision == nil). Errors are handled per-case below (best-effort:
+			// a vision failure never blocks the engine result).
+			var gptSug *Suggestion
+			var gptErr error
+			if gptCh != nil {
+				arb := <-gptCh
+				gptSug, gptErr = arb.sug, arb.err
+			}
+
 			base := engine // "plantnet" or "plantid-fallback"/"plantid"
 			if base == "plantid" {
 				base = "plantid-fallback"
@@ -412,6 +441,7 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				// whole slice (idempotent) so [0] keeps a correct PlantID.
 				// This wins even over a higher-confidence out-of-catalog top
 				// (no threshold here — rule B precedence, unchanged from #20).
+				bestConf := cands[bestIdx].Confidence
 				if bestIdx != 0 {
 					result.Suggestions[0], result.Suggestions[bestIdx] =
 						result.Suggestions[bestIdx], result.Suggestions[0]
@@ -419,27 +449,93 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				pid := bestPID
 				result.Suggestions[0].PlantID = &pid
 				engine = base + "-catalog"
+				// Arbiter reconciliation (identify-gpt-arbiter). The engine can be
+				// confidently WRONG about an in-catalog species, OR weakly
+				// false-positive a NON-plant onto a catalog species (rule-B has no
+				// confidence floor). Two arbiter verdicts act here:
+				switch {
+				case errors.Is(gptErr, ErrVisionNotAPlant) && bestConf < plantnetConfidentSkipAIConfidence:
+					// GPT says not-a-plant AND the engine's catalog hit is weak
+					// (< plantnetConfidentSkipAIConfidence) → trust GPT and return
+					// the Unknown sentinel, same as the no-catalog recovery branch.
+					// A >=0.80 engine catalog hit is still trusted (mirrors
+					// confident-oob: guard against a GPT is_plant false-negative).
+					result = unknownSentinelResult()
+					unknownSentinel = true
+					engine = "unknown-sentinel"
+				case gptErr == nil && gptSug != nil:
+					// GPT resolves to a DIFFERENT catalog plant AND is at least as
+					// confident as the engine's in-catalog candidate → adopt GPT's
+					// (GPT is the more accurate identifier per real-photo evidence;
+					// resolves-to-catalog + >=conf gates guard against a
+					// hallucinated override).
+					if id, ok := resolvePlantID(content, gptSug.ScientificName); ok &&
+						id != bestPID && gptSug.Confidence >= bestConf {
+						gpid := id
+						gptSug.PlantID = &gpid
+						result = &IdentifyResult{
+							IsPlant:           true,
+							IsPlantConfidence: gptSug.Confidence,
+							Suggestions:       []Suggestion{*gptSug},
+						}
+						engine = "ai-catalog-override"
+					}
+				}
 
 			case engineTopConf >= plantnetConfidentSkipAIConfidence:
-				// 0 candidates in catalog BUT the engine's own top candidate
-				// is highly confident (≥ plantnetConfidentSkipAIConfidence) →
-				// the engine is sure of a specific out-of-catalog plant; a
-				// curated match is unlikely and the AI catalog-recovery probe
-				// is not worth the GPT-4o latency/cost. Keep the engine's
-				// ORIGINAL top as-is (out-of-catalog, PlantID resolved nil by
-				// the loop below → iOS enrichment) and DO NOT call vision.
-				// (len(cands) > 0 is implied — empty set ⇒ engineTopConf = -1.)
+				// 0 candidates in catalog BUT the engine's own top candidate is
+				// highly confident (≥ plantnetConfidentSkipAIConfidence) about a
+				// specific OUT-OF-catalog plant. The engine can be confidently
+				// WRONG here — real case: a California-poppy photo returned as
+				// Papaver cambricum (Welsh poppy), an out-of-catalog species not
+				// in the 1522 catalog, so it never reaches the bestIdx>=0 case
+				// and the app renders an enriched page for the wrong species,
+				// even though the correct species (Eschscholzia californica,
+				// AAA0505) IS curated. Previously the engine was trusted and
+				// vision was skipped entirely, so nothing could catch this.
+				//
+				// Now we DO run a GPT-4o vision cross-check, but keep it
+				// conservative: it may OVERRIDE the confident engine ONLY when
+				// its guess resolves to a curated catalog plant AND it is at
+				// least as confident as the engine (engineTopConf). A correct
+				// confident out-of-catalog engine result is thus never displaced
+				// by a weak/hallucinated GPT catalog guess. Vision's
+				// not-a-plant verdict and low-confidence guesses are ignored
+				// here (the confident engine stays trusted by default). Cost:
+				// one GPT-4o call only on this confident-out-of-catalog subset;
+				// on a hit we keep the engine's ORIGINAL top out-of-catalog
+				// (PlantID nil → iOS enrichment). (len(cands) > 0 is implied —
+				// empty set ⇒ engineTopConf = -1.)
 				engine = base + "-confident-oob"
+				if vision != nil {
+					aiSug, verr := gptSug, gptErr
+					switch {
+					case verr == nil && aiSug != nil:
+						if id, ok := resolvePlantID(content, aiSug.ScientificName); ok &&
+							aiSug.Confidence >= engineTopConf {
+							pid := id
+							aiSug.PlantID = &pid
+							result = &IdentifyResult{
+								IsPlant:           true,
+								IsPlantConfidence: aiSug.Confidence,
+								Suggestions:       []Suggestion{*aiSug},
+							}
+							engine = "ai-catalog-override"
+						}
+					case verr != nil && !errors.Is(verr, ErrVisionNotAPlant):
+						log.Printf("identify confident-oob vision cross-check err: deviceID=%s err=%v", deviceID, verr)
+					}
+				}
 
 			case vision != nil:
 				// 0 candidates in catalog AND engine NOT confident (top <
 				// plantnetConfidentSkipAIConfidence, or no top) → AI vision
-				// catalog-recovery probe.
-				aiSug, verr := vision.IdentifyPlant(ctx, imgBytes, mime)
+				// catalog-recovery probe (reuses the parallel GPT arbiter guess).
+				aiSug, verr := gptSug, gptErr
 				var aiPID string
 				aiHasPID := false
 				if verr == nil && aiSug != nil {
-					if id, ok := content.LookupPlantID(aiSug.ScientificName); ok {
+					if id, ok := resolvePlantID(content, aiSug.ScientificName); ok {
 						aiPID = id
 						aiHasPID = true
 					}
@@ -530,29 +626,6 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			log.Printf("identify no engine: deviceID=%s appVer=%s", deviceID, appVer)
 			writeError(w, http.StatusBadGateway, "plant_id_unavailable")
 			return
-		}
-
-		// 7. Optional AI rerank. Failures here do not affect the 200 response
-		//    contract — AIEnhancedAt simply stays null. The vision call uses
-		//    the same ctx but its client has an inner 8 s timeout (see SPEC §2.1).
-		if !unknownSentinel && aiEnhance && vision != nil && len(result.Suggestions) > 0 {
-			pick, verr := vision.RerankIdentify(ctx, imgBytes, mime, result.Suggestions)
-			if verr != nil {
-				log.Printf("identify ai_enhance failed: deviceID=%s err=%v", deviceID, verr)
-			} else {
-				// Move the picked candidate to index 0 if it isn't already.
-				for i, s := range result.Suggestions {
-					if s.Name == pick {
-						if i != 0 {
-							result.Suggestions[0], result.Suggestions[i] =
-								result.Suggestions[i], result.Suggestions[0]
-						}
-						break
-					}
-				}
-				ts := time.Now().UTC().Format(time.RFC3339)
-				result.AIEnhancedAt = &ts
-			}
 		}
 
 		// 7a. Rose cultivar rerank — ON by default; ROSE_RERANK_ENABLED=false is a

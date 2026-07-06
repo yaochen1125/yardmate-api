@@ -348,175 +348,6 @@ func TestHandleIdentify_PlantIDImageRejected_MapsToClient400(t *testing.T) {
 	}
 }
 
-// --- HandleIdentify ai_enhance ---
-
-// buildMultipartWithFlag builds a multipart body containing both an image
-// file part and a free-form ai_enhance text part, in that order.
-func buildMultipartWithFlag(t *testing.T, image []byte, flag string) (*bytes.Buffer, string) {
-	t.Helper()
-	var buf bytes.Buffer
-	w := multipart.NewWriter(&buf)
-	fw, err := w.CreateFormFile("image", "test.jpg")
-	if err != nil {
-		t.Fatalf("CreateFormFile: %v", err)
-	}
-	if _, err := fw.Write(image); err != nil {
-		t.Fatalf("write file: %v", err)
-	}
-	if flag != "" {
-		if err := w.WriteField("ai_enhance", flag); err != nil {
-			t.Fatalf("WriteField: %v", err)
-		}
-	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	return &buf, w.FormDataContentType()
-}
-
-func TestHandleIdentify_AIEnhance_False_NoRerank(t *testing.T) {
-	h, srv := newIdentifyHandlerWithVision(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, cannedPlantIDOK)
-	}, nil)
-	defer srv.Close()
-	body, ct := buildMultipart(t, "image", jpegMagic)
-	req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
-	req.Header.Set("Content-Type", ct)
-	req.Header.Set("X-Device-Install-Id", testUUID)
-	req.Header.Set("X-App-Version", "1.1.1")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code = %d", rec.Code)
-	}
-	var result IdentifyResult
-	_ = json.Unmarshal(rec.Body.Bytes(), &result)
-	if result.AIEnhancedAt != nil {
-		t.Errorf("AIEnhancedAt = %v, want nil (ai_enhance not requested)", *result.AIEnhancedAt)
-	}
-}
-
-func TestHandleIdentify_AIEnhance_True_NoVisionClient(t *testing.T) {
-	// ai_enhance=true but vision client is nil — server gracefully skips
-	// the rerank and ships the Plant.id ordering unchanged.
-	h, srv := newIdentifyHandlerWithVision(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, cannedPlantIDOK)
-	}, nil)
-	defer srv.Close()
-	body, ct := buildMultipartWithFlag(t, jpegMagic, "true")
-	req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
-	req.Header.Set("Content-Type", ct)
-	req.Header.Set("X-Device-Install-Id", testUUID)
-	req.Header.Set("X-App-Version", "1.1.1")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code = %d", rec.Code)
-	}
-	var result IdentifyResult
-	_ = json.Unmarshal(rec.Body.Bytes(), &result)
-	if result.AIEnhancedAt != nil {
-		t.Errorf("AIEnhancedAt = %v, want nil (vision client absent)", *result.AIEnhancedAt)
-	}
-	if result.Suggestions[0].Name != "Monstera deliciosa" {
-		t.Errorf("top-1 should be unchanged Plant.id top: %s", result.Suggestions[0].Name)
-	}
-}
-
-func TestHandleIdentify_AIEnhance_True_RerankPromotesTopN(t *testing.T) {
-	// Vision returns the 2nd candidate ("Other plant"); handler must swap
-	// it into position 0 and set AIEnhancedAt.
-	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Other plant"}}]}`)
-	}))
-	defer llm.Close()
-	vision := &VisionClient{APIKey: "k", Endpoint: llm.URL, Model: "t", HTTP: llm.Client()}
-
-	h, srv := newIdentifyHandlerWithVision(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, cannedPlantIDOK)
-	}, vision)
-	defer srv.Close()
-	body, ct := buildMultipartWithFlag(t, jpegMagic, "true")
-	req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
-	req.Header.Set("Content-Type", ct)
-	req.Header.Set("X-Device-Install-Id", testUUID)
-	req.Header.Set("X-App-Version", "1.1.1")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code = %d body=%s", rec.Code, rec.Body)
-	}
-	var result IdentifyResult
-	_ = json.Unmarshal(rec.Body.Bytes(), &result)
-	if result.AIEnhancedAt == nil {
-		t.Fatal("AIEnhancedAt = nil, want timestamp")
-	}
-	if result.Suggestions[0].Name != "Other plant" {
-		t.Errorf("top-1 = %q, want \"Other plant\" (after rerank)", result.Suggestions[0].Name)
-	}
-}
-
-func TestHandleIdentify_AIEnhance_True_VisionError_KeepsOriginal(t *testing.T) {
-	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadGateway)
-	}))
-	defer llm.Close()
-	vision := &VisionClient{APIKey: "k", Endpoint: llm.URL, Model: "t", HTTP: llm.Client()}
-
-	h, srv := newIdentifyHandlerWithVision(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, cannedPlantIDOK)
-	}, vision)
-	defer srv.Close()
-	body, ct := buildMultipartWithFlag(t, jpegMagic, "true")
-	req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
-	req.Header.Set("Content-Type", ct)
-	req.Header.Set("X-Device-Install-Id", testUUID)
-	req.Header.Set("X-App-Version", "1.1.1")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code = %d", rec.Code)
-	}
-	var result IdentifyResult
-	_ = json.Unmarshal(rec.Body.Bytes(), &result)
-	if result.AIEnhancedAt != nil {
-		t.Errorf("AIEnhancedAt = %v, want nil on LLM failure", *result.AIEnhancedAt)
-	}
-	// Plant.id order preserved.
-	if result.Suggestions[0].Name != "Monstera deliciosa" {
-		t.Errorf("top-1 = %q, want \"Monstera deliciosa\" (Plant.id top-1)", result.Suggestions[0].Name)
-	}
-}
-
-func TestHandleIdentify_AIEnhance_FlagAcceptsTrueAndOne(t *testing.T) {
-	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Monstera deliciosa"}}]}`)
-	}))
-	defer llm.Close()
-	vision := &VisionClient{APIKey: "k", Endpoint: llm.URL, Model: "t", HTTP: llm.Client()}
-
-	for _, flag := range []string{"true", "1", "yes"} {
-		t.Run("flag="+flag, func(t *testing.T) {
-			h, srv := newIdentifyHandlerWithVision(t, func(w http.ResponseWriter, r *http.Request) {
-				_, _ = io.WriteString(w, cannedPlantIDOK)
-			}, vision)
-			defer srv.Close()
-			body, ct := buildMultipartWithFlag(t, jpegMagic, flag)
-			req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
-			req.Header.Set("Content-Type", ct)
-			req.Header.Set("X-Device-Install-Id", testUUID)
-			req.Header.Set("X-App-Version", "1.1.1")
-			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, req)
-			var result IdentifyResult
-			_ = json.Unmarshal(rec.Body.Bytes(), &result)
-			if result.AIEnhancedAt == nil {
-				t.Errorf("flag=%q: AIEnhancedAt should be non-nil", flag)
-			}
-		})
-	}
-}
-
 // --- HandleIdentify two-engine cascade (SPEC §1.1 / §7) ---
 
 // newCascadeHandler wires HandleIdentify with BOTH a Pl@ntNet fake (primary)
@@ -1171,9 +1002,7 @@ func TestHandleIdentify_Tier3_VisionNotAPlant_ReturnsSentinel(t *testing.T) {
 }
 
 func TestHandleIdentify_Tier3_BothEnginesDown_StillReturns502(t *testing.T) {
-	visionCalled := false
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		visionCalled = true
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"X\",\"common_names\":[],\"confidence\":0.9}"}}]}`)
 	}))
 	defer vsrv.Close()
@@ -1196,9 +1025,10 @@ func TestHandleIdentify_Tier3_BothEnginesDown_StillReturns502(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `"plant_id_unavailable"`) {
 		t.Errorf("body = %s, want plant_id_unavailable (wire code unchanged)", rec.Body.String())
 	}
-	if visionCalled {
-		t.Error("vision was called on a both-engines-down error; tier-3 must only fire on a SUCCESSFUL empty cascade")
-	}
+	// The parallel GPT arbiter (identify-gpt-arbiter) may fire concurrently with
+	// the cascade, but its result is discarded on a both-engines-down error
+	// (reconciliation runs only under err==nil) — so the 502 contract above holds:
+	// AI never substitutes for engine-unavailable.
 }
 
 // --- HandleIdentify catalog-preference selection cascade (SPEC §1.1/§2.1/§7) ---
@@ -1360,17 +1190,18 @@ func TestHandleIdentify_CatalogPref_NoneInCatalog_AICatalogRecovery(t *testing.T
 }
 
 // (d) NO candidate in catalog + engine's ORIGINAL TOP is highly confident
-// (score 0.88 ≥ plantnetConfidentSkipAIConfidence 0.80) → the AI catalog-
-// recovery probe is SKIPPED entirely; the engine's original top is kept
-// (out-of-catalog, plant_id null → iOS enrichment). engine=plantnet-
-// confident-oob. (Change 1: this fixture used to exercise the AI-low-conf
-// rejection path; under the new ordering a confident engine top short-
-// circuits before vision is ever called — vision must NOT be hit.)
+// (score 0.88 >= plantnetConfidentSkipAIConfidence 0.80). The confident-oob
+// GPT-4o cross-check now RUNS, but the AI guess (Abelia chinensis, 0.40) is
+// LESS confident than the engine (0.88 > 0.40) → override WITHHELD; the
+// engine's original top is kept (out-of-catalog, plant_id null → iOS
+// enrichment). engine=plantnet-confident-oob. (identify-oob-gpt-recovery:
+// vision IS called as a cross-check, but only overrides when it resolves to
+// catalog AND is >= the engine confidence.)
 func TestHandleIdentify_CatalogPref_ConfidentTop_SkipsAI_EngineTopUsed(t *testing.T) {
 	visionCalled := false
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// If reached this would (under the new 0.10 floor) be ACCEPTED as a
-		// catalog recovery — so reaching it at all is the bug we guard against.
+		// Cross-check now runs, but conf 0.40 < engine 0.88 → override WITHHELD
+		// (a weak AI catalog guess must not displace a more-confident engine).
 		visionCalled = true
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.40}"}}]}`)
 	}))
@@ -1402,10 +1233,9 @@ func TestHandleIdentify_CatalogPref_ConfidentTop_SkipsAI_EngineTopUsed(t *testin
 	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	// AI must have been SKIPPED — a confident engine top (0.88 ≥ 0.80) +
-	// none-in-catalog short-circuits before the vision probe.
-	if visionCalled {
-		t.Error("vision was called; a confident engine top (≥0.80) + none-in-catalog must SKIP the AI catalog-recovery probe")
+	// The cross-check MUST run now; it just does not override (AI 0.40 < 0.88).
+	if !visionCalled {
+		t.Error("vision was NOT called; confident-oob must run a GPT-4o cross-check (identify-oob-gpt-recovery)")
 	}
 	// Engine's ORIGINAL top kept as-is (out-of-catalog → iOS enrichment).
 	if result.Suggestions[0].ScientificName != "Engineschoice fakeum" {
@@ -1414,10 +1244,10 @@ func TestHandleIdentify_CatalogPref_ConfidentTop_SkipsAI_EngineTopUsed(t *testin
 	if result.Suggestions[0].PlantID != nil {
 		t.Errorf("Suggestions[0].PlantID = %v, want nil (out-of-catalog → enrichment)", result.Suggestions[0].PlantID)
 	}
-	// AI's "Abelia chinensis" must NOT have leaked in anywhere (probe skipped).
+	// AI's "Abelia chinensis" must NOT have leaked in (override withheld: AI < engine).
 	for i, s := range result.Suggestions {
 		if s.ScientificName == "Abelia chinensis" {
-			t.Errorf("Suggestions[%d] = Abelia chinensis; AI probe was skipped, its guess must not appear", i)
+			t.Errorf("Suggestions[%d] = Abelia chinensis; override withheld (AI 0.40 < engine 0.88), must not appear", i)
 		}
 	}
 }
@@ -1480,9 +1310,7 @@ func TestHandleIdentify_CatalogPref_EngineZero_VisionNil_Empty(t *testing.T) {
 // (g) BOTH engines unavailable → still 502 plant_id_unavailable; vision is
 // NOT called (AI must not substitute for engine-unavailable, locked #18).
 func TestHandleIdentify_CatalogPref_BothEnginesDown_502_VisionNotCalled(t *testing.T) {
-	visionCalled := false
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		visionCalled = true
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.99}"}}]}`)
 	}))
 	defer vsrv.Close()
@@ -1505,9 +1333,9 @@ func TestHandleIdentify_CatalogPref_BothEnginesDown_502_VisionNotCalled(t *testi
 	if !strings.Contains(rec.Body.String(), `"plant_id_unavailable"`) {
 		t.Errorf("body = %s, want plant_id_unavailable (wire code unchanged)", rec.Body.String())
 	}
-	if visionCalled {
-		t.Error("vision called on both-engines-down; AI must NOT substitute for engine-unavailable")
-	}
+	// The parallel arbiter may fire concurrently, but its result is discarded on
+	// both-engines-down (reconciliation runs only under err==nil). The 502 contract
+	// above (no AI substitution in the RESULT) still holds.
 }
 
 // Response is trimmed to top-3 even when selection ran across 10 candidates,
@@ -1559,25 +1387,27 @@ func TestHandleIdentify_CatalogPref_TrimsTo3_ChosenStaysFirst(t *testing.T) {
 
 // --- Change 1 + Change 2 (cascade tune, 2026-05-19) ---
 //
-// Change 1: when 0 candidates resolve to the 1522 catalog AND the engine's
-// ORIGINAL top candidate is highly confident (Confidence ≥
-// plantnetConfidentSkipAIConfidence = 0.80), the AI catalog-recovery probe is
-// SKIPPED — engine top is used as-is (out-of-catalog), vision NOT called.
+// Change 1 (SUPERSEDED 2026-07-05 by branch identify-oob-gpt-recovery): when 0
+// candidates resolve to the 1522 catalog AND the engine's ORIGINAL top is
+// highly confident (Confidence >= plantnetConfidentSkipAIConfidence = 0.80),
+// the AI probe USED to be skipped. It now runs ONE GPT-4o catalog cross-check
+// and OVERRIDES the engine iff the AI guess resolves to a curated plant AND is
+// >= the engine confidence (else the engine top is kept). See test (i) below.
 // Change 2: aiCatalogRecoveryMinConfidence lowered 0.55 → 0.10 (maximize
 // curated-library hits; user accepts occasional wrong-but-curated).
 // Rule-B precedence (≥1 in catalog wins, even over a higher-conf OOB top) is
 // UNCHANGED. The 502/both-down + iOS shape are UNCHANGED.
 
-// (i) NONE in catalog + engine TOP Confidence 0.85 (≥ 0.80) → the engine top
-// is used as-is (out-of-catalog, plant_id null) and the AI catalog-recovery
-// probe is SKIPPED entirely (vision must NOT be called — asserted via a
-// vision fake that fails the test if hit). engine=plantnet-confident-oob.
-func TestHandleIdentify_CatalogPref_ConfidentTop085_SkipsAIProbe(t *testing.T) {
+// (i) NONE in catalog + engine TOP Confidence 0.85 (>= 0.80) + AI returns a
+// CATALOG plant (Abelia chinensis, AAA0001) at 0.99 >= 0.85 → the confident
+// engine is now OVERRIDDEN by the GPT-4o catalog cross-check
+// (engine=ai-catalog-override; supersedes the old confident-oob AI skip).
+func TestHandleIdentify_CatalogPref_ConfidentTop085_VisionOverridesToCatalog(t *testing.T) {
 	visionCalled := false
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		visionCalled = true
-		// Would resolve to catalog at conf 0.99 (≥ new 0.10 floor) → if the
-		// probe were NOT skipped this would wrongly become the answer.
+		// Resolves to catalog (Abelia chinensis, AAA0001) at conf 0.99 >= engine
+		// 0.85 → the cross-check OVERRIDES the confident engine top.
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.99}"}}]}`)
 	}))
 	defer vsrv.Close()
@@ -1609,19 +1439,14 @@ func TestHandleIdentify_CatalogPref_ConfidentTop085_SkipsAIProbe(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if visionCalled {
-		t.Error("vision was called; engine top 0.85 ≥ 0.80 + none-in-catalog must SKIP the AI probe (Change 1)")
+	if !visionCalled {
+		t.Error("vision was NOT called; confident-oob must now run a GPT-4o catalog cross-check (identify-oob-gpt-recovery)")
 	}
-	if result.Suggestions[0].ScientificName != "Confident fakeum" {
-		t.Errorf("Suggestions[0] = %q, want Confident fakeum (confident engine top used as-is)", result.Suggestions[0].ScientificName)
+	if result.Suggestions[0].ScientificName != "Abelia chinensis" {
+		t.Errorf("Suggestions[0] = %q, want Abelia chinensis (AI catalog override of confident engine)", result.Suggestions[0].ScientificName)
 	}
-	if result.Suggestions[0].PlantID != nil {
-		t.Errorf("Suggestions[0].PlantID = %v, want nil (out-of-catalog → iOS enrichment)", result.Suggestions[0].PlantID)
-	}
-	for i, s := range result.Suggestions {
-		if s.ScientificName == "Abelia chinensis" {
-			t.Errorf("Suggestions[%d] = Abelia chinensis; AI probe was skipped, its guess must not appear", i)
-		}
+	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0001" {
+		t.Errorf("Suggestions[0].PlantID = %v, want AAA0001 (confident-oob override)", result.Suggestions[0].PlantID)
 	}
 }
 
@@ -2691,5 +2516,194 @@ func TestIsUUID(t *testing.T) {
 		if got := isUUID(tc.s); got != tc.want {
 			t.Errorf("isUUID(%q) = %v, want %v", tc.s, got, tc.want)
 		}
+	}
+}
+
+// --- confident-out-of-catalog GPT-4o cross-check (branch: identify-oob-gpt-recovery) ---
+// When the engine is confident (>= plantnetConfidentSkipAIConfidence) about a
+// species that is NOT in the 1522 catalog, the handler runs ONE GPT-4o vision
+// cross-check and OVERRIDES the engine iff the AI guess resolves to a curated
+// catalog plant AND is at least as confident as the engine. Regression target:
+// a California-poppy photo the engine returns as an out-of-catalog species
+// (real bug: Welsh poppy / Papaver cambricum) must be recoverable to the
+// curated species instead of silently rendering an enriched wrong-species page.
+
+// cannedConfidentOOB: engine (Plant.id) is 0.90-confident on an out-of-catalog
+// binomial, with NO in-catalog candidate → hits the confident-oob branch.
+const cannedConfidentOOB = `{
+  "result": {
+    "is_plant": {"probability": 0.98, "binary": true},
+    "classification": {
+      "suggestions": [
+        {"name": "Zzzz nonexistent plantii", "probability": 0.90,
+         "details": {"common_names": [], "scientific_name": "Zzzz nonexistent plantii"}}
+      ]
+    }
+  }
+}`
+
+func runConfidentOOBIdentify(t *testing.T, visionBody string) IdentifyResult {
+	t.Helper()
+	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, visionBody)
+	}))
+	defer llm.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: llm.URL, Model: "t", HTTP: llm.Client()}
+
+	h, srv := newIdentifyHandlerWithVision(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, cannedConfidentOOB)
+	}, vision)
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body=%s", rec.Code, rec.Body)
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return result
+}
+
+func TestHandleIdentify_ConfidentOOB_VisionOverridesToCatalog(t *testing.T) {
+	// GPT-4o says "Abelia chinensis" (curated AAA0001) at 0.95 >= engine 0.90 → OVERRIDE.
+	result := runConfidentOOBIdentify(t,
+		`{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.95}"}}]}`)
+	if len(result.Suggestions) != 1 {
+		t.Fatalf("suggestions = %d, want 1 (AI catalog override)", len(result.Suggestions))
+	}
+	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0001" {
+		t.Errorf("suggestions[0].PlantID = %v, want AAA0001 (Abelia chinensis override)", result.Suggestions[0].PlantID)
+	}
+}
+
+func TestHandleIdentify_ConfidentOOB_VisionLowerConfidence_KeepsEngine(t *testing.T) {
+	// GPT-4o resolves to catalog but is LESS confident than the engine
+	// (0.50 < 0.90) → must NOT displace the confident engine result.
+	result := runConfidentOOBIdentify(t,
+		`{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis\",\"common_names\":[],\"confidence\":0.5}"}}]}`)
+	if len(result.Suggestions) == 0 {
+		t.Fatalf("suggestions empty, want engine top preserved")
+	}
+	if !strings.HasPrefix(result.Suggestions[0].ScientificName, "Zzzz") {
+		t.Errorf("suggestions[0].ScientificName = %q, want the engine's out-of-catalog top preserved (no override below engine conf)", result.Suggestions[0].ScientificName)
+	}
+	if result.Suggestions[0].PlantID != nil {
+		t.Errorf("suggestions[0].PlantID = %v, want nil (out-of-catalog engine kept)", *result.Suggestions[0].PlantID)
+	}
+}
+
+func TestHandleIdentify_ConfidentOOB_VisionOutOfCatalog_KeepsEngine(t *testing.T) {
+	// GPT-4o is very confident but its own guess is ALSO out-of-catalog (does
+	// not resolve to any AAA id) → no override; engine top preserved.
+	result := runConfidentOOBIdentify(t,
+		`{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Yyyy alsomissing plantii\",\"common_names\":[],\"confidence\":0.99}"}}]}`)
+	if len(result.Suggestions) == 0 {
+		t.Fatalf("suggestions empty, want engine top preserved")
+	}
+	if !strings.HasPrefix(result.Suggestions[0].ScientificName, "Zzzz") {
+		t.Errorf("suggestions[0].ScientificName = %q, want the engine's out-of-catalog top preserved (AI guess out-of-catalog)", result.Suggestions[0].ScientificName)
+	}
+	if result.Suggestions[0].PlantID != nil {
+		t.Errorf("suggestions[0].PlantID = %v, want nil", *result.Suggestions[0].PlantID)
+	}
+}
+
+func TestHandleIdentify_ConfidentOOB_VisionTrinomial_OverridesToSpecies(t *testing.T) {
+	// PR #82 review note: GPT returns a bare TRINOMIAL of a catalog species
+	// ("Abelia chinensis spontanea"). A direct one-pass LookupPlantID would MISS
+	// it; the two-pass resolvePlantID collapses it to the species (Abelia
+	// chinensis, AAA0001), so the confident-oob override still applies.
+	result := runConfidentOOBIdentify(t,
+		`{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis spontanea\",\"common_names\":[],\"confidence\":0.95}"}}]}`)
+	if len(result.Suggestions) == 0 || result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0001" {
+		t.Fatalf("trinomial AI guess must collapse to species AAA0001 via resolvePlantID; got %+v", result.Suggestions)
+	}
+}
+
+// --- Universal GPT arbiter: in-catalog cross-check (identify-gpt-arbiter) ---
+// The parallel GPT arbiter now also arbitrates the bestIdx>=0 case (the engine
+// already resolved to a catalog plant) — the "engine confidently wrong about an
+// in-catalog species" hole that all prior AI paths left uncovered.
+
+func runArbiterIdentify(t *testing.T, engineBody, visionBody string) IdentifyResult {
+	t.Helper()
+	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, visionBody)
+	}))
+	defer llm.Close()
+	vision := &VisionClient{APIKey: "k", Endpoint: llm.URL, Model: "t", HTTP: llm.Client()}
+	h, srv := newIdentifyHandlerWithVision(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, engineBody)
+	}, vision)
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return result
+}
+
+func TestHandleIdentify_Arbiter_OverridesInCatalogEngine(t *testing.T) {
+	// Engine returns in-catalog Abelia chinensis (AAA0001) at 0.60. GPT independently
+	// says a DIFFERENT catalog species Eschscholzia californica (AAA0505) at 0.95 >=
+	// 0.60 → GPT overrides the engine's in-catalog pick.
+	const engine = `{"result":{"is_plant":{"probability":0.98,"binary":true},"classification":{"suggestions":[{"name":"Abelia chinensis","probability":0.60,"details":{"common_names":[],"scientific_name":"Abelia chinensis"}}]}}}`
+	result := runArbiterIdentify(t, engine,
+		`{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Eschscholzia californica\",\"common_names\":[],\"confidence\":0.95}"}}]}`)
+	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0505" {
+		t.Errorf("want AAA0505 (GPT override of in-catalog engine), got %+v", result.Suggestions[0])
+	}
+}
+
+func TestHandleIdentify_Arbiter_KeepsInCatalogEngine_WhenGPTLessConfident(t *testing.T) {
+	// Engine in-catalog Abelia chinensis (AAA0001) at 0.90; GPT says a different
+	// catalog species at 0.50 < 0.90 → NO override; engine's in-catalog pick kept.
+	const engine = `{"result":{"is_plant":{"probability":0.98,"binary":true},"classification":{"suggestions":[{"name":"Abelia chinensis","probability":0.90,"details":{"common_names":[],"scientific_name":"Abelia chinensis"}}]}}}`
+	result := runArbiterIdentify(t, engine,
+		`{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Eschscholzia californica\",\"common_names\":[],\"confidence\":0.5}"}}]}`)
+	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0001" {
+		t.Errorf("want AAA0001 kept (GPT less confident than in-catalog engine), got %+v", result.Suggestions[0])
+	}
+}
+
+func TestHandleIdentify_Arbiter_NonPlant_OverridesWeakCatalogEngine(t *testing.T) {
+	// Non-plant upload the engine WEAKLY (0.40) false-positives onto a catalog
+	// species; the arbiter says not-a-plant → Unknown sentinel (AAA0000), same as
+	// the no-catalog branch. Guards PR #83 review r3526593359.
+	const engine = `{"result":{"is_plant":{"probability":0.98,"binary":true},"classification":{"suggestions":[{"name":"Abelia chinensis","probability":0.40,"details":{"common_names":[],"scientific_name":"Abelia chinensis"}}]}}}`
+	result := runArbiterIdentify(t, engine,
+		`{"choices":[{"message":{"content":"{\"is_plant\":false,\"scientific_name\":\"Unknown\",\"common_names\":[],\"confidence\":0.1}"}}]}`)
+	if len(result.Suggestions) == 0 || result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0000" {
+		t.Errorf("want AAA0000 (Unknown sentinel: GPT not-a-plant over weak catalog hit), got %+v", result.Suggestions)
+	}
+}
+
+func TestHandleIdentify_Arbiter_NonPlant_KeepsConfidentCatalogEngine(t *testing.T) {
+	// Confident (0.90) in-catalog engine hit + GPT not-a-plant → engine KEPT
+	// (>= 0.80 protects against a GPT is_plant false-negative, mirroring confident-oob).
+	const engine = `{"result":{"is_plant":{"probability":0.98,"binary":true},"classification":{"suggestions":[{"name":"Abelia chinensis","probability":0.90,"details":{"common_names":[],"scientific_name":"Abelia chinensis"}}]}}}`
+	result := runArbiterIdentify(t, engine,
+		`{"choices":[{"message":{"content":"{\"is_plant\":false,\"scientific_name\":\"Unknown\",\"common_names\":[],\"confidence\":0.1}"}}]}`)
+	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0001" {
+		t.Errorf("want AAA0001 kept (confident engine, GPT not-a-plant ignored), got %+v", result.Suggestions[0])
 	}
 }
