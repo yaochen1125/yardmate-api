@@ -1,11 +1,12 @@
 package rosererank
 
-// MinConfidenceFloor is the defensive lower bound applied to the first SURVIVING
-// (real, in-catalog) candidate. The primary gate is the model's CultivarCertain
-// bool; this floor only catches the self-contradiction case (certain==true yet a
-// trivially low top confidence). Model self-reported confidence is uncalibrated,
-// so we deliberately do not lean on a tuned number (SPEC §2.4 / §5).
-const MinConfidenceFloor = 0.35
+// MinConfidenceFloor is now the PRIMARY gate (rose-guess-loosen / solution A):
+// the model ALWAYS returns its best-guess ranked matches, and we surface the top
+// cultivar whenever its honest confidence clears this floor — even when the model
+// is not fully certain. Matches ChatGPT's "best guess" behaviour; accepted
+// tradeoff: an occasional confident-but-wrong cultivar on visually
+// indistinguishable roses. Tunable via the `identify rose rerank:` topConf log.
+const MinConfidenceFloor = 0.40
 
 // MaxMatches caps how many cultivars we surface — fills the ≤3 suggestions
 // contract and conveys uncertainty honestly (SPEC §5).
@@ -22,9 +23,9 @@ const MaxMatches = 3
 // validIDs is the set of known rose candidate plantIds (built by proxy from the
 // candidate list); a match whose PlantID is absent is treated as hallucinated.
 func Decide(res RoseRerankResult, validIDs map[string]bool) ([]RoseMatch, bool) {
-	if !res.CultivarCertain {
-		return nil, false
-	}
+	// (A / rose-guess-loosen) No longer gate on CultivarCertain — the model
+	// always returns best-guess ranked matches; the confidence floor below is
+	// the sole gate. CultivarCertain is kept only as a logged signal.
 
 	// Drop hallucinated ids AND duplicate ids, preserving the model's ranking
 	// order (keep the first/highest-ranked occurrence of each — Codex #44 P2:
