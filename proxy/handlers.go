@@ -449,14 +449,26 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				pid := bestPID
 				result.Suggestions[0].PlantID = &pid
 				engine = base + "-catalog"
-				// Arbiter cross-check (identify-gpt-arbiter): the engine can be
-				// confidently WRONG about an in-catalog species (two similar
-				// catalog plants). If the parallel GPT guess resolves to a
-				// DIFFERENT catalog plant AND is at least as confident as the
-				// engine's in-catalog candidate, adopt GPT's — GPT is the more
-				// accurate identifier per real-photo evidence; resolves-to-catalog
-				// + >=conf gates guard against a hallucinated override.
-				if gptErr == nil && gptSug != nil {
+				// Arbiter reconciliation (identify-gpt-arbiter). The engine can be
+				// confidently WRONG about an in-catalog species, OR weakly
+				// false-positive a NON-plant onto a catalog species (rule-B has no
+				// confidence floor). Two arbiter verdicts act here:
+				switch {
+				case errors.Is(gptErr, ErrVisionNotAPlant) && bestConf < plantnetConfidentSkipAIConfidence:
+					// GPT says not-a-plant AND the engine's catalog hit is weak
+					// (< plantnetConfidentSkipAIConfidence) → trust GPT and return
+					// the Unknown sentinel, same as the no-catalog recovery branch.
+					// A >=0.80 engine catalog hit is still trusted (mirrors
+					// confident-oob: guard against a GPT is_plant false-negative).
+					result = unknownSentinelResult()
+					unknownSentinel = true
+					engine = "unknown-sentinel"
+				case gptErr == nil && gptSug != nil:
+					// GPT resolves to a DIFFERENT catalog plant AND is at least as
+					// confident as the engine's in-catalog candidate → adopt GPT's
+					// (GPT is the more accurate identifier per real-photo evidence;
+					// resolves-to-catalog + >=conf gates guard against a
+					// hallucinated override).
 					if id, ok := resolvePlantID(content, gptSug.ScientificName); ok &&
 						id != bestPID && gptSug.Confidence >= bestConf {
 						gpid := id

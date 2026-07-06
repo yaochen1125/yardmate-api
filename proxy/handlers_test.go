@@ -2684,3 +2684,26 @@ func TestHandleIdentify_Arbiter_KeepsInCatalogEngine_WhenGPTLessConfident(t *tes
 		t.Errorf("want AAA0001 kept (GPT less confident than in-catalog engine), got %+v", result.Suggestions[0])
 	}
 }
+
+func TestHandleIdentify_Arbiter_NonPlant_OverridesWeakCatalogEngine(t *testing.T) {
+	// Non-plant upload the engine WEAKLY (0.40) false-positives onto a catalog
+	// species; the arbiter says not-a-plant → Unknown sentinel (AAA0000), same as
+	// the no-catalog branch. Guards PR #83 review r3526593359.
+	const engine = `{"result":{"is_plant":{"probability":0.98,"binary":true},"classification":{"suggestions":[{"name":"Abelia chinensis","probability":0.40,"details":{"common_names":[],"scientific_name":"Abelia chinensis"}}]}}}`
+	result := runArbiterIdentify(t, engine,
+		`{"choices":[{"message":{"content":"{\"is_plant\":false,\"scientific_name\":\"Unknown\",\"common_names\":[],\"confidence\":0.1}"}}]}`)
+	if len(result.Suggestions) == 0 || result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0000" {
+		t.Errorf("want AAA0000 (Unknown sentinel: GPT not-a-plant over weak catalog hit), got %+v", result.Suggestions)
+	}
+}
+
+func TestHandleIdentify_Arbiter_NonPlant_KeepsConfidentCatalogEngine(t *testing.T) {
+	// Confident (0.90) in-catalog engine hit + GPT not-a-plant → engine KEPT
+	// (>= 0.80 protects against a GPT is_plant false-negative, mirroring confident-oob).
+	const engine = `{"result":{"is_plant":{"probability":0.98,"binary":true},"classification":{"suggestions":[{"name":"Abelia chinensis","probability":0.90,"details":{"common_names":[],"scientific_name":"Abelia chinensis"}}]}}}`
+	result := runArbiterIdentify(t, engine,
+		`{"choices":[{"message":{"content":"{\"is_plant\":false,\"scientific_name\":\"Unknown\",\"common_names\":[],\"confidence\":0.1}"}}]}`)
+	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0001" {
+		t.Errorf("want AAA0001 kept (confident engine, GPT not-a-plant ignored), got %+v", result.Suggestions[0])
+	}
+}
