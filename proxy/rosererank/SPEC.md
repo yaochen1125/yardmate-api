@@ -1,6 +1,6 @@
 # `proxy/rosererank` package — rose cultivar rerank (V1, behind a test flag)
 
-> Status: **draft — SPEC for review; implementation in a follow-up commit.**
+> Status: **shipped (V1, default-on) + guess-tier extension (this branch — not yet merged/deployed; needs the paired iOS "possibly XX" PR before deploy, §6).**
 > Companion: parent `proxy/SPEC.md` §2.1 `POST /v1/identify`. This package is **not a new endpoint** — it is an optional in-line step inside the identify handler, after the cascade settles and before plant_id resolution.
 > Background: PlantNet (primary) + Plant.id (fallback) only resolve roses to a **species** (`Rosa chinensis` → "China Rose", `Rosa rugosa`, …). Garden roses are overwhelmingly **named cultivars** (`Rosa 'Peace'`, `Rosa 'About Face'`, …), so every rose photo comes back as the generic "China Rose". The curated catalog already carries **110 `Rosa` entries** (9 species + 101 cultivars) with flower colour / habit / description fields. This package re-ranks the user's photo against those 110 candidates with a vision model and, when the photo is distinguishable, replaces the species result with the best-matching cultivars. When it can't tell, it leaves the species result untouched.
 
@@ -43,7 +43,7 @@ Genus gate: the result's `suggestions[0].ScientificName` first token must equal 
 | `RerankRose(ctx, image, mime, candidates)` | `RoseRerankResult{ CultivarCertain bool, Matches []RoseMatch }` or typed error | `RoseMatch{ PlantID string, Confidence float64, Reason string }`, ≤3, descending confidence. |
 | Handler-side apply | mutates `result.Suggestions` in place + sets `result.AIEnhancedAt` | only when the result is *applied* (not on fallback). |
 
-When applied: `result.Suggestions` is rewritten to the matched cultivars (each `ScientificName` = candidate's `Rosa 'Cultivar'`, `Name` = common name, `Confidence` = model confidence). Downstream `resolvePlantID` + common-name override (handlers.go:549+) run **unchanged** — a `Rosa 'About Face'` scientific name resolves cleanly to its `AAA####` plantId and curated common name, so no special-casing downstream. `AIEnhancedAt` is set (AI influenced the result), matching the existing `RerankIdentify` convention.
+When applied by tier (§2.4): **TierCertain** REWRITES `result.Suggestions` to the matched cultivars (`rewriteSuggestionsFromRose`); **TierGuess** keeps the species suggestion at index 0 and APPENDS the cultivars as guesses tagged `match_kind:"cultivar_guess"` (`appendRoseGuesses`), capped to the top-3 contract; **TierNone** leaves the slice untouched. Each cultivar suggestion's `ScientificName` = candidate's `Rosa 'Cultivar'`, `Name` = common name, `Confidence` = model confidence. Downstream `resolvePlantID` + common-name override (handlers.go) run **unchanged** — a `Rosa 'About Face'` scientific name resolves cleanly to its `AAA####` plantId and curated common name, so no special-casing downstream. `AIEnhancedAt` is set on both apply tiers (AI influenced the result), matching the existing `RerankIdentify` convention.
 
 ### 1.5 External dependencies
 
@@ -81,7 +81,7 @@ roseCandidates = sort_by_plantId(
 - **User content**: the photo as a base64 data URL (`dataURL(mime, image)`) + the candidate list serialized compactly:
   `[{"id":"AAA1136","name":"About Face","colors":["orange","yellow"],"desc":"…"}, …]` (110 rows).
 - **System instruction** (English-only output, per `app_language`):
-  > You are a rose-cultivar expert. From the candidate list, pick the cultivars whose described flower colour / form (grandiflora, floribunda, climber, …) / petal shape / habit best match the photo. **First decide whether the photo even has enough distinguishing features** — flower colour combination, bloom form, petal count, plant habit. If many red double roses would look identical, or the photo is unclear, set `cultivar_certain:false` and return no matches. Only give high confidence when the visible traits genuinely single out a cultivar. Return at most 3, most-likely first. `reason` ≤ 15 words, English.
+  > You are a rose-cultivar expert. From the candidate list, **always** rank the cultivars whose described flower colour / form (grandiflora, floribunda, climber, …) / petal shape / habit best match the photo, most-likely first, and **always** return your top matches (≤3) with an honest 0..1 confidence each. **Separately**, set `cultivar_certain:true` ONLY if the visible traits (flower colour combination, bloom form, petal count, plant habit) genuinely single out ONE cultivar; set it `false` when many roses would look identical or the photo is unclear — but STILL return your best-guess ranked matches in that case (with honest, lower confidence). `reason` ≤ 15 words, English.
 - **Output** (`response_format: {type:"json_schema", strict:true}`, `additionalProperties:false`):
   ```json
   { "cultivar_certain": true,
@@ -89,21 +89,28 @@ roseCandidates = sort_by_plantId(
   ```
   `matches` maxItems 3; strict mode keeps `required == properties`.
 
-### 2.4 Decision: rewrite vs fall back
+### 2.4 Decision: tiered — replace / guess / fall back
+
+`Decide` (pure, in `rosererank`) returns a tiered `Outcome`, NOT a binary apply/skip. The model now ALWAYS returns its best-guess ranked matches (§2.3); the tier decides how much they influence the result:
 
 ```
 res, err := vision.RerankRose(...)
-if err != nil           → fall back (log, keep species result)   // best-effort
-if !res.CultivarCertain → fall back (model says indistinguishable)
-// VALIDATE BEFORE THE FLOOR — a hallucinated high-confidence first id must not
-// shield a low-confidence real candidate behind it (Codex #44 P2):
-survivors := dedup([ m in res.Matches : m.PlantID is a known rose candidate id ])   // drop hallucinated + duplicate ids, keep first occurrence
-if len(survivors) == 0            → fall back
-if survivors[0].Confidence < 0.35 → fall back   // floor on the FIRST SURVIVING real candidate
-rewrite result.Suggestions from survivors (≤3), set result.AIEnhancedAt
+if err != nil → fall back (log, keep species result)                 // best-effort
+// VALIDATE BEFORE THE FLOOR — drop hallucinated + duplicate ids first, so a
+// hallucinated high-confidence first id can't shield a low real one (Codex #44 P2):
+survivors := dedup([ m in res.Matches : m.PlantID is a known rose candidate id ])
+if len(survivors) == 0 → TierNone (fall back)
+top := survivors[0].Confidence                                       // first REAL survivor
+switch {
+  cultivar_certain && top ≥ 0.35 → TierCertain → REPLACE suggestions with cultivars
+  top ≥ 0.15                      → TierGuess   → APPEND cultivars as "possibly XX"
+                                                   alongside the species (match_kind)
+  default                        → TierNone    → keep the species result verbatim
+}
+// TierCertain / TierGuess both set result.AIEnhancedAt; TierNone leaves it as-is.
 ```
 
-The **primary** gate is `cultivar_certain` (the model's own "can I distinguish?" judgement) plus catalog membership; the `0.35` floor is a defensive backstop for the self-contradiction case (certain=true yet trivially low confidence), **not** a tuned threshold — model self-reported confidence is uncalibrated, so we don't lean on a magic number (resolved discussion).
+Two floors, both defensive backstops, **NOT** tuned thresholds (model confidence is uncalibrated — §5): `MinConfidenceFloor 0.35` separates an *asserted* cultivar from a *guess*; `GuessFloor 0.15` trims near-zero noise so we don't append meaningless guesses. The **primary** signal is still the model's `cultivar_certain` bool plus catalog membership. The **guess tier** is the honest middle ground: a distinguishable-in-principle cultivar (e.g. 'Queen of Sweden' on a soft-pink cupped bloom) reaches the user as a confirmable "possibly" instead of silently collapsing to the bare genus — without ever asserting a cultivar the model isn't sure of.
 
 ### 2.5 Where it hooks in `handlers.go`
 
@@ -139,11 +146,12 @@ Rose rerank does **not** add new error codes to parent SPEC §3 and never conver
 - **Default-ON with a server kill-switch (`ROSE_RERANK_ENABLED`).** Validated on real photos during a header-gated test phase, then flipped to default-on. The kill-switch is server-controlled (not a client flag) so the emergency off needs no client release.
 - **`top-3`, not `top-1`.** Multiple candidates honestly convey uncertainty, fill the existing ≤3 `suggestions` contract, and need zero iOS display change.
 - **Primary gate = model `cultivar_certain` bool, not a numeric threshold.** Self-reported vision confidence is uncalibrated/overconfident; we ask the model the binary "can the photo distinguish a cultivar?" and only keep a `0.35` floor as a defensive backstop.
+- **Three tiers, not binary apply/skip (`Decide` → `Outcome{Tier, Matches}`).** The original V1 fell back to the bare genus whenever `cultivar_certain=false` — which is *most* garden-rose photos, since a soft-pink cupped bloom rarely singles out ONE cultivar. That silently discarded a real, confirmable signal. The **guess tier** (`GuessFloor 0.15 ≤ top < 0.35`, or not-certain-but-plausible) now surfaces those candidates as low-confidence "possibly XX" *alongside* the species result, so a distinguishable-in-principle cultivar reaches the user for confirmation instead of vanishing — while `cultivar_certain=true` above `0.35` still REPLACES (asserts) as before. This keeps precision (never asserts an uncertain cultivar) while recovering recall.
 - **Candidate set = all 110 `Rosa` (9 species + 101 cultivars).** Including the 9 species lets the model legitimately "stay at species" (pick `Rosa rugosa`) for a wild/uncertain photo instead of being forced onto a cultivar.
 - **Text candidates + single user image — no per-cultivar reference photos.** The catalog has no clean canonical per-cultivar image, and 110-image comparison is slow + costly; `flower_color` + `description` carry enough discriminative signal.
 - **`gpt-4o` (vision), 18 s `identifyHTTP` client.** Cultivar disambiguation needs the image; the candidate-heavy strict-JSON call matches `IdentifyPlant`'s latency, not `RerankIdentify`'s 8 s.
 - **`temperature: 0` + fixed `seed` (best-effort stable, NOT fully deterministic).** Reduces the `cultivar_certain` flip-flop seen on a boundary `Rosa chinensis` photo during default-on smoke. OpenAI Chat Completions is **not** bit-identical even at temperature 0 — `seed` + a stable `system_fingerprint` is documented as best-effort, not a guarantee (Codex #47 P2) — so repeats are *substantially more consistent*, not identical. Implemented via new `*float64 Temperature` + `*int Seed` fields on `openAIChatRequest` (both omitempty → only `RerankRose` sets them; `RerankIdentify`/`IdentifyPlant` unchanged).
-- **No new response field (MVP).** Reuse `suggestions`. The visible "AI-guessed cultivar" marker is V1.1.
+- **`match_kind` on `Suggestion` (optional, omitempty).** The certain tier still reuses `suggestions` with no marker (asserted). The guess tier needs the client to render a guess AS a guess, so guess suggestions carry `match_kind:"cultivar_guess"`; everything else omits the field. Backward-compatible — older clients ignore it and see an unchanged contract — but rendering "possibly XX" is a paired iOS PR (§6).
 - **Best-effort.** Rose rerank failure is invisible to the client — it degrades to the species result, never a 5xx.
 - **Downstream reuse, no special-casing.** Rewritten `Rosa 'Cultivar'` scientific names flow through the existing `resolvePlantID` + common-name override unchanged.
 - **Genus match is exact-token, never substring** — avoids the `Hibiscus rosa-sinensis` / `Anemone nemorosa` false-positives (§7).
@@ -154,9 +162,9 @@ Rose rerank does **not** add new error codes to parent SPEC §3 and never conver
 ## 6. Out-of-scope (V1.1+ candidates)
 
 - ~~**Default-on.**~~ **DONE** — header gate + iOS toggle removed; rose rerank is on by default for all clients, gated only by the `ROSE_RERANK_ENABLED` server kill-switch.
-- **Visible "possibly / best match" marker.** Add a response field (e.g. `match_kind: "cultivar_guess"`) + iOS "possibly XX" phrasing so the guess reads as a guess. Requires an iOS PR + contract bump.
+- **Visible "possibly / best match" marker.** ~~Add a response field~~ **DONE (backend)** — `Suggestion.match_kind:"cultivar_guess"` + the TierGuess surfacing ship the contract. **Still pending: the paired iOS PR** to render guess suggestions as "possibly XX" (a distinct treatment from asserted matches); until it ships, older clients render a guess like any other suggestion, so this backend must NOT be deployed alone.
 - **Other cultivar-heavy genera** (Hydrangea, Tulipa, Camellia, Hosta, Iris …). Same machine; keep trigger-genus + candidate-source as the only genus-specific knobs so adding a genus = config + candidate data, not a rewrite. Still: V1 implements `Rosa` only.
-- **Image-based similarity** (reference photos / embeddings per cultivar) if text descriptions prove too weak.
+- **Image-based similarity** (reference photos / embeddings per cultivar) if text descriptions prove too weak. **NOTE — the §5 premise that "the catalog has no clean canonical per-cultivar image" is now likely stale**: since this SPEC was written the catalog gained self-hosted R2 hero images per plant (incl. cultivars). A two-stage rerank — text narrows 110 → top-K, then ONE multimodal call compares the user photo against the K candidates' reference images — is now feasible and is the real precision lever for visually-similar roses (where text alone can't separate 'Queen of Sweden' from 'Olivia Rose Austin'). It costs +1 vision call on ambiguous roses, so it needs its own cost/latency review before adoption. The guess tier above is the zero-added-cost honesty layer that ships first and *instruments* whether this is even needed (the rerank decision log shows whether the right cultivar is landing in the candidate set at all).
 - **Confidence calibration / telemetry** on accept-vs-fallback rates to tune the floor and the prompt.
 
 ---
