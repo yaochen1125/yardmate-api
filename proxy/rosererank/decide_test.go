@@ -26,9 +26,20 @@ func TestDecide(t *testing.T) {
 			wantApply: true, wantIDs: []string{"AAA1", "AAA2"},
 		},
 		{
-			name: "not certain -> fall back",
+			// Solution A (rose-guess-loosen): CultivarCertain is no longer a gate.
+			// A confident best-guess (>= floor) applies even when not certain.
+			name: "not certain but top >= floor -> apply (solution A)",
 			res: RoseRerankResult{CultivarCertain: false, Matches: []RoseMatch{
 				{PlantID: "AAA1", Confidence: 0.9},
+			}},
+			wantApply: true, wantIDs: []string{"AAA1"},
+		},
+		{
+			// The confidence floor is now the SOLE gate — a low-confidence guess
+			// still falls back even without the certain gate.
+			name: "not certain and top < floor -> fall back",
+			res: RoseRerankResult{CultivarCertain: false, Matches: []RoseMatch{
+				{PlantID: "AAA1", Confidence: 0.3},
 			}},
 			wantApply: false,
 		},
