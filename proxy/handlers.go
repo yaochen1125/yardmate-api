@@ -391,8 +391,8 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			var gptSug *Suggestion
 			var gptErr error
 			if gptCh != nil {
-				r := <-gptCh
-				gptSug, gptErr = r.sug, r.err
+				arb := <-gptCh
+				gptSug, gptErr = arb.sug, arb.err
 			}
 
 			base := engine // "plantnet" or "plantid-fallback"/"plantid"
