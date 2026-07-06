@@ -732,13 +732,21 @@ func hasUsableScientificName(sci string) bool {
 }
 
 // isSpeciesEpithet reports whether t is a lowercase-Latin epithet (≥2 letters)
-// that is not a rank / uncertainty marker. A bare "x"/"×" hybrid marker (1
-// char) and markers like "sp." / "spp." / "cf." / "var." are excluded so a
-// genus-only "Genus sp." is not mistaken for a binomial.
+// that is not a rank / uncertainty marker. Hyphenated epithets are allowed
+// (e.g. "victoriae-reginae", "uva-ursi", "filix-femina" — 16 such species are
+// in the curated catalog): every hyphen-separated segment must be non-empty
+// lowercase Latin. A bare "x"/"×" hybrid marker (1 char) and markers like
+// "sp." / "spp." / "cf." / "var." are excluded so a genus-only "Genus sp." is
+// not mistaken for a binomial.
 func isSpeciesEpithet(t string) bool {
 	t = strings.TrimSuffix(t, ".")
-	if len(t) < 2 || !isLowerLatin(t) {
+	if len(t) < 2 {
 		return false
+	}
+	for _, seg := range strings.Split(t, "-") {
+		if !isLowerLatin(seg) {
+			return false
+		}
 	}
 	switch t {
 	case "sp", "spp", "cf", "aff", "var", "subsp", "ssp", "forma", "cv":

@@ -39,6 +39,14 @@ func TestHasUsableScientificName(t *testing.T) {
 		// Usable — infraspecific.
 		{"Ceanothus griseus horizontalis", true},
 		{"Salvia officinalis subsp. lavandulifolia", true},
+		// Usable — hyphenated Latin epithets (16 such species in the catalog).
+		{"Agave victoriae-reginae", true},
+		{"Arctostaphylos uva-ursi", true},
+		{"Athyrium filix-femina", true},
+		{"Hibiscus rosa-sinensis", true},
+		// Unusable — malformed hyphen (empty segment) is not a real epithet.
+		{"Rosa -ursi", false},
+		{"Rosa uva-", false},
 		// Usable — quoted cultivar (no lowercase-Latin epithet but a real name).
 		{"Rosa 'Brass Band'", true},
 		{"Hosta 'Blue Angel'", true},
