@@ -1,0 +1,54 @@
+[Unit]
+Description=YardMate API STAGING (App-Attest secret vendor)
+Documentation=https://github.com/yaochen1125/yardmate-api/blob/main/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yardmate-api
+Group=yardmate-api
+
+# yardmate-api reads /etc/yardmate-api/secrets-staging.env directly via secrets.Load.
+# The file is owned by yardmate-api:yardmate-api with mode 0600 — readable only
+# by this service. Server-side config env vars are baked into Environment=
+# below; bin path is fixed.
+Environment=YARDMATE_API_ADDR=127.0.0.1:8081
+Environment=YARDMATE_API_DB_PATH=/var/lib/yardmate-api-staging/credentials.db
+Environment=YARDMATE_API_SECRETS_PATH=/etc/yardmate-api/secrets-staging.env
+Environment=YARDMATE_API_APP_ID=PMX32RG52M.com.chenyao.plantapp
+
+ExecStart=/usr/local/bin/yardmate-api-staging
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/yardmate-api-staging
+
+# Resource caps. The box is dedicated to YardMate (8 GB). MemoryMax is the
+# in-flight ceiling for /v1/identify + /v1/diagnose, which each buffer the
+# uploaded image (≤8 MB) in memory: 4 GB → a few hundred concurrent uploads
+# before the cgroup cap kicks in, while still capping so a flood can't OOM the
+# whole box (nginx + catalog-promote share it). Raised from 512M (2026-07-03).
+LimitNOFILE=4096
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
