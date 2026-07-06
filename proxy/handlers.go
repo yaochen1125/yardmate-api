@@ -630,6 +630,25 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			result.Suggestions = trimmed
 		}
 
+		// 7d. Final nameless guard — never return a top suggestion the client
+		//     cannot turn into a loadable plant detail. The engine converters
+		//     already drop blank/genus-only candidates at the source; this
+		//     backstops the AI-vision paths (ai-catalog-recovery / ai-raw-oob)
+		//     and any future producer. If Suggestions[0] has NO plant_id AND no
+		//     usable scientific name, iOS would store a dead Recent-snaps record
+		//     whose detail can never load — fall back to the Unknown sentinel,
+		//     which iOS refuses to record. Skipped when already the sentinel.
+		if !unknownSentinel && len(result.Suggestions) > 0 {
+			s0 := result.Suggestions[0]
+			noPID := s0.PlantID == nil || strings.TrimSpace(*s0.PlantID) == ""
+			if noPID && !hasUsableScientificName(s0.ScientificName) {
+				log.Printf("identify nameless-guard: deviceID=%s engine=%s sci=%q dropped→unknown-sentinel", deviceID, engine, s0.ScientificName)
+				result = unknownSentinelResult()
+				unknownSentinel = true
+				engine += "-nameless-guard"
+			}
+		}
+
 		// 8. Success — single-line structured log (SPEC §5.2 forensics).
 		//    suggestionsWithImage counts how many carry a Pl@ntNet reference
 		//    image_url (always 0 on the Plant.id fallback path). catalogHit is

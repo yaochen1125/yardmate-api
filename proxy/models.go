@@ -188,6 +188,14 @@ func (r *plantIDAPIResponse) toIdentifyResult() *IdentifyResult {
 	}
 	for i := 0; i < n; i++ {
 		s := r.Result.Classification.Suggestions[i]
+		// Drop candidates without a usable scientific name (blank or genus-only):
+		// they resolve to no catalog plant_id and are not enrichable, so the
+		// client would store a dead, unopenable Recent-snaps record (content.go
+		// hasUsableScientificName). ScientificName (details.scientific_name) is
+		// what downstream resolves/displays, so guard on exactly that.
+		if !hasUsableScientificName(s.Details.ScientificName) {
+			continue
+		}
 		common := s.Details.CommonNames
 		if common == nil {
 			common = []string{}
