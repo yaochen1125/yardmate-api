@@ -337,8 +337,11 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//          plantnetConfidentSkipAIConfidence → the engine is sure of a
 		//          specific out-of-catalog plant; use the engine top as-is
 		//          (out-of-catalog → iOS enrichment) and DO NOT call vision —
-		//          a curated match is unlikely and the AI probe is not worth
-		//          the latency/cost (engine=<base>-confident-oob). Edge: zero
+		//          EXCEPT for one GPT-4o vision cross-check that OVERRIDES the
+		//          engine only on a curated catalog hit at >= engine confidence
+		//          (engine=ai-catalog-override), else keeps the engine top
+		//          out-of-catalog (engine=<base>-confident-oob). AI not-a-plant
+		//          / low-conf never displaces it. Edge: zero
 		//          candidates ⇒ no top ⇒ treated as < the gate ⇒ fall to
 		//          step 3 (do NOT skip AI on an empty set).
 		//       3. Else (0 in catalog, engine NOT confident) if vision != nil
@@ -421,15 +424,49 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				engine = base + "-catalog"
 
 			case engineTopConf >= plantnetConfidentSkipAIConfidence:
-				// 0 candidates in catalog BUT the engine's own top candidate
-				// is highly confident (≥ plantnetConfidentSkipAIConfidence) →
-				// the engine is sure of a specific out-of-catalog plant; a
-				// curated match is unlikely and the AI catalog-recovery probe
-				// is not worth the GPT-4o latency/cost. Keep the engine's
-				// ORIGINAL top as-is (out-of-catalog, PlantID resolved nil by
-				// the loop below → iOS enrichment) and DO NOT call vision.
-				// (len(cands) > 0 is implied — empty set ⇒ engineTopConf = -1.)
+				// 0 candidates in catalog BUT the engine's own top candidate is
+				// highly confident (≥ plantnetConfidentSkipAIConfidence) about a
+				// specific OUT-OF-catalog plant. The engine can be confidently
+				// WRONG here — real case: a California-poppy photo returned as
+				// Papaver cambricum (Welsh poppy), an out-of-catalog species not
+				// in the 1522 catalog, so it never reaches the bestIdx>=0 case
+				// and the app renders an enriched page for the wrong species,
+				// even though the correct species (Eschscholzia californica,
+				// AAA0505) IS curated. Previously the engine was trusted and
+				// vision was skipped entirely, so nothing could catch this.
+				//
+				// Now we DO run a GPT-4o vision cross-check, but keep it
+				// conservative: it may OVERRIDE the confident engine ONLY when
+				// its guess resolves to a curated catalog plant AND it is at
+				// least as confident as the engine (engineTopConf). A correct
+				// confident out-of-catalog engine result is thus never displaced
+				// by a weak/hallucinated GPT catalog guess. Vision's
+				// not-a-plant verdict and low-confidence guesses are ignored
+				// here (the confident engine stays trusted by default). Cost:
+				// one GPT-4o call only on this confident-out-of-catalog subset;
+				// on a hit we keep the engine's ORIGINAL top out-of-catalog
+				// (PlantID nil → iOS enrichment). (len(cands) > 0 is implied —
+				// empty set ⇒ engineTopConf = -1.)
 				engine = base + "-confident-oob"
+				if vision != nil {
+					aiSug, verr := vision.IdentifyPlant(ctx, imgBytes, mime)
+					switch {
+					case verr == nil && aiSug != nil:
+						if id, ok := content.LookupPlantID(aiSug.ScientificName); ok &&
+							aiSug.Confidence >= engineTopConf {
+							pid := id
+							aiSug.PlantID = &pid
+							result = &IdentifyResult{
+								IsPlant:           true,
+								IsPlantConfidence: aiSug.Confidence,
+								Suggestions:       []Suggestion{*aiSug},
+							}
+							engine = "ai-catalog-override"
+						}
+					case verr != nil && !errors.Is(verr, ErrVisionNotAPlant):
+						log.Printf("identify confident-oob vision cross-check err: deviceID=%s err=%v", deviceID, verr)
+					}
+				}
 
 			case vision != nil:
 				// 0 candidates in catalog AND engine NOT confident (top <
