@@ -635,15 +635,29 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		if roseEnabled && !unknownSentinel && vision != nil &&
 			len(result.Suggestions) > 0 && len(roseCands) > 0 &&
 			genusOf(result.Suggestions[0].ScientificName) == "Rosa" {
-			if budget := roseBudget(ctx, reqStart); budget >= minRoseBudget {
+			budget := roseBudget(ctx, reqStart)
+			if budget >= minRoseBudget {
 				rctx, cancel := context.WithTimeout(ctx, budget)
 				res, verr := vision.RerankRose(rctx, imgBytes, mime, roseCands)
 				cancel()
 				if verr != nil {
 					log.Printf("identify rose rerank failed: deviceID=%s err=%v", deviceID, verr)
-				} else if matches, ok := rosererank.Decide(res, roseIDs); ok {
-					rewriteSuggestionsFromRose(result, matches, roseMap)
+				} else {
+					matches, ok := rosererank.Decide(res, roseIDs)
+					topID, topConf := "", 0.0
+					if len(res.Matches) > 0 {
+						topID, topConf = res.Matches[0].PlantID, res.Matches[0].Confidence
+					}
+					// Observability (rose-rerank-observability): make the silent
+					// fallback visible — why did the rose land where it did?
+					log.Printf("identify rose rerank: deviceID=%s certain=%v rawMatches=%d topId=%s topConf=%.2f applied=%v",
+						deviceID, res.CultivarCertain, len(res.Matches), topID, topConf, ok)
+					if ok {
+						rewriteSuggestionsFromRose(result, matches, roseMap)
+					}
 				}
+			} else {
+				log.Printf("identify rose rerank: deviceID=%s SKIPPED-budget budget=%v min=%v", deviceID, budget, minRoseBudget)
 			}
 		}
 
