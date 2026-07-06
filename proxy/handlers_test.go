@@ -2787,3 +2787,15 @@ func TestHandleIdentify_ConfidentOOB_VisionOutOfCatalog_KeepsEngine(t *testing.T
 		t.Errorf("suggestions[0].PlantID = %v, want nil", *result.Suggestions[0].PlantID)
 	}
 }
+
+func TestHandleIdentify_ConfidentOOB_VisionTrinomial_OverridesToSpecies(t *testing.T) {
+	// PR #82 review note: GPT returns a bare TRINOMIAL of a catalog species
+	// ("Abelia chinensis spontanea"). A direct one-pass LookupPlantID would MISS
+	// it; the two-pass resolvePlantID collapses it to the species (Abelia
+	// chinensis, AAA0001), so the confident-oob override still applies.
+	result := runConfidentOOBIdentify(t,
+		`{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Abelia chinensis spontanea\",\"common_names\":[],\"confidence\":0.95}"}}]}`)
+	if len(result.Suggestions) == 0 || result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != "AAA0001" {
+		t.Fatalf("trinomial AI guess must collapse to species AAA0001 via resolvePlantID; got %+v", result.Suggestions)
+	}
+}

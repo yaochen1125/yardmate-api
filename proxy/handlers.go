@@ -452,7 +452,7 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					aiSug, verr := vision.IdentifyPlant(ctx, imgBytes, mime)
 					switch {
 					case verr == nil && aiSug != nil:
-						if id, ok := content.LookupPlantID(aiSug.ScientificName); ok &&
+						if id, ok := resolvePlantID(content, aiSug.ScientificName); ok &&
 							aiSug.Confidence >= engineTopConf {
 							pid := id
 							aiSug.PlantID = &pid
@@ -476,7 +476,7 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				var aiPID string
 				aiHasPID := false
 				if verr == nil && aiSug != nil {
-					if id, ok := content.LookupPlantID(aiSug.ScientificName); ok {
+					if id, ok := resolvePlantID(content, aiSug.ScientificName); ok {
 						aiPID = id
 						aiHasPID = true
 					}
