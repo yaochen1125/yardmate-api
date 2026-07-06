@@ -690,3 +690,67 @@ func isLowerLatin(w string) bool {
 	}
 	return true
 }
+
+// hasUsableScientificName reports whether sci is a real, enrichable plant name
+// the client can turn into a plant-detail page — a binomial or richer (genus +
+// a lowercase-Latin species epithet, allowing a hybrid marker or rank marker in
+// between), OR a quoted cultivar (e.g. Rosa 'Brass Band'). It is FALSE for the
+// two degenerate engine outputs that create a DEAD Recent-snaps record on iOS:
+//   - a blank / whitespace-only name, and
+//   - a genus-only name (single token, or "Genus sp."/"Genus spp." with no real
+//     epithet).
+//
+// Rationale: such a suggestion resolves to NO catalog plant_id AND has no
+// enrichable scientific name, so iOS stores it (plant_id + scientific_name both
+// empty/genus) and its plant-detail can never load — the exact "无法加载植物详情"
+// dead record. The Pl@ntNet and Plant.id response converters drop failing
+// candidates at the source; HandleIdentify applies a final guard on the chosen
+// suggestion (covers the AI-vision paths and any future producer).
+func hasUsableScientificName(sci string) bool {
+	s := strings.TrimSpace(sci)
+	if s == "" {
+		return false
+	}
+	// A quoted cultivar epithet is a real, specific name even without a
+	// lowercase-Latin species epithet (ASCII ' or the typographic ’).
+	if strings.ContainsAny(s, "'’") {
+		return true
+	}
+	fields := strings.Fields(s)
+	if len(fields) < 2 {
+		return false // genus only
+	}
+	// A usable name has at least one real species/infraspecific epithet after
+	// the genus. Hybrid markers ("x"/"×") and rank/uncertainty markers are
+	// connectors, not epithets — the real epithet follows them.
+	for _, t := range fields[1:] {
+		if isSpeciesEpithet(t) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSpeciesEpithet reports whether t is a lowercase-Latin epithet (≥2 letters)
+// that is not a rank / uncertainty marker. Hyphenated epithets are allowed
+// (e.g. "victoriae-reginae", "uva-ursi", "filix-femina" — 16 such species are
+// in the curated catalog): every hyphen-separated segment must be non-empty
+// lowercase Latin. A bare "x"/"×" hybrid marker (1 char) and markers like
+// "sp." / "spp." / "cf." / "var." are excluded so a genus-only "Genus sp." is
+// not mistaken for a binomial.
+func isSpeciesEpithet(t string) bool {
+	t = strings.TrimSuffix(t, ".")
+	if len(t) < 2 {
+		return false
+	}
+	for _, seg := range strings.Split(t, "-") {
+		if !isLowerLatin(seg) {
+			return false
+		}
+	}
+	switch t {
+	case "sp", "spp", "cf", "aff", "var", "subsp", "ssp", "forma", "cv":
+		return false
+	}
+	return true
+}

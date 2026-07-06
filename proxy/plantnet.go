@@ -136,6 +136,14 @@ func (r *plantNetAPIResponse) toIdentifyResult() *IdentifyResult {
 	}
 	for i := 0; i < n; i++ {
 		s := r.Results[i]
+		// Drop candidates without a usable scientific name (blank or genus-only):
+		// they resolve to no catalog plant_id and are not enrichable, so the
+		// client would store a dead, unopenable Recent-snaps record (content.go
+		// hasUsableScientificName). A dropped [0] just lets the next valid
+		// candidate lead; all-dropped → empty set → handler's AI/sentinel path.
+		if !hasUsableScientificName(s.Species.ScientificNameWithoutAuthor) {
+			continue
+		}
 		common := s.Species.CommonNames
 		if common == nil {
 			common = []string{}

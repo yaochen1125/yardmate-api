@@ -44,20 +44,20 @@ const cannedPlantIDOK = `{
         },
         {
           "id": "ghi",
-          "name": "Third",
+          "name": "Ficus lyrata",
           "probability": 0.01,
           "details": {
             "common_names": null,
-            "scientific_name": "Third"
+            "scientific_name": "Ficus lyrata"
           }
         },
         {
           "id": "jkl",
-          "name": "Fourth (kept by client; top-3 trim is the handler's job now)",
+          "name": "Epipremnum aureum (kept by client; top-3 trim is the handler's job now)",
           "probability": 0.005,
           "details": {
             "common_names": [],
-            "scientific_name": "Fourth"
+            "scientific_name": "Epipremnum aureum"
           }
         }
       ]
