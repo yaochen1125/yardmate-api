@@ -35,6 +35,14 @@ type Suggestion struct {
 	// related image. iOS uses it for the detail hero / gallery of
 	// out-of-catalog plants (PlantID == null), which otherwise have no image.
 	ImageURL *string `json:"image_url"`
+	// MatchKind marks how a suggestion was produced. Empty/omitted for normal
+	// engine suggestions and the confident (TierCertain) rose rerank — those are
+	// asserted matches. It is "cultivar_guess" for the low-confidence cultivar
+	// candidates surfaced ALONGSIDE a species result when the rose rerank is not
+	// certain (TierGuess), so the client can render them as "possibly XX" instead
+	// of an assertion (SPEC §6). Backward-compatible: omitempty, so older clients
+	// that ignore the field see an unchanged suggestions contract.
+	MatchKind string `json:"match_kind,omitempty"`
 }
 
 // --- diagnose (POST /v1/diagnose, SPEC §2.2) ---

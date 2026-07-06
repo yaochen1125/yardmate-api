@@ -558,7 +558,10 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		// 7a. Rose cultivar rerank — ON by default; ROSE_RERANK_ENABLED=false is a
 		//     server kill-switch (roseEnabled). Best-effort: any failure / timeout /
 		//     uncertainty falls back to the species result. Budget-aware: shares
-		//     identify's 30 s ctx (rosererank SPEC).
+		//     identify's 30 s ctx (rosererank SPEC). Tiered (SPEC §2.4):
+		//       certain → replace suggestions with the cultivar(s);
+		//       guess   → surface cultivars as "possibly XX" alongside the species;
+		//       none    → keep the species result verbatim.
 		if roseEnabled && !unknownSentinel && vision != nil &&
 			len(result.Suggestions) > 0 && len(roseCands) > 0 &&
 			genusOf(result.Suggestions[0].ScientificName) == "Rosa" {
@@ -568,8 +571,20 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				cancel()
 				if verr != nil {
 					log.Printf("identify rose rerank failed: deviceID=%s err=%v", deviceID, verr)
-				} else if matches, ok := rosererank.Decide(res, roseIDs); ok {
-					rewriteSuggestionsFromRose(result, matches, roseMap)
+				} else {
+					outcome := rosererank.Decide(res, roseIDs)
+					switch outcome.Tier {
+					case rosererank.TierCertain:
+						rewriteSuggestionsFromRose(result, outcome.Matches, roseMap)
+					case rosererank.TierGuess:
+						appendRoseGuesses(result, outcome.Matches, roseMap)
+					}
+					// Observability: rose rerank was otherwise a silent black box
+					// (only errors were logged), so accept/guess/fallback rates were
+					// untunable (SPEC §6). Log the decision — this is the signal that
+					// tells whether a miss is "not certain" vs "never triggered".
+					log.Printf("identify rose rerank: deviceID=%s certain=%v tier=%s topMatch=%s conf=%.2f nMatches=%d",
+						deviceID, res.CultivarCertain, outcome.Tier, roseTopID(outcome.Matches), roseTopConf(outcome.Matches), len(outcome.Matches))
 				}
 			}
 		}

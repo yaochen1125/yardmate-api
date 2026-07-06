@@ -29,3 +29,41 @@ type RoseRerankResult struct {
 	CultivarCertain bool        `json:"cultivar_certain"`
 	Matches         []RoseMatch `json:"matches"`
 }
+
+// Tier is how much the rerank verdict may influence the identify result.
+type Tier int
+
+const (
+	// TierNone: no usable cultivar signal — keep the species result verbatim.
+	TierNone Tier = iota
+	// TierCertain: the model is confident AND the top surviving (real, in-catalog)
+	// candidate clears MinConfidenceFloor — REPLACE the species suggestions with the
+	// matched cultivars (the original V1 behaviour).
+	TierCertain
+	// TierGuess: the model is NOT confident (or the top real candidate sits below
+	// MinConfidenceFloor) but there ARE plausible in-catalog candidates — surface
+	// them as low-confidence "possibly" guesses ALONGSIDE the species result, never
+	// as a verdict. This is the honest middle ground that lets a distinguishable-in-
+	// principle cultivar (e.g. 'Queen of Sweden') reach the user for confirmation
+	// instead of silently collapsing to the bare genus (SPEC §2.4 / §6).
+	TierGuess
+)
+
+// String renders the tier for logs/telemetry (SPEC §6).
+func (t Tier) String() string {
+	switch t {
+	case TierCertain:
+		return "certain"
+	case TierGuess:
+		return "guess"
+	default:
+		return "none"
+	}
+}
+
+// Outcome is the result of Decide: which tier applies + the surviving (real,
+// deduped, ≤MaxMatches) candidates. Matches is empty when Tier == TierNone.
+type Outcome struct {
+	Tier    Tier
+	Matches []RoseMatch
+}
