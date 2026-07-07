@@ -20,11 +20,12 @@ import (
 // (marketing name + identifier, "iOS 26.0", BCP-47 app language, region code)
 // purely for triage context — never parsed, never trusted beyond truncation.
 type feedbackRequestPayload struct {
-	Message     string `json:"message"`
-	Device      string `json:"device"`
-	System      string `json:"system"`
-	AppLanguage string `json:"appLanguage"`
-	Region      string `json:"region"`
+	Message      string `json:"message"`
+	Device       string `json:"device"`
+	System       string `json:"system"`
+	AppLanguage  string `json:"appLanguage"`
+	Region       string `json:"region"`
+	IsSubscriber bool   `json:"isSubscriber"` // 是否付费用户（粗粒度，不含身份）
 }
 
 const (
@@ -82,13 +83,14 @@ func HandleFeedback(db *DB, mailer *FeedbackMailer) http.HandlerFunc {
 		}
 
 		row := feedbackRow{
-			deviceID:    deviceID,
-			appVersion:  truncateRunes(appVersion, feedbackMetaMaxRunes),
-			message:     message,
-			device:      truncateRunes(strings.TrimSpace(req.Device), feedbackMetaMaxRunes),
-			system:      truncateRunes(strings.TrimSpace(req.System), feedbackMetaMaxRunes),
-			appLanguage: truncateRunes(strings.TrimSpace(req.AppLanguage), feedbackMetaMaxRunes),
-			region:      truncateRunes(strings.TrimSpace(req.Region), feedbackMetaMaxRunes),
+			deviceID:     deviceID,
+			appVersion:   truncateRunes(appVersion, feedbackMetaMaxRunes),
+			message:      message,
+			device:       truncateRunes(strings.TrimSpace(req.Device), feedbackMetaMaxRunes),
+			system:       truncateRunes(strings.TrimSpace(req.System), feedbackMetaMaxRunes),
+			appLanguage:  truncateRunes(strings.TrimSpace(req.AppLanguage), feedbackMetaMaxRunes),
+			region:       truncateRunes(strings.TrimSpace(req.Region), feedbackMetaMaxRunes),
+			isSubscriber: req.IsSubscriber,
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
@@ -111,13 +113,14 @@ func HandleFeedback(db *DB, mailer *FeedbackMailer) http.HandlerFunc {
 
 // feedbackRow carries one validated, truncated feedback insert.
 type feedbackRow struct {
-	deviceID    string
-	appVersion  string
-	message     string
-	device      string
-	system      string
-	appLanguage string
-	region      string
+	deviceID     string
+	appVersion   string
+	message      string
+	device       string
+	system       string
+	appLanguage  string
+	region       string
+	isSubscriber bool
 }
 
 // RecordFeedback inserts one feedback row unless the device already submitted
@@ -150,13 +153,13 @@ func (d *DB) RecordFeedback(ctx context.Context, row feedbackRow) (string, bool,
 			SELECT count(*) AS n FROM feedback
 			WHERE device_id = $1 AND created_at > now() - interval '24 hours'
 		)
-		INSERT INTO feedback (device_id, app_version, message, device, system, app_language, region)
-		SELECT $1, $2, $3, $4, $5, $6, $7 FROM recent WHERE n < $8
+		INSERT INTO feedback (device_id, app_version, message, device, system, app_language, region, is_subscriber)
+		SELECT $1, $2, $3, $4, $5, $6, $7, $8 FROM recent WHERE n < $9
 		RETURNING id`
 	var id string
 	err = tx.QueryRow(ctx, stmt,
 		row.deviceID, row.appVersion, row.message,
-		row.device, row.system, row.appLanguage, row.region,
+		row.device, row.system, row.appLanguage, row.region, row.isSubscriber,
 		feedbackDailyCapPerDevice,
 	).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {

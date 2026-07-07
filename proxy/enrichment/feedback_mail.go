@@ -120,10 +120,19 @@ func (m *FeedbackMailer) compose(id string, row feedbackRow, now time.Time) stri
 	fmt.Fprintf(&b, "System: %s\r\n", row.system)
 	fmt.Fprintf(&b, "App language: %s\r\n", row.appLanguage)
 	fmt.Fprintf(&b, "Region: %s\r\n", row.region)
+	fmt.Fprintf(&b, "Subscriber: %s\r\n", yesNo(row.isSubscriber))
 	fmt.Fprintf(&b, "Device install id: %s\r\n", row.deviceID)
 	fmt.Fprintf(&b, "Feedback id: %s\r\n", id)
 	fmt.Fprintf(&b, "Received at: %s\r\n", now.Format(time.RFC3339))
 	return b.String()
+}
+
+// yesNo renders a bool for the human-readable email body.
+func yesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
 }
 
 // headerSafe strips CR/LF so a client-supplied value cannot inject headers.

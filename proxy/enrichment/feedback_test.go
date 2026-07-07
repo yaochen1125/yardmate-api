@@ -80,6 +80,7 @@ func TestFeedbackMailerCompose(t *testing.T) {
 		message:    "多语言 message ✓",
 		device:     "iPhone 17 (iPhone18,3)",
 		system:     "iOS 26.0", appLanguage: "zh-Hans", region: "US",
+		isSubscriber: true,
 	}
 	msg := m.compose("fid-1", row, time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC))
 	// CR/LF stripped → "Bcc:" survives only as inline Subject text, never as
@@ -90,7 +91,7 @@ func TestFeedbackMailerCompose(t *testing.T) {
 			t.Fatalf("header injection not neutralized:\n%s", header)
 		}
 	}
-	for _, want := range []string{"多语言 message ✓", "iPhone 17", "zh-Hans", "fid-1", "2026-07-06T12:00:00Z", testInstallID} {
+	for _, want := range []string{"多语言 message ✓", "iPhone 17", "zh-Hans", "fid-1", "2026-07-06T12:00:00Z", testInstallID, "Subscriber: yes"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("compose missing %q:\n%s", want, msg)
 		}
