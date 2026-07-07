@@ -69,6 +69,10 @@ if [[ -f /usr/local/bin/yardmate-api-staging ]]; then
     cp /usr/local/bin/yardmate-api-staging /usr/local/bin/yardmate-api-staging.prev
 fi
 
+# unit 的 BoltDB 指向 /var/lib/yardmate-api-staging/credentials.db；未手动引导过的
+# 主机上该目录不存在，服务启动会直接失败。
+install -d -o yardmate-api -g yardmate-api -m 0750 /var/lib/yardmate-api-staging
+
 install -o yardmate-api -g yardmate-api -m 0755 /tmp/yardmate-api-staging.new /usr/local/bin/yardmate-api-staging
 install -o root -g root -m 0644 /tmp/yardmate-api-staging.service.new /etc/systemd/system/yardmate-api-staging.service
 rm -f /tmp/yardmate-api-staging.new /tmp/yardmate-api-staging.service.new
