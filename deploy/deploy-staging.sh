@@ -69,6 +69,11 @@ if [[ -f /usr/local/bin/yardmate-api-staging ]]; then
     cp /usr/local/bin/yardmate-api-staging /usr/local/bin/yardmate-api-staging.prev
 fi
 
+# BoltDB 状态目录（unit 指向 /var/lib/yardmate-api-staging/credentials.db）：
+# 未手动引导过的主机上不存在 → attest.OpenStore 直接 bbolt.Open 报
+# no such file or directory，服务起不来（Codex api#87 P2）。install -d 幂等。
+install -d -o yardmate-api -g yardmate-api -m 0750 /var/lib/yardmate-api-staging
+
 install -o yardmate-api -g yardmate-api -m 0755 /tmp/yardmate-api-staging.new /usr/local/bin/yardmate-api-staging
 install -o root -g root -m 0644 /tmp/yardmate-api-staging.service.new /etc/systemd/system/yardmate-api-staging.service
 rm -f /tmp/yardmate-api-staging.new /tmp/yardmate-api-staging.service.new
