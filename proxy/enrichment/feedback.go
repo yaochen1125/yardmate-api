@@ -121,14 +121,29 @@ type feedbackRow struct {
 }
 
 // RecordFeedback inserts one feedback row unless the device already submitted
-// feedbackDailyCapPerDevice messages in the last 24 hours. The cap check and
-// insert run as a single statement (CTE), so concurrent submissions cannot
-// meaningfully overshoot. Returns the new row id, or ("", false, nil) when
-// the cap suppressed the insert. Nil-safe (returns ErrDBUnavailable when the
-// shared pool is absent, matching the enrichment DB contract).
+// feedbackDailyCapPerDevice messages in the last 24 hours. The count + insert
+// run inside a transaction holding a per-device advisory lock: without it,
+// concurrent submissions each read a snapshot that misses the other's
+// in-flight insert and both pass n < cap (Codex api#87) — and since
+// /v1/feedback deliberately sits outside the per-device middleware, this SQL
+// cap is the abuse gate and must be strict. The lock key hashes
+// "feedback:"+device, so only same-device submissions serialize. Returns the
+// new row id, or ("", false, nil) when the cap suppressed the insert.
+// Nil-safe (returns ErrDBUnavailable when the shared pool is absent, matching
+// the enrichment DB contract).
 func (d *DB) RecordFeedback(ctx context.Context, row feedbackRow) (string, bool, error) {
 	if d == nil || d.pool == nil {
 		return "", false, ErrDBUnavailable
+	}
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return "", false, fmt.Errorf("%w: feedback begin: %v", ErrDBUnavailable, err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit; releases the lock on every early return
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended('feedback:' || $1, 0))`,
+		row.deviceID); err != nil {
+		return "", false, fmt.Errorf("%w: feedback lock: %v", ErrDBUnavailable, err)
 	}
 	const stmt = `
 		WITH recent AS (
@@ -139,7 +154,7 @@ func (d *DB) RecordFeedback(ctx context.Context, row feedbackRow) (string, bool,
 		SELECT $1, $2, $3, $4, $5, $6, $7 FROM recent WHERE n < $8
 		RETURNING id`
 	var id string
-	err := d.pool.QueryRow(ctx, stmt,
+	err = tx.QueryRow(ctx, stmt,
 		row.deviceID, row.appVersion, row.message,
 		row.device, row.system, row.appLanguage, row.region,
 		feedbackDailyCapPerDevice,
@@ -149,6 +164,9 @@ func (d *DB) RecordFeedback(ctx context.Context, row feedbackRow) (string, bool,
 	}
 	if err != nil {
 		return "", false, fmt.Errorf("%w: feedback insert: %v", ErrDBUnavailable, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", false, fmt.Errorf("%w: feedback commit: %v", ErrDBUnavailable, err)
 	}
 	return id, true, nil
 }

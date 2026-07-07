@@ -37,9 +37,11 @@ smoke() {
 }
 
 echo "=== [1/4] deploy staging ==="
-# YARDMATE_SECRETS 指向 prod secrets，进 staging 段前必须剥掉——deploy-staging.sh
-# 只认 YARDMATE_SECRETS_STAGING，见到 YARDMATE_SECRETS 会直接拒绝（防 prod 凭证
-# 误装进 staging）。staging 段一律只发二进制，保留服务器现有 secrets-staging.env。
+# 本脚本的 YARDMATE_SECRETS 指向 PROD secrets，进 staging 段前必须剥掉——
+# deploy-staging.sh 只认 YARDMATE_STAGING_SECRETS，见到 YARDMATE_SECRETS 会直接
+# 拒绝（防 prod 凭证误装进 staging，Codex api#87 P1）。要给 staging 发 secrets
+# 设 YARDMATE_STAGING_SECRETS=<file>（自动透传）；不设 = 只发二进制，保留服务器
+# 现有 secrets-staging.env。
 env -u YARDMATE_SECRETS "$DIR/deploy-staging.sh"
 
 echo "=== [2/4] staging 冒烟（公网全链路：DNS/TLS/nginx/app）==="
