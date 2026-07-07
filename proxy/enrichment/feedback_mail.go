@@ -103,7 +103,9 @@ func (m *FeedbackMailer) send(id string, row feedbackRow) error {
 // truncated but not newline-free, and header injection must be impossible.
 // The body is plain UTF-8 text, so the raw message is fine there.
 func (m *FeedbackMailer) compose(id string, row feedbackRow, now time.Time) string {
-	subject := "[YardMate] New feedback · " + headerSafe(row.device) + " · " + headerSafe(row.appVersion)
+	// Subject 保持纯 ASCII 结构符（"-" 而非 "·"）：header 里的非 ASCII 字符按
+	// RFC 2047 须编码，设备名/版本实际恒 ASCII，不引入编码依赖。
+	subject := "[YardMate] New feedback - " + headerSafe(row.device) + " - " + headerSafe(row.appVersion)
 	var b strings.Builder
 	fmt.Fprintf(&b, "From: YardMate Feedback <%s>\r\n", m.from)
 	fmt.Fprintf(&b, "To: %s\r\n", m.to)
