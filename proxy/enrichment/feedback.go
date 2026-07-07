@@ -46,7 +46,10 @@ const (
 // parity with /v1/plants/signal). Registered outside the per-device
 // expensive-call group — abuse is bounded by the /v1 per-IP limit plus the
 // per-device daily cap in SQL.
-func HandleFeedback(db *DB) http.HandlerFunc {
+//
+// mailer (nil = disabled) forwards each stored message to the operator inbox
+// asynchronously — mail failures never affect the client response.
+func HandleFeedback(db *DB, mailer *FeedbackMailer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, requestBodyCap)
 
@@ -78,9 +81,7 @@ func HandleFeedback(db *DB) http.HandlerFunc {
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-		inserted, err := db.RecordFeedback(ctx, feedbackRow{
+		row := feedbackRow{
 			deviceID:    deviceID,
 			appVersion:  truncateRunes(appVersion, feedbackMetaMaxRunes),
 			message:     message,
@@ -88,7 +89,10 @@ func HandleFeedback(db *DB) http.HandlerFunc {
 			system:      truncateRunes(strings.TrimSpace(req.System), feedbackMetaMaxRunes),
 			appLanguage: truncateRunes(strings.TrimSpace(req.AppLanguage), feedbackMetaMaxRunes),
 			region:      truncateRunes(strings.TrimSpace(req.Region), feedbackMetaMaxRunes),
-		})
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		id, inserted, err := db.RecordFeedback(ctx, row)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "db_unavailable")
 			log.Printf("feedback err: deviceID=%s err=%v", deviceID, err)
@@ -97,6 +101,9 @@ func HandleFeedback(db *DB) http.HandlerFunc {
 		if !inserted {
 			writeError(w, http.StatusTooManyRequests, "rate_limit_feedback")
 			return
+		}
+		if mailer != nil {
+			go mailer.notify(id, row)
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "received"})
 	}
@@ -116,12 +123,12 @@ type feedbackRow struct {
 // RecordFeedback inserts one feedback row unless the device already submitted
 // feedbackDailyCapPerDevice messages in the last 24 hours. The cap check and
 // insert run as a single statement (CTE), so concurrent submissions cannot
-// meaningfully overshoot. Returns (false, nil) when the cap suppressed the
-// insert. Nil-safe (returns ErrDBUnavailable when the shared pool is absent,
-// matching the enrichment DB contract).
-func (d *DB) RecordFeedback(ctx context.Context, row feedbackRow) (bool, error) {
+// meaningfully overshoot. Returns the new row id, or ("", false, nil) when
+// the cap suppressed the insert. Nil-safe (returns ErrDBUnavailable when the
+// shared pool is absent, matching the enrichment DB contract).
+func (d *DB) RecordFeedback(ctx context.Context, row feedbackRow) (string, bool, error) {
 	if d == nil || d.pool == nil {
-		return false, ErrDBUnavailable
+		return "", false, ErrDBUnavailable
 	}
 	const stmt = `
 		WITH recent AS (
@@ -138,12 +145,12 @@ func (d *DB) RecordFeedback(ctx context.Context, row feedbackRow) (bool, error) 
 		feedbackDailyCapPerDevice,
 	).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		return "", false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("%w: feedback insert: %v", ErrDBUnavailable, err)
+		return "", false, fmt.Errorf("%w: feedback insert: %v", ErrDBUnavailable, err)
 	}
-	return true, nil
+	return id, true, nil
 }
 
 // truncateRunes hard-caps s at max runes (not bytes), preserving valid UTF-8.

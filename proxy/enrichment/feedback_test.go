@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testInstallID = "3f2b8a9c-1d4e-4f6a-9b0c-7e5d2a8f1c3b"
@@ -19,7 +20,7 @@ func postFeedback(t *testing.T, db *DB, deviceID, appVersion, body string) *http
 		req.Header.Set("X-App-Version", appVersion)
 	}
 	rec := httptest.NewRecorder()
-	HandleFeedback(db)(rec, req)
+	HandleFeedback(db, nil)(rec, req)
 	return rec
 }
 
@@ -65,6 +66,40 @@ func TestHandleFeedbackMessageAtCapPassesValidation(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "db_unavailable") {
 		t.Fatalf("body = %s, want db_unavailable", rec.Body.String())
+	}
+}
+
+func TestFeedbackMailerCompose(t *testing.T) {
+	m := NewFeedbackMailer("", "", "from@example.com", "pw", "to@example.com")
+	if m == nil {
+		t.Fatal("mailer should be enabled when from/pass/to set")
+	}
+	row := feedbackRow{
+		deviceID:   testInstallID,
+		appVersion: "1.0.4\r\nBcc: evil@example.com", // header-injection attempt
+		message:    "多语言 message ✓",
+		device:     "iPhone 17 (iPhone18,3)",
+		system:     "iOS 26.0", appLanguage: "zh-Hans", region: "US",
+	}
+	msg := m.compose("fid-1", row, time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC))
+	// CR/LF stripped → "Bcc:" survives only as inline Subject text, never as
+	// its own header line.
+	header := strings.SplitN(msg, "\r\n\r\n", 2)[0]
+	for _, line := range strings.Split(header, "\r\n") {
+		if strings.HasPrefix(line, "Bcc:") {
+			t.Fatalf("header injection not neutralized:\n%s", header)
+		}
+	}
+	for _, want := range []string{"多语言 message ✓", "iPhone 17", "zh-Hans", "fid-1", "2026-07-06T12:00:00Z", testInstallID} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("compose missing %q:\n%s", want, msg)
+		}
+	}
+}
+
+func TestNewFeedbackMailerDisabledWhenIncomplete(t *testing.T) {
+	if NewFeedbackMailer("", "", "from@example.com", "", "to@example.com") != nil {
+		t.Fatal("mailer must be nil when pass missing")
 	}
 }
 
