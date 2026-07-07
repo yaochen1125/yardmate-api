@@ -14,7 +14,9 @@ ssh root@5.78.183.252
 # Dedicated user (no login shell, no home dir).
 useradd --system --user-group --no-create-home --shell /usr/sbin/nologin yardmate-api
 
-# Paths.
+# Paths — now auto-created, kept for reference: /etc/yardmate-api is ensured
+# by deploy.sh / deploy-staging.sh (install -d), /var/lib/yardmate-api[-staging]
+# by StateDirectory= in the systemd units at every start.
 install -d -o yardmate-api -g yardmate-api -m 0750 /etc/yardmate-api
 install -d -o yardmate-api -g yardmate-api -m 0750 /var/lib/yardmate-api
 

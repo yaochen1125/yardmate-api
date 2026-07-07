@@ -42,6 +42,12 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallArchitectures=native
 ReadWritePaths=/var/lib/yardmate-api-staging
 
+# systemd creates/chowns the state dir (BoltDB home) before every start —
+# covers fresh hosts and accidental deletion; no manual install -d in the
+# deploy script.
+StateDirectory=yardmate-api-staging
+StateDirectoryMode=0750
+
 # Resource caps. The box is dedicated to YardMate (8 GB). MemoryMax is the
 # in-flight ceiling for /v1/identify + /v1/diagnose, which each buffer the
 # uploaded image (≤8 MB) in memory: 4 GB → a few hundred concurrent uploads

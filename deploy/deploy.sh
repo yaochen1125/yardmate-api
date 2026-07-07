@@ -97,6 +97,7 @@ if [[ -f /usr/local/bin/yardmate-api ]]; then
 fi
 
 install -o yardmate-api -g yardmate-api -m 0755 /tmp/yardmate-api.new /usr/local/bin/yardmate-api
+install -d -o yardmate-api -g yardmate-api -m 0750 /etc/yardmate-api
 install -o yardmate-api -g yardmate-api -m 0600 /tmp/secrets.env.new /etc/yardmate-api/secrets.env
 install -o root -g root -m 0644 /tmp/yardmate-api.service.new /etc/systemd/system/yardmate-api.service
 
