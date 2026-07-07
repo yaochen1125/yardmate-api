@@ -158,6 +158,15 @@ func newServer(
 		if enrichDB != nil {
 			r.Post("/plants/signal", enrichment.HandleSignal(enrichDB))
 		}
+
+		// /v1/feedback — anonymous in-app "Send feedback" messages (More →
+		// SUPPORT). Same posture as /v1/plants/signal: outside the per-device
+		// expensive-call group, bounded by this /v1 scope's per-IP limit plus a
+		// per-device daily cap enforced in SQL (RecordFeedback). The handler
+		// requires + validates X-Device-Install-Id itself.
+		if enrichDB != nil {
+			r.Post("/feedback", enrichment.HandleFeedback(enrichDB))
+		}
 	})
 
 	return &Server{
