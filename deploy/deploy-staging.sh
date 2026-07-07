@@ -5,14 +5,16 @@
 # 与 deploy.sh（prod）的差异：
 #   - 目标 = yardmate-api-staging（独立 binary / unit / secrets / DB / 端口）
 #   - ATTEST_ALLOW_DEV=true 是预期（staging 供模拟器 / 开发机 App Attest 降级路径）
-#   - 不带 YARDMATE_SECRETS 时**只发二进制**，保留服务器上现有
+#   - secrets 变量名与 prod 刻意不同：staging 只认 YARDMATE_STAGING_SECRETS；
+#     见到 YARDMATE_SECRETS（prod 专用）直接拒绝，杜绝把 prod 凭证误发到 staging
+#   - 不带 YARDMATE_STAGING_SECRETS 时**只发二进制**，保留服务器上现有
 #     /etc/yardmate-api/secrets-staging.env（日常改代码验证的最短路径）
 #
 # 流程：staging 验证通过后，再用 ./deploy/deploy.sh 发 prod。
 #
 # Usage:
 #   ./deploy/deploy-staging.sh          # 只发二进制 + unit，保留服务器 secrets
-#   YARDMATE_SECRETS=~/.config/yardmate-api/secrets.env.staging ./deploy/deploy-staging.sh
+#   YARDMATE_STAGING_SECRETS=~/.config/yardmate-api/secrets.env.staging ./deploy/deploy-staging.sh
 #
 # Optional env:
 #   YARDMATE_DEPLOY_HOST   default 5.78.183.252
@@ -22,7 +24,7 @@ set -euo pipefail
 
 HOST="${YARDMATE_DEPLOY_HOST:-5.78.183.252}"
 USER="${YARDMATE_DEPLOY_USER:-root}"
-SECRETS="${YARDMATE_SECRETS:-}"
+SECRETS="${YARDMATE_STAGING_SECRETS:-}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_OUT="${REPO_ROOT}/bin/yardmate-api-staging-linux-amd64"
 
@@ -32,6 +34,10 @@ yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 die() { red "FATAL: $*" >&2; exit 1; }
 
 # --- 1. pre-flight: secrets file（可选；不带 = 保留服务器现有 secrets-staging.env）---
+# 硬闸：YARDMATE_SECRETS 是 prod 专用（deploy.sh / ship.sh）。staging 误收它会把
+# prod 凭证装进 secrets-staging.env，staging 直连 prod 数据——见到就拒绝。
+[[ -z "${YARDMATE_SECRETS:-}" ]] || die "YARDMATE_SECRETS 是 prod 专用；staging secrets 用 YARDMATE_STAGING_SECRETS=<file>，只发二进制则先 unset YARDMATE_SECRETS"
+
 SHIP_SECRETS=0
 if [[ -n "$SECRETS" ]]; then
     [[ -f "$SECRETS" ]] || die "secrets file not found: $SECRETS"
@@ -39,7 +45,7 @@ if [[ -n "$SECRETS" ]]; then
     SHIP_SECRETS=1
     yellow ">> will ship secrets -> /etc/yardmate-api/secrets-staging.env"
 else
-    yellow ">> YARDMATE_SECRETS unset — keeping server's secrets-staging.env"
+    yellow ">> YARDMATE_STAGING_SECRETS unset — keeping server's secrets-staging.env"
 fi
 
 # --- 2. pre-flight: tests pass ---
@@ -69,15 +75,13 @@ if [[ -f /usr/local/bin/yardmate-api-staging ]]; then
     cp /usr/local/bin/yardmate-api-staging /usr/local/bin/yardmate-api-staging.prev
 fi
 
-# BoltDB 状态目录（unit 指向 /var/lib/yardmate-api-staging/credentials.db）：
-# 未手动引导过的主机上不存在 → attest.OpenStore 直接 bbolt.Open 报
-# no such file or directory，服务起不来（Codex api#87 P2）。install -d 幂等。
-install -d -o yardmate-api -g yardmate-api -m 0750 /var/lib/yardmate-api-staging
-
+# BoltDB 状态目录 /var/lib/yardmate-api-staging 由 unit 的 StateDirectory= 在
+# 每次启动前自建（Codex api#87 P2 的更深修法：全新主机/目录被误删均自愈）。
 install -o yardmate-api -g yardmate-api -m 0755 /tmp/yardmate-api-staging.new /usr/local/bin/yardmate-api-staging
 install -o root -g root -m 0644 /tmp/yardmate-api-staging.service.new /etc/systemd/system/yardmate-api-staging.service
 rm -f /tmp/yardmate-api-staging.new /tmp/yardmate-api-staging.service.new
 if [[ "$SHIP_SECRETS" == "1" ]]; then
+    install -d -o yardmate-api -g yardmate-api -m 0750 /etc/yardmate-api
     install -o yardmate-api -g yardmate-api -m 0600 /tmp/secrets-staging.env.new /etc/yardmate-api/secrets-staging.env
     shred -u /tmp/secrets-staging.env.new
 fi
