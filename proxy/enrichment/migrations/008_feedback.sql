@@ -2,8 +2,8 @@
 -- In-app "Send feedback" messages (iOS: More → SUPPORT → Send feedback).
 --
 -- One row per submitted message. The server writes via POST /v1/feedback
--- (proxy/enrichment/feedback.go); a per-device daily cap is enforced in the
--- insert statement itself (CTE count over the last 24h), so no extra
+-- (proxy/enrichment/feedback.go); a per-device daily cap is enforced by a
+-- count+insert transaction under a per-device advisory lock, so no extra
 -- constraint is needed here. Anonymous by design: the only identifier is the
 -- device install id (rate-cap key), never a user id or email.
 --

@@ -37,7 +37,11 @@ smoke() {
 }
 
 echo "=== [1/4] deploy staging ==="
-"$DIR/deploy-staging.sh"
+# deploy-staging.sh 把任何非空 YARDMATE_SECRETS 当 staging secrets 上传——
+# 而本脚本的 YARDMATE_SECRETS 指向 PROD secrets，直接继承会把 prod 的
+# DB/API 密钥灌进 /etc/yardmate-api/secrets-staging.env（Codex api#87 P1）。
+# staging 侧要发 secrets 用专用变量 YARDMATE_STAGING_SECRETS。
+YARDMATE_SECRETS="${YARDMATE_STAGING_SECRETS:-}" "$DIR/deploy-staging.sh"
 
 echo "=== [2/4] staging 冒烟（公网全链路：DNS/TLS/nginx/app）==="
 smoke https://api-staging.yardmate.ai
