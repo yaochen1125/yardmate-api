@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"net/http"
 	"time"
 
@@ -157,6 +158,24 @@ func newServer(
 		// handler still requires + validates X-Device-Install-Id itself.
 		if enrichDB != nil {
 			r.Post("/plants/signal", enrichment.HandleSignal(enrichDB))
+		}
+
+		// /v1/feedback — anonymous in-app "Send feedback" messages (More →
+		// SUPPORT). Same posture as /v1/plants/signal: outside the per-device
+		// expensive-call group, bounded by this /v1 scope's per-IP limit plus a
+		// per-device daily cap enforced in SQL (RecordFeedback). The handler
+		// requires + validates X-Device-Install-Id itself. Each stored message
+		// is also emailed to the operator (FEEDBACK_SMTP_* / FEEDBACK_EMAIL_TO
+		// in the Vault; all-absent = mail disabled, rows still stored).
+		if enrichDB != nil {
+			feedbackMailer := enrichment.NewFeedbackMailer(
+				vault.Get("FEEDBACK_SMTP_HOST"), vault.Get("FEEDBACK_SMTP_PORT"),
+				vault.Get("FEEDBACK_SMTP_FROM"), vault.Get("FEEDBACK_SMTP_PASS"),
+				vault.Get("FEEDBACK_EMAIL_TO"))
+			if feedbackMailer == nil {
+				log.Printf("feedback mail disabled (FEEDBACK_SMTP_FROM/PASS/EMAIL_TO not all set)")
+			}
+			r.Post("/feedback", enrichment.HandleFeedback(enrichDB, feedbackMailer))
 		}
 	})
 
