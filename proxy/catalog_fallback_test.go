@@ -67,8 +67,16 @@ func TestMapCatalogID_Cascade(t *testing.T) {
 		t.Errorf("alias overwatering: got %s, want L08", derefOr(id))
 	}
 	// Out-of-catalog name + nil vision → nil (enrichment handles detail separately).
-	if id := mapCatalogID(context.Background(), "drought stress", c, nil); id != nil {
-		t.Errorf("out-of-catalog drought stress (nil vision): got %s, want nil", derefOr(id))
+	// 注：原样例 "drought stress" 已于 2026-07 晋升入库（L25），换真正库外的名字。
+	if id := mapCatalogID(context.Background(), "sudden oak death", c, nil); id != nil {
+		t.Errorf("out-of-catalog sudden oak death (nil vision): got %s, want nil", derefOr(id))
+	}
+	// Promoted diseases now resolve in-catalog directly (2026-07: O1/O2/O3 → L25/R08/L26).
+	if id := mapCatalogID(context.Background(), "drought stress", c, nil); id == nil || *id != "L25" {
+		t.Errorf("promoted drought stress: got %s, want L25", derefOr(id))
+	}
+	if id := mapCatalogID(context.Background(), "fungi", c, nil); id == nil || *id != "L26" {
+		t.Errorf("promoted fungi: got %s, want L26", derefOr(id))
 	}
 	// LLM answers NONE → nil (no forced pass / L08 net anymore).
 	vNone, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
