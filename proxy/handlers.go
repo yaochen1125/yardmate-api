@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -193,7 +194,21 @@ type visionArbiterResult struct {
 // (ratelimit.GlobalGate).
 type SpendGate func(w http.ResponseWriter) bool
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled bool, spendGate SpendGate) http.HandlerFunc {
+// parseCoord parses one coarse GPS coordinate from a multipart body value,
+// returning a rounded pointer or nil for anything invalid. It rejects non-finite
+// and out-of-range values and rounds to 2 decimals (~1.1 km) as a server-side
+// privacy floor even if the client sent finer precision. The returned value is
+// forwarded to the location prior only; it is NEVER logged or echoed.
+func parseCoord(s string, min, max float64) *float64 {
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < min || v > max {
+		return nil
+	}
+	v = math.Round(v*100) / 100
+	return &v
+}
+
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled bool, spendGate SpendGate) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -242,6 +257,13 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		var (
 			imgBytes []byte
 			organ    = "auto"
+			// Optional geographic prior (identify-geo-prior). Pointers so
+			// "absent" is distinguishable from a real 0.0 coordinate. Populated
+			// only from the multipart BODY — never a URL/query param — and never
+			// logged (SPEC privacy: "Never place personal data in URL params").
+			// The iOS toggle is opt-in and already coarsens to ~2 decimals; we
+			// re-round server-side as defense-in-depth (~1.1 km cell).
+			geoLat, geoLon *float64
 		)
 		for {
 			part, perr := mr.NextPart()
@@ -284,6 +306,17 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					case "leaf", "flower", "fruit", "bark", "auto":
 						organ = strings.ToLower(strings.TrimSpace(string(b)))
 					}
+				}
+			case "latitude":
+				// Body-only geo prior. Parse defensively; a bad value is dropped
+				// (nil), never surfaced or logged. 32 bytes is ample for any
+				// legal coordinate string.
+				if b, e := io.ReadAll(io.LimitReader(part, 32)); e == nil {
+					geoLat = parseCoord(string(b), -90, 90)
+				}
+			case "longitude":
+				if b, e := io.ReadAll(io.LimitReader(part, 32)); e == nil {
+					geoLon = parseCoord(string(b), -180, 180)
 				}
 			}
 			_ = part.Close()
@@ -360,6 +393,16 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		unknownSentinel := false
 		err = nil
 
+		// Effective geographic prior: forwarded to the engine ONLY when the
+		// GEO_PRIOR_ENABLED kill-switch is on AND both coordinates parsed
+		// cleanly. Either missing / disabled → nil pair → a normal identify with
+		// no location bias (graceful, no error). Pl@ntNet region mapping is
+		// deferred (Phase 2); today only Plant.id consumes the prior.
+		var priorLat, priorLon *float64
+		if geoPriorEnabled && geoLat != nil && geoLon != nil {
+			priorLat, priorLon = geoLat, geoLon
+		}
+
 		if plantNet != nil {
 			engine = "plantnet"
 			result, err = plantNet.Identify(ctx, bytes.NewReader(imgBytes), mime, organ)
@@ -383,7 +426,7 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			} else {
 				engine = "plantid"
 			}
-			result, err = plantID.Identify(ctx, bytes.NewReader(imgBytes), mime)
+			result, err = plantID.Identify(ctx, bytes.NewReader(imgBytes), mime, priorLat, priorLon)
 		}
 
 		// --- Catalog-preference selection cascade (SPEC §1.1 / §2.1 / §7).

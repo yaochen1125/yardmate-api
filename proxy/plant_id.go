@@ -63,7 +63,14 @@ func NewPlantIDClient(apiKey string) *PlantIDClient {
 // SPEC §6 pitfall 4 calls out io.Pipe streaming as a V1.1 optimization.
 // At V1 scale (8 MB image cap × per-IP rate limit), the memory cost is
 // bounded and acceptable.
-func (c *PlantIDClient) Identify(ctx context.Context, image io.Reader, mime string) (*IdentifyResult, error) {
+// lat/lon are an optional coarse geographic prior (identify-geo-prior). When
+// both are non-nil they are forwarded to Plant.id v3 inside the multipart `data`
+// JSON field (its contract for non-image params), biasing suggestions toward
+// species plausible at that location. Callers pass already-coarsened values
+// (~2 decimals). The caller passes nil (both) whenever the GEO_PRIOR_ENABLED
+// kill-switch is off or the client sent no coordinates, so identify degrades to
+// a plain call.
+func (c *PlantIDClient) Identify(ctx context.Context, image io.Reader, mime string, lat, lon *float64) (*IdentifyResult, error) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 
@@ -78,6 +85,22 @@ func (c *PlantIDClient) Identify(ctx context.Context, image io.Reader, mime stri
 	if _, err := io.Copy(part, image); err != nil {
 		return nil, fmt.Errorf("plant_id: copy image: %w", err)
 	}
+
+	// Geographic prior — Plant.id v3 multipart contract: non-image parameters
+	// travel as a JSON string in a single `data` field, NOT as separate form
+	// fields (which the API silently ignores). Body-only (never URL/query/log);
+	// both set together or not at all (handler nils the pair unless both parsed);
+	// already coarsened to ~2 decimals upstream. json.Marshal renders the floats
+	// with a '.' separator, locale-independent.
+	if lat != nil && lon != nil {
+		if payload, mErr := json.Marshal(map[string]float64{
+			"latitude":  *lat,
+			"longitude": *lon,
+		}); mErr == nil {
+			_ = writer.WriteField("data", string(payload))
+		}
+	}
+
 	if err := writer.Close(); err != nil {
 		return nil, fmt.Errorf("plant_id: close multipart: %w", err)
 	}

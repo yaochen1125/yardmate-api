@@ -33,7 +33,7 @@
 | Function | Input |
 |---|---|
 | `PlantNetClient.Identify(ctx, image io.Reader, mime, organ)` | image stream + MIME + organ (`leaf`/`flower`/`fruit`/`bark`/`auto`); ≤8 MB. **Primary engine.** |
-| `PlantIDClient.Identify(ctx, image io.Reader, mime)` | image stream + MIME (`image/jpeg` or `image/png`); ≤8 MB. **Fallback engine.** |
+| `PlantIDClient.Identify(ctx, image io.Reader, mime, lat, lon *float64)` | image stream + MIME (`image/jpeg` or `image/png`); ≤8 MB. **Fallback engine.** Optional `lat`/`lon` = coarse geographic prior (identify-geo-prior): when both non-nil, packed into Plant.id v3's multipart `data` JSON field (`{"latitude":…,"longitude":…}` — its contract for non-image params; separate form fields are ignored), never URL/query/log, coarsened to 2 decimals. `HandleIdentify` passes them only when `GEO_PRIOR_ENABLED` (default on) is set AND the client sent both coords in the multipart body; otherwise nil → plain identify. |
 | `PlantIDClient.Diagnose(ctx, image []byte, mime)` | image bytes + MIME; bytes because the upstream needs a base64 JSON body |
 | `VisionClient.RerankIdentify(ctx, image, mime, candidates)` | image bytes + Plant.id top-N |
 | `VisionClient.IdentifyPlant(ctx, image, mime)` | image bytes + MIME only (no candidate list); tier-3 identify fallback |
