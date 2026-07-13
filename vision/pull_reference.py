@@ -15,19 +15,30 @@ def get(url):
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
 
+def _atomic_json(obj, path):
+    # 原子写(H2): 写 .tmp 再 os.replace。避免写一半被杀(OOM/重启)留下残缺 JSON →
+    # 下次 json.load 崩 → 无限重试全崩、resume 被彻底 brick。
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
 def species_query(sci):
     return re.sub(r"\s*'[^']+'", "", sci).strip()  # 去 cultivar, 种级查询
 
 def resolve(q):
     u = "https://api.inaturalist.org/v1/taxa?" + urllib.parse.urlencode({"q": q, "per_page": 5})
-    try: res = get(u)
-    except Exception as e: print("  taxa err", q, e); return False  # 瞬时 API 失败(区别于查无 taxon 的 None)
+    try:
+        res = get(u)
+    except Exception as e:
+        print("  taxa err", q, e); time.sleep(1.1); return False  # 出错也 sleep(M7 防洪);瞬时失败=False(≠查无 taxon 的 None)
     time.sleep(1.1)
     results = res.get("results", [])
-    for want in (("species", "form", "variety", "subspecies"), None):
-        for r in results:
-            if want is None or r.get("rank") in want:
-                return r["id"], r.get("name"), r.get("rank")
+    # 只接受种级/种下(M6): 无种级匹配(如属级 cultivar Rosa 'X')→ None=零覆盖,
+    # 绝不回退属级 —— 属级会拉一堆泛属照片污染判别索引(记忆"属名必逐种查防代表种污染")。
+    for r in results:
+        if r.get("rank") in ("species", "subspecies", "variety", "form", "hybrid"):
+            return r["id"], r.get("name"), r.get("rank")
     return None
 
 def pull(taxon_id, outdir, per):
@@ -39,7 +50,7 @@ def pull(taxon_id, outdir, per):
     except Exception as e:
         # 瞬时 obs 失败(Codex #101): 不清目录、返回 None → main 保留已有部分参考图 +
         # 下次重试。绝不因一次网络抖动删掉可用参考图并把该株永久标记完成。
-        print("  obs err", e)
+        print("  obs err", e); time.sleep(1.1)  # 出错也 sleep(M7 防洪)
         return None
     time.sleep(1.1)
     # 观测请求成功后才清目录干净重拉(Codex #100): 避免上面失败时误删已有参考图。
@@ -74,7 +85,7 @@ def main(idx_path, out_dir, per=40):
     zero_log = open(f"{out_dir}/_zero_coverage.txt", "a")
     manifest_path = f"{out_dir}/_manifest.json"
     manifest = json.load(open(manifest_path)) if os.path.exists(manifest_path) else {}
-    done = skipped = zero = 0
+    done = skipped = zero = transient = 0
     for pl in plants:
         cid, sci = pl["id"], pl["scientific_name"]
         # Resume (Codex #100): manifest 是"已处理"真源 —— 处理过的株(含无 taxon /
@@ -89,6 +100,7 @@ def main(idx_path, out_dir, per=40):
         q = species_query(sci)
         tx = resolve(q)
         if tx is False:  # 瞬时 taxa API 失败 → 不记 manifest, 保留现状, 下次重试(Codex #101)
+            transient += 1
             print(f"  transient resolve fail {cid}, retry next run")
             continue
         if tx is None:  # 确实查无此 taxon(区别于瞬时失败)
@@ -98,17 +110,21 @@ def main(idx_path, out_dir, per=40):
             tid, tname, trank = tx
             photos = pull(tid, outdir, per)  # obs 成功后才清目录干净重拉
             if photos is None:  # 瞬时 obs 失败 → 不记、保留已有参考图, 下次重试(Codex #101)
+                transient += 1
                 print(f"  transient fetch fail {cid}, retry next run")
                 continue
             if len(photos) == 0:
                 zero += 1; zero_log.write(f"{cid}\t{sci}\t{tname}\tNO_PHOTOS\n"); zero_log.flush()
             manifest[cid] = {"sci": sci, "resolved": {"id": tid, "name": tname, "rank": trank}, "n": len(photos)}
         done += 1
-        json.dump(manifest, open(manifest_path, "w"), ensure_ascii=False, indent=2)  # 每株持久化 → 断点最多丢 1 株
+        _atomic_json(manifest, manifest_path)  # 每株原子持久化 → 断点最多丢 1 株、绝不残缺
         if done % 20 == 0:
             print(f"progress: done={done} skipped={skipped} zero={zero} (last {cid})")
-    json.dump(manifest, open(manifest_path, "w"), ensure_ascii=False, indent=2)
-    print(f"DONE done={done} skipped={skipped} zero_coverage={zero} total={len(plants)}")
+    _atomic_json(manifest, manifest_path)
+    print(f"DONE done={done} skipped={skipped} zero_coverage={zero} transient={transient} total={len(plants)}")
+    return transient  # >0 = 本轮有株因瞬时失败被跳过未记 → caller 应重试直到 0(build_pipeline 靠 exit code)
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 40)
+    # 有瞬时跳过 → exit 1,让 build_pipeline 的可续重试循环真跑起来(否则漏株就建索引)。
+    left = main(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 40)
+    sys.exit(1 if left else 0)
