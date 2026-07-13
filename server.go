@@ -62,6 +62,14 @@ func newServer(
 	// Species-level cultivar disambiguation (non-Rosa) is ON by default;
 	// CULTIVAR_DISAMBIG_ENABLED=false kill-switches it independently of rose.
 	disambigEnabled := vault.GetBool("CULTIVAR_DISAMBIG_ENABLED", true)
+	// P1C #3 — Engine↔GPT agreement confidence boost is ON by default;
+	// AGREEMENT_BOOST_ENABLED=false kill-switches it (raise-only, never changes
+	// which plant is returned).
+	agreementBoostEnabled := vault.GetBool("AGREEMENT_BOOST_ENABLED", true)
+	// P1C #5 — Bloom-month tiebreak for near-tie in-catalog candidates is ON by
+	// default; BLOOM_TIEBREAK_ENABLED=false kill-switches it (tiebreak only,
+	// never overrides a clear confidence winner).
+	bloomTiebreakEnabled := vault.GetBool("BLOOM_TIEBREAK_ENABLED", true)
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(realIPFromNginx)
@@ -132,7 +140,7 @@ func newServer(
 					// (fallback); register when EITHER engine is present
 					// (SPEC §1.1 / §7).
 					if plantNet != nil || plantID != nil {
-						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, roseEnabled, disambigEnabled, spendGate))
+						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, spendGate))
 					}
 					// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
 					// assessment, SPEC §1.5) — still requires plantID.

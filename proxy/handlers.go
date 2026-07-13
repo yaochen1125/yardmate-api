@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -54,6 +55,32 @@ const aiCatalogRecoveryMinConfidence = 0.10
 // the AI catalog-recovery path runs as before. 0.80 is a deliberate
 // "engine is very sure" bar; see SPEC §7 resolved decisions.
 const plantnetConfidentSkipAIConfidence = 0.80
+
+// --- P1C fusion-accuracy tuning (identify #3 / #5) ---
+
+// Engine↔GPT agreement boost (#3, AGREEMENT_BOOST_ENABLED). When the parallel
+// GPT-4o arbiter independently resolves to the SAME species as the chosen
+// in-catalog suggestion, the two independent signals corroborate each other, so
+// the returned Confidence is RAISED (never lowered, plant never changed). The
+// boosted value is max(engineConf, gptConf) pulled up to at least the floor and
+// clamped to the cap — but never below the engine's own reported confidence.
+const (
+	agreementBoostFloor = 0.90
+	agreementBoostCap   = 0.99
+)
+
+// Bloom-month tiebreak (#5, BLOOM_TIEBREAK_ENABLED). When ≥2 in-catalog
+// candidates are within this confidence epsilon of the best, the one whose
+// BloomMonthsNorth contains the current (Northern-hemisphere) month is
+// preferred. A clear winner (no near-tie blooming candidate) is never
+// overridden — this is a tiebreak, not a hard filter.
+const bloomTiebreakEpsilon = 0.05
+
+// nowMonth returns the current month used by the bloom tiebreak. It is a var so
+// tests can pin a deterministic month; production uses the wall clock. Northern
+// hemisphere only (no lat/long → no hemisphere flip), matching the tiebreak's
+// BloomMonthsNorth semantics.
+var nowMonth = func() time.Month { return time.Now().Month() }
 
 // Unknown sentinel (SPEC §2.1 "Unknown sentinel"). When identify cannot name a
 // real plant — AI vision explicitly reports is_plant=false, OR every engine
@@ -166,7 +193,7 @@ type visionArbiterResult struct {
 // (ratelimit.GlobalGate).
 type SpendGate func(w http.ResponseWriter) bool
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, roseEnabled, disambigEnabled bool, spendGate SpendGate) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled bool, spendGate SpendGate) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -399,12 +426,15 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     the old tier-3 "zero suggestions → AI" block (the zero-engine
 		//     case is covered by branch 3/4 above; the confident-oob skip in
 		//     branch 2 never applies to an empty set). ---
+		// GPT-4o arbiter guess/err, hoisted to the handler scope so the #3
+		// agreement boost (post-rerank, below) can read it too. Populated only on
+		// the err == nil path; nil when vision == nil or the cascade failed.
+		var gptSug *Suggestion
+		var gptErr error
 		if err == nil {
 			// Await the parallel GPT arbiter fired at cascade start (gptSug is nil
 			// when vision == nil). Errors are handled per-case below (best-effort:
 			// a vision failure never blocks the engine result).
-			var gptSug *Suggestion
-			var gptErr error
 			if gptCh != nil {
 				arb := <-gptCh
 				gptSug, gptErr = arb.sug, arb.err
@@ -425,6 +455,12 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			// is nil-safe and reports no catalog.
 			bestIdx := -1
 			var bestPID string
+			// #5 bloom tiebreak — collect every in-catalog candidate so a
+			// near-tie can prefer the one blooming this month (built only when
+			// the switch is on; empty/nil otherwise → zero overhead + no-op).
+			var inCat []bloomTiebreakCand
+			bestPos := -1
+			tbMonth := nowMonth()
 			for i := range cands {
 				// two-pass: original then species-level (resolvePlantID), so
 				// a non-top engine candidate whose reported NAME is a
@@ -434,9 +470,34 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				if !ok {
 					continue
 				}
+				pos := -1
+				if bloomTiebreakEnabled {
+					pos = len(inCat)
+					inCat = append(inCat, bloomTiebreakCand{
+						origIdx:     i,
+						plantID:     id,
+						confidence:  cands[i].Confidence,
+						bloomsMonth: bloomsInMonth(content, id, tbMonth),
+					})
+				}
 				if bestIdx == -1 || cands[i].Confidence > cands[bestIdx].Confidence {
 					bestIdx = i
 					bestPID = id
+					bestPos = pos
+				}
+			}
+
+			// #5 bloom tiebreak — BLOOM_TIEBREAK_ENABLED. When ≥2 in-catalog
+			// candidates are within bloomTiebreakEpsilon of the confidence best
+			// and the best does NOT bloom this month, prefer a near-tie candidate
+			// that DOES. A clear winner is never overridden (see bloomTiebreak).
+			if bloomTiebreakEnabled && bestPos >= 0 && len(inCat) > 1 {
+				if winner, changed := bloomTiebreak(inCat, bestPos, bloomTiebreakEpsilon); changed {
+					log.Printf("identify bloom tiebreak: deviceID=%s month=%d from=idx%d/%s(%.2f) to=idx%d/%s(%.2f)",
+						deviceID, int(tbMonth), bestIdx, bestPID, cands[bestIdx].Confidence,
+						winner.origIdx, winner.plantID, winner.confidence)
+					bestIdx = winner.origIdx
+					bestPID = winner.plantID
 				}
 			}
 
@@ -722,6 +783,29 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			}
 		}
 
+		// 7a-3. Engine↔GPT agreement boost — AGREEMENT_BOOST_ENABLED. The
+		//     parallel GPT-4o arbiter ran for every identify; when it
+		//     independently resolves to the SAME species as the chosen in-catalog
+		//     suggestion, the two signals corroborate one another, so we RAISE the
+		//     returned confidence. Strictly bounded: fires ONLY on an in-catalog
+		//     hit (Suggestions[0].PlantID != nil) with GPT agreement; it NEVER
+		//     lowers confidence and NEVER changes which plant is returned
+		//     (plant_id / scientific_name untouched). GPT missing / errored /
+		//     disagreeing → no-op (original behavior). Placed after the cultivar
+		//     reranks so it reflects the final chosen row.
+		if agreementBoostEnabled && !unknownSentinel && gptErr == nil && gptSug != nil &&
+			len(result.Suggestions) > 0 && result.Suggestions[0].PlantID != nil {
+			s0 := &result.Suggestions[0]
+			engKey := speciesKey(s0.ScientificName)
+			if engKey != "" && engKey == speciesKey(gptSug.ScientificName) {
+				if boosted := boostedConfidence(s0.Confidence, gptSug.Confidence); boosted > s0.Confidence {
+					log.Printf("identify agreement boost: deviceID=%s plantId=%s engineConf=%.2f gptConf=%.2f boostedConf=%.2f",
+						deviceID, *s0.PlantID, s0.Confidence, gptSug.Confidence, boosted)
+					s0.Confidence = boosted
+				}
+			}
+		}
+
 		// 7b. Resolve YardMate plantId per suggestion from scientific_name
 		//     (SPEC §2.1 "plant_id mapping"). Same resolver /v1/diagnose uses
 		//     at the handler layer; content/LookupPlantID are nil-safe. Done
@@ -872,6 +956,98 @@ func resolvePlantID(content *ContentIndex, sci string) (string, bool) {
 		return "", false
 	}
 	return content.LookupPlantID(species)
+}
+
+// --- P1C fusion-accuracy helpers (identify #3 / #5) ---
+
+// speciesKey reduces a scientific name to its species-level catalog key —
+// speciesBinomial to drop any cultivar/infraspecific tail, then
+// normalizeScientificName (the same key LookupPlantID uses) so casing, hybrid
+// markers and spacing don't matter. Used to compare the GPT arbiter's guess
+// against the chosen suggestion for the #3 agreement boost. "" on empty input.
+func speciesKey(sci string) string {
+	return normalizeScientificName(speciesBinomial(sci))
+}
+
+// boostedConfidence computes the #3 agreement-boosted confidence when the engine
+// and the GPT arbiter independently agree on the species. It takes the higher of
+// the two confidences, pulls it up to at least agreementBoostFloor and clamps to
+// agreementBoostCap — but NEVER returns below engineConf (the boost only ever
+// raises; if the engine already reports above the cap that value is preserved).
+func boostedConfidence(engineConf, gptConf float64) float64 {
+	boosted := math.Max(engineConf, gptConf)
+	if boosted < agreementBoostFloor {
+		boosted = agreementBoostFloor
+	}
+	if boosted > agreementBoostCap {
+		boosted = agreementBoostCap
+	}
+	if boosted < engineConf {
+		boosted = engineConf
+	}
+	return boosted
+}
+
+// bloomTiebreakCand is one in-catalog candidate the #5 bloom tiebreak considers:
+// its position in the engine's original candidate slice, its resolved catalog
+// plantId, its engine confidence, and whether its BloomMonthsNorth contains the
+// target month.
+type bloomTiebreakCand struct {
+	origIdx     int
+	plantID     string
+	confidence  float64
+	bloomsMonth bool
+}
+
+// bloomTiebreak applies the #5 near-tie bloom preference over the in-catalog
+// candidates (in engine order). bestPos is the index within `cands` of the
+// confidence winner (from the caller's selection loop). Rules:
+//   - If the confidence best already blooms this month, it is already the
+//     preferred pick → returned unchanged (changed=false).
+//   - Otherwise, among candidates within epsilon of the best's confidence
+//     (near-ties) that DO bloom this month, the highest-confidence one is
+//     chosen. A clear winner — no near-tie blooming candidate — is never
+//     overridden (changed=false). This is a tiebreak, not a hard filter.
+//
+// Candidates with no bloom data have bloomsMonth=false, so they never win a
+// tiebreak but also never block one.
+func bloomTiebreak(cands []bloomTiebreakCand, bestPos int, epsilon float64) (bloomTiebreakCand, bool) {
+	best := cands[bestPos]
+	if best.bloomsMonth {
+		return best, false
+	}
+	winner := best
+	changed := false
+	for i := range cands {
+		c := cands[i]
+		if i == bestPos || !c.bloomsMonth {
+			continue
+		}
+		if c.confidence < best.confidence-epsilon {
+			continue // beyond the near-tie window — clear loser, not a tie
+		}
+		if !changed || c.confidence > winner.confidence {
+			winner = c
+			changed = true
+		}
+	}
+	return winner, changed
+}
+
+// bloomsInMonth reports whether the catalog plant's BloomMonthsNorth contains
+// `month` (Northern hemisphere). Missing detail / empty bloom data → false, so
+// such candidates simply don't participate in the #5 tiebreak. content nil-safe.
+func bloomsInMonth(content *ContentIndex, plantID string, month time.Month) bool {
+	det, ok := content.LookupFullDetail(plantID)
+	if !ok || det == nil {
+		return false
+	}
+	for _, m := range det.BloomMonthsNorth {
+		if time.Month(m) == month {
+			return true
+		}
+	}
+	return false
 }
 
 // isBareSpecies reports whether an engine-reported scientific name is a plain
