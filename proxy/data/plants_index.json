@@ -37,7 +37,7 @@
  {
   "id": "AAA0008",
   "scientific_name": "Abies concolor",
-  "common_name": "Balsam Fir"
+  "common_name": "White Fir"
  },
  {
   "id": "AAA0009",
@@ -147,7 +147,7 @@
  {
   "id": "AAA0030",
   "scientific_name": "Actinidia deliciosa",
-  "common_name": "Chinese-Gooseberry"
+  "common_name": "Kiwifruit"
  },
  {
   "id": "AAA0031",
@@ -902,7 +902,7 @@
  {
   "id": "AAA0181",
   "scientific_name": "Beaucarnea recurvata",
-  "common_name": "Elephant's-Foot"
+  "common_name": "Ponytail Palm"
  },
  {
   "id": "AAA0182",
@@ -1177,7 +1177,7 @@
  {
   "id": "AAA0236",
   "scientific_name": "Calibrachoa x hybrida",
-  "common_name": "Petunia"
+  "common_name": "Million Bells"
  },
  {
   "id": "AAA0237",
@@ -1312,7 +1312,7 @@
  {
   "id": "AAA0263",
   "scientific_name": "Capsicum baccatum",
-  "common_name": "Locoto Pepper"
+  "common_name": "Ají"
  },
  {
   "id": "AAA0264",
@@ -1322,7 +1322,7 @@
  {
   "id": "AAA0265",
   "scientific_name": "Capsicum pubescens",
-  "common_name": "Tree Pepper"
+  "common_name": "Rocoto"
  },
  {
   "id": "AAA0266",
@@ -1907,7 +1907,7 @@
  {
   "id": "AAA0383",
   "scientific_name": "Crassula tetragona",
-  "common_name": "Kerkei"
+  "common_name": "Miniature Pine Tree"
  },
  {
   "id": "AAA0384",
@@ -2242,12 +2242,12 @@
  {
   "id": "AAA0450",
   "scientific_name": "Dieffenbachia seguine",
-  "common_name": "Tuftroot"
+  "common_name": "Dumb Cane"
  },
  {
   "id": "AAA0451",
   "scientific_name": "Digitalis purpurea",
-  "common_name": "Purple Foxglove"
+  "common_name": "Common Foxglove"
  },
  {
   "id": "AAA0452",
@@ -2287,12 +2287,12 @@
  {
   "id": "AAA0459",
   "scientific_name": "Dracaena fragrans",
-  "common_name": "Cornstalk Dracaena"
+  "common_name": "Corn Plant"
  },
  {
   "id": "AAA0460",
   "scientific_name": "Dracaena marginata",
-  "common_name": "Dracaena Reflexa"
+  "common_name": "Madagascar Dragon Tree"
  },
  {
   "id": "AAA0461",
@@ -2427,7 +2427,7 @@
  {
   "id": "AAA0487",
   "scientific_name": "Enkianthus campanulatus",
-  "common_name": "Campanulate Enkianthus"
+  "common_name": "Redvein Enkianthus"
  },
  {
   "id": "AAA0488",
@@ -2497,7 +2497,7 @@
  {
   "id": "AAA0501",
   "scientific_name": "Eruca sativa",
-  "common_name": "Rocket Salad"
+  "common_name": "Arugula"
  },
  {
   "id": "AAA0502",
@@ -2607,7 +2607,7 @@
  {
   "id": "AAA0523",
   "scientific_name": "Exochorda giraldii",
-  "common_name": "Exochorda Racemosa"
+  "common_name": "Redbud Pearlbush"
  },
  {
   "id": "AAA0524",
@@ -2657,7 +2657,7 @@
  {
   "id": "AAA0533",
   "scientific_name": "Ficus audrey",
-  "common_name": "Ficus Benghalensis"
+  "common_name": "Ficus Audrey"
  },
  {
   "id": "AAA0534",
@@ -3142,7 +3142,7 @@
  {
   "id": "AAA0630",
   "scientific_name": "Holboellia latifolia",
-  "common_name": "Stauntonia Latifolia"
+  "common_name": "Sausage Vine"
  },
  {
   "id": "AAA0631",
@@ -3152,7 +3152,7 @@
  {
   "id": "AAA0632",
   "scientific_name": "Hosta fortunei",
-  "common_name": "Hosta Sieboldiana"
+  "common_name": "Fortune's Hosta"
  },
  {
   "id": "AAA0633",
@@ -3162,7 +3162,7 @@
  {
   "id": "AAA0634",
   "scientific_name": "Hosta montana",
-  "common_name": "Hosta Sieboldiana"
+  "common_name": "Mountain Hosta"
  },
  {
   "id": "AAA0635",
@@ -3187,7 +3187,7 @@
  {
   "id": "AAA0639",
   "scientific_name": "Hosta tokudama",
-  "common_name": "Hosta Sieboldiana"
+  "common_name": "Tokudama Hosta"
  },
  {
   "id": "AAA0640",
@@ -3292,7 +3292,7 @@
  {
   "id": "AAA0660",
   "scientific_name": "Hypericum calycinum",
-  "common_name": "Rose-Of-Sharon"
+  "common_name": "Aaron's Beard"
  },
  {
   "id": "AAA0661",
@@ -3382,7 +3382,7 @@
  {
   "id": "AAA0678",
   "scientific_name": "Ipomoea aquatica",
-  "common_name": "Water Morning Glory"
+  "common_name": "Water Spinach"
  },
  {
   "id": "AAA0679",
@@ -3612,7 +3612,7 @@
  {
   "id": "AAA0724",
   "scientific_name": "Lagerstroemia fauriei",
-  "common_name": "Lagerstroemia Subcostata"
+  "common_name": "Japanese Crape Myrtle"
  },
  {
   "id": "AAA0725",
@@ -3737,7 +3737,7 @@
  {
   "id": "AAA0749",
   "scientific_name": "Leucothoe populifolia",
-  "common_name": "Agarista Populifolia"
+  "common_name": "Florida Leucothoe"
  },
  {
   "id": "AAA0750",
@@ -3817,7 +3817,7 @@
  {
   "id": "AAA0765",
   "scientific_name": "Lilium orientalis",
-  "common_name": "Lilies"
+  "common_name": "Oriental Lily"
  },
  {
   "id": "AAA0766",
@@ -4112,7 +4112,7 @@
  {
   "id": "AAA0824",
   "scientific_name": "Mazus reptans",
-  "common_name": "Miquel's Mazus"
+  "common_name": "Creeping Mazus"
  },
  {
   "id": "AAA0825",
@@ -4582,7 +4582,7 @@
  {
   "id": "AAA0918",
   "scientific_name": "Osmanthus x burkwoodii",
-  "common_name": "Osmanthus Delavayi"
+  "common_name": "Burkwood Osmanthus"
  },
  {
   "id": "AAA0919",
@@ -4852,7 +4852,7 @@
  {
   "id": "AAA0972",
   "scientific_name": "Pericallis x hybrida",
-  "common_name": "Common Ragwort"
+  "common_name": "Florist's Cineraria"
  },
  {
   "id": "AAA0973",
@@ -4862,7 +4862,7 @@
  {
   "id": "AAA0974",
   "scientific_name": "Perovskia atriplicifolia",
-  "common_name": "Swanleaf Clouding Sage"
+  "common_name": "Russian Sage"
  },
  {
   "id": "AAA0975",
@@ -4957,7 +4957,7 @@
  {
   "id": "AAA0993",
   "scientific_name": "Philodendron micans",
-  "common_name": "Philodendron micans"
+  "common_name": "Velvet-Leaf Philodendron"
  },
  {
   "id": "AAA0994",
@@ -5392,7 +5392,7 @@
  {
   "id": "AAA1080",
   "scientific_name": "Prunus triloba",
-  "common_name": "Flowering Plum"
+  "common_name": "Flowering Almond"
  },
  {
   "id": "AAA1081",
@@ -5607,7 +5607,7 @@
  {
   "id": "AAA1123",
   "scientific_name": "Rhododendron yakushimanum",
-  "common_name": "Rhododendron Degronianum"
+  "common_name": "Yakushima Rhododendron"
  },
  {
   "id": "AAA1124",
@@ -6232,7 +6232,7 @@
  {
   "id": "AAA1248",
   "scientific_name": "Rubus fruticosus",
-  "common_name": "Pilated-Leaved Blackberry"
+  "common_name": "Blackberry"
  },
  {
   "id": "AAA1249",
@@ -6472,7 +6472,7 @@
  {
   "id": "AAA1296",
   "scientific_name": "Sansevieria zeylanica",
-  "common_name": "Dracaena"
+  "common_name": "Ceylon Snake Plant"
  },
  {
   "id": "AAA1297",
@@ -6607,7 +6607,7 @@
  {
   "id": "AAA1323",
   "scientific_name": "Senecio mandraliscae",
-  "common_name": "Curio Talinoides"
+  "common_name": "Blue Chalksticks"
  },
  {
   "id": "AAA1324",
@@ -6862,7 +6862,7 @@
  {
   "id": "AAA1374",
   "scientific_name": "Stromanthe sanguinea",
-  "common_name": "Stromanthe Thalia"
+  "common_name": "Triostar Stromanthe"
  },
  {
   "id": "AAA1375",
@@ -7542,7 +7542,7 @@
  {
   "id": "AAA1510",
   "scientific_name": "Zamioculcas zamiifolia",
-  "common_name": "Zanzibar Gem"
+  "common_name": "ZZ Plant"
  },
  {
   "id": "AAA1511",
@@ -7622,7 +7622,7 @@
  {
   "id": "AAA1526",
   "scientific_name": "Centranthus ruber",
-  "common_name": "Red Flower Carnation"
+  "common_name": "Red Valerian"
  },
  {
   "id": "AAA1527",
@@ -7632,12 +7632,12 @@
  {
   "id": "AAA1528",
   "scientific_name": "Myosotis arvensis",
-  "common_name": "Garden Forget-me-not"
+  "common_name": "Field Forget-me-not"
  },
  {
   "id": "AAA1529",
   "scientific_name": "Phlebodium aureum",
-  "common_name": "Golden Fern"
+  "common_name": "Golden Polypody"
  },
  {
   "id": "AAA1530",

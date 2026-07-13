@@ -170618,7 +170618,7 @@
  {
   "id": "AAA0451",
   "scientific_name": "Digitalis purpurea",
-  "common_name": "Purple Foxglove",
+  "common_name": "Common Foxglove",
   "common_name_source": "inat",
   "flower_color": [
    "purple",
@@ -239373,7 +239373,7 @@
   "uses_list": [
    {
     "icon": "ornamental",
-    "text": "Hosta Sieboldiana perennial used in cottage and naturalistic borders"
+    "text": "Fortune's Hosta perennial used in cottage and naturalistic borders"
    }
   ],
   "symbolism_list": [
@@ -370027,7 +370027,7 @@
   "uses_list": [
    {
     "icon": "pollinator",
-    "text": "Common Ragwort flowers nourish foraging bees and pollinators"
+    "text": "Cineraria flowers nourish foraging bees and pollinators"
    },
    {
     "icon": "ornamental",
@@ -370740,7 +370740,7 @@
   "description": "Russian Sage is a Central Asian woody perennial producing airy panicles of small violet-blue flowers above silver-gray aromatic divided foliage. Growing 3 to 5 feet tall and wide, it blooms from midsummer through fall, offering a long season of hazy lavender color. A signature American xeric garden plant and the 1995 Perennial Plant of the Year, now classified by botanists as Salvia yangii.",
   "history_text_short": "Perovskia atriplicifolia inhabits rocky hillsides and dry valleys across the Hindu Kush, Afghanistan, Pakistan, and Tibet. The Russian botanist George Karelin named the genus in 1841 to honor General Vasily Perovski, then governor of Orenburg.",
   "history_text_long": "Perovskia atriplicifolia inhabits rocky hillsides and dry valleys across the Hindu Kush, Afghanistan, Pakistan, and Tibet. The Russian botanist George Karelin named the genus in 1841 to honor General Vasily Perovski, then governor of Orenburg. European plant hunters introduced it to Kew by the 1880s.\n\nAfghan and Central Asian cultures used the fragrant leaves as a substitute for sage in cooking and, in Persia, as a spiritual cleansing smoke. Western garden use expanded rapidly after the Perennial Plant Association named it 1995 Perennial of the Year. Modern taxonomy merged Perovskia into Salvia in 2017, making the accepted name Salvia yangii, though Perovskia remains in wide horticultural use.\n\nCultivars include 'Blue Spire', 'Little Spire', and 'Lacey Blue'. Native from Iran through Afghanistan into Tibet. Introduced to American horticulture in the mid-20th century and became an instant classic after winning the 1995 Perennial Plant of the Year award. Recent DNA research reclassified it as Salvia yangii, though Perovskia remains the common garden name.",
-  "name_origin": "The name Swanleaf Clouding Sage describes its sage-like aromatic foliage or flowers. 'Perovskia' honors V. A. Perovski, 19th-century Russian general; 'atriplicifolia' means with leaves like Atriplex (saltbush).",
+  "name_origin": "The common name Russian Sage reflects its sage-scented foliage and its association with Russia, though it is not a true sage. 'Perovskia' honors V. A. Perovski, 19th-century Russian general; 'atriplicifolia' means with leaves like Atriplex (saltbush).",
   "attributes": [
    "fragrant",
    "drought-tolerant",

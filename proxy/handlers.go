@@ -1427,6 +1427,16 @@ func buildFallbackIssue(ctx context.Context, plantID *string, plantName string, 
 					refs = append(refs, DiseaseNameRef{ID: d.ID, Name: d.Name})
 				}
 			}
+			if len(refs) == 0 {
+				// Resolved plant with an EMPTY curated disease list (e.g. a newly
+				// promoted catalog plant whose common_diseases_list isn't populated
+				// yet): fall back to the full catalog like an unresolved plant, so
+				// the AI still grounds a specific disease on the plant name. Without
+				// this, a resolved-but-listless plant skips the AI layer and drops
+				// straight to the generic L08 net — behaving WORSE than a plant that
+				// never resolved at all.
+				refs = content.AllDiseaseNames()
+			}
 		} else {
 			refs = content.AllDiseaseNames()
 		}
