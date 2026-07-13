@@ -166,7 +166,7 @@ type visionArbiterResult struct {
 // (ratelimit.GlobalGate).
 type SpendGate func(w http.ResponseWriter) bool
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, roseEnabled bool, spendGate SpendGate) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, roseEnabled, disambigEnabled bool, spendGate SpendGate) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -643,10 +643,16 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			return
 		}
 
-		// 7a. Rose cultivar rerank — ON by default; ROSE_RERANK_ENABLED=false is a
-		//     server kill-switch (roseEnabled). Best-effort: any failure / timeout /
-		//     uncertainty falls back to the species result. Budget-aware: shares
-		//     identify's 30 s ctx (rosererank SPEC).
+		// 7a. Cultivar refinement — TWO mutually-exclusive vision reranks, at most
+		//     one per identify (an else-if chain: Rosa goes to rose rerank, every
+		//     other genus to the generic species-group disambiguation). Both are
+		//     ON by default with independent server kill-switches, both best-effort
+		//     (any failure / timeout / uncertainty falls back to the species
+		//     result unchanged), and both share identify's budget via roseBudget.
+		//
+		// 7a-1. Rose cultivar rerank — ROSE_RERANK_ENABLED=false kill-switches it.
+		//     Genus-wide (all ~110 Rosa candidates), for the "every rose comes back
+		//     as generic China Rose" problem (rosererank SPEC).
 		if roseEnabled && !unknownSentinel && vision != nil &&
 			len(result.Suggestions) > 0 && len(roseCands) > 0 &&
 			genusOf(result.Suggestions[0].ScientificName) == "Rosa" {
@@ -673,6 +679,46 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				}
 			} else {
 				log.Printf("identify rose rerank: deviceID=%s SKIPPED-budget budget=%v min=%v", deviceID, budget, minRoseBudget)
+			}
+
+			// 7a-2. Species-level cultivar disambiguation (non-Rosa) —
+			//     CULTIVAR_DISAMBIG_ENABLED=false kill-switches it. Fires ONLY when
+			//     the engine resolved to a BARE species (isBareSpecies: no cultivar
+			//     quote, no infraspecific marker) whose catalog holds ≥2 rows
+			//     (species + cultivars/varieties, e.g. Juncus effusus AAA0701 +
+			//     'Spiralis' AAA1633). A vision pass over just those group members
+			//     picks the right row; on any uncertainty it falls back to the
+			//     first-write-wins species result. Genus Rosa is excluded (handled
+			//     by 7a-1 above, even when that branch is kill-switched off) so the
+			//     two never both fire.
+		} else if disambigEnabled && !unknownSentinel && vision != nil &&
+			len(result.Suggestions) > 0 && content != nil &&
+			genusOf(result.Suggestions[0].ScientificName) != "Rosa" &&
+			isBareSpecies(result.Suggestions[0].ScientificName) {
+			key := speciesGroupKey(result.Suggestions[0].ScientificName)
+			if group, ok := content.SpeciesGroupFor(key); ok && len(group) > 1 {
+				budget := roseBudget(ctx, reqStart)
+				if budget >= minRoseBudget {
+					rctx, cancel := context.WithTimeout(ctx, budget)
+					res, verr := vision.RerankCultivar(rctx, imgBytes, mime, group)
+					cancel()
+					if verr != nil {
+						log.Printf("identify cultivar disambig failed: deviceID=%s key=%q err=%v", deviceID, key, verr)
+					} else {
+						matches, applied := rosererank.Decide(res, roseIDSet(group))
+						topID, topConf := "", 0.0
+						if len(res.Matches) > 0 {
+							topID, topConf = res.Matches[0].PlantID, res.Matches[0].Confidence
+						}
+						log.Printf("identify cultivar disambig: deviceID=%s key=%q members=%d certain=%v rawMatches=%d topId=%s topConf=%.2f applied=%v",
+							deviceID, key, len(group), res.CultivarCertain, len(res.Matches), topID, topConf, applied)
+						if applied {
+							rewriteSuggestionsFromRose(result, matches, roseByID(group))
+						}
+					}
+				} else {
+					log.Printf("identify cultivar disambig: deviceID=%s SKIPPED-budget key=%q budget=%v min=%v", deviceID, key, budget, minRoseBudget)
+				}
 			}
 		}
 
@@ -826,6 +872,24 @@ func resolvePlantID(content *ContentIndex, sci string) (string, bool) {
 		return "", false
 	}
 	return content.LookupPlantID(species)
+}
+
+// isBareSpecies reports whether an engine-reported scientific name is a plain
+// "Genus species" binomial with NO cultivar quote and NO infraspecific rank
+// marker — i.e. the engine only resolved to the species level. It gates the
+// cultivar-disambiguation rerank (7a-2): we disambiguate ONLY when the engine
+// gave us just the species (so the catalog's several cultivars under it are
+// genuinely ambiguous). A name the engine already pinned to a variety/subspecies
+// (e.g. "Brassica oleracea var. italica") is precise-resolved by resolvePlantID
+// and must NOT be re-disambiguated. normalizeScientificNamePrecise keeps the
+// infraspecific/hybrid marker, so a bare binomial normalizes to exactly 2
+// whitespace tokens ("brassica oleracea var. italica" -> 4, "abelia x
+// grandiflora" -> 3), and a quoted cultivar is rejected outright.
+func isBareSpecies(sci string) bool {
+	if strings.ContainsAny(sci, "'’") {
+		return false
+	}
+	return len(strings.Fields(normalizeScientificNamePrecise(sci))) == 2
 }
 
 // prependUnique returns name followed by list with any case-insensitive
