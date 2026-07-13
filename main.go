@@ -38,13 +38,13 @@ const (
 	// reqs/hr from a single device exhausted the old 100 ceiling and 429'd
 	// identify after ~3 photos. The expensive upstream calls
 	// (identify/diagnose/enrichment) stay independently bounded by the per-Device
-	// bucket (100/hr) regardless of this ceiling, so raising per-IP does NOT
+	// bucket (300/hr) regardless of this ceiling, so raising per-IP does NOT
 	// widen the upstream-cost / abuse surface.
 	defaultIPLimit       = 600
 	defaultIPWindow      = time.Hour
 	defaultKeyIDLimit    = 50
 	defaultKeyIDWindow   = 24 * time.Hour
-	defaultDeviceLimit   = 100
+	defaultDeviceLimit   = 300
 	defaultDeviceWindow  = time.Hour
 	defaultSweepInterval = time.Minute
 

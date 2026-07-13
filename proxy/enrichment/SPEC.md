@@ -230,8 +230,8 @@ Inherits parent SPEC §4 with these specifics:
 
 | Layer | Scope | Limit | Code |
 |---|---|---|---|
-| Per-IP | All `/v1/*` (already mounted) | 100 / hour | `rate_limit_ip` |
-| Per-device | Proxy endpoint group; enrichment joins | 100 / hour | `rate_limit_device` |
+| Per-IP | All `/v1/*` (already mounted) | 600 / hour | `rate_limit_ip` |
+| Per-device | Proxy endpoint group; enrichment joins | 300 / hour | `rate_limit_device` |
 
 Body cap: **64 KB** (JSON-only). Path 3 (LLM) responses are bounded by the strict JSON schema to ~2 KB; the cap is for the request body.
 

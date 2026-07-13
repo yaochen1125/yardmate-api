@@ -82,7 +82,7 @@ func (b *Bucket) Size() int {
 // (identify + diagnose) served per hour across ALL callers. It is a cost
 // ceiling, not a per-caller quota: it backstops PerDevice, which an attacker
 // can sidestep by minting a fresh X-Device-Install-Id UUID per request (each
-// new UUID = a fresh 100/h device bucket), leaving only PerIP — itself dodgeable
+// new UUID = a fresh 300/h device bucket), leaving only PerIP — itself dodgeable
 // by IP rotation. 5000/h is comfortably above legitimate aggregate traffic while
 // capping the worst-case paid-upstream spend during a UUID/IP-rotation flood.
 const DefaultGlobalHourlyBudget = 5000
