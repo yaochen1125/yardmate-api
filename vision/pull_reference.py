@@ -21,7 +21,7 @@ def species_query(sci):
 def resolve(q):
     u = "https://api.inaturalist.org/v1/taxa?" + urllib.parse.urlencode({"q": q, "per_page": 5})
     try: res = get(u)
-    except Exception as e: print("  taxa err", q, e); return None
+    except Exception as e: print("  taxa err", q, e); return False  # 瞬时 API 失败(区别于查无 taxon 的 None)
     time.sleep(1.1)
     results = res.get("results", [])
     for want in (("species", "form", "variety", "subspecies"), None):
@@ -31,13 +31,26 @@ def resolve(q):
     return None
 
 def pull(taxon_id, outdir, per):
-    os.makedirs(outdir, exist_ok=True)
     u = "https://api.inaturalist.org/v1/observations?" + urllib.parse.urlencode({
         "taxon_id": taxon_id, "photos": "true", "quality_grade": "research",
         "per_page": per, "order_by": "votes", "order": "desc"})
-    try: res = get(u)
-    except Exception as e: print("  obs err", e); return []
+    try:
+        res = get(u)
+    except Exception as e:
+        # 瞬时 obs 失败(Codex #101): 不清目录、返回 None → main 保留已有部分参考图 +
+        # 下次重试。绝不因一次网络抖动删掉可用参考图并把该株永久标记完成。
+        print("  obs err", e)
+        return None
     time.sleep(1.1)
+    # 观测请求成功后才清目录干净重拉(Codex #100): 避免上面失败时误删已有参考图。
+    # 只有未在 manifest 记录的 taxon 才会进到这里(见 main),故清空安全。
+    if os.path.isdir(outdir):
+        for f in os.listdir(outdir):
+            try:
+                os.remove(os.path.join(outdir, f))
+            except OSError:
+                pass
+    os.makedirs(outdir, exist_ok=True)
     man = []
     for obs in res.get("results", []):
         for p in obs.get("photos", [])[:1]:
@@ -64,24 +77,36 @@ def main(idx_path, out_dir, per=40):
     done = skipped = zero = 0
     for pl in plants:
         cid, sci = pl["id"], pl["scientific_name"]
+        # Resume (Codex #100): manifest 是"已处理"真源 —— 处理过的株(含无 taxon /
+        # 零图)都记入并每株持久化,重跑直接跳过,不重拉、不覆盖。文件数是二级兜底
+        # (老 manifest 缺失但目录已够时仍跳)。
+        if cid in manifest:
+            skipped += 1; continue
         outdir = f"{out_dir}/{cid}"
-        have = len([f for f in os.listdir(outdir)]) if os.path.isdir(outdir) else 0
-        if have >= min(per, 15):  # 已够 → 跳(resumable)
+        have = len(os.listdir(outdir)) if os.path.isdir(outdir) else 0
+        if have >= min(per, 15):
             skipped += 1; continue
         q = species_query(sci)
         tx = resolve(q)
-        if not tx:
+        if tx is False:  # 瞬时 taxa API 失败 → 不记 manifest, 保留现状, 下次重试(Codex #101)
+            print(f"  transient resolve fail {cid}, retry next run")
+            continue
+        if tx is None:  # 确实查无此 taxon(区别于瞬时失败)
             zero += 1; zero_log.write(f"{cid}\t{sci}\tNO_TAXON\n"); zero_log.flush()
-            manifest[cid] = {"sci": sci, "resolved": None, "n": 0}; continue
-        tid, tname, trank = tx
-        photos = pull(tid, outdir, per)
-        if len(photos) == 0:
-            zero += 1; zero_log.write(f"{cid}\t{sci}\t{tname}\tNO_PHOTOS\n"); zero_log.flush()
-        manifest[cid] = {"sci": sci, "resolved": {"id": tid, "name": tname, "rank": trank}, "n": len(photos)}
+            manifest[cid] = {"sci": sci, "resolved": None, "n": 0}
+        else:
+            tid, tname, trank = tx
+            photos = pull(tid, outdir, per)  # obs 成功后才清目录干净重拉
+            if photos is None:  # 瞬时 obs 失败 → 不记、保留已有参考图, 下次重试(Codex #101)
+                print(f"  transient fetch fail {cid}, retry next run")
+                continue
+            if len(photos) == 0:
+                zero += 1; zero_log.write(f"{cid}\t{sci}\t{tname}\tNO_PHOTOS\n"); zero_log.flush()
+            manifest[cid] = {"sci": sci, "resolved": {"id": tid, "name": tname, "rank": trank}, "n": len(photos)}
         done += 1
+        json.dump(manifest, open(manifest_path, "w"), ensure_ascii=False, indent=2)  # 每株持久化 → 断点最多丢 1 株
         if done % 20 == 0:
-            json.dump(manifest, open(manifest_path, "w"), ensure_ascii=False, indent=2)
-            print(f"progress: done={done} skipped={skipped} zero={zero} ({cid} {tname}:{len(photos)})")
+            print(f"progress: done={done} skipped={skipped} zero={zero} (last {cid})")
     json.dump(manifest, open(manifest_path, "w"), ensure_ascii=False, indent=2)
     print(f"DONE done={done} skipped={skipped} zero_coverage={zero} total={len(plants)}")
 

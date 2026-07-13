@@ -842,29 +842,41 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     ONLY, to gather staging data before we let it override. Fail-open:
 		//     nil client / error / timeout → no-op.
 		if visionKNN != nil && knnCh != nil && !unknownSentinel && len(result.Suggestions) > 0 {
-			kr := <-knnCh
-			if kr.err != nil || kr.resp == nil {
-				log.Printf("identify vision-knn failed: deviceID=%s err=%v", deviceID, kr.err)
-			} else {
-				s0 := &result.Suggestions[0]
-				knnTopID, knnTopSim := "", 0.0
-				if len(kr.resp.Candidates) > 0 {
-					knnTopID, knnTopSim = kr.resp.Candidates[0].CatalogID, kr.resp.Candidates[0].VisionSim
-				}
-				decidedID := ""
-				if s0.PlantID != nil {
-					decidedID = *s0.PlantID
-				}
-				agrees := visionKNNAgreesWithDecision(s0, kr.resp)
-				log.Printf("identify vision-knn: deviceID=%s decidedId=%s knnTopId=%s knnTopSim=%.3f inCatalog=%v nnSim=%.3f agrees=%v",
-					deviceID, decidedID, knnTopID, knnTopSim, kr.resp.InCatalog, kr.resp.NNSim, agrees)
-				if agrees {
-					if boosted := visionKNNBoostedConfidence(s0.Confidence, knnTopSim); boosted > s0.Confidence {
-						log.Printf("identify vision-knn boost: deviceID=%s plantId=%s conf=%.2f knnSim=%.2f boostedConf=%.2f",
-							deviceID, *s0.PlantID, s0.Confidence, knnTopSim, boosted)
-						s0.Confidence = boosted
+			// Bounded wait (Codex #100): the goroutine ran concurrently with the
+			// whole cascade, so a healthy local service is usually already done
+			// here. Cap the extra wait at visionKNNWaitBudget so a slow/wedged
+			// service can't add its full HTTP timeout to the already-decided user
+			// response — skip the optional signal instead of blocking on it.
+			select {
+			case kr := <-knnCh:
+				if kr.err != nil || kr.resp == nil {
+					log.Printf("identify vision-knn failed: deviceID=%s err=%v", deviceID, kr.err)
+				} else {
+					s0 := &result.Suggestions[0]
+					knnTopID, knnTopSim := "", 0.0
+					if len(kr.resp.Candidates) > 0 {
+						knnTopID, knnTopSim = kr.resp.Candidates[0].CatalogID, kr.resp.Candidates[0].VisionSim
+					}
+					decidedID := ""
+					if s0.PlantID != nil {
+						decidedID = *s0.PlantID
+					}
+					agrees := visionKNNAgreesWithDecision(s0, kr.resp)
+					log.Printf("identify vision-knn: deviceID=%s decidedId=%s knnTopId=%s knnTopSim=%.3f inCatalog=%v nnSim=%.3f agrees=%v",
+						deviceID, decidedID, knnTopID, knnTopSim, kr.resp.InCatalog, kr.resp.NNSim, agrees)
+					if agrees {
+						if boosted := visionKNNBoostedConfidence(s0.Confidence, knnTopSim); boosted > s0.Confidence {
+							log.Printf("identify vision-knn boost: deviceID=%s plantId=%s conf=%.2f knnSim=%.2f boostedConf=%.2f",
+								deviceID, *s0.PlantID, s0.Confidence, knnTopSim, boosted)
+							s0.Confidence = boosted
+						}
 					}
 				}
+			case <-time.After(visionKNNWaitBudget):
+				// Still running past the grace budget — skip rather than delay the
+				// response. The buffered goroutine finishes into knnCh and is GC'd;
+				// ctx-cancel on return aborts the in-flight call.
+				log.Printf("identify vision-knn: deviceID=%s SKIPPED-not-ready-within=%v", deviceID, visionKNNWaitBudget)
 			}
 		}
 
