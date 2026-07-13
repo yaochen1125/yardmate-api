@@ -1,6 +1,8 @@
-# L1 Vision kNN 微服务依赖。CPU 部署(server 无 GPU)。
-# 建库/推理共用 vision_embed。torch CPU wheel 见 README(--index-url)。
+# L1 Vision kNN 微服务依赖。CPU 部署(server 无 GPU)。清单参考用;实际安装按 README:
+# torch + torchvision 必须一起从 CPU index 装(--index-url .../whl/cpu)且版本匹配,
+# 别用 `pip install -r`(会从 PyPI 拽不匹配的 torchvision → torchvision::nms 崩)。
 torch>=2.2
+torchvision>=0.17     # 必须与 torch 同源(CPU wheel)同版本 —— 见 README
 open_clip_torch>=2.24
 hnswlib>=0.8
 fastapi>=0.110
