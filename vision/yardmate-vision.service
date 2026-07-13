@@ -7,7 +7,11 @@ Type=simple
 User=root
 WorkingDirectory=/root/yardmate-vision
 Environment=VISION_INDEX_DIR=/root/yardmate-vision-index
-# CPU-only; 限内存防挤爆 8GB(API 另占 4G)。BioCLIP-2 ViT-L 常驻 ~2G。
+# 限并发嵌入(H3, 护 CPU/内存):默认 1=串行。识别路径本就多秒、Go 侧有 1.5s 等待预算, 串行够用。
+Environment=VISION_MAX_CONCURRENT_EMBED=1
+# 库内外阈值(M4):不设=用索引 meta 的 0.80 先验;staging 标定后设此 env 即可免重建索引。
+# Environment=VISION_IN_OUT_THRESHOLD=0.80
+# CPU-only。文本塔已释放 → BioCLIP-2 常驻 ~1.6G(实测);2600M 宽裕, API 另占 4G, 8G box 有余量。
 Environment=OMP_NUM_THREADS=3
 MemoryMax=2600M
 ExecStart=/root/yardmate-vision/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8099 --log-level warning
