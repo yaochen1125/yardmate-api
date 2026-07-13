@@ -267,8 +267,8 @@ func LoadContent() (*ContentIndex, error) {
 //   - Tier 1 (precise) preserves variety / subspecies / cultivar suffixes AND a
 //     stand-alone ASCII "x" — so "Brassica oleracea var. italica" resolves to
 //     its own cultivar id (distinct from var. acephala), and a catalog row that
-//     uses the ASCII-x hybrid form (e.g. "Chrysanthemum x morifolium", AAA0325)
-//     stays addressable separately from its bare-form sibling.
+//     uses the ASCII-x hybrid form (e.g. a "Genus x species" row) stays
+//     addressable separately from its bare-form sibling.
 //   - Tier 2 (species fallback) folds the Unicode × marker, drops a stand-alone
 //     ASCII "x", and strips variety / cultivar / subspecies suffixes (`var.`,
 //     `cv.`, `subsp.`, `f.`) — so a query whose variety / hybrid marker the
@@ -547,11 +547,11 @@ func normalizeScientificName(s string) string {
 //	"Chrysanthemum × morifolium"       -> "chrysanthemum morifolium"
 //	"Abelia × grandiflora"             -> "abelia grandiflora"
 //
-// Why "x" is kept here but dropped in normalizeScientificName: the catalog
-// stores some pairs of rows that differ ONLY by the hybrid marker — e.g.
-// AAA0324 "Chrysanthemum morifolium" and AAA0325 "Chrysanthemum x morifolium".
-// The precise index must preserve that distinction so each row is reachable
-// via its own scientific_name. Inputs using the conventional Unicode × still
+// Why "x" is kept here but dropped in normalizeScientificName: the catalog may
+// store pairs of rows that differ ONLY by the hybrid marker — a bare
+// "Genus species" and its "Genus x species" hybrid form. The precise index must
+// preserve that distinction so each row is reachable via its own
+// scientific_name. Inputs using the conventional Unicode × still
 // collapse to the bare-form row (× -> space, then strings.Fields drops the
 // empty token); the species-level fallback (normalizeScientificName) continues
 // to drop both forms so a query without any hybrid marker still resolves.
