@@ -1,0 +1,10 @@
+# L1 Vision kNN 微服务依赖。CPU 部署(server 无 GPU)。
+# 建库/推理共用 vision_embed。torch CPU wheel 见 README(--index-url)。
+torch>=2.2
+open_clip_torch>=2.24
+hnswlib>=0.8
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+pillow>=10
+numpy>=1.26

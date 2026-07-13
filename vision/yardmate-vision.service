@@ -1,0 +1,18 @@
+[Unit]
+Description=YardMate L1 Vision kNN microservice (BioCLIP-2 + hnswlib)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/yardmate-api/vision
+Environment=VISION_INDEX_DIR=/root/yardmate-vision-index
+# CPU-only; 限内存防挤爆 8GB(API 另占 4G)。BioCLIP-2 ViT-L 常驻 ~2G。
+Environment=OMP_NUM_THREADS=3
+MemoryMax=2600M
+ExecStart=/root/yardmate-api/vision/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8099 --log-level warning
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
