@@ -14,7 +14,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
-	"strconv"
 	"time"
 )
 
@@ -65,10 +64,12 @@ func NewPlantIDClient(apiKey string) *PlantIDClient {
 // At V1 scale (8 MB image cap × per-IP rate limit), the memory cost is
 // bounded and acceptable.
 // lat/lon are an optional coarse geographic prior (identify-geo-prior). When
-// both are non-nil they are forwarded to Plant.id v3 as `latitude`/`longitude`
-// BODY fields, biasing suggestions toward species plausible at that location.
-// The caller passes nil (both) whenever the GEO_PRIOR_ENABLED kill-switch is off
-// or the client sent no coordinates, so identify degrades to a plain call.
+// both are non-nil they are forwarded to Plant.id v3 inside the multipart `data`
+// JSON field (its contract for non-image params), biasing suggestions toward
+// species plausible at that location. Callers pass already-coarsened values
+// (~2 decimals). The caller passes nil (both) whenever the GEO_PRIOR_ENABLED
+// kill-switch is off or the client sent no coordinates, so identify degrades to
+// a plain call.
 func (c *PlantIDClient) Identify(ctx context.Context, image io.Reader, mime string, lat, lon *float64) (*IdentifyResult, error) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -85,13 +86,19 @@ func (c *PlantIDClient) Identify(ctx context.Context, image io.Reader, mime stri
 		return nil, fmt.Errorf("plant_id: copy image: %w", err)
 	}
 
-	// Geographic prior — multipart BODY fields only (never URL/query/log).
-	// Plant.id v3 accepts latitude/longitude beside `images`. Set together or
-	// not at all (the handler nils the pair unless both parsed). Already
-	// coarsened to ~2 decimals upstream; formatted here at the same precision.
+	// Geographic prior — Plant.id v3 multipart contract: non-image parameters
+	// travel as a JSON string in a single `data` field, NOT as separate form
+	// fields (which the API silently ignores). Body-only (never URL/query/log);
+	// both set together or not at all (handler nils the pair unless both parsed);
+	// already coarsened to ~2 decimals upstream. json.Marshal renders the floats
+	// with a '.' separator, locale-independent.
 	if lat != nil && lon != nil {
-		_ = writer.WriteField("latitude", strconv.FormatFloat(*lat, 'f', 2, 64))
-		_ = writer.WriteField("longitude", strconv.FormatFloat(*lon, 'f', 2, 64))
+		if payload, mErr := json.Marshal(map[string]float64{
+			"latitude":  *lat,
+			"longitude": *lon,
+		}); mErr == nil {
+			_ = writer.WriteField("data", string(payload))
+		}
 	}
 
 	if err := writer.Close(); err != nil {

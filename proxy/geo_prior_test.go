@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"testing"
@@ -47,8 +48,9 @@ func TestParseCoord(t *testing.T) {
 }
 
 // TestPlantIDClient_Identify_GeoPrior asserts the geographic prior travels only
-// in the multipart BODY (Plant.id `latitude`/`longitude` fields), formatted at
-// 2 decimals, and is absent when the caller passes a nil pair.
+// in the multipart BODY, packed into Plant.id's single `data` JSON field (NOT
+// separate lat/lon form fields, which the API ignores), and is absent when the
+// caller passes a nil pair.
 func TestPlantIDClient_Identify_GeoPrior(t *testing.T) {
 	f := func(v float64) *float64 { return &v }
 
@@ -76,13 +78,22 @@ func TestPlantIDClient_Identify_GeoPrior(t *testing.T) {
 		return capturedQuery, capturedVals
 	}
 
-	t.Run("forwards coords in body only", func(t *testing.T) {
-		query, vals := run(t, f(37.7749), f(-122.4194))
-		if got := vals["latitude"]; len(got) != 1 || got[0] != "37.77" {
-			t.Errorf("latitude body field = %v, want [37.77]", got)
+	t.Run("forwards coords in the data JSON field, body only", func(t *testing.T) {
+		query, vals := run(t, f(37.77), f(-122.42))
+		data := vals["data"]
+		if len(data) != 1 {
+			t.Fatalf("data field = %v, want exactly one JSON string", data)
 		}
-		if got := vals["longitude"]; len(got) != 1 || got[0] != "-122.42" {
-			t.Errorf("longitude body field = %v, want [-122.42]", got)
+		var got map[string]float64
+		if err := json.Unmarshal([]byte(data[0]), &got); err != nil {
+			t.Fatalf("data field is not valid JSON (%q): %v", data[0], err)
+		}
+		if got["latitude"] != 37.77 || got["longitude"] != -122.42 {
+			t.Errorf("data = %v, want latitude 37.77 / longitude -122.42", got)
+		}
+		// Plant.id ignores separate lat/lon form fields — ensure we didn't send them.
+		if len(vals["latitude"]) != 0 || len(vals["longitude"]) != 0 {
+			t.Errorf("unexpected separate lat/lon form fields: %v %v", vals["latitude"], vals["longitude"])
 		}
 		// Privacy invariant: coordinates must never leak into the URL/query.
 		if query != "" {
@@ -90,13 +101,10 @@ func TestPlantIDClient_Identify_GeoPrior(t *testing.T) {
 		}
 	})
 
-	t.Run("omits coords when nil", func(t *testing.T) {
+	t.Run("omits data when nil coords", func(t *testing.T) {
 		_, vals := run(t, nil, nil)
-		if got := vals["latitude"]; len(got) != 0 {
-			t.Errorf("latitude present with nil coords: %v", got)
-		}
-		if got := vals["longitude"]; len(got) != 0 {
-			t.Errorf("longitude present with nil coords: %v", got)
+		if got := vals["data"]; len(got) != 0 {
+			t.Errorf("data field present with nil coords: %v", got)
 		}
 	})
 }
