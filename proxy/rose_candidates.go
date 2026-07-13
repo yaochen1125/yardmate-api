@@ -71,6 +71,7 @@ func buildRoseCandidates(content *ContentIndex) []rosererank.RoseCandidate {
 			ScientificName: p.ScientificName,
 			CommonName:     p.CommonName,
 			FlowerColor:    p.FlowerColor,
+			FoliageColor:   p.FoliageColor,
 			Description:    truncateWords(p.Description, roseDescriptionWords),
 		})
 	}

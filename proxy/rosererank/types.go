@@ -14,6 +14,7 @@ type RoseCandidate struct {
 	ScientificName string   // e.g. "Rosa 'About Face'" or "Rosa rugosa"
 	CommonName     string   // e.g. "About Face"
 	FlowerColor    []string // e.g. ["orange","yellow"]
+	FoliageColor   []string // e.g. ["purple","dark-green"] — the discriminator for dark-leaved cultivars (Aeonium 'Zwartkop', Sambucus 'Black Lace') where FlowerColor is identical to the species
 	Description    string   // catalog description, truncated to ~30 words by the caller
 }
 

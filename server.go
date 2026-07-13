@@ -59,6 +59,9 @@ func newServer(
 ) *Server {
 	// Rose cultivar rerank is ON by default; ROSE_RERANK_ENABLED=false kill-switches it.
 	roseEnabled := vault.GetBool("ROSE_RERANK_ENABLED", true)
+	// Species-level cultivar disambiguation (non-Rosa) is ON by default;
+	// CULTIVAR_DISAMBIG_ENABLED=false kill-switches it independently of rose.
+	disambigEnabled := vault.GetBool("CULTIVAR_DISAMBIG_ENABLED", true)
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(realIPFromNginx)
@@ -129,7 +132,7 @@ func newServer(
 					// (fallback); register when EITHER engine is present
 					// (SPEC §1.1 / §7).
 					if plantNet != nil || plantID != nil {
-						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, roseEnabled, spendGate))
+						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, roseEnabled, disambigEnabled, spendGate))
 					}
 					// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
 					// assessment, SPEC §1.5) — still requires plantID.
