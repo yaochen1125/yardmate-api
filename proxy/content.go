@@ -7,6 +7,8 @@ import (
 	"log"
 	"sort"
 	"strings"
+
+	"github.com/yaochen1125/yardmate-api/proxy/rosererank"
 )
 
 // Embedded YardMate content catalog. Built once at startup; immutable.
@@ -92,6 +94,17 @@ type ContentIndex struct {
 	// (iOS reads their already-denormalized steps from the CDN).
 	stepByID   map[string]*SharedStep
 	remedyByID map[string]*SharedRemedy
+
+	// speciesGroups maps a bare species binomial key (speciesGroupKey) to the
+	// catalog records sharing it, kept ONLY when ≥2 records fold to one key
+	// (a species + its cultivars/varieties). Drives the cultivar-disambiguation
+	// rerank: when the engine reports only the bare species but the catalog
+	// holds several rows under it (e.g. Juncus effusus AAA0701 + Juncus effusus
+	// 'Spiralis' AAA1633), a vision pass picks the right row. Built once at
+	// startup, read-only, safe for concurrent use. Genus-only keys are excluded
+	// so genus-level cultivar clusters (the Rosa domain, handled by rose rerank)
+	// never form a group.
+	speciesGroups map[string][]rosererank.RoseCandidate
 }
 
 // DiseaseCatalog is the subset of diseases.json[*] fields the server consumes
@@ -200,6 +213,11 @@ func LoadContent() (*ContentIndex, error) {
 	}
 	pdis := make(map[string][]string, len(details))
 	fpd := make(map[string]*PlantDetail, len(details))
+	// Cultivar-disambiguation groups: bare species binomial -> records sharing it.
+	// Built from `details` (not plants_index) so members carry the visual-
+	// discriminative subset (flower/foliage colour + description) the vision pass
+	// needs. Pruned to ≥2 members + sorted below.
+	groups := make(map[string][]rosererank.RoseCandidate)
 	for i := range details {
 		p := &details[i]
 		if p.ID == nil || *p.ID == "" {
@@ -207,6 +225,27 @@ func LoadContent() (*ContentIndex, error) {
 		}
 		pdis[*p.ID] = p.CommonDiseasesList
 		fpd[*p.ID] = p
+		if key := speciesGroupKey(p.ScientificName); key != "" {
+			groups[key] = append(groups[key], rosererank.RoseCandidate{
+				PlantID:        *p.ID,
+				ScientificName: p.ScientificName,
+				CommonName:     p.CommonName,
+				FlowerColor:    p.FlowerColor,
+				FoliageColor:   p.FoliageColor,
+				Description:    truncateWords(p.Description, roseDescriptionWords),
+			})
+		}
+	}
+	// Keep ONLY groups with ≥2 members (a lone species needs no disambiguation),
+	// and sort each group's members by PlantID so the vision prompt order is
+	// stable regardless of catalog row order — reproducibility + OpenAI prompt-
+	// cache (mirrors buildRoseCandidates).
+	for k, v := range groups {
+		if len(v) < 2 {
+			delete(groups, k)
+			continue
+		}
+		sort.Slice(v, func(i, j int) bool { return v[i].PlantID < v[j].PlantID })
 	}
 
 	var diseaseFile struct {
@@ -258,7 +297,19 @@ func LoadContent() (*ContentIndex, error) {
 		sciByID:                   sciByID,
 		stepByID:                  diseaseFile.Shared.Steps,
 		remedyByID:                diseaseFile.Shared.Remedies,
+		speciesGroups:             groups,
 	}, nil
+}
+
+// SpeciesGroupFor returns the cultivar-disambiguation group for a bare species
+// key (from speciesGroupKey), or (nil,false) when no ≥2-member group exists for
+// it. nil-safe.
+func (c *ContentIndex) SpeciesGroupFor(key string) ([]rosererank.RoseCandidate, bool) {
+	if c == nil || key == "" {
+		return nil, false
+	}
+	g, ok := c.speciesGroups[key]
+	return g, ok
 }
 
 // LookupPlantID maps a Plant.id / Pl@ntNet-reported scientific name to a
@@ -701,6 +752,28 @@ func speciesBinomial(s string) string {
 		return strings.Join(f, " ")
 	}
 	return f[0] + " " + f[1]
+}
+
+// speciesGroupKey folds a scientific name to its bare "genus species" binomial
+// for the cultivar-disambiguation group index. UNLIKE normalizeScientificName it
+// ALSO strips a trailing cultivar quote (ASCII ' or typographic ’) and anything
+// after it, so "Juncus effusus 'Spiralis'" and bare "Juncus effusus" both fold
+// to "juncus effusus". Returns "" for a genus-only result (e.g.
+// "Rosa 'About Face'" → "rosa" is rejected): genus-level cultivar clusters are
+// the rose-rerank domain, not a species group. Reuses normalizeScientificName
+// for the var./cv./subsp./× strip + lowercasing so the folding stays consistent
+// with the catalog name indexes. It deliberately does NOT mutate
+// normalizeScientificName itself (that helper is a shared source of truth for
+// the precise/species indexes + the enrichment PK — see its doc comment).
+func speciesGroupKey(sci string) string {
+	if i := strings.IndexAny(sci, "'’"); i >= 0 {
+		sci = sci[:i]
+	}
+	key := normalizeScientificName(sci)
+	if len(strings.Fields(key)) < 2 {
+		return ""
+	}
+	return key
 }
 
 // isLowerLatin reports whether w is a non-empty all-lowercase a-z word — used
