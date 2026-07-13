@@ -10,7 +10,7 @@ import (
 
 const (
 	creditsKey          = "plant_images/ingested/credits.json" // 库外 ingest 图分目录（SPEC §4）
-	creditsCacheControl = "public, max-age=3600" // short — changes as ingest runs (SPEC §2.7)
+	creditsCacheControl = "public, max-age=3600"               // short — changes as ingest runs (SPEC §2.7)
 )
 
 // CreditsManifest is the public credits.json shape (SPEC §2.7) the iOS Settings
@@ -70,6 +70,15 @@ func BuildCreditsManifest(rows []FileRow, now time.Time) CreditsManifest {
 // sync with what is live in R2. A failure is returned (caller logs, does not
 // abort the ingest).
 func (in *Ingestor) rebuildCredits(ctx context.Context) error {
+	// Serialize the read-modify-write across ALL slugs (finding #6). Single-flight
+	// only mutexes per-slug, so two different slugs can both reach here at once; if
+	// slug-A reads IngestedFiles, then slug-B reads + Puts, then slug-A Puts, A's
+	// stale snapshot silently drops B's just-added credits. Holding creditsMu over
+	// IngestedFiles + Put makes "newest snapshot wins" and keeps every live image
+	// present in the published manifest.
+	in.creditsMu.Lock()
+	defer in.creditsMu.Unlock()
+
 	rows, err := in.ledger.IngestedFiles(ctx)
 	if err != nil {
 		return fmt.Errorf("imageingest/credits: load ingested files: %w", err)

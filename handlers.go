@@ -13,13 +13,14 @@ import (
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
 
-// vendedKeys is the env keys returned by /v1/app-secrets. Add entries here
-// as the YardMate feature set grows. Keys are uppercased here (env name) and
-// lowercased on output by Vault.Snapshot (JSON convention).
-var vendedKeys = []string{
-	"OPENAI_API_KEY",
-	"PLANT_ID_API_KEY",
-}
+// vendedKeys is the env keys returned by /v1/app-secrets. Empty since V1:
+// vending of production keys is STOPPED — identify/diagnose/enrichment all run
+// through the server-side proxy, so no key leaves the server. If client-side
+// direct calls are ever restored, register the env key names here again
+// (uppercased env name; lowercased on output by Vault.Snapshot). The variable
+// and the handleAppSecrets route are kept as skeleton; Snapshot of an empty
+// slice returns an empty map (no panic).
+var vendedKeys = []string{}
 
 type challengeResponse struct {
 	Challenge string `json:"challenge"`

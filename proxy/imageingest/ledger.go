@@ -143,6 +143,18 @@ func (l *Ledger) UpsertSpecies(ctx context.Context, row SpeciesRow) error {
 // ON CONFLICT (slug, image_index) DO UPDATE (SPEC §6.1). attempts is set
 // absolutely by the caller. Empty optional columns map to NULL via NULLIF.
 // Source defaults to wikimedia_commons (NOT NULL column) when unset.
+//
+// The ON CONFLICT clause is a PARTIAL update (findings #1/#2 root cause): only
+// status / attempts / last_error / updated_at are overwritten unconditionally.
+// Every metadata column (r2_key / source / *_url / license_* / attribution_* /
+// mime / bytes / w / h) uses COALESCE(incoming, existing) so a SPARSE upsert —
+// e.g. a `failed`/`no_acceptable` row carrying no license, or a status flip —
+// NEVER nulls out a still-live image's r2_key/license/author (which would drop a
+// CC-BY/SA image from credits.json = an attribution-compliance violation). A
+// caller that genuinely has new metadata passes it and it wins; a caller with an
+// empty field preserves whatever is already there. `source` is handled via the
+// raw $5 param (not EXCLUDED) so the NOT-NULL insert default doesn't leak into
+// the conflict path and clobber a real 'inaturalist' source with wikimedia.
 func (l *Ledger) UpsertFile(ctx context.Context, row FileRow) error {
 	if l == nil || l.pool == nil {
 		return ErrLedgerUnavailable
@@ -150,40 +162,38 @@ func (l *Ledger) UpsertFile(ctx context.Context, row FileRow) error {
 	if row.Slug == "" {
 		return errors.New("imageingest/ledger: upsert file empty slug")
 	}
-	source := row.Source
-	if source == "" {
-		source = SourceWikimediaCommons
-	}
 	const stmt = `
 		INSERT INTO plant_image_files (
 			slug, image_index, status, r2_key, source, source_url, pending_url,
 			license_code, license_short, license_url, attribution_author, attribution_required,
 			mime, bytes, width, height, attempts, last_error, updated_at
 		) VALUES (
-			$1, $2, $3, NULLIF($4,''), $5, NULLIF($6,''), NULLIF($7,''),
+			$1, $2, $3, NULLIF($4,''), COALESCE(NULLIF($5,''), 'wikimedia_commons'), NULLIF($6,''), NULLIF($7,''),
 			NULLIF($8,''), NULLIF($9,''), NULLIF($10,''), NULLIF($11,''), $12,
 			NULLIF($13,''), NULLIF($14,0)::BIGINT, NULLIF($15,0)::INT, NULLIF($16,0)::INT, $17, NULLIF($18,''), NOW()
 		)
 		ON CONFLICT (slug, image_index) DO UPDATE SET
 			status               = EXCLUDED.status,
-			r2_key               = EXCLUDED.r2_key,
-			source               = EXCLUDED.source,
-			source_url           = EXCLUDED.source_url,
-			pending_url          = EXCLUDED.pending_url,
-			license_code         = EXCLUDED.license_code,
-			license_short        = EXCLUDED.license_short,
-			license_url          = EXCLUDED.license_url,
-			attribution_author   = EXCLUDED.attribution_author,
-			attribution_required = EXCLUDED.attribution_required,
-			mime                 = EXCLUDED.mime,
-			bytes                = EXCLUDED.bytes,
-			width                = EXCLUDED.width,
-			height               = EXCLUDED.height,
+			r2_key               = COALESCE(EXCLUDED.r2_key, plant_image_files.r2_key),
+			source               = COALESCE(NULLIF($5,''), plant_image_files.source),
+			source_url           = COALESCE(EXCLUDED.source_url, plant_image_files.source_url),
+			pending_url          = COALESCE(EXCLUDED.pending_url, plant_image_files.pending_url),
+			license_code         = COALESCE(EXCLUDED.license_code, plant_image_files.license_code),
+			license_short        = COALESCE(EXCLUDED.license_short, plant_image_files.license_short),
+			license_url          = COALESCE(EXCLUDED.license_url, plant_image_files.license_url),
+			attribution_author   = COALESCE(EXCLUDED.attribution_author, plant_image_files.attribution_author),
+			attribution_required = CASE WHEN NULLIF($8,'') IS NULL
+			                            THEN plant_image_files.attribution_required
+			                            ELSE EXCLUDED.attribution_required END,
+			mime                 = COALESCE(EXCLUDED.mime, plant_image_files.mime),
+			bytes                = COALESCE(EXCLUDED.bytes, plant_image_files.bytes),
+			width                = COALESCE(EXCLUDED.width, plant_image_files.width),
+			height               = COALESCE(EXCLUDED.height, plant_image_files.height),
 			attempts             = EXCLUDED.attempts,
 			last_error           = EXCLUDED.last_error,
 			updated_at           = NOW()`
 	_, err := l.pool.Exec(ctx, stmt,
-		row.Slug, row.ImageIndex, string(row.Status), row.R2Key, source, row.SourceURL, row.PendingURL,
+		row.Slug, row.ImageIndex, string(row.Status), row.R2Key, row.Source, row.SourceURL, row.PendingURL,
 		row.LicenseCode, row.LicenseShort, row.LicenseURL, row.AttributionAuthor, row.AttributionRequired,
 		row.MIME, row.Bytes, row.Width, row.Height, row.Attempts, row.LastError,
 	)

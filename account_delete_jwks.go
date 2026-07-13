@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // jwksCache fetches and caches the Supabase project's JWT signing public keys
@@ -25,6 +27,8 @@ type jwksCache struct {
 	url        string // SUPABASE_URL (no trailing slash)
 	httpClient *http.Client
 	minRefetch time.Duration // floor between network refetches (forged-kid flood guard)
+
+	sf singleflight.Group // coalesces concurrent refreshes into one upstream fetch
 
 	mu        sync.Mutex
 	keys      map[string]*ecdsa.PublicKey
@@ -43,29 +47,78 @@ func newJWKSCache(supabaseURL string) *jwksCache {
 // cache miss. Refetch is rate-limited by minRefetch so an attacker streaming
 // random kids cannot force unbounded upstream fetches. Returns an error when the
 // kid is unknown (the caller maps that to a 401).
+//
+// Concurrency + failure notes:
+//   - The network fetch runs WITHOUT c.mu held (the round-trip is up to 8 s;
+//     holding the mutex across it would stall every concurrent verify). The lock
+//     only guards the map + timestamp reads/writes.
+//   - Concurrent refreshes are coalesced via singleflight: a burst of unknown-kid
+//     requests at window-open triggers exactly ONE fetchJWKS, and every waiter
+//     shares its result. This both caps upstream fan-out (forged-kid flood guard)
+//     and, unlike a "reserve the window then 401 everyone else" scheme, still
+//     resolves a legitimately freshly-rotated kid that arrives mid-fetch.
+//   - lastFetch records the last fetch ATTEMPT (success OR failure), so a JWKS
+//     endpoint outage doesn't turn a forged-kid flood into one upstream call per
+//     request — at most one attempt per minRefetch window.
 func (c *jwksCache) keyForKID(ctx context.Context, kid string) (*ecdsa.PublicKey, error) {
 	if kid == "" {
 		return nil, errors.New("jwks: empty kid")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
+	c.mu.Lock()
 	if k, ok := c.keys[kid]; ok {
+		c.mu.Unlock()
 		return k, nil
 	}
-	// Cache miss: refetch unless we just did (balances key-rotation pickup
-	// against the forged-kid flood guard).
-	if c.keys != nil && time.Since(c.lastFetch) < c.minRefetch {
+	// Cache miss: refetch unless we attempted too recently (balances key-rotation
+	// pickup against the forged-kid / endpoint-outage flood guard). lastFetch is
+	// zero only before the very first attempt.
+	if !c.lastFetch.IsZero() && time.Since(c.lastFetch) < c.minRefetch {
+		c.mu.Unlock()
 		return nil, errors.New("jwks: unknown kid")
 	}
-	fetched, err := fetchJWKS(ctx, c.httpClient, c.url)
-	if err != nil {
-		return nil, err
-	}
-	c.keys = fetched
-	c.lastFetch = time.Now()
+	c.mu.Unlock()
+
+	// Only ONE goroutine per burst runs the fetch; the rest block here and share
+	// its (err) result. The shared work updates c.keys + c.lastFetch under the lock.
+	_, err, _ := c.sf.Do("refresh", func() (interface{}, error) {
+		// Re-check the window inside the flight: a just-completed refresh by a
+		// prior leader may have set lastFetch, in which case skip re-fetching.
+		c.mu.Lock()
+		if !c.lastFetch.IsZero() && time.Since(c.lastFetch) < c.minRefetch {
+			c.mu.Unlock()
+			return nil, nil
+		}
+		c.mu.Unlock()
+
+		// Detach the shared fetch from the leader's request context: this flight is
+		// shared by all coalesced waiters, so the leader's account-delete request
+		// being cancelled mid-fetch must not (a) fail the other waiters nor (b) arm
+		// the minRefetch floor from a cancelled attempt (which would suppress a
+		// legitimate key-rotation refetch until the window elapses). fetchJWKS
+		// re-imposes its own 8 s timeout, so dropping the deadline can't hang it.
+		fctx := context.WithoutCancel(ctx)
+		fetched, ferr := fetchJWKS(fctx, c.httpClient, c.url)
+
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.lastFetch = time.Now() // record the attempt (success or failure) for the floor
+		if ferr != nil {
+			return nil, ferr
+		}
+		c.keys = fetched
+		return nil, nil
+	})
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// The fetch (this goroutine's or a coalesced leader's) has run; the key is
+	// present iff the refreshed set contains it.
 	if k, ok := c.keys[kid]; ok {
 		return k, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 	return nil, errors.New("jwks: unknown kid")
 }

@@ -36,6 +36,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -44,6 +45,12 @@ import (
 	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
+
+// uuidPattern matches an RFC 4122 canonical UUID — the shape Supabase uses for
+// auth user ids (the `sub` claim). We reject anything else before running an
+// admin delete keyed by that value, so a validly-signed token with a malformed
+// subject can never drive a delete against an unexpected path segment.
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 const (
 	// bestEffortTimeout caps EACH best-effort phase (Apple revoke, Storage
@@ -57,8 +64,17 @@ const (
 	// hardDeleteTimeout bounds the load-bearing deletes (DeleteUserRows +
 	// deleteAuthUser) on their OWN fresh context, untouched by the best-effort
 	// phases. Generous enough for two sequential round-trips, capped so a hung
-	// DB/Admin API can't wedge the handler past the server's 35 s WriteTimeout.
-	hardDeleteTimeout = 15 * time.Second
+	// DB/Admin API can't wedge the handler past the server's WriteTimeout.
+	//
+	// Budgeted at 12 s (was 15 s) so the FULL worst-case chain fits under the
+	// server's WriteTimeout (35 s + inflightWait). The chain also includes the
+	// JWKS fetch in step 1, which the earlier accounting omitted: on a cache miss
+	// verifySupabaseToken can spend up to ~8 s fetching the project JWKS BEFORE
+	// any phase below runs. Worst case ≈ 8 (JWKS) + 10 (Apple) + 10 (Storage) +
+	// 12 (deletes) = 40 s, i.e. the 35 s base + the default 5 s inflightWait — and
+	// in practice a JWKS cache miss is rare and each best-effort phase trips at
+	// its own 10 s HTTP client timeout well before its context cap.
+	hardDeleteTimeout = 12 * time.Second
 )
 
 // accountDeleteRequest is the JSON body. The Authorization header carries the
@@ -139,7 +155,13 @@ func handleAccountDelete(vault *secrets.Vault, enrichDB *enrichment.DB) http.Han
 		}
 
 		// ---- 1. verify Supabase JWT -> userID (401 on any failure) ----
-		userID, err := verifySupabaseToken(r.Context(), bearerToken(r), jwks.keyForKID)
+		// Pin issuer + audience to this Supabase project's GoTrue endpoint: iss =
+		// {SUPABASE_URL}/auth/v1, aud = "authenticated" (the role GoTrue stamps on
+		// user access tokens). This rejects a validly-signed token minted for a
+		// DIFFERENT project/audience even if it shares a JWKS-resolvable kid.
+		userID, err := verifySupabaseToken(r.Context(), bearerToken(r), jwks.keyForKID,
+			jwt.WithIssuer(cfg.supabaseURL+"/auth/v1"),
+			jwt.WithAudience("authenticated"))
 		if err != nil {
 			// Do not echo the token or the parse error detail to the client; a
 			// generic code is enough and avoids leaking which check failed.
@@ -158,9 +180,12 @@ func handleAccountDelete(vault *secrets.Vault, enrichDB *enrichment.DB) http.Han
 		// best-effort phases have not consumed. Every context derives from
 		// Background (not r.Context()) because deletion must complete regardless
 		// of client disconnect; the per-phase caps keep a hung upstream/DB from
-		// wedging the handler past the server's 35 s WriteTimeout. Worst case is
-		// ~10 (Apple) + ~10 (Storage) + ~15 (deletes) = ~35 s of wall clock, and
-		// in practice each phase's own HTTP client timeout (10 s) trips first.
+		// wedging the handler past the server's WriteTimeout (35 s + inflightWait).
+		// Worst case ≈ 8 (JWKS cache-miss fetch in step 1) + 10 (Apple) +
+		// 10 (Storage) + 12 (deletes) = 40 s of wall clock — the 35 s base + the
+		// default 5 s inflightWait — and in practice a JWKS cache miss is rare and
+		// each phase's own HTTP client timeout (JWKS 8 s / Apple+Storage 10 s) trips
+		// first.
 
 		// ---- 2. revoke Apple token (BEST-EFFORT: log + continue) ----
 		if code := strings.TrimSpace(req.AppleAuthorizationCode); code != "" {
@@ -230,14 +255,26 @@ func bearerToken(r *http.Request) string {
 //     unless WithExpirationRequired is set; for an account-destroying endpoint
 //     we refuse any token that omits exp so a leaked token can never be
 //     non-expiring),
-//   - a present, non-empty `sub`.
+//   - a present, non-empty `sub` that is a well-formed UUID (rejects a validly
+//     signed token whose subject can't be a real Supabase auth user id),
+//   - plus any extraOpts the caller supplies — the handler passes
+//     jwt.WithIssuer + jwt.WithAudience to pin the token to this project's
+//     GoTrue endpoint / the "authenticated" role.
 //
 // Any failure returns an error (the handler maps all of them to a single 401
 // without leaking which check failed).
-func verifySupabaseToken(ctx context.Context, tokenStr string, keyForKID func(context.Context, string) (*ecdsa.PublicKey, error)) (string, error) {
+func verifySupabaseToken(ctx context.Context, tokenStr string, keyForKID func(context.Context, string) (*ecdsa.PublicKey, error), extraOpts ...jwt.ParserOption) (string, error) {
 	if tokenStr == "" {
 		return "", errors.New("missing bearer token")
 	}
+	opts := []jwt.ParserOption{
+		jwt.WithValidMethods([]string{"ES256"}),
+		// Reject tokens with no exp claim. jwt/v5 validates exp only when it is
+		// present by default; for account deletion we require it so a token can
+		// never be effectively non-expiring.
+		jwt.WithExpirationRequired(),
+	}
+	opts = append(opts, extraOpts...)
 	claims := jwt.MapClaims{}
 	_, err := jwt.ParseWithClaims(
 		tokenStr,
@@ -251,21 +288,21 @@ func verifySupabaseToken(ctx context.Context, tokenStr string, keyForKID func(co
 			kid, _ := t.Header["kid"].(string)
 			return keyForKID(ctx, kid)
 		},
-		jwt.WithValidMethods([]string{"ES256"}),
-		// Reject tokens with no exp claim. jwt/v5 validates exp only when it is
-		// present by default; for account deletion we require it so a token can
-		// never be effectively non-expiring.
-		jwt.WithExpirationRequired(),
+		opts...,
 	)
 	if err != nil {
-		return "", err // covers bad signature, expired, malformed, wrong alg, unknown kid
+		return "", err // covers bad signature, expired, malformed, wrong alg, unknown kid, bad iss/aud
 	}
 	sub, err := claims.GetSubject()
 	if err != nil {
 		return "", err
 	}
-	if strings.TrimSpace(sub) == "" {
+	sub = strings.TrimSpace(sub)
+	if sub == "" {
 		return "", errors.New("empty subject claim")
+	}
+	if !uuidPattern.MatchString(sub) {
+		return "", errors.New("subject claim is not a UUID")
 	}
 	return sub, nil
 }

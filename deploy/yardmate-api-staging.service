@@ -17,6 +17,10 @@ Environment=YARDMATE_API_ADDR=127.0.0.1:8081
 Environment=YARDMATE_API_DB_PATH=/var/lib/yardmate-api-staging/credentials.db
 Environment=YARDMATE_API_SECRETS_PATH=/etc/yardmate-api/secrets-staging.env
 Environment=YARDMATE_API_APP_ID=PMX32RG52M.com.chenyao.plantapp
+# Staging is a low-traffic verification box: cap in-flight uploads at 4 so peak
+# image buffering (4 × ≤8 MB) stays comfortably under the 512M MemoryMax below,
+# instead of the prod default of 30 (~480 MB peak) which would OOM-kill here.
+Environment=YARDMATE_API_INFLIGHT_MAX=4
 
 ExecStart=/usr/local/bin/yardmate-api-staging
 Restart=on-failure
@@ -40,6 +44,14 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictNamespaces=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0077
 ReadWritePaths=/var/lib/yardmate-api-staging
 
 # systemd creates/chowns the state dir (BoltDB home) before every start —
@@ -48,11 +60,10 @@ ReadWritePaths=/var/lib/yardmate-api-staging
 StateDirectory=yardmate-api-staging
 StateDirectoryMode=0750
 
-# Resource caps. The box is dedicated to YardMate (8 GB). MemoryMax is the
-# in-flight ceiling for /v1/identify + /v1/diagnose, which each buffer the
-# uploaded image (≤8 MB) in memory: 4 GB → a few hundred concurrent uploads
-# before the cgroup cap kicks in, while still capping so a flood can't OOM the
-# whole box (nginx + catalog-promote share it). Raised from 512M (2026-07-03).
+# Resource caps. Staging shares the box with prod + nginx + catalog-promote, so
+# it keeps a tight 512M MemoryMax and pairs it with YARDMATE_API_INFLIGHT_MAX=4
+# above (peak image buffering 4 × ≤8 MB ≈ 32 MB, well under the cap). Do NOT copy
+# prod's 4G here — this unit intentionally runs lean.
 LimitNOFILE=4096
 MemoryMax=512M
 

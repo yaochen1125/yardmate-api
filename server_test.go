@@ -302,13 +302,19 @@ func TestRequestBodySizeCap_Returns413(t *testing.T) {
 	}
 }
 
-func TestVendedKeysAllPresent(t *testing.T) {
-	// Sanity: every vended key resolves on a Vault populated with values.
+func TestVendedKeysEmpty(t *testing.T) {
+	// V1 security posture: /v1/app-secrets vends NOTHING. identify/diagnose/
+	// enrichment all run server-side, so no upstream API key ever reaches a
+	// client. This guard fails loudly if a key is re-added to vendedKeys —
+	// forcing that to be a deliberate, reviewed decision.
+	if len(vendedKeys) != 0 {
+		t.Fatalf("vendedKeys must be empty (no key leaves the server); got %v", vendedKeys)
+	}
+	// A populated Vault must still snapshot to nothing through the empty list.
 	v, _ := secrets.Parse(strings.NewReader(
 		"OPENAI_API_KEY=k1\nPLANT_ID_API_KEY=k2\n",
 	))
-	snap := v.Snapshot(vendedKeys)
-	if snap["openai_api_key"] != "k1" || snap["plant_id_api_key"] != "k2" {
-		t.Errorf("vended snapshot = %v", snap)
+	if snap := v.Snapshot(vendedKeys); len(snap) != 0 {
+		t.Errorf("vended snapshot must be empty, got %v", snap)
 	}
 }

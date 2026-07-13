@@ -94,7 +94,7 @@ func (c *PlantIDClient) Identify(ctx context.Context, image io.Reader, mime stri
 		// Network error, timeout, or context cancel — all treated as transient.
 		return nil, fmt.Errorf("%w: %v", ErrPlantIDUnavailable, err)
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 
 	switch {
 	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
@@ -163,7 +163,7 @@ func (c *PlantIDClient) Diagnose(ctx context.Context, image []byte, mime string)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrPlantIDUnavailable, err)
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 
 	switch {
 	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
@@ -183,4 +183,23 @@ func (c *PlantIDClient) Diagnose(ctx context.Context, image []byte, mime string)
 	default:
 		return nil, fmt.Errorf("%w: status %d", ErrPlantIDBadResponse, resp.StatusCode)
 	}
+}
+
+// drainMaxBytes caps how much of an unread response body drainAndClose will
+// consume, so a malicious / oversized body can't make the drain spin.
+const drainMaxBytes = 1 << 20 // 1 MiB
+
+// drainAndClose discards any unread portion of body (up to drainMaxBytes) before
+// closing it, so the underlying TCP connection can return to the keep-alive pool
+// instead of being torn down. Paths that return early on a non-2xx status, or
+// decode with json.Decoder (which stops at the closing '}' short of EOF), leave
+// bytes buffered; without draining, net/http abandons the connection and every
+// upstream call pays a fresh TCP+TLS handshake. Shared by the Plant.id,
+// Pl@ntNet and iNat clients (same package).
+func drainAndClose(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, drainMaxBytes))
+	_ = body.Close()
 }

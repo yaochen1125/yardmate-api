@@ -4,6 +4,8 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"log"
+	"sort"
 	"strings"
 )
 
@@ -217,15 +219,32 @@ func LoadContent() (*ContentIndex, error) {
 	if err := json.Unmarshal(diseasesRaw, &diseaseFile); err != nil {
 		return nil, fmt.Errorf("content: diseases: %w", err)
 	}
+	// Build the normalized-name -> id index first-write-wins over a SORTED id
+	// list, mirroring the plant-name indexes above. diseaseFile.Diseases is a
+	// Go map (randomized range), so a plain last-write-wins loop would let the
+	// surviving id on a normalized-name collision vary across process restarts —
+	// non-deterministic catalog resolution. Sorting the ids makes the winner
+	// stable; a collision keeps the lowest id and logs once.
 	dnam := make(map[string]string, len(diseaseFile.Diseases))
-	for id, dz := range diseaseFile.Diseases {
+	diseaseIDs := make([]string, 0, len(diseaseFile.Diseases))
+	for id := range diseaseFile.Diseases {
+		diseaseIDs = append(diseaseIDs, id)
+	}
+	sort.Strings(diseaseIDs)
+	for _, id := range diseaseIDs {
+		dz := diseaseFile.Diseases[id]
 		if dz == nil {
 			continue
 		}
 		key := normalizeDiseaseName(dz.Name)
-		if key != "" {
-			dnam[key] = id
+		if key == "" {
+			continue
 		}
+		if existing, ok := dnam[key]; ok {
+			log.Printf("WARN content: disease name collision key=%q keeping=%q dropping=%q", key, existing, id)
+			continue
+		}
+		dnam[key] = id
 	}
 
 	return &ContentIndex{
@@ -375,6 +394,10 @@ func (c *ContentIndex) AllDiseaseNames() []DiseaseNameRef {
 		}
 		out = append(out, DiseaseNameRef{ID: id, Name: d.Name, Description: diseaseRefHint(d)})
 	}
+	// Stable order by id: this list becomes an LLM prompt prefix, so a random
+	// map-range order would break OpenAI's prompt caching and make the prompt
+	// non-deterministic across calls.
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
@@ -593,6 +616,8 @@ func (c *ContentIndex) AllStepRefs() []DiseaseNameRef {
 		}
 		out = append(out, DiseaseNameRef{ID: id, Name: s.Title})
 	}
+	// Stable order by id — feeds an LLM prompt (see AllDiseaseNames).
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
@@ -608,6 +633,8 @@ func (c *ContentIndex) AllRemedyRefs() []DiseaseNameRef {
 		}
 		out = append(out, DiseaseNameRef{ID: id, Name: r.Title})
 	}
+	// Stable order by id — feeds an LLM prompt (see AllDiseaseNames).
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 

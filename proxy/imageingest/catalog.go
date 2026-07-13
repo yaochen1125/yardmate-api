@@ -50,6 +50,39 @@ func catalogIndexKey(catalogID string) string {
 // stay immutable (imageCacheControl) — a slot's bytes never change once chosen.
 const externalIndexCacheControl = "public, max-age=3600"
 
+// catalogMaxIngestAttempts bounds how many times a species whose ingest keeps
+// falling short (with a retryable failure) will re-run the full iNat→Wikimedia
+// cascade + re-PUT images before we give up and commit whatever partial gallery
+// exists (finding #7). Without a cap, a deterministically-failing species re-runs
+// the entire cascade on EVERY detail-page mount forever, burning third-party API
+// quota + R2 PUTs.
+const catalogMaxIngestAttempts = 3
+
+// catalogRetryMarkerKey is a tiny HEAD-checkable marker recording one failed,
+// not-yet-committed ingest attempt (finding #7). Sequential markers (.retry-1,
+// .retry-2, …) let us count attempts with HEAD only — no Get on ObjectStore, no
+// DB — so the zero-DB catalog path stays zero-DB. They live under external/ so a
+// folder-level cleanup removes them with the gallery.
+func catalogRetryMarkerKey(catalogID string, attempt int) string {
+	return fmt.Sprintf("plant_images/%s/external/.retry-%d", catalogID, attempt)
+}
+
+// catalogPriorAttempts counts prior failed-and-not-committed attempts by probing
+// the sequential retry markers with HEAD only (0..cap). It stops at the first
+// absent marker or a HEAD error (under-counting on a transient HEAD blip only
+// delays the cap, never re-runs beyond it).
+func (in *Ingestor) catalogPriorAttempts(ctx context.Context, catalogID string) int {
+	n := 0
+	for k := 1; k <= catalogMaxIngestAttempts; k++ {
+		exists, err := in.store.Exists(ctx, catalogRetryMarkerKey(catalogID, k))
+		if err != nil || !exists {
+			break
+		}
+		n = k
+	}
+	return n
+}
+
 // ExternalIndex is the per-species manifest iOS reads from
 // plant_images/{AAA}/external/index.json to learn how many supplementary images
 // exist and their attribution — the in-catalog analogue of the out-of-catalog
@@ -243,13 +276,42 @@ func (in *Ingestor) IngestCatalogSpecies(ctx context.Context, catalogID string, 
 	// images are harmless contiguous orphans, overwritten on the next full run. An
 	// empty gallery never writes (also retries).
 	committable := len(out.PerImage) >= n || (len(out.PerImage) > 0 && !sawFailure)
-	if committable {
-		body, err := BuildExternalIndex(out.PerImage)
-		if err != nil {
-			return out, fmt.Errorf("imageingest catalog: marshal index %s: %w", catalogID, err)
+
+	// Attempt-cap the non-committable (retryable-shortfall) case so a
+	// deterministically-failing species can't re-run the full cascade + re-PUT
+	// forever (finding #7). Below the cap: record this attempt via a HEAD-checkable
+	// marker and DON'T commit (a later mount retries). At the cap: fall through and
+	// commit whatever partial (possibly empty) gallery we have, so the species
+	// stops re-running — the marker's job is to bound cost, not to lock in quality.
+	if !committable {
+		attempt := in.catalogPriorAttempts(ctx, catalogID) + 1
+		if err := in.store.Put(ctx, catalogRetryMarkerKey(catalogID, attempt), []byte("1"), "text/plain", externalIndexCacheControl); err != nil {
+			log.Printf("imageingest catalog retry-marker put err: id=%s attempt=%d err=%v", catalogID, attempt, err)
 		}
-		if err := in.store.Put(ctx, idxKey, body, "application/json", externalIndexCacheControl); err != nil {
-			return out, fmt.Errorf("imageingest catalog: put index %s: %w", catalogID, err)
+		if attempt < catalogMaxIngestAttempts {
+			return out, nil
+		}
+		log.Printf("imageingest catalog: attempt cap (%d) reached, committing partial gallery of %d image(s): id=%s",
+			catalogMaxIngestAttempts, len(out.PerImage), catalogID)
+	}
+
+	body, err := BuildExternalIndex(out.PerImage)
+	if err != nil {
+		return out, fmt.Errorf("imageingest catalog: marshal index %s: %w", catalogID, err)
+	}
+	if err := in.store.Put(ctx, idxKey, body, "application/json", externalIndexCacheControl); err != nil {
+		return out, fmt.Errorf("imageingest catalog: put index %s: %w", catalogID, err)
+	}
+
+	// A committed index.json ends this ingest cycle, so clear any retry markers
+	// left by earlier failed attempts. Otherwise a later FORCED re-ingest (index.json
+	// deleted to pick up newly-available photos) would count the stale .retry-N
+	// markers, compute attempt > cap on its very first failure, and give up with 0
+	// retries — the species could never recover its retry budget. Delete is
+	// idempotent (a missing marker is a no-op).
+	for k := 1; k <= catalogMaxIngestAttempts; k++ {
+		if err := in.store.Delete(ctx, catalogRetryMarkerKey(catalogID, k)); err != nil {
+			log.Printf("imageingest catalog retry-marker cleanup err: id=%s marker=%d err=%v", catalogID, k, err)
 		}
 	}
 

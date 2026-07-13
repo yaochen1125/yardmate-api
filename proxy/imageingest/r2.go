@@ -22,6 +22,11 @@ type ObjectStore interface {
 	// Put uploads body verbatim under key with the given Content-Type and
 	// Cache-Control (no re-encode — SPEC §2.6 / §7 D2).
 	Put(ctx context.Context, key string, body []byte, contentType, cacheControl string) error
+	// Delete removes the object at key (idempotent; a missing object is NOT an
+	// error). Used to compensate a ledger write that failed AFTER a successful Put
+	// so the "R2 object ⇔ ledger license row" invariant holds (SPEC §2.6 / finding
+	// #3).
+	Delete(ctx context.Context, key string) error
 }
 
 // R2Client wraps an aws-sdk-go-v2 S3 client pointed at Cloudflare R2.
@@ -107,4 +112,27 @@ func (c *R2Client) Put(ctx context.Context, key string, body []byte, contentType
 		return fmt.Errorf("imageingest/r2: put %q: %w", key, err)
 	}
 	return nil
+}
+
+// Delete removes the object at key. A missing object (404 NotFound / NoSuchKey) is
+// NOT an error — the delete is idempotent (S3/R2 DeleteObject also returns success
+// for an absent key) — because its caller uses it to restore the R2⇔ledger
+// invariant after a failed ledger write (SPEC §2.6 / finding #3), where the object
+// being already gone is the desired end state.
+func (c *R2Client) Delete(ctx context.Context, key string) error {
+	_, err := c.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
+	if err == nil {
+		return nil
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NotFound", "NoSuchKey":
+			return nil
+		}
+	}
+	return fmt.Errorf("imageingest/r2: delete %q: %w", key, err)
 }

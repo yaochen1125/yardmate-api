@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +14,14 @@ import (
 
 // adminTokenHeader is the header carrying the internal admin token (SPEC §2.1).
 const adminTokenHeader = "X-Ingest-Admin-Token"
+
+// slugPattern is the Slug() value domain: lowercase-alphanumeric groups joined by
+// single hyphens (no leading / trailing / doubled hyphen). The internal ?slug=
+// param is interpolated straight into R2 keys AND the ledger primary key, so an
+// unvalidated value could smuggle '/', '..', or ':' (path traversal / key
+// clobbering) — and a "catalog:..." value would collide with the
+// IngestCatalogSpecies single-flight key. Reject anything off-domain (finding #10).
+var slugPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 // internalRequestTimeout bounds a synchronous internal run (search + downloads
 // + uploads for one gallery, paced; generous headroom over the per-call 30s).
@@ -191,6 +200,12 @@ func HandleRun(svc *Service) http.HandlerFunc {
 
 		// Single-slug path (smoke-testing the slug↔R2 round-trip; forces a slug).
 		if slug := q.Get("slug"); slug != "" {
+			// Shape-validate before the value reaches R2 keys / the ledger PK
+			// (finding #10): only the Slug() value domain is accepted.
+			if !slugPattern.MatchString(slug) {
+				writeError(w, http.StatusBadRequest, "bad_request")
+				return
+			}
 			name := q.Get("name")
 			if name == "" {
 				writeError(w, http.StatusBadRequest, "bad_request")

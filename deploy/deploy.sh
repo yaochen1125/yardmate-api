@@ -50,9 +50,19 @@ fi
 for key in ATTEST_ALLOW_DEV OPENAI_API_KEY PLANT_ID_API_KEY SUPABASE_DB_URL \
            SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY \
            APPLE_TEAM_ID APPLE_KEY_ID APPLE_BUNDLE_ID; do
-    val=$(grep -E "^${key}=" "$SECRETS" | head -1 | cut -d= -f2-)
+    # `|| true` so a MISSING key (grep exit 1 under set -e + pipefail) flows to
+    # the die below with an accurate message, instead of the whole script
+    # aborting silently on the assignment.
+    val=$(grep -E "^${key}=" "$SECRETS" | head -1 | cut -d= -f2- || true)
     [[ -n "$val" ]] || die "missing or empty key '$key' in $SECRETS"
 done
+
+# PLANTNET_API_KEY is optional — identify degrades to Plant.id-only when absent
+# (main.go WARN-logs the downgrade). Not a hard requirement, but a missing key on
+# a fresh secrets file silently changes identify quality + Plant.id billing, so
+# warn loudly here rather than leaving it to be discovered in journalctl.
+plantnet_key=$(grep -E '^PLANTNET_API_KEY=' "$SECRETS" | head -1 | cut -d= -f2- || true)
+[[ -n "$plantnet_key" ]] || yellow "WARNING: PLANTNET_API_KEY absent — identify will run Plant.id-only (primary engine disabled). Intentional? See main.go engine selection."
 
 # Apple private key: exactly one of APPLE_PRIVATE_KEY (the .p8 PEM inline) or
 # APPLE_PRIVATE_KEY_PATH (path to the .p8 on the server) must be set. Both empty
@@ -91,9 +101,21 @@ yellow ">> installing on $HOST"
 ssh "$USER@$HOST" bash -se <<'REMOTE'
 set -euo pipefail
 
-# Save previous binary for one-step rollback.
+# Clean up staged /tmp files even if an install step fails mid-script, so plain
+# secrets never linger on the shared /tmp past this ssh session.
+trap 'shred -u /tmp/secrets.env.new 2>/dev/null || true; rm -f /tmp/yardmate-api.new /tmp/yardmate-api.service.new' EXIT
+
+# Save previous binary + secrets + unit for one-step rollback: if the failure
+# root cause is the new secrets or unit (not the binary), a binary-only .prev
+# can't recover.
 if [[ -f /usr/local/bin/yardmate-api ]]; then
     cp /usr/local/bin/yardmate-api /usr/local/bin/yardmate-api.prev
+fi
+if [[ -f /etc/yardmate-api/secrets.env ]]; then
+    cp -p /etc/yardmate-api/secrets.env /etc/yardmate-api/secrets.env.prev
+fi
+if [[ -f /etc/systemd/system/yardmate-api.service ]]; then
+    cp /etc/systemd/system/yardmate-api.service /etc/systemd/system/yardmate-api.service.prev
 fi
 
 install -o yardmate-api -g yardmate-api -m 0755 /tmp/yardmate-api.new /usr/local/bin/yardmate-api
@@ -101,27 +123,46 @@ install -d -o yardmate-api -g yardmate-api -m 0750 /etc/yardmate-api
 install -o yardmate-api -g yardmate-api -m 0600 /tmp/secrets.env.new /etc/yardmate-api/secrets.env
 install -o root -g root -m 0644 /tmp/yardmate-api.service.new /etc/systemd/system/yardmate-api.service
 
-shred -u /tmp/yardmate-api.new /tmp/secrets.env.new /tmp/yardmate-api.service.new
-
 systemctl daemon-reload
 systemctl enable yardmate-api
 systemctl restart yardmate-api
 REMOTE
 
-# --- 5. health check ---
-yellow ">> waiting up to 10 s for /healthz"
-for i in 1 2 3 4 5 6 7 8 9 10; do
+# --- 5. health check (auto-rollback on failure) ---
+# 30 s window: startup does content-index load + Supabase ping; 10 s was tight
+# enough to false-negative a slow-but-healthy boot and leave the new binary in
+# service while printing "aborted".
+yellow ">> waiting up to 30 s for /healthz"
+healthy=0
+for _ in $(seq 1 30); do
     if ssh "$USER@$HOST" "curl -sf http://127.0.0.1:8080/healthz" 2>/dev/null | grep -q '"ok"'; then
         green "/healthz OK"
+        healthy=1
         break
     fi
     sleep 1
-    if [[ $i -eq 10 ]]; then
-        red "/healthz never became healthy. Logs:"
-        ssh "$USER@$HOST" "journalctl -u yardmate-api -n 50 --no-pager" >&2 || true
-        die "deploy aborted; previous binary at /usr/local/bin/yardmate-api.prev for rollback"
-    fi
 done
+
+if [[ "$healthy" -ne 1 ]]; then
+    red "/healthz never became healthy. Logs:"
+    ssh "$USER@$HOST" "journalctl -u yardmate-api -n 50 --no-pager" >&2 || true
+    yellow ">> auto-rolling back to previous binary + unit + secrets"
+    ssh "$USER@$HOST" bash -se <<'ROLLBACK' || true
+set -uo pipefail
+[[ -f /usr/local/bin/yardmate-api.prev ]] && cp /usr/local/bin/yardmate-api.prev /usr/local/bin/yardmate-api
+[[ -f /etc/systemd/system/yardmate-api.service.prev ]] && cp /etc/systemd/system/yardmate-api.service.prev /etc/systemd/system/yardmate-api.service
+if [[ -f /etc/yardmate-api/secrets.env.prev ]]; then
+    cp -p /etc/yardmate-api/secrets.env.prev /etc/yardmate-api/secrets.env
+fi
+systemctl daemon-reload
+systemctl restart yardmate-api
+ROLLBACK
+    sleep 2
+    if ssh "$USER@$HOST" "curl -sf http://127.0.0.1:8080/healthz" 2>/dev/null | grep -q '"ok"'; then
+        die "deploy FAILED — auto-rolled back to previous version; service healthy on old binary."
+    fi
+    die "deploy FAILED and rollback health-check also failed — MANUAL INTERVENTION NEEDED. Check journalctl on $HOST."
+fi
 
 # --- 6. effective config eyeball check ---
 banner "EFFECTIVE CONFIG ON $HOST"

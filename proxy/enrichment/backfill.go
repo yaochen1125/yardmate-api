@@ -77,8 +77,26 @@ func (b *Backfiller) Enqueue(job BackfillJob) {
 }
 
 func (b *Backfiller) worker() {
+	// A worker runs for the process lifetime; an unrecovered panic in this
+	// goroutine would crash the whole single-instance server. Recover at the top
+	// (last resort — the worker then exits, shrinking the pool but keeping the
+	// process alive) AND per-job below so a single poison job never kills the
+	// worker.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("enrichment backfill: worker panic recovered (worker exiting): %v", r)
+		}
+	}()
 	for job := range b.jobs {
-		b.run(job)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("enrichment backfill: job panic recovered sciName=%q sourceLang=%s: %v",
+						job.ScientificName, job.SourceLang, r)
+				}
+			}()
+			b.run(job)
+		}()
 	}
 }
 
