@@ -53,7 +53,7 @@ For each key, store `{count, resetAt}`. On `Allow(key, now)`:
 Chose fixed-window over token-bucket / sliding-window because:
 
 - Boring is good — one map + one mutex + one int.
-- The "burst at window boundary" classic fixed-window flaw is acceptable at YardMate scale (a worst-case 2× limit burst over a 2-second slice doesn't matter when limits are 100/h or 50/day).
+- The "burst at window boundary" classic fixed-window flaw is acceptable at YardMate scale (a worst-case 2× limit burst over a 2-second slice doesn't matter when limits are 300/h or 50/day).
 - Memory cost is one entry per active key, bounded by `Sweep`.
 
 ## 3. Production policy (V1 defaults)
@@ -62,7 +62,7 @@ Chose fixed-window over token-bucket / sliding-window because:
 |---|---|---|---|
 | Per-IP | 600 | 1 hour | NAT-friendly + gates ALL /v1 incl. the cheap App-Attest/secrets handshake (one key fetch = several handshake reqs). 100 starved identify in prod: ~90 handshake reqs/hr from one device 429'd identify after ~3 photos. The expensive upstream calls stay bounded by per-device (below) regardless, so 600 doesn't widen the cost/abuse surface; it's a per-egress-IP ceiling for many-real-users-behind-NAT + handshake overhead. |
 | Per-keyID | 50 | 24 hours | iOS clients cache vended secrets in memory; a typical user issues 1–10 fetches/day. 50 leaves headroom for cold starts, app reinstalls, and the occasional client bug, while still rate-limiting abuse from a leaked private key. |
-| Per-device | 100 | 1 hour | Applied on the proxy endpoint group (`/v1/identify`, `/v1/diagnose`). The real cap on expensive upstream calls — a single install hitting 100/h is already abusive. Combined with per-IP, this defends against IP-rotation-but-reused-install attacks. |
+| Per-device | 300 | 1 hour | Applied on the proxy endpoint group (`/v1/identify`, `/v1/diagnose`, `/v1/plants/enrichment`, `/v1/plants/imageingest`, `/v1/plants/catalog-images`, `/v1/account/delete`). The real cap on expensive upstream calls. 100 starved a legitimate nursery walk in prod (2026-07-12): every identify of an out-of-catalog plant also fires enrichment + imageingest + catalog-images into the SAME bucket, so effective cost ≈ 2× per identify — 55 identifies + 45 companion calls tripped 100/h. 300 = heavy real use (~100 identifies/h × 2 companion multiplier) + 50% headroom; upstream spend stays bounded by the global 5000/h gate. Combined with per-IP, this defends against IP-rotation-but-reused-install attacks. |
 
 All three numbers are env-overridable for staging vs production:
 
@@ -71,7 +71,7 @@ YARDMATE_API_RL_IP_LIMIT          (default 600)
 YARDMATE_API_RL_IP_WINDOW         (default 1h)
 YARDMATE_API_RL_KEYID_LIMIT       (default 50)
 YARDMATE_API_RL_KEYID_WINDOW      (default 24h)
-YARDMATE_API_RL_DEVICE_LIMIT      (default 100)
+YARDMATE_API_RL_DEVICE_LIMIT      (default 300)
 YARDMATE_API_RL_DEVICE_WINDOW     (default 1h)
 ```
 

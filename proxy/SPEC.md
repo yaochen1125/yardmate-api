@@ -349,8 +349,8 @@ Both layers are applied as chi middleware in `server.go`:
 
 | Layer | Scope | Key | Default | Env override | Error code |
 |---|---|---|---|---|---|
-| Per-IP | All `/v1/*` routes | client IP (chi `middleware.RealIP`) | 100 / hour | `YARDMATE_API_RL_IP_LIMIT` / `_WINDOW` | `rate_limit_ip` |
-| Per-device | Proxy endpoint group only (`/v1/identify`, `/v1/diagnose`) | `X-Device-Install-Id` UUID | 100 / hour | `YARDMATE_API_RL_DEVICE_LIMIT` / `_WINDOW` | `rate_limit_device` |
+| Per-IP | All `/v1/*` routes | client IP (chi `middleware.RealIP`) | 600 / hour | `YARDMATE_API_RL_IP_LIMIT` / `_WINDOW` | `rate_limit_ip` |
+| Per-device | Proxy endpoint group only (`/v1/identify`, `/v1/diagnose`) | `X-Device-Install-Id` UUID | 300 / hour | `YARDMATE_API_RL_DEVICE_LIMIT` / `_WINDOW` | `rate_limit_device` |
 
 Both return 429 with `Retry-After` header on exhaustion. The two layers compose multiplicatively against the IP-rotation-but-reused-device attack: an attacker who rotates outbound IPs (defeating per-IP) still gets blocked once their install hits the per-device bucket.
 
