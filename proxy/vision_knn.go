@@ -28,6 +28,14 @@ type VisionKNNClient struct {
 
 const defaultVisionKNNEndpoint = "http://127.0.0.1:8099"
 
+// visionKNNWaitBudget bounds how long identify's 7a-4 block waits for the parallel
+// vision-kNN result once the engine decision is ready. The goroutine ran
+// concurrently with the whole cascade, so a healthy local service is normally
+// already done here; this cap keeps a slow/wedged service from adding its full
+// HTTP timeout to the user-visible response (the signal only boosts, so skipping
+// it is harmless). A var (not const) so tests can shrink it.
+var visionKNNWaitBudget = 1500 * time.Millisecond
+
 // NewVisionKNNClient builds a client. endpoint == "" falls back to the
 // same-host default. The 6 s hard cap keeps a hung microservice from eating
 // identify's wall-clock budget; the caller's ctx deadline bounds it further.

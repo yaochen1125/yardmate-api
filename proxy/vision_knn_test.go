@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestVisionKNNAgreesWithDecision(t *testing.T) {
@@ -220,5 +221,74 @@ func TestRerankSchemaPlantNeutralForCultivar(t *testing.T) {
 	}
 	if !bytes.Contains(gotBody, []byte(`"rose_cultivar_rerank"`)) {
 		t.Errorf("RerankRose must still send the rose_cultivar_rerank schema")
+	}
+}
+
+// TestHandleIdentify_VisionKNN_SlowServiceSkipped guards Codex #100: a slow/wedged
+// kNN service must NOT block the already-decided response — 7a-4 skips it after the
+// grace budget instead of waiting the full client timeout. Verified by wall-clock
+// (handler returns fast) and by the confidence matching the no-kNN baseline.
+func TestHandleIdentify_VisionKNN_SlowServiceSkipped(t *testing.T) {
+	orig := visionKNNWaitBudget
+	visionKNNWaitBudget = 50 * time.Millisecond
+	defer func() { visionKNNWaitBudget = orig }()
+
+	pnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, cannedPlantNetAbelia)
+	}))
+	defer pnSrv.Close()
+	pn := &PlantNetClient{APIKey: "k", Endpoint: pnSrv.URL, Lang: "en", NbResults: 10, HTTP: pnSrv.Client()}
+
+	content, err := LoadContent()
+	if err != nil {
+		t.Fatalf("LoadContent: %v", err)
+	}
+
+	doReq := func(knn *VisionKNNClient) (IdentifyResult, time.Duration) {
+		h := HandleIdentify(pn, nil, content, nil, nil, knn, false, false, false, false, nil)
+		var buf bytes.Buffer
+		w := multipart.NewWriter(&buf)
+		fw, _ := w.CreateFormFile("image", "a.jpg")
+		_, _ = fw.Write(jpegMagic)
+		_ = w.WriteField("organ", "flower")
+		_ = w.Close()
+		req := httptest.NewRequest(http.MethodPost, "/v1/identify", &buf)
+		req.Header.Set("Content-Type", w.FormDataContentType())
+		req.Header.Set("X-Device-Install-Id", testUUID)
+		req.Header.Set("X-App-Version", "1.1.1")
+		rec := httptest.NewRecorder()
+		start := time.Now()
+		h.ServeHTTP(rec, req)
+		elapsed := time.Since(start)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var out IdentifyResult
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return out, elapsed
+	}
+
+	// Baseline: no kNN at all.
+	base, _ := doReq(nil)
+	if len(base.Suggestions) == 0 || base.Suggestions[0].PlantID == nil {
+		t.Fatalf("baseline not in-catalog: %+v", base.Suggestions)
+	}
+	baseConf := base.Suggestions[0].Confidence
+
+	// Slow kNN (responds well after the 50ms grace budget) → must be skipped.
+	slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = io.WriteString(w, `{"candidates":[{"catalog_id":"`+*base.Suggestions[0].PlantID+`","vision_sim":0.99}],"nn_sim":0.99,"in_catalog":true,"in_catalog_confidence":0.9,"model":"t"}`)
+	}))
+	defer slowSrv.Close()
+
+	out, elapsed := doReq(NewVisionKNNClient(slowSrv.URL))
+	if elapsed > 250*time.Millisecond {
+		t.Errorf("handler blocked on slow kNN (%v); must skip after ~%v grace budget", elapsed, visionKNNWaitBudget)
+	}
+	if out.Suggestions[0].Confidence != baseConf {
+		t.Errorf("slow kNN should be skipped (no boost); conf %.4f != baseline %.4f", out.Suggestions[0].Confidence, baseConf)
 	}
 }

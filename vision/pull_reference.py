@@ -31,6 +31,15 @@ def resolve(q):
     return None
 
 def pull(taxon_id, outdir, per):
+    # 干净重拉(Codex #100): 清掉该 taxon 目录已有文件, 避免中断后重跑从 000.jpg
+    # 覆盖旧文件 / 残留孤儿。只有未在 manifest 记录的 taxon 才会进到这里(见 main),
+    # 故清空是安全的(不会误删已完成株的参考图)。
+    if os.path.isdir(outdir):
+        for f in os.listdir(outdir):
+            try:
+                os.remove(os.path.join(outdir, f))
+            except OSError:
+                pass
     os.makedirs(outdir, exist_ok=True)
     u = "https://api.inaturalist.org/v1/observations?" + urllib.parse.urlencode({
         "taxon_id": taxon_id, "photos": "true", "quality_grade": "research",
@@ -64,24 +73,30 @@ def main(idx_path, out_dir, per=40):
     done = skipped = zero = 0
     for pl in plants:
         cid, sci = pl["id"], pl["scientific_name"]
+        # Resume (Codex #100): manifest 是"已处理"真源 —— 处理过的株(含无 taxon /
+        # 零图)都记入并每株持久化,重跑直接跳过,不重拉、不覆盖。文件数是二级兜底
+        # (老 manifest 缺失但目录已够时仍跳)。
+        if cid in manifest:
+            skipped += 1; continue
         outdir = f"{out_dir}/{cid}"
-        have = len([f for f in os.listdir(outdir)]) if os.path.isdir(outdir) else 0
-        if have >= min(per, 15):  # 已够 → 跳(resumable)
+        have = len(os.listdir(outdir)) if os.path.isdir(outdir) else 0
+        if have >= min(per, 15):
             skipped += 1; continue
         q = species_query(sci)
         tx = resolve(q)
         if not tx:
             zero += 1; zero_log.write(f"{cid}\t{sci}\tNO_TAXON\n"); zero_log.flush()
-            manifest[cid] = {"sci": sci, "resolved": None, "n": 0}; continue
-        tid, tname, trank = tx
-        photos = pull(tid, outdir, per)
-        if len(photos) == 0:
-            zero += 1; zero_log.write(f"{cid}\t{sci}\t{tname}\tNO_PHOTOS\n"); zero_log.flush()
-        manifest[cid] = {"sci": sci, "resolved": {"id": tid, "name": tname, "rank": trank}, "n": len(photos)}
+            manifest[cid] = {"sci": sci, "resolved": None, "n": 0}
+        else:
+            tid, tname, trank = tx
+            photos = pull(tid, outdir, per)  # pull() 会先清目录, 干净重拉
+            if len(photos) == 0:
+                zero += 1; zero_log.write(f"{cid}\t{sci}\t{tname}\tNO_PHOTOS\n"); zero_log.flush()
+            manifest[cid] = {"sci": sci, "resolved": {"id": tid, "name": tname, "rank": trank}, "n": len(photos)}
         done += 1
+        json.dump(manifest, open(manifest_path, "w"), ensure_ascii=False, indent=2)  # 每株持久化 → 断点最多丢 1 株
         if done % 20 == 0:
-            json.dump(manifest, open(manifest_path, "w"), ensure_ascii=False, indent=2)
-            print(f"progress: done={done} skipped={skipped} zero={zero} ({cid} {tname}:{len(photos)})")
+            print(f"progress: done={done} skipped={skipped} zero={zero} (last {cid})")
     json.dump(manifest, open(manifest_path, "w"), ensure_ascii=False, indent=2)
     print(f"DONE done={done} skipped={skipped} zero_coverage={zero} total={len(plants)}")
 
