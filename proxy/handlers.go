@@ -807,7 +807,15 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     (plant_id / scientific_name untouched). GPT missing / errored /
 		//     disagreeing → no-op (original behavior). Placed after the cultivar
 		//     reranks so it reflects the final chosen row.
-		if agreementBoostEnabled && !unknownSentinel && gptErr == nil && gptSug != nil &&
+		//     Codex #98: SKIP when the chosen row ITSELF came from the GPT arbiter
+		//     (engine "ai-catalog-override" / "ai-catalog-recovery" / "ai-raw-oob",
+		//     all "ai-"-prefixed). Comparing a GPT-sourced result back to the same
+		//     gptSug is circular self-agreement, not independent corroboration — it
+		//     would inflate a low-confidence ai-catalog-recovery straight to the
+		//     boost floor, defeating the recovery threshold. Only engine-sourced
+		//     (Pl@ntNet / Plant.id) in-catalog hits get the boost.
+		if agreementBoostEnabled && !unknownSentinel && !strings.HasPrefix(engine, "ai-") &&
+			gptErr == nil && gptSug != nil &&
 			len(result.Suggestions) > 0 && result.Suggestions[0].PlantID != nil {
 			s0 := &result.Suggestions[0]
 			engKey := speciesKey(s0.ScientificName)
@@ -823,12 +831,16 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		// 7a-4. L1 vision-kNN corroboration — VISION_KNN_ENABLED. The parallel
 		//     catalog-native nearest-neighbour pass (real-photo reference index)
 		//     ran for every identify. v1 is deliberately CONSERVATIVE (P0: a new,
-		//     uncalibrated signal): it ACTS only to RAISE confidence when vision
+		//     uncalibrated signal): it ACTS only to RAISE confidence — via the
+		//     GENTLE visionKNNBoostedConfidence (a capped partial nudge toward the
+		//     visual similarity, NOT the GPT boost's 0.90 floor) — when vision
 		//     independently agrees with the chosen in-catalog row (never lowers,
-		//     never changes the plant). Every other outcome — disagreement inside
-		//     the catalog, or an out-of-catalog verdict against an in-catalog
-		//     decision — is LOGGED ONLY, to gather staging data before we let it
-		//     override. Fail-open: nil client / error / timeout → no-op.
+		//     never changes the plant). Unlike 7a-3 this signal IS independent of
+		//     the GPT arbiter, so it may corroborate a GPT-sourced recovery too, but
+		//     only gently. Every other outcome — disagreement inside the catalog, or
+		//     an out-of-catalog verdict against an in-catalog decision — is LOGGED
+		//     ONLY, to gather staging data before we let it override. Fail-open:
+		//     nil client / error / timeout → no-op.
 		if visionKNN != nil && knnCh != nil && !unknownSentinel && len(result.Suggestions) > 0 {
 			kr := <-knnCh
 			if kr.err != nil || kr.resp == nil {
@@ -847,9 +859,9 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				log.Printf("identify vision-knn: deviceID=%s decidedId=%s knnTopId=%s knnTopSim=%.3f inCatalog=%v nnSim=%.3f agrees=%v",
 					deviceID, decidedID, knnTopID, knnTopSim, kr.resp.InCatalog, kr.resp.NNSim, agrees)
 				if agrees {
-					if boosted := boostedConfidence(s0.Confidence, kr.resp.NNSim); boosted > s0.Confidence {
+					if boosted := visionKNNBoostedConfidence(s0.Confidence, knnTopSim); boosted > s0.Confidence {
 						log.Printf("identify vision-knn boost: deviceID=%s plantId=%s conf=%.2f knnSim=%.2f boostedConf=%.2f",
-							deviceID, *s0.PlantID, s0.Confidence, kr.resp.NNSim, boosted)
+							deviceID, *s0.PlantID, s0.Confidence, knnTopSim, boosted)
 						s0.Confidence = boosted
 					}
 				}

@@ -113,3 +113,29 @@ func visionKNNAgreesWithDecision(s0 *Suggestion, resp *VisionKNNResponse) bool {
 	}
 	return resp.Candidates[0].CatalogID == *s0.PlantID
 }
+
+// visionKNNBoostCap caps the gentle vision-kNN confidence boost. Deliberately
+// below the GPT agreement boost's 0.90 floor / 0.99 cap: this signal is new and
+// uncalibrated (P0 low-strength start), so it only NUDGES, never snaps to a floor.
+const visionKNNBoostCap = 0.90
+
+// visionKNNBoostedConfidence returns a GENTLE, raise-only confidence bump when
+// the independent vision-kNN corroborates the in-catalog decision. Unlike the
+// calibrated GPT boost (boostedConfidence, which snaps up to a 0.90 floor), this
+// moves only a FRACTION of the way from the current confidence toward the visual
+// similarity and caps at visionKNNBoostCap — so a weak visual agreement cannot
+// inflate a shaky decision to near-certain. Never returns below cur. Pure (unit-
+// tested) so staging can recalibrate the fraction/cap without touching the handler.
+func visionKNNBoostedConfidence(cur, knnSim float64) float64 {
+	if knnSim <= cur {
+		return cur
+	}
+	boosted := cur + 0.4*(knnSim-cur)
+	if boosted > visionKNNBoostCap {
+		boosted = visionKNNBoostCap
+	}
+	if boosted < cur {
+		boosted = cur
+	}
+	return boosted
+}
