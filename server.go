@@ -80,6 +80,12 @@ func newServer(
 	if vault.GetBool("VISION_KNN_ENABLED", false) {
 		visionKNN = proxy.NewVisionKNNClient(vault.Get("VISION_KNN_ENDPOINT"))
 	}
+	// Geographic prior — forward the client's coarse GPS (latitude/longitude,
+	// body-only, never URL/log) to Plant.id's location prior. ON by default;
+	// GEO_PRIOR_ENABLED=false kill-switches it (coords are then parsed-and-dropped,
+	// never reaching any engine). The iOS toggle is opt-in, so most requests carry
+	// no coords regardless — this switch is the server-side circuit breaker.
+	geoPriorEnabled := vault.GetBool("GEO_PRIOR_ENABLED", true)
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(realIPFromNginx)
@@ -150,7 +156,7 @@ func newServer(
 					// (fallback); register when EITHER engine is present
 					// (SPEC §1.1 / §7).
 					if plantNet != nil || plantID != nil {
-						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, visionKNN, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, spendGate))
+						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, visionKNN, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, spendGate))
 					}
 					// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
 					// assessment, SPEC §1.5) — still requires plantID.

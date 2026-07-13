@@ -97,7 +97,7 @@ func TestPlantIDClient_Identify_Success(t *testing.T) {
 	defer srv.Close()
 
 	result, err := c.Identify(context.Background(),
-		bytes.NewReader([]byte("dummy image bytes")), "image/jpeg")
+		bytes.NewReader([]byte("dummy image bytes")), "image/jpeg", nil, nil)
 	if err != nil {
 		t.Fatalf("Identify: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestPlantIDClient_Identify_Unauthorized(t *testing.T) {
 		w.WriteHeader(http.StatusUnauthorized)
 	})
 	defer srv.Close()
-	_, err := c.Identify(context.Background(), strings.NewReader("x"), "image/jpeg")
+	_, err := c.Identify(context.Background(), strings.NewReader("x"), "image/jpeg", nil, nil)
 	if !errors.Is(err, ErrPlantIDUnauthorized) {
 		t.Errorf("err = %v, want ErrPlantIDUnauthorized", err)
 	}
@@ -155,7 +155,7 @@ func TestPlantIDClient_Identify_RateLimit(t *testing.T) {
 		w.WriteHeader(http.StatusTooManyRequests)
 	})
 	defer srv.Close()
-	_, err := c.Identify(context.Background(), strings.NewReader("x"), "image/jpeg")
+	_, err := c.Identify(context.Background(), strings.NewReader("x"), "image/jpeg", nil, nil)
 	if !errors.Is(err, ErrPlantIDRateLimit) {
 		t.Errorf("err = %v, want ErrPlantIDRateLimit", err)
 	}
@@ -166,7 +166,7 @@ func TestPlantIDClient_Identify_Unavailable_5xx(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 	defer srv.Close()
-	_, err := c.Identify(context.Background(), strings.NewReader("x"), "image/jpeg")
+	_, err := c.Identify(context.Background(), strings.NewReader("x"), "image/jpeg", nil, nil)
 	if !errors.Is(err, ErrPlantIDUnavailable) {
 		t.Errorf("err = %v, want ErrPlantIDUnavailable", err)
 	}
@@ -178,7 +178,7 @@ func TestPlantIDClient_Identify_ImageRejected_400(t *testing.T) {
 		_, _ = io.WriteString(w, `{"error":"unsupported_image"}`)
 	})
 	defer srv.Close()
-	_, err := c.Identify(context.Background(), strings.NewReader("x"), "image/jpeg")
+	_, err := c.Identify(context.Background(), strings.NewReader("x"), "image/jpeg", nil, nil)
 	if !errors.Is(err, ErrPlantIDImageRejected) {
 		t.Errorf("err = %v, want ErrPlantIDImageRejected", err)
 	}
@@ -193,7 +193,7 @@ func TestPlantIDClient_Identify_Accepts201Created(t *testing.T) {
 	defer srv.Close()
 
 	result, err := c.Identify(context.Background(),
-		bytes.NewReader([]byte("img")), "image/jpeg")
+		bytes.NewReader([]byte("img")), "image/jpeg", nil, nil)
 	if err != nil {
 		t.Fatalf("Identify on 201: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestPlantIDClient_Identify_BadResponseJSON(t *testing.T) {
 		_, _ = io.WriteString(w, `{not valid json`)
 	})
 	defer srv.Close()
-	_, err := c.Identify(context.Background(), strings.NewReader("x"), "image/jpeg")
+	_, err := c.Identify(context.Background(), strings.NewReader("x"), "image/jpeg", nil, nil)
 	if !errors.Is(err, ErrPlantIDBadResponse) {
 		t.Errorf("err = %v, want ErrPlantIDBadResponse", err)
 	}
