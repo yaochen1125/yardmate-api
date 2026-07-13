@@ -106,14 +106,19 @@ func ClassifyLicenseCode(rawCode, rawShort, rawURL, author string) License {
 
 	case hasToken(tokens, "cc") && hasToken(tokens, "by") && hasToken(tokens, "sa"):
 		return License{
-			Allowed: true, Family: FamilyCCBYSA, Code: code,
+			// orDefault the Code (finding #8): a Commons file that carries only a
+			// LicenseShortName (no machine code) classifies as BY-SA but would return
+			// Code="" — and recordIngested then computes attributionRequiredFamily("")
+			// = false, storing a required-attribution image as attribution_required=
+			// false. Backfill a canonical code so the family is preserved downstream.
+			Allowed: true, Family: FamilyCCBYSA, Code: orDefault(code, "cc-by-sa"),
 			ShortName: orDefault(short, "CC BY-SA"), URL: licURL, Author: author,
 			AttributionRequired: true,
 		}
 
 	case hasToken(tokens, "cc") && hasToken(tokens, "by"):
 		return License{
-			Allowed: true, Family: FamilyCCBY, Code: code,
+			Allowed: true, Family: FamilyCCBY, Code: orDefault(code, "cc-by"),
 			ShortName: orDefault(short, "CC BY"), URL: licURL, Author: author,
 			AttributionRequired: true,
 		}

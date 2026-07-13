@@ -40,6 +40,7 @@ func NewWikimediaClient(opts WikimediaOptions) *WikimediaClient {
 	if c.apiBase == "" {
 		c.apiBase = commonsAPIBase
 	}
+	c.secureDownloads(AllowedDownloadHosts) // arm the download SSRF guard (finding #9)
 	return c
 }
 

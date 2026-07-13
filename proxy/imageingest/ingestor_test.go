@@ -68,6 +68,7 @@ type mockStore struct {
 	existsErr error
 	puts      map[string][]byte
 	putErr    error
+	deleteErr error
 }
 
 func newMockStore() *mockStore {
@@ -90,6 +91,16 @@ func (m *mockStore) Put(_ context.Context, key string, body []byte, _, _ string)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.puts[key] = body
+	return nil
+}
+
+func (m *mockStore) Delete(_ context.Context, key string) error {
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.puts, key)
 	return nil
 }
 

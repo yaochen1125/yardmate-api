@@ -141,6 +141,13 @@ type Ingestor struct {
 	// (SPEC §4.2 / §9 #11 / #19). Process-local mutex map (single-instance OK).
 	flightMu sync.Mutex
 	inflight map[string]bool
+
+	// creditsMu serializes the credits.json read-modify-write across ALL slugs
+	// (finding #6). Single-flight only mutexes per-slug, so two different slugs can
+	// both reach rebuildCredits concurrently; without this lock the later Put can
+	// publish a manifest built from a snapshot that predates the other slug's rows,
+	// silently dropping credits. The critical section is IngestedFiles + Put.
+	creditsMu sync.Mutex
 }
 
 // NewIngestor builds an Ingestor. Defaults are applied to zero Config fields.
@@ -220,14 +227,27 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 	// 新槽位要排除这些，否则填 slot 5/6 会重复挑已在 slot 1-4 的照片（within-gather 去重
 	// 只在本次抓取内生效，不跨已存槽位 §2.5 #4）。
 	usedSourceURLs := map[string]bool{}
+	// wroteLedger tracks whether this trigger mutated the ledger at all (finding
+	// #11). A fully-satisfied gallery re-triggered on every detail-page mount must
+	// NOT keep recomputing the aggregate and republishing credits.json when nothing
+	// changed. Pass 2 (below) always writes one row per planned slot, so len(plan)>0
+	// implies a write; here in pass 1 the only write is recordSkippedExists, which
+	// fires iff an object is present but its ledger row is missing or not-yet-
+	// ingested (keep this condition in sync with recordSkippedExists).
+	wroteLedger := false
 	for i := 1; i <= n; i++ {
 		oc, needsFill, prior := in.planSlot(ctx, slug, i)
 		out.PerImage[i-1] = oc
 		if needsFill {
 			plan = append(plan, i)
 			priors[i] = prior
-		} else if prior != nil && prior.SourceURL != "" {
+			continue
+		}
+		if prior != nil && prior.SourceURL != "" {
 			usedSourceURLs[prior.SourceURL] = true
+		}
+		if oc.Status == ImgSkippedExists && (prior == nil || prior.Status != StatusIngested) {
+			wroteLedger = true
 		}
 	}
 
@@ -239,6 +259,7 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 	// was depleted by transient download failures (vs genuinely no acceptable
 	// image) so later empty slots stay retryable (§3 / §9 #13).
 	if len(plan) > 0 {
+		wroteLedger = true // every planned slot writes exactly one ledger row (pass 2)
 		// usedSourceURLs 传进 gather：在 n*2 提前 break 之前就排除已用图，凑不够才继续
 		// 问下一源（Codex #40 P1：gather 后再过滤会因 break 提前导致新槽位永久缺图）。
 		eligible, gated := in.gatherCandidates(ctx, req.ScientificName, len(plan), usedSourceURLs)
@@ -272,6 +293,15 @@ func (in *Ingestor) IngestSpecies(ctx context.Context, req IngestRequest) (Inges
 		}
 	}
 
+	// Nothing was written to the ledger this trigger (fully-satisfied gallery, every
+	// slot skipped via cache/HEAD): the aggregate and credits manifest are already
+	// current, so skip the recompute + full credits rebuild + their R2/DB traffic
+	// (finding #11). A no-op re-trigger on every detail-page mount thus costs one
+	// HEAD per slot and no writes.
+	if !wroteLedger {
+		return out, nil
+	}
+
 	// Recompute the species aggregate AFTER all file rows are written (SPEC §2.1
 	// step 5 / §9 #17 — never trust a separately-incremented counter; the species
 	// row already exists from the upsert above, so this never errors on missing).
@@ -299,8 +329,16 @@ func (in *Ingestor) planSlot(ctx context.Context, slug string, i int) (ImageOutc
 
 	prior, lerr := in.ledger.LookupFile(ctx, slug, i)
 	if lerr != nil {
-		log.Printf("imageingest lookup file err: slug=%s i=%d err=%v", slug, i, lerr)
-		prior = nil // transient lookup error shouldn't permanently block; treat as fresh
+		// Transient ledger READ failure (finding #1). Do NOT treat it as a fresh
+		// miss: a fresh-treat would go on to HEAD + potentially recordFailed a sparse
+		// row that overwrites this slot's existing r2_key/license/author. A read
+		// error tells us nothing about the row, so skip this slot as RETRYABLE —
+		// no HEAD, no ledger write — and let the next trigger re-read + self-heal.
+		// (nil,nil) below is a genuine miss and is handled as fresh; (nil,err) is not.
+		log.Printf("imageingest lookup file err (retryable skip): slug=%s i=%d err=%v", slug, i, lerr)
+		oc.Status = ImgSourceError
+		oc.Note = "ledger lookup failed"
+		return oc, false, nil
 	}
 	// Statuses representing NO R2 object short-circuit without a HEAD (it would
 	// always miss): a stable no_acceptable_image negative cache, or a gated
@@ -314,9 +352,14 @@ func (in *Ingestor) planSlot(ctx context.Context, slug string, i int) (ImageOutc
 	key := galleryKey(slug, i)
 	exists, err := in.store.Exists(ctx, key)
 	if err != nil {
+		// Transient HEAD failure (finding #2). Return RETRYABLE and — crucially — do
+		// NOT recordFailed: a sparse `failed` upsert here would (pre-fix) null out an
+		// existing row's r2_key/license/author, permanently dropping a live CC-BY/SA
+		// image from credits.json with no self-heal. Leave the ledger untouched; the
+		// next trigger re-HEADs.
+		log.Printf("imageingest head check err (retryable skip): slug=%s i=%d err=%v", slug, i, err)
 		oc.Status = ImgSourceError
 		oc.Note = "head check failed"
-		in.recordFailed(ctx, slug, i, oc, prior)
 		return oc, false, nil
 	}
 	if exists {
@@ -347,7 +390,13 @@ func (in *Ingestor) fillSlot(ctx context.Context, slug string, i int, prior *Fil
 		data, mime, derr := pick.dl.Download(ctx, pick.cand.DownloadURL)
 		if derr != nil {
 			// deriveLarge/thumb rendition may 404 — fall through to the next
-			// candidate before giving up (SPEC §2.5 #5; Slice 2 review item).
+			// candidate before giving up (SPEC §2.5 #5; Slice 2 review item). Mark
+			// the gallery as having seen a download failure HERE (finding #4): any
+			// single failed download — even in a slot that later SUCCEEDS via
+			// fall-through — means the eligible pool was consumed by a transient
+			// failure, so later empty slots must fall to retryable source_error, not
+			// a permanent no_acceptable_image negative cache (§3 / §9 #13).
+			*sawDownloadFail = true
 			log.Printf("imageingest download fail (fall-through): slug=%s i=%d url=%s err=%v",
 				slug, i, pick.cand.DownloadURL, derr)
 			continue
@@ -366,10 +415,9 @@ func (in *Ingestor) fillSlot(ctx context.Context, slug string, i int, prior *Fil
 
 	// Eligible candidates existed for this slot but every download failed →
 	// source_error (a transient/infra failure that should self-heal on retry,
-	// SPEC §3), distinct from "no acceptable license" below. Mark the gallery so
-	// later slots emptied by the same depletion are also treated as retryable.
+	// SPEC §3), distinct from "no acceptable license" below. (sawDownloadFail was
+	// already set in the download-failure branch above, finding #4.)
 	if *poolIdx > entryIdx {
-		*sawDownloadFail = true
 		oc.Status = ImgSourceError
 		oc.Note = "all downloads failed"
 		in.recordFailed(ctx, slug, i, oc, prior)
@@ -603,8 +651,15 @@ func (in *Ingestor) ingestedOutcome(i int, key string, pick scoredCandidate, mim
 	}
 }
 
+// recordIngested persists a freshly-uploaded slot. Unlike the other record*
+// helpers, the R2 object ALREADY EXISTS here, so a silently-dropped ledger write
+// would strand an un-credited orphan — an image served with NO credits.json entry
+// (attribution-compliance hole) that never self-heals (finding #3). So: retry the
+// upsert with bounded backoff; if it still fails, DELETE the just-Put object to
+// restore the "R2 object ⇔ ledger license row" invariant, letting the slot
+// re-ingest wholesale on the next trigger.
 func (in *Ingestor) recordIngested(ctx context.Context, slug string, oc ImageOutcome) {
-	in.upsertFile(ctx, FileRow{
+	row := FileRow{
 		Slug:                slug,
 		ImageIndex:          oc.Index,
 		Status:              StatusIngested,
@@ -620,15 +675,74 @@ func (in *Ingestor) recordIngested(ctx context.Context, slug string, oc ImageOut
 		Bytes:               oc.Bytes,
 		Width:               oc.Width,
 		Height:              oc.Height,
-	})
+	}
+	if err := in.upsertFileWithRetry(ctx, row); err != nil {
+		log.Printf("imageingest ingested ledger write failed after retries; deleting orphan R2 object to keep the R2⇔ledger invariant: slug=%s i=%d key=%s err=%v",
+			slug, oc.Index, oc.R2Key, err)
+		in.deleteOrphan(oc.R2Key)
+	}
+}
+
+// upsertFileWithRetry retries a ledger UpsertFile with bounded linear backoff.
+// Used ONLY for the ingested write (where the R2 object already exists so a lost
+// write must be either landed or compensated, never dropped). Returns the last
+// error after exhausting attempts, or ctx.Err() if the context ends mid-backoff.
+func (in *Ingestor) upsertFileWithRetry(ctx context.Context, row FileRow) error {
+	const attempts = 3
+	var err error
+	for a := 0; a < attempts; a++ {
+		if a > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(a) * 200 * time.Millisecond):
+			}
+		}
+		if err = in.ledger.UpsertFile(ctx, row); err == nil {
+			return nil
+		}
+		log.Printf("imageingest ingested upsert attempt %d/%d failed: slug=%s i=%d err=%v",
+			a+1, attempts, row.Slug, row.ImageIndex, err)
+	}
+	return err
+}
+
+// deleteOrphan removes an R2 object whose ledger row could not be written, so the
+// "R2 object ⇔ ledger license row" invariant holds (finding #3). Uses a fresh
+// short context so a cancelled/expired ingest ctx does not also block cleanup. A
+// delete failure leaves an orphan (logged) that the next full re-ingest overwrites.
+func (in *Ingestor) deleteOrphan(key string) {
+	if key == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := in.store.Delete(ctx, key); err != nil {
+		log.Printf("imageingest orphan delete failed (uncredited object remains): key=%s err=%v", key, err)
+	}
 }
 
 // recordSkippedExists handles a HEAD hit (R2 has the key). The skip carries no
-// license/author (we never searched), so a PRIOR attribution row is preserved
-// UNCHANGED — re-writing would wipe a live CC-BY/SA image's required credit. No
-// prior row (object present but ledger missing) → minimal ingested marker.
+// license/author (we never searched). Cases:
+//   - prior already `ingested`: no-op — its license row is intact, and the
+//     COALESCE upsert would only rewrite updated_at (re-writing risks nothing but
+//     is pointless), so leave it untouched.
+//   - prior present but NOT ingested (failed / deferred / no_acceptable): the
+//     object is live in R2 yet the ledger says otherwise, so it is missing from
+//     credits.json + image_count_filled. Flip status back to `ingested` and
+//     re-assert r2_key; UpsertFile's COALESCE keeps the existing license/author
+//     (and the CASE keeps attribution_required), so no prior credit is lost
+//     (findings #1/#2).
+//   - no prior (object present but ledger missing): minimal ingested marker.
 func (in *Ingestor) recordSkippedExists(ctx context.Context, slug string, i int, key string, prior *FileRow) {
 	if prior != nil {
+		if prior.Status == StatusIngested {
+			return
+		}
+		in.upsertFile(ctx, FileRow{
+			Slug: slug, ImageIndex: i, Status: StatusIngested, R2Key: key,
+			Attempts: prior.Attempts,
+		})
 		return
 	}
 	in.upsertFile(ctx, FileRow{
@@ -732,9 +846,27 @@ func sourceTier(source string) int {
 	return 1
 }
 
+// acceptedCandidateMIME mirrors the sources download-layer whitelist
+// ({jpeg,png,webp}) so candidate filtering and download acceptance agree (finding
+// #5). Kept here rather than imported to preserve the one-way imageingest→sources
+// edge (the value is small and stable).
+var acceptedCandidateMIME = map[string]bool{
+	"image/jpeg": true,
+	"image/png":  true,
+	"image/webp": true,
+}
+
+// isExcludedFormat drops a candidate whose format the download layer would reject
+// anyway. The old svg/gif/tiff BLACKLIST let Wikimedia PDF / DjVu / webm results
+// (image/* they are not) into the eligible pool, where they downloaded, failed
+// the {jpeg,png,webp} MIME whitelist, and burned a slot deterministically (finding
+// #5). Mirror the download whitelist instead: a candidate carrying a NON-EMPTY
+// advisory MIME outside {jpeg,png,webp} is excluded up front. An EMPTY MIME
+// (iNaturalist candidates carry none) is allowed through and re-sniffed on
+// download. The title-suffix blacklist stays as a belt-and-braces fallback for
+// mislabeled Commons titles.
 func isExcludedFormat(c sources.Candidate) bool {
-	switch strings.ToLower(c.MIME) {
-	case "image/svg+xml", "image/gif", "image/tiff":
+	if mime := strings.ToLower(strings.TrimSpace(c.MIME)); mime != "" && !acceptedCandidateMIME[mime] {
 		return true
 	}
 	t := strings.ToLower(c.Title)

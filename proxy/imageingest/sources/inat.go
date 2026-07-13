@@ -56,6 +56,7 @@ func NewINatClient(opts INatOptions) *INatClient {
 	if c.apiBase == "" {
 		c.apiBase = inatAPIBase
 	}
+	c.secureDownloads(AllowedDownloadHosts) // arm the download SSRF guard (finding #9)
 	return c
 }
 

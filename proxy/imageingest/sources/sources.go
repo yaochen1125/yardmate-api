@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -58,6 +59,42 @@ var allowedDownloadMIME = map[string]bool{
 	"image/webp": true,
 }
 
+// AllowedDownloadHosts is the SSRF allowlist for outbound image downloads (SPEC
+// §5 / finding #9). Download URLs come from THIRD-PARTY API responses (iNat
+// large_url, Commons thumburl), so a tampered/compromised upstream could return a
+// URL pointing at an internal service; without a host check Download would happily
+// fetch it (second-order SSRF). Only the exact CDN hosts the two sources serve
+// renditions from are permitted:
+//   - static.inaturalist.org                 iNat static photo renditions
+//   - inaturalist-open-data.s3.amazonaws.com iNat open-data S3 bucket renditions
+//   - upload.wikimedia.org                   Wikimedia Commons thumbs
+//
+// KEEP THIS IN SYNC with the hosts the sources actually download from — a new
+// rendition host must be added here or its downloads will be refused. The scheme
+// is additionally pinned to https. Re-checked on every redirect hop (secureDownloads).
+var AllowedDownloadHosts = map[string]bool{
+	"static.inaturalist.org":                 true,
+	"inaturalist-open-data.s3.amazonaws.com": true,
+	"upload.wikimedia.org":                   true,
+}
+
+// validateDownloadURL enforces the outbound-download SSRF guard: https scheme +
+// host in the allowlist. Applied to the initial download URL AND every redirect
+// hop (finding #9).
+func validateDownloadURL(u *url.URL, allowed map[string]bool) error {
+	if u == nil {
+		return fmt.Errorf("%w: nil url", ErrBadResponse)
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return fmt.Errorf("%w: non-https download scheme %q", ErrBadResponse, u.Scheme)
+	}
+	host := strings.ToLower(u.Hostname())
+	if !allowed[host] {
+		return fmt.Errorf("%w: download host %q not in allowlist", ErrBadResponse, host)
+	}
+	return nil
+}
+
 // Candidate is one image candidate from a source, carrying RAW (unclassified)
 // license signals. The parent imageingest package classifies these via
 // ClassifyLicenseCode (SPEC §2.4.3) before ranking (SPEC §2.5).
@@ -87,6 +124,37 @@ type fetcher struct {
 	httpClient *http.Client
 	userAgent  string
 	maxBytes   int64
+	// allowedHosts is the outbound-download SSRF allowlist (finding #9). When set
+	// (production clients call secureDownloads), Download enforces https + host∈set
+	// on the initial URL and every redirect hop. When nil (tests that inject their
+	// own httptest client), the check is skipped so loopback fixtures still work.
+	allowedHosts map[string]bool
+}
+
+// secureDownloads arms the SSRF guard: it records the download host allowlist and
+// installs a CheckRedirect that re-validates every redirect hop against the same
+// allowlist (a 30x to an internal host is the second-order SSRF, finding #9).
+// Production source constructors call this; tests do not, leaving downloads
+// unrestricted for httptest fixtures. Safe on the per-client default httpClient
+// created by newFetcher.
+func (f *fetcher) secureDownloads(hosts map[string]bool) {
+	f.allowedHosts = hosts
+	if f.httpClient == nil {
+		return
+	}
+	base := f.httpClient.CheckRedirect
+	f.httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if err := validateDownloadURL(req.URL, hosts); err != nil {
+			return err
+		}
+		if base != nil {
+			return base(req, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("imageingest/sources: stopped after 10 redirects")
+		}
+		return nil
+	}
 }
 
 func newFetcher(client *http.Client, userAgent string, maxBytes int64) fetcher {
@@ -106,11 +174,24 @@ func newFetcher(client *http.Client, userAgent string, maxBytes int64) fetcher {
 // Download fetches the bytes at rawURL (a source-returned rendition URL), capped
 // at maxBytes via io.LimitReader, then re-sniffs the MIME on the first 512 bytes
 // (the source-declared mime is advisory — SPEC §4.1). Returns bytes + sniffed
-// MIME. The URL always originates from a source API response, never from a
-// client (no SSRF surface — SPEC §5).
+// MIME. The URL originates from a THIRD-PARTY source API response, so a
+// compromised/tampered upstream is a second-order SSRF surface — bounded by the
+// https + host allowlist guard below (finding #9 / SPEC §5).
 func (f *fetcher) Download(ctx context.Context, rawURL string) ([]byte, string, error) {
 	if strings.TrimSpace(rawURL) == "" {
 		return nil, "", fmt.Errorf("%w: empty url", ErrBadResponse)
+	}
+	// SSRF guard (finding #9): when an allowlist is configured (production clients),
+	// the target must be https + a known source CDN host; redirects are re-checked
+	// via the client's CheckRedirect. Tests inject no allowlist → check skipped.
+	if len(f.allowedHosts) > 0 {
+		parsed, perr := url.Parse(rawURL)
+		if perr != nil {
+			return nil, "", fmt.Errorf("%w: parse download url: %v", ErrBadResponse, perr)
+		}
+		if err := validateDownloadURL(parsed, f.allowedHosts); err != nil {
+			return nil, "", err
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
