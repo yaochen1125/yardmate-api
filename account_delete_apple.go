@@ -41,6 +41,12 @@ const (
 	appleHTTPTimeout = 10 * time.Second
 )
 
+// appleHTTPClient is shared across the token-exchange + revoke round-trips.
+// Reused package-wide rather than constructed per request so the transport
+// pools connections instead of leaking one per call. Its short timeout keeps a
+// hung Apple endpoint from eating the request's deadline budget.
+var appleHTTPClient = &http.Client{Timeout: appleHTTPTimeout}
+
 // appleRevokeConfig holds the Sign in with Apple service-account parameters.
 // Resolved from the secrets vault by loadAccountDeleteSecrets.
 type appleRevokeConfig struct {
@@ -185,16 +191,15 @@ func revokeAppleRefreshToken(ctx context.Context, clientID, clientSecret, token 
 }
 
 // applePostForm POSTs application/x-www-form-urlencoded to an Apple endpoint and
-// returns the response body + status. A dedicated short-timeout client keeps a
-// hung Apple endpoint from eating the request's deadline budget.
+// returns the response body + status. It uses the shared short-timeout
+// appleHTTPClient so a hung Apple endpoint can't eat the request's deadline budget.
 func applePostForm(ctx context.Context, endpoint string, form url.Values) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	client := &http.Client{Timeout: appleHTTPTimeout}
-	resp, err := client.Do(req)
+	resp, err := appleHTTPClient.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}

@@ -78,11 +78,22 @@ func (b *Bucket) Size() int {
 	return len(b.cache)
 }
 
+// DefaultGlobalHourlyBudget is the total number of expensive upstream calls
+// (identify + diagnose) served per hour across ALL callers. It is a cost
+// ceiling, not a per-caller quota: it backstops PerDevice, which an attacker
+// can sidestep by minting a fresh X-Device-Install-Id UUID per request (each
+// new UUID = a fresh 100/h device bucket), leaving only PerIP — itself dodgeable
+// by IP rotation. 5000/h is comfortably above legitimate aggregate traffic while
+// capping the worst-case paid-upstream spend during a UUID/IP-rotation flood.
+const DefaultGlobalHourlyBudget = 5000
+
 // Limiter bundles the production buckets used by yardmate-api:
 //   - PerIP — applied at /v1 router scope via PerIPMiddleware
 //   - PerKeyID — checked inside /v1/app-secrets after assertion verification
 //   - PerDevice — applied at proxy-endpoint group (/v1/identify, /v1/diagnose)
 //     via PerDeviceMiddleware, keyed by X-Device-Install-Id
+//   - Global — single shared hourly budget for identify+diagnose via
+//     GlobalMiddleware; a UUID/IP-rotation cost backstop (see the const above)
 //
 // See SPEC §4 for application points and the rationale for layering per-IP +
 // per-device on the same proxy endpoints (defense-in-depth against IP-rotation
@@ -91,6 +102,7 @@ type Limiter struct {
 	PerIP     *Bucket
 	PerKeyID  *Bucket
 	PerDevice *Bucket
+	Global    *Bucket
 }
 
 // New constructs a Limiter with the three production buckets. The device
@@ -105,6 +117,8 @@ func New(
 		PerIP:     NewBucket(ipLimit, ipWindow),
 		PerKeyID:  NewBucket(keyIDLimit, keyIDWindow),
 		PerDevice: NewBucket(deviceLimit, deviceWindow),
+		// Fixed hourly cost ceiling shared across all callers (identify+diagnose).
+		Global: NewBucket(DefaultGlobalHourlyBudget, time.Hour),
 	}
 }
 
@@ -123,6 +137,7 @@ func (l *Limiter) StartSweeper(interval time.Duration) chan<- struct{} {
 				l.PerIP.Sweep(now)
 				l.PerKeyID.Sweep(now)
 				l.PerDevice.Sweep(now)
+				l.Global.Sweep(now)
 			}
 		}
 	}()
@@ -130,8 +145,9 @@ func (l *Limiter) StartSweeper(interval time.Duration) chan<- struct{} {
 }
 
 // PerIPMiddleware wraps a handler. The bucket key is the remote IP (port stripped).
-// Assumes chi's middleware.RealIP has already populated r.RemoteAddr with the
-// client IP (see SPEC §6.1).
+// Assumes the server's realIPFromNginx middleware has already populated
+// r.RemoteAddr with the client IP from nginx's trusted X-Real-IP header (see
+// SPEC §6.1); it falls back to the real TCP RemoteAddr when that header is absent.
 //
 // On limit: 429 with Retry-After header + JSON body {"error":"<errCode>"}.
 func PerIPMiddleware(b *Bucket, errCode string) func(http.Handler) http.Handler {
@@ -154,6 +170,33 @@ func extractIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// globalBudgetKey is the single constant key GlobalMiddleware counts against, so
+// every request shares one bucket (a total spend ceiling, not per-caller).
+const globalBudgetKey = "global"
+
+// GlobalMiddleware wraps a handler with a single shared hourly budget keyed by a
+// constant (globalBudgetKey). Unlike PerIP/PerDevice it does NOT partition by
+// caller — it is a total spend ceiling for the expensive upstream endpoints
+// (identify/diagnose). It backstops PerDevice, which an attacker sidesteps by
+// minting a fresh X-Device-Install-Id UUID per request (fresh device bucket
+// each time), leaving only the IP-rotatable PerIP limit. The global bucket caps
+// worst-case paid upstream calls per hour regardless of UUID/IP churn
+// (DefaultGlobalHourlyBudget).
+//
+// On limit: 429 with Retry-After header + JSON body {"error":"<errCode>"}.
+func GlobalMiddleware(b *Bucket, errCode string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			allowed, retry := b.Allow(globalBudgetKey, time.Now())
+			if !allowed {
+				Write429(w, retry, errCode)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // Write429 writes the standard 429 response shape: Retry-After header (seconds,

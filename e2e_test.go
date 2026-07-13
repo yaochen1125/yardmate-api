@@ -106,7 +106,11 @@ func TestE2E_HappyPath(t *testing.T) {
 	json.NewDecoder(rr.Body).Decode(&secChal)
 	secChallenge, _ := base64.StdEncoding.DecodeString(secChal.Challenge)
 
-	// 5-6. assertion + app-secrets vending
+	// 5-6. assertion + app-secrets. The full App Attest handshake still runs and
+	// must succeed (200), but V1 vends NOTHING: identify/diagnose/enrichment all
+	// run server-side, so no upstream key ever reaches a client (vendedKeys is
+	// empty). This asserts the handshake stays wired AND the response body carries
+	// zero secrets — the security contract, not the old vend-the-keys behavior.
 	assCBOR := issuer.MintAssertion(t, testkit.AssertionParams{
 		Counter:   1,
 		Challenge: secChallenge,
@@ -121,11 +125,8 @@ func TestE2E_HappyPath(t *testing.T) {
 	}
 	var sec map[string]string
 	json.NewDecoder(rr.Body).Decode(&sec)
-	if sec["openai_api_key"] != "e2e-openai" {
-		t.Errorf("openai = %q, want e2e-openai", sec["openai_api_key"])
-	}
-	if sec["plant_id_api_key"] != "e2e-plantid" {
-		t.Errorf("plantid = %q, want e2e-plantid", sec["plant_id_api_key"])
+	if len(sec) != 0 {
+		t.Errorf("app-secrets must vend nothing (no key leaves the server), got %v", sec)
 	}
 }
 

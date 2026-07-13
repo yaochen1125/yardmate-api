@@ -157,12 +157,18 @@ func consumeChallengeTx(tx *bbolt.Tx, challenge []byte, expectedPurpose string, 
 	if now.Sub(rec.IssuedAt) > ttl {
 		return ErrChallengeExpired
 	}
+	// Consume by flagging Consumed=true (NOT deleting): a replay then reads the
+	// row back and trips ErrChallengeReplay above — a distinct, actionable
+	// security signal (someone is re-submitting a spent challenge) that a plain
+	// delete would collapse into the generic ErrChallengeUnknown. Unbounded
+	// growth of consumed rows is prevented by the periodic SweepExpired backstop
+	// (wired up in main.go), which drops every row past TTL regardless of state.
 	rec.Consumed = true
-	updated, err := encodeGob(rec)
+	encoded, err := encodeGob(rec)
 	if err != nil {
 		return err
 	}
-	return b.Put(challenge, updated)
+	return b.Put(challenge, encoded)
 }
 
 // SweepExpired deletes challenges older than TTL. Safe to call from a

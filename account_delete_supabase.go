@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 )
@@ -48,6 +49,11 @@ const (
 	// supabaseHTTPTimeout caps each admin REST round-trip.
 	supabaseHTTPTimeout = 10 * time.Second
 )
+
+// supabaseHTTPClient is shared across all admin REST calls (list / delete /
+// auth-user delete). Reused package-wide rather than constructed per request so
+// the underlying transport pools connections instead of leaking one per call.
+var supabaseHTTPClient = &http.Client{Timeout: supabaseHTTPTimeout}
 
 // supabaseListItem is one entry from POST /storage/v1/object/list. A "folder"
 // (a synthetic prefix) has a null id; a real object has a non-null id.
@@ -90,7 +96,10 @@ func deleteUserStorageObjects(ctx context.Context, supabaseURL, serviceRoleKey, 
 		files, err := storageList(ctx, supabaseURL, serviceRoleKey, diaryImagesBucket, folder)
 		if err != nil {
 			// Don't abort the whole wipe on one folder; record + continue.
-			// (Best-effort overall, but maximise what we do remove.)
+			// (Best-effort overall, but maximise what we do remove.) Log the
+			// error text only — never the folder path / object keys (they embed
+			// the userID), per this file's no-sensitive-logging contract.
+			log.Printf("account/delete: storage sub-folder list failed (best-effort, continuing): %v", err)
 			continue
 		}
 		for _, f := range files {
@@ -207,8 +216,7 @@ func supabaseDo(ctx context.Context, method, endpoint, serviceRoleKey string, js
 	if jsonBody != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	client := &http.Client{Timeout: supabaseHTTPTimeout}
-	resp, err := client.Do(req)
+	resp, err := supabaseHTTPClient.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}

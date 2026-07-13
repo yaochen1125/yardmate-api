@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/yaochen1125/yardmate-api/attest"
@@ -45,6 +47,12 @@ const (
 	defaultDeviceLimit   = 100
 	defaultDeviceWindow  = time.Hour
 	defaultSweepInterval = time.Minute
+
+	// defaultChallengeSweepInterval is how often the attest challenge store is
+	// pruned of expired rows. Challenges are ~5 min-lived (attest.DefaultChallengeTTL)
+	// and the consume path deletes on success, so a 10-min sweep is ample to keep
+	// issued-but-never-consumed challenges from accumulating in BoltDB.
+	defaultChallengeSweepInterval = 10 * time.Minute
 
 	// In-flight concurrency bound for /v1/identify + /v1/diagnose (inflight/SPEC).
 	// maxInflight is the memory guard (each request buffers a ≤8 MB image);
@@ -116,6 +124,27 @@ func main() {
 	)
 	sweepStop := lim.StartSweeper(defaultSweepInterval)
 	defer close(sweepStop)
+
+	// Challenge-store sweeper: attest challenges persist in BoltDB until they
+	// expire, and nothing else prunes them (the consume path deletes on success —
+	// this backstops issued-but-never-consumed challenges). Mirrors
+	// lim.StartSweeper's lifecycle: a ticker goroutine stopped on shutdown.
+	challengeSweepStop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(defaultChallengeSweepInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-challengeSweepStop:
+				return
+			case now := <-t.C:
+				if _, err := store.SweepExpired(now, verifier.ChallengeTTL()); err != nil {
+					log.Printf("attest challenge sweep: %v", err)
+				}
+			}
+		}
+	}()
+	defer close(challengeSweepStop)
 
 	// Pl@ntNet proxy client — PRIMARY /v1/identify engine (SPEC §7).
 	// Key never leaves server. Disabled if PLANTNET_API_KEY is missing;
@@ -240,9 +269,36 @@ func main() {
 		WriteTimeout:      35*time.Second + inflightWait,
 		IdleTimeout:       60 * time.Second,
 	}
+	// Graceful shutdown: on SIGTERM/SIGINT stop accepting new connections and
+	// drain in-flight requests via httpSrv.Shutdown, THEN let main return so the
+	// deferred cleanup (store.Close, sweeper stops) actually runs — previously
+	// log.Fatal(ListenAndServe) called os.Exit and skipped every defer. systemd's
+	// default TimeoutStopSec (90 s) comfortably covers the 30 s drain deadline.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+
 	log.Printf("yardmate-api listening on %s", addr)
-	if err := httpSrv.ListenAndServe(); err != nil {
+	serveErr := make(chan error, 1)
+	go func() {
+		// ListenAndServe returns http.ErrServerClosed on graceful shutdown; only a
+		// real listen/serve failure is surfaced here.
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serveErr <- err
+		}
+	}()
+
+	select {
+	case err := <-serveErr:
+		// Listener never came up (e.g. addr in use) — nothing to drain; exit.
 		log.Fatal(err)
+	case <-ctx.Done():
+		stop() // restore default handling so a second signal force-kills
+		log.Printf("shutdown signal received; draining in-flight requests")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown: %v", err)
+		}
 	}
 }
 

@@ -61,7 +61,7 @@ func newServer(
 	roseEnabled := vault.GetBool("ROSE_RERANK_ENABLED", true)
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	r.Use(realIPFromNginx)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
@@ -115,6 +115,11 @@ func newServer(
 				// (text) / account-delete / signal below stay unbounded. A nil
 				// inflightLim (bound disabled / tests) is a pass-through.
 				r.Group(func(r chi.Router) {
+					// Global hourly spend ceiling for the two paid upstream
+					// endpoints — checked BEFORE acquiring an inflight slot so an
+					// over-budget request is shed cheaply. Backstops the per-device
+					// limit, which resets per fresh UUID (ratelimit.GlobalMiddleware).
+					r.Use(ratelimit.GlobalMiddleware(lim.Global, "rate_limit_global"))
 					r.Use(inflight.Middleware(inflightLim, "server_busy"))
 					// /v1/identify cascades Pl@ntNet (primary) → Plant.id
 					// (fallback); register when EITHER engine is present
@@ -192,4 +197,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// realIPFromNginx overwrites r.RemoteAddr from the single X-Real-IP header that
+// our nginx reverse proxy sets explicitly (proxy_set_header X-Real-IP
+// $remote_addr), so the per-IP rate limiter keys on the real client IP.
+//
+// TRUST BOUNDARY: we trust ONLY this one header, and only because nginx sits in
+// front of the localhost-bound server and rewrites it with the real TCP peer on
+// every request. We deliberately DO NOT honour True-Client-IP or
+// X-Forwarded-For — those are client-settable, and chi's middleware.RealIP would
+// trust the first XFF hop, letting an attacker forge/rotate source IPs to dodge
+// the per-IP rate limit. When the header is absent (a direct hit that bypassed
+// nginx, or a unit test), we leave the real TCP RemoteAddr untouched so
+// extractIP still keys on the actual connection.
+func realIPFromNginx(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ip := r.Header.Get("X-Real-IP"); ip != "" {
+			r.RemoteAddr = ip
+		}
+		next.ServeHTTP(w, r)
+	})
 }

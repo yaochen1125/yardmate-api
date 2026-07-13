@@ -43,27 +43,51 @@ func newJWKSCache(supabaseURL string) *jwksCache {
 // cache miss. Refetch is rate-limited by minRefetch so an attacker streaming
 // random kids cannot force unbounded upstream fetches. Returns an error when the
 // kid is unknown (the caller maps that to a 401).
+//
+// Concurrency + failure notes:
+//   - The network fetch runs WITHOUT the lock held: the round-trip is up to 8 s,
+//     and holding c.mu across it would serialize (and stall) every concurrent
+//     verify. The lock only guards the map + timestamp reads/writes.
+//   - lastFetch records the last fetch ATTEMPT (success OR failure), so a JWKS
+//     endpoint outage doesn't turn a forged-kid flood into one upstream call per
+//     request — at most one attempt per minRefetch window. (Previously only a
+//     success updated lastFetch, so while keys==nil after a failed fetch the
+//     floor never applied and every request re-hit the upstream.)
 func (c *jwksCache) keyForKID(ctx context.Context, kid string) (*ecdsa.PublicKey, error) {
 	if kid == "" {
 		return nil, errors.New("jwks: empty kid")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
+	c.mu.Lock()
 	if k, ok := c.keys[kid]; ok {
+		c.mu.Unlock()
 		return k, nil
 	}
-	// Cache miss: refetch unless we just did (balances key-rotation pickup
-	// against the forged-kid flood guard).
-	if c.keys != nil && time.Since(c.lastFetch) < c.minRefetch {
+	// Cache miss: refetch unless we attempted too recently (balances key-rotation
+	// pickup against the forged-kid / endpoint-outage flood guard). lastFetch is
+	// zero only before the very first attempt.
+	if !c.lastFetch.IsZero() && time.Since(c.lastFetch) < c.minRefetch {
+		c.mu.Unlock()
 		return nil, errors.New("jwks: unknown kid")
 	}
+	c.mu.Unlock()
+
+	// Fetch outside the lock. Concurrent goroutines may race to do the same
+	// fetch; that's acceptable (JWKS is tiny + idempotent) and the map write
+	// below is serialized.
 	fetched, err := fetchJWKS(ctx, c.httpClient, c.url)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastFetch = time.Now() // record the attempt (success or failure) for the floor
 	if err != nil {
+		// A concurrent fetch may have populated the key in the meantime.
+		if k, ok := c.keys[kid]; ok {
+			return k, nil
+		}
 		return nil, err
 	}
 	c.keys = fetched
-	c.lastFetch = time.Now()
 	if k, ok := c.keys[kid]; ok {
 		return k, nil
 	}
