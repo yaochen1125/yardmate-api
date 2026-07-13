@@ -193,7 +193,7 @@ type visionArbiterResult struct {
 // (ratelimit.GlobalGate).
 type SpendGate func(w http.ResponseWriter) bool
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled bool, spendGate SpendGate) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled bool, spendGate SpendGate) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -329,6 +329,20 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			go func() {
 				s, e := vision.IdentifyPlant(ctx, imgBytes, mime)
 				gptCh <- visionArbiterResult{sug: s, err: e}
+			}()
+		}
+
+		// --- Parallel L1 vision-kNN (catalog-native nearest-neighbour over a
+		//     real-photo reference index). Same concurrent shape as the GPT
+		//     arbiter so its CPU latency hides behind the engine cascade. nil
+		//     client (VISION_KNN_ENABLED off) → skipped. Buffered (cap 1) so the
+		//     goroutine never blocks if 7a-4 bails before reading it; fail-open. ---
+		var knnCh chan visionKNNResult
+		if visionKNN != nil {
+			knnCh = make(chan visionKNNResult, 1)
+			go func() {
+				resp, e := visionKNN.Identify(ctx, imgBytes, mime)
+				knnCh <- visionKNNResult{resp: resp, err: e}
 			}()
 		}
 
@@ -802,6 +816,42 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					log.Printf("identify agreement boost: deviceID=%s plantId=%s engineConf=%.2f gptConf=%.2f boostedConf=%.2f",
 						deviceID, *s0.PlantID, s0.Confidence, gptSug.Confidence, boosted)
 					s0.Confidence = boosted
+				}
+			}
+		}
+
+		// 7a-4. L1 vision-kNN corroboration — VISION_KNN_ENABLED. The parallel
+		//     catalog-native nearest-neighbour pass (real-photo reference index)
+		//     ran for every identify. v1 is deliberately CONSERVATIVE (P0: a new,
+		//     uncalibrated signal): it ACTS only to RAISE confidence when vision
+		//     independently agrees with the chosen in-catalog row (never lowers,
+		//     never changes the plant). Every other outcome — disagreement inside
+		//     the catalog, or an out-of-catalog verdict against an in-catalog
+		//     decision — is LOGGED ONLY, to gather staging data before we let it
+		//     override. Fail-open: nil client / error / timeout → no-op.
+		if visionKNN != nil && knnCh != nil && !unknownSentinel && len(result.Suggestions) > 0 {
+			kr := <-knnCh
+			if kr.err != nil || kr.resp == nil {
+				log.Printf("identify vision-knn failed: deviceID=%s err=%v", deviceID, kr.err)
+			} else {
+				s0 := &result.Suggestions[0]
+				knnTopID, knnTopSim := "", 0.0
+				if len(kr.resp.Candidates) > 0 {
+					knnTopID, knnTopSim = kr.resp.Candidates[0].CatalogID, kr.resp.Candidates[0].VisionSim
+				}
+				decidedID := ""
+				if s0.PlantID != nil {
+					decidedID = *s0.PlantID
+				}
+				agrees := visionKNNAgreesWithDecision(s0, kr.resp)
+				log.Printf("identify vision-knn: deviceID=%s decidedId=%s knnTopId=%s knnTopSim=%.3f inCatalog=%v nnSim=%.3f agrees=%v",
+					deviceID, decidedID, knnTopID, knnTopSim, kr.resp.InCatalog, kr.resp.NNSim, agrees)
+				if agrees {
+					if boosted := boostedConfidence(s0.Confidence, kr.resp.NNSim); boosted > s0.Confidence {
+						log.Printf("identify vision-knn boost: deviceID=%s plantId=%s conf=%.2f knnSim=%.2f boostedConf=%.2f",
+							deviceID, *s0.PlantID, s0.Confidence, kr.resp.NNSim, boosted)
+						s0.Confidence = boosted
+					}
 				}
 			}
 		}
