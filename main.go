@@ -126,8 +126,9 @@ func main() {
 	defer close(sweepStop)
 
 	// Challenge-store sweeper: attest challenges persist in BoltDB until they
-	// expire, and nothing else prunes them (the consume path deletes on success —
-	// this backstops issued-but-never-consumed challenges). Mirrors
+	// expire. Consume marks a challenge Consumed=true (kept, NOT deleted, so a
+	// replay still trips ErrChallengeReplay), so THIS sweeper is the only cleanup
+	// for both consumed and issued-but-never-consumed rows once past TTL. Mirrors
 	// lim.StartSweeper's lifecycle: a ticker goroutine stopped on shutdown.
 	challengeSweepStop := make(chan struct{})
 	go func() {

@@ -268,6 +268,16 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	// detail + source; overrideINat is applied per-caller AFTER Do so each caller
 	// gets its own (copied) iNat-refreshed English name.
 	v, err, _ := s.sf.Do(cacheKey, func() (any, error) {
+		// Detach the SHARED generation from any single caller's context. This
+		// flight is coalesced across all concurrent first-callers, so if the
+		// leader's client disconnects (or its deadline expires) mid-generation,
+		// the followers — whose own connections are still alive — must NOT inherit
+		// its context.Canceled and 5xx. WithoutCancel keeps values but drops the
+		// leader's cancellation + deadline; re-impose an independent timeout so the
+		// flight still can't hang. Shadows ctx so every downstream call below uses it.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), requestTimeout)
+		defer cancel()
+
 		// A leader that finished while this follower was blocked entering Do has
 		// already populated the cache (callers arriving AFTER the leader returns do
 		// NOT coalesce) — re-check before paying for generation.

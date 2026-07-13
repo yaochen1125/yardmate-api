@@ -303,6 +303,18 @@ func (in *Ingestor) IngestCatalogSpecies(ctx context.Context, catalogID string, 
 		return out, fmt.Errorf("imageingest catalog: put index %s: %w", catalogID, err)
 	}
 
+	// A committed index.json ends this ingest cycle, so clear any retry markers
+	// left by earlier failed attempts. Otherwise a later FORCED re-ingest (index.json
+	// deleted to pick up newly-available photos) would count the stale .retry-N
+	// markers, compute attempt > cap on its very first failure, and give up with 0
+	// retries — the species could never recover its retry budget. Delete is
+	// idempotent (a missing marker is a no-op).
+	for k := 1; k <= catalogMaxIngestAttempts; k++ {
+		if err := in.store.Delete(ctx, catalogRetryMarkerKey(catalogID, k)); err != nil {
+			log.Printf("imageingest catalog retry-marker cleanup err: id=%s marker=%d err=%v", catalogID, k, err)
+		}
+	}
+
 	return out, nil
 }
 

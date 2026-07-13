@@ -91,7 +91,14 @@ func (c *jwksCache) keyForKID(ctx context.Context, kid string) (*ecdsa.PublicKey
 		}
 		c.mu.Unlock()
 
-		fetched, ferr := fetchJWKS(ctx, c.httpClient, c.url)
+		// Detach the shared fetch from the leader's request context: this flight is
+		// shared by all coalesced waiters, so the leader's account-delete request
+		// being cancelled mid-fetch must not (a) fail the other waiters nor (b) arm
+		// the minRefetch floor from a cancelled attempt (which would suppress a
+		// legitimate key-rotation refetch until the window elapses). fetchJWKS
+		// re-imposes its own 8 s timeout, so dropping the deadline can't hang it.
+		fctx := context.WithoutCancel(ctx)
+		fetched, ferr := fetchJWKS(fctx, c.httpClient, c.url)
 
 		c.mu.Lock()
 		defer c.mu.Unlock()
