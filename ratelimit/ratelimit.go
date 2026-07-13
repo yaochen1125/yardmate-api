@@ -92,8 +92,9 @@ const DefaultGlobalHourlyBudget = 5000
 //   - PerKeyID — checked inside /v1/app-secrets after assertion verification
 //   - PerDevice — applied at proxy-endpoint group (/v1/identify, /v1/diagnose)
 //     via PerDeviceMiddleware, keyed by X-Device-Install-Id
-//   - Global — single shared hourly budget for identify+diagnose via
-//     GlobalMiddleware; a UUID/IP-rotation cost backstop (see the const above)
+//   - Global — single shared hourly budget for identify+diagnose via GlobalGate,
+//     checked inside the handler after validation; a UUID/IP-rotation cost
+//     backstop (see the const above)
 //
 // See SPEC §4 for application points and the rationale for layering per-IP +
 // per-device on the same proxy endpoints (defense-in-depth against IP-rotation
@@ -172,30 +173,39 @@ func extractIP(r *http.Request) string {
 	return host
 }
 
-// globalBudgetKey is the single constant key GlobalMiddleware counts against, so
+// globalBudgetKey is the single constant key the global budget counts against, so
 // every request shares one bucket (a total spend ceiling, not per-caller).
 const globalBudgetKey = "global"
 
-// GlobalMiddleware wraps a handler with a single shared hourly budget keyed by a
-// constant (globalBudgetKey). Unlike PerIP/PerDevice it does NOT partition by
-// caller — it is a total spend ceiling for the expensive upstream endpoints
-// (identify/diagnose). It backstops PerDevice, which an attacker sidesteps by
-// minting a fresh X-Device-Install-Id UUID per request (fresh device bucket
-// each time), leaving only the IP-rotatable PerIP limit. The global bucket caps
-// worst-case paid upstream calls per hour regardless of UUID/IP churn
+// GlobalGate returns a budget check meant to be called INSIDE the identify/
+// diagnose handler — AFTER all request validation and immediately BEFORE the
+// first paid upstream call — NOT as router middleware. Placing it after
+// validation is essential: as middleware it would consume the shared budget for
+// every request, including the malformed ones that 400 before any upstream cost,
+// so an attacker could exhaust the hourly budget with cheap header-less/imageless
+// requests and deny legitimate paid traffic for the rest of the window without
+// burning a cent of upstream spend.
+//
+// Unlike PerIP/PerDevice it does NOT partition by caller — it is a total spend
+// ceiling that backstops PerDevice (which an attacker sidesteps by minting a
+// fresh X-Device-Install-Id UUID per request) and the IP-rotatable PerIP limit,
+// capping worst-case paid upstream calls per hour regardless of UUID/IP churn
 // (DefaultGlobalHourlyBudget).
 //
-// On limit: 429 with Retry-After header + JSON body {"error":"<errCode>"}.
-func GlobalMiddleware(b *Bucket, errCode string) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			allowed, retry := b.Allow(globalBudgetKey, time.Now())
-			if !allowed {
-				Write429(w, retry, errCode)
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
+// Returns true when the request may proceed to upstream. On exhaustion it writes
+// the standard 429 (Retry-After + {"error":"<errCode>"}) and returns false — the
+// caller must stop. A nil bucket (budget disabled / tests) always allows.
+func GlobalGate(b *Bucket, errCode string) func(http.ResponseWriter) bool {
+	return func(w http.ResponseWriter) bool {
+		if b == nil {
+			return true
+		}
+		allowed, retry := b.Allow(globalBudgetKey, time.Now())
+		if !allowed {
+			Write429(w, retry, errCode)
+			return false
+		}
+		return true
 	}
 }
 

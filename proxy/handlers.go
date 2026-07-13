@@ -158,7 +158,15 @@ type visionArbiterResult struct {
 	err error
 }
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, roseEnabled bool) http.HandlerFunc {
+// SpendGate is called once per request AFTER all validation and immediately
+// BEFORE the first paid upstream call. It returns true when the request may
+// proceed; on a global-budget denial it has already written the 429 and returns
+// false (the handler must stop). Injected so the budget is consumed only by
+// requests that actually reach upstream — a nil gate always allows
+// (ratelimit.GlobalGate).
+type SpendGate func(w http.ResponseWriter) bool
+
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, roseEnabled bool, spendGate SpendGate) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -267,6 +275,13 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		mime := http.DetectContentType(head)
 		if mime != "image/jpeg" && mime != "image/png" {
 			writeError(w, http.StatusBadRequest, "bad_image")
+			return
+		}
+
+		// Global spend ceiling — consumed HERE, after every validation, so a
+		// malformed request that 400s above never draws down the shared budget
+		// (which would let cheap invalid requests deny legitimate paid traffic).
+		if spendGate != nil && !spendGate(w) {
 			return
 		}
 
@@ -910,7 +925,7 @@ const minDiagnoseFallbackBudget = 6 * time.Second
 // healthy"). content / vision may be nil — both are graceful no-ops (plantId
 // stays null, catalogId falls back to name-match only); even with both nil the
 // force-pick still ships the generic Leaf-spot tail, so issues is never empty.
-func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *VisionClient, enricher DiseaseEnricher) http.HandlerFunc {
+func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *VisionClient, enricher DiseaseEnricher, spendGate SpendGate) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		reqStart := time.Now() // WriteTimeout wall-clock start, for the AI fallback budget (mirrors HandleIdentify)
 		r.Body = http.MaxBytesReader(w, r.Body, diagnoseMaxBody)
@@ -1008,6 +1023,13 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 		mime := http.DetectContentType(head)
 		if mime != "image/jpeg" && mime != "image/png" {
 			writeError(w, http.StatusBadRequest, "bad_image")
+			return
+		}
+
+		// Global spend ceiling — consumed HERE, after every validation, so a
+		// malformed request that 400s above never draws down the shared budget
+		// (which would let cheap invalid requests deny legitimate paid traffic).
+		if spendGate != nil && !spendGate(w) {
 			return
 		}
 

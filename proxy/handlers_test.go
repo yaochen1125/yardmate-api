@@ -59,7 +59,7 @@ func newIdentifyHandlerWithVision(t *testing.T, upstream http.HandlerFunc, visio
 	if err != nil {
 		t.Fatalf("LoadContent: %v", err)
 	}
-	return HandleIdentify(nil, c, content, vision, nil, false), srv
+	return HandleIdentify(nil, c, content, vision, nil, false, nil), srv
 }
 
 func TestHandleIdentify_Success(t *testing.T) {
@@ -385,7 +385,7 @@ func newCascadeHandler(t *testing.T, plantNetUp, plantIDUp http.HandlerFunc) (ht
 			c()
 		}
 	}
-	return HandleIdentify(pnClient, piClient, content, nil, nil, false), cleanup
+	return HandleIdentify(pnClient, piClient, content, nil, nil, false, nil), cleanup
 }
 
 func doCascadeReq(t *testing.T, h http.Handler) *httptest.ResponseRecorder {
@@ -628,7 +628,7 @@ func TestHandleIdentify_Cascade_OrganForwardedToPlantNet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadContent: %v", err)
 	}
-	h := HandleIdentify(pn, nil, content, nil, nil, false)
+	h := HandleIdentify(pn, nil, content, nil, nil, false, nil)
 
 	// Build a multipart body with image + organ=flower.
 	var buf bytes.Buffer
@@ -678,7 +678,7 @@ func TestHandleIdentify_Cascade_UnknownOrganDefaultsAuto(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadContent: %v", err)
 	}
-	h := HandleIdentify(pn, nil, content, nil, nil, false)
+	h := HandleIdentify(pn, nil, content, nil, nil, false, nil)
 
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
@@ -737,7 +737,7 @@ func newCascadeHandlerWithVision(t *testing.T, plantNetUp, plantIDUp http.Handle
 			c()
 		}
 	}
-	return HandleIdentify(pnClient, piClient, content, vision, nil, false), cleanup
+	return HandleIdentify(pnClient, piClient, content, vision, nil, false, nil), cleanup
 }
 
 // cannedPlantNetRosa — Pl@ntNet returns a Rosa species, so genus == "Rosa"
@@ -779,7 +779,7 @@ func TestHandleIdentify_RoseRerank_KillSwitch(t *testing.T) {
 	}
 
 	doReq := func(roseEnabled bool) IdentifyResult {
-		h := HandleIdentify(pn, nil, content, vision, nil, roseEnabled)
+		h := HandleIdentify(pn, nil, content, vision, nil, roseEnabled, nil)
 		var buf bytes.Buffer
 		w := multipart.NewWriter(&buf)
 		fw, _ := w.CreateFormFile("image", "r.jpg")
@@ -1570,7 +1570,7 @@ func newDiagnoseHandler(t *testing.T, upstream http.HandlerFunc, vision *VisionC
 	if err != nil {
 		t.Fatalf("LoadContent: %v", err)
 	}
-	return HandleDiagnose(c, content, vision, nil), srv
+	return HandleDiagnose(c, content, vision, nil, nil), srv
 }
 
 // cannedDiagnoseHealthy mimics Plant.id when the plant is healthy.

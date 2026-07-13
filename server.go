@@ -115,22 +115,26 @@ func newServer(
 				// (text) / account-delete / signal below stay unbounded. A nil
 				// inflightLim (bound disabled / tests) is a pass-through.
 				r.Group(func(r chi.Router) {
-					// Global hourly spend ceiling for the two paid upstream
-					// endpoints — checked BEFORE acquiring an inflight slot so an
-					// over-budget request is shed cheaply. Backstops the per-device
-					// limit, which resets per fresh UUID (ratelimit.GlobalMiddleware).
-					r.Use(ratelimit.GlobalMiddleware(lim.Global, "rate_limit_global"))
 					r.Use(inflight.Middleware(inflightLim, "server_busy"))
+					// Global hourly spend ceiling for the two paid upstream
+					// endpoints. Passed INTO the handlers (not mounted as
+					// middleware) so it is consumed only AFTER validation, right
+					// before the upstream call — a malformed request that 400s
+					// early must not draw down the shared budget, or an attacker
+					// could exhaust it with cheap invalid requests and deny
+					// legitimate paid traffic. Backstops the per-device limit,
+					// which resets per fresh UUID (ratelimit.GlobalGate).
+					spendGate := ratelimit.GlobalGate(lim.Global, "rate_limit_global")
 					// /v1/identify cascades Pl@ntNet (primary) → Plant.id
 					// (fallback); register when EITHER engine is present
 					// (SPEC §1.1 / §7).
 					if plantNet != nil || plantID != nil {
-						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, roseEnabled))
+						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, roseEnabled, spendGate))
 					}
 					// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
 					// assessment, SPEC §1.5) — still requires plantID.
 					if plantID != nil {
-						r.Post("/diagnose", proxy.HandleDiagnose(plantID, content, vision, diseaseEnricher))
+						r.Post("/diagnose", proxy.HandleDiagnose(plantID, content, vision, diseaseEnricher, spendGate))
 					}
 				})
 				if enrich != nil {
