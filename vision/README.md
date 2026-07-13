@@ -30,11 +30,17 @@ Go 侧 fail-open:超时/不可达/kill-switch off → 视作无信号,不影响�
 
 ## 部署(server 5.78.183.252, 先 staging)
 ```bash
-cd /root/yardmate-api/vision
-python3.11 -m venv venv
-venv/bin/pip install -r requirements.txt   # CPU: --index-url https://download.pytorch.org/whl/cpu 装 torch
-# 1) 建库(4-8h, 一次性; 用当前权威 plants_index)
-venv/bin/python pull_reference.py /path/to/plants_index.json /root/yardmate-vision-ref 40
+cd /root/yardmate-vision            # vision/ 服务代码 + 数据目录
+python3 -m venv venv
+venv/bin/pip install --upgrade pip
+# ⚠️ torch + torchvision 必须同源(CPU index)且版本匹配 —— 否则 torchvision::nms
+#    缺失、open_clip 一导入就崩。先装 torch、再让 open_clip 从 PyPI 拽 torchvision
+#    会装到不匹配的版本(踩过)。所以显式一起从 CPU index 装:
+venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+venv/bin/pip install open_clip_torch hnswlib fastapi "uvicorn[standard]" python-multipart pillow numpy
+# 1) 建库:pull 可续 + 瞬时失败重试;build_index 幂等。生产用 systemd 全程托管
+#    (build_pipeline.sh + yardmate-vision-build.service:pull→embed,开机自启 + 失败重试):
+venv/bin/python pull_reference.py /path/to/plants_index.json /root/yardmate-vision-ref 25
 venv/bin/python build_index.py /root/yardmate-vision-ref /root/yardmate-vision-index
 # 2) 起服务
 cp yardmate-vision.service /etc/systemd/system/ && systemctl enable --now yardmate-vision
