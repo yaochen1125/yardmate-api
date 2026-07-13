@@ -21,7 +21,7 @@ def species_query(sci):
 def resolve(q):
     u = "https://api.inaturalist.org/v1/taxa?" + urllib.parse.urlencode({"q": q, "per_page": 5})
     try: res = get(u)
-    except Exception as e: print("  taxa err", q, e); return None
+    except Exception as e: print("  taxa err", q, e); return False  # 瞬时 API 失败(区别于查无 taxon 的 None)
     time.sleep(1.1)
     results = res.get("results", [])
     for want in (("species", "form", "variety", "subspecies"), None):
@@ -31,9 +31,19 @@ def resolve(q):
     return None
 
 def pull(taxon_id, outdir, per):
-    # 干净重拉(Codex #100): 清掉该 taxon 目录已有文件, 避免中断后重跑从 000.jpg
-    # 覆盖旧文件 / 残留孤儿。只有未在 manifest 记录的 taxon 才会进到这里(见 main),
-    # 故清空是安全的(不会误删已完成株的参考图)。
+    u = "https://api.inaturalist.org/v1/observations?" + urllib.parse.urlencode({
+        "taxon_id": taxon_id, "photos": "true", "quality_grade": "research",
+        "per_page": per, "order_by": "votes", "order": "desc"})
+    try:
+        res = get(u)
+    except Exception as e:
+        # 瞬时 obs 失败(Codex #101): 不清目录、返回 None → main 保留已有部分参考图 +
+        # 下次重试。绝不因一次网络抖动删掉可用参考图并把该株永久标记完成。
+        print("  obs err", e)
+        return None
+    time.sleep(1.1)
+    # 观测请求成功后才清目录干净重拉(Codex #100): 避免上面失败时误删已有参考图。
+    # 只有未在 manifest 记录的 taxon 才会进到这里(见 main),故清空安全。
     if os.path.isdir(outdir):
         for f in os.listdir(outdir):
             try:
@@ -41,12 +51,6 @@ def pull(taxon_id, outdir, per):
             except OSError:
                 pass
     os.makedirs(outdir, exist_ok=True)
-    u = "https://api.inaturalist.org/v1/observations?" + urllib.parse.urlencode({
-        "taxon_id": taxon_id, "photos": "true", "quality_grade": "research",
-        "per_page": per, "order_by": "votes", "order": "desc"})
-    try: res = get(u)
-    except Exception as e: print("  obs err", e); return []
-    time.sleep(1.1)
     man = []
     for obs in res.get("results", []):
         for p in obs.get("photos", [])[:1]:
@@ -84,12 +88,18 @@ def main(idx_path, out_dir, per=40):
             skipped += 1; continue
         q = species_query(sci)
         tx = resolve(q)
-        if not tx:
+        if tx is False:  # 瞬时 taxa API 失败 → 不记 manifest, 保留现状, 下次重试(Codex #101)
+            print(f"  transient resolve fail {cid}, retry next run")
+            continue
+        if tx is None:  # 确实查无此 taxon(区别于瞬时失败)
             zero += 1; zero_log.write(f"{cid}\t{sci}\tNO_TAXON\n"); zero_log.flush()
             manifest[cid] = {"sci": sci, "resolved": None, "n": 0}
         else:
             tid, tname, trank = tx
-            photos = pull(tid, outdir, per)  # pull() 会先清目录, 干净重拉
+            photos = pull(tid, outdir, per)  # obs 成功后才清目录干净重拉
+            if photos is None:  # 瞬时 obs 失败 → 不记、保留已有参考图, 下次重试(Codex #101)
+                print(f"  transient fetch fail {cid}, retry next run")
+                continue
             if len(photos) == 0:
                 zero += 1; zero_log.write(f"{cid}\t{sci}\t{tname}\tNO_PHOTOS\n"); zero_log.flush()
             manifest[cid] = {"sci": sci, "resolved": {"id": tid, "name": tname, "rank": trank}, "n": len(photos)}
