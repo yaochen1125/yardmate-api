@@ -10,6 +10,8 @@ import os, sys, json, tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pull_reference as pr
 
+_REAL_RESOLVE = pr.resolve  # 真 resolve(其它测试会覆写 pr.resolve,这里留住原函数)
+
 
 def _fresh():
     d = tempfile.mkdtemp()
@@ -59,6 +61,23 @@ def test_genuine_no_taxon_records_zero():
     pr.main(idx, out, 25)
     m = _manifest(out).get("AAA0001", {})
     assert m.get("n") == 0 and m.get("resolved") is None
+
+
+def test_resolve_rejects_genus():
+    # 只有属级结果 → None(零覆盖),绝不返回属级 taxon 去拉泛属照片污染索引(M6)
+    pr.get = lambda url: {"results": [{"id": 1, "name": "Rosa", "rank": "genus"}]}
+    pr.time.sleep = lambda *a: None
+    assert _REAL_RESOLVE("Rosa") is None
+
+
+def test_resolve_accepts_species():
+    pr.get = lambda url: {"results": [
+        {"id": 9, "name": "Rosa", "rank": "genus"},          # 属级在前也要跳过
+        {"id": 2, "name": "Rosa chinensis", "rank": "species"},
+    ]}
+    pr.time.sleep = lambda *a: None
+    tx = _REAL_RESOLVE("Rosa chinensis")
+    assert tx and tx[0] == 2 and tx[2] == "species"
 
 
 if __name__ == "__main__":

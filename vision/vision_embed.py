@@ -1,5 +1,5 @@
 """BioCLIP-2 嵌入(P0 选定模型)。单例懒加载。给 build_index 和 app 共用。"""
-import io, warnings, threading
+import io, gc, warnings, threading
 warnings.filterwarnings("ignore")
 import torch, torch.nn.functional as F
 from PIL import Image
@@ -16,7 +16,19 @@ def _ensure():
                 dev = "mps" if torch.backends.mps.is_available() else "cpu"
                 m, _, pp = open_clip.create_model_and_transforms(MODEL_ID)
                 m.eval().to(dev)
-                _state.update(model=m, pp=pp, dev=dev)
+                # C1: 只用 encode_image。释放未用的文本塔省 ~440MB(实测释放后嵌入 bit-identical),
+                # 让 8G box 上 API(4G)+serve 常驻不吃紧、避免 OOM 误杀 API。
+                for attr in ("transformer", "token_embedding", "ln_final", "text_projection", "positional_embedding"):
+                    if hasattr(m, attr):
+                        try:
+                            delattr(m, attr)
+                        except Exception:
+                            pass
+                gc.collect()
+                # L1: model 最后赋值 —— 并发读者要么看到全 None、要么全就绪,
+                # 不会出现 model 已设而 pp/dev 仍 None 的中间态。
+                _state["pp"], _state["dev"] = pp, dev
+                _state["model"] = m
     return _state
 
 @torch.no_grad()

@@ -1,0 +1,17 @@
+[Unit]
+# 全库参考索引一次性构建(pull→embed),由 build_pipeline.sh 驱动。可续 + 幂等。
+Description=YardMate L1 vision reference index build (pull -> embed), resumable
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/yardmate-vision
+ExecStart=/usr/bin/bash /root/yardmate-vision/build_pipeline.sh
+Restart=on-failure
+RestartSec=30
+# 建索引常驻 BioCLIP-2(文本塔已释放,~1.6G)+ 向量;限内存防挤爆 8G(API 另占 4G)。
+MemoryMax=3G
+
+[Install]
+WantedBy=multi-user.target

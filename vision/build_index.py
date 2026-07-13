@@ -9,6 +9,13 @@ import vision_embed
 
 IN_OUT_THRESHOLD = 0.80  # P0: BioCLIP-2 库内外余弦分界先验(staging 再标定)
 
+def _atomic_json(obj, path, **kw):
+    # 原子写(L4): 写 .tmp 再 os.replace,避免 serve 启动读到半截 JSON。
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, **kw)
+    os.replace(tmp, path)
+
 def main(data_root, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     dirs = sorted(d for d in os.listdir(data_root)
@@ -30,12 +37,15 @@ def main(data_root, out_dir):
     idx.init_index(max_elements=len(X), ef_construction=200, M=32)
     idx.add_items(X, np.array(labels))
     idx.set_ef(64)
-    idx.save_index(f"{out_dir}/index.bin")
-    json.dump(mapping, open(f"{out_dir}/mapping.json", "w"))
-    json.dump({"dim": dim, "count": len(X), "model": vision_embed.MODEL_ID,
-               "space": "cosine", "in_out_threshold": IN_OUT_THRESHOLD,
-               "catalog_ids": sorted(set(m["catalog_id"] for m in mapping))},
-              open(f"{out_dir}/meta.json", "w"), indent=2)
+    # 原子写,且 meta.json 最后写 —— idempotency 依赖它:半成品(崩在中途)无 meta.json,
+    # build_pipeline 的 [ -f meta.json ] 判定"未完成"→ 干净重建。
+    idx.save_index(f"{out_dir}/index.bin.tmp")
+    os.replace(f"{out_dir}/index.bin.tmp", f"{out_dir}/index.bin")
+    _atomic_json(mapping, f"{out_dir}/mapping.json")
+    _atomic_json({"dim": dim, "count": len(X), "model": vision_embed.MODEL_ID,
+                  "space": "cosine", "in_out_threshold": IN_OUT_THRESHOLD,
+                  "catalog_ids": sorted(set(m["catalog_id"] for m in mapping))},
+                 f"{out_dir}/meta.json", indent=2)
     print(f"INDEX built: {len(X)} vectors, dim {dim}, {len(set(m['catalog_id'] for m in mapping))} catalog ids -> {out_dir}")
 
 if __name__ == "__main__":
