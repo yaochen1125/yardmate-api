@@ -68,7 +68,7 @@ func (c *INatClient) PreferredCommonName(ctx context.Context, sciName string) (s
 	if err != nil {
 		return "", false
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", false
 	}

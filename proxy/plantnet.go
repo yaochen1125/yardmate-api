@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,43 @@ import (
 	"strings"
 	"time"
 )
+
+// sanitizePlantNetErr strips the Pl@ntNet api-key from a transport error before
+// it is wrapped and logged upstream. The api-key is a URL query param
+// (?api-key=<secret>); c.HTTP.Do returns a *url.Error whose Error() embeds the
+// FULL request URL, and Go redacts only userinfo — NOT query params — so the
+// secret would otherwise reach the logs verbatim. Primary fix: unwrap to the
+// transport-level cause (timeout / connection refused / context cancel), which
+// carries no URL. Belt-and-suspenders: scrub any lingering "api-key=" value.
+func sanitizePlantNetErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		err = ue.Err
+	}
+	if msg := err.Error(); scrubAPIKeyQuery(msg) != msg {
+		return errors.New(scrubAPIKeyQuery(msg))
+	}
+	return err
+}
+
+// scrubAPIKeyQuery replaces the value of an "api-key=" query param with REDACTED.
+// The value runs until the next query separator / quote / whitespace.
+func scrubAPIKeyQuery(s string) string {
+	const key = "api-key="
+	i := strings.Index(s, key)
+	if i < 0 {
+		return s
+	}
+	j := i + len(key)
+	end := j
+	for end < len(s) && s[end] != '&' && s[end] != ' ' && s[end] != '"' {
+		end++
+	}
+	return s[:j] + "REDACTED" + s[end:]
+}
 
 // defaultPlantNetEndpoint is the Pl@ntNet API v2 identify URL (all organs).
 // The api-key is a QUERY param appended at call time (SPEC §1.5) — NOT a
@@ -267,10 +305,12 @@ func (c *PlantNetClient) Identify(ctx context.Context, image io.Reader, mime, or
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		// Network error, timeout, or context cancel — all transient; the
-		// handler advances to the Plant.id fallback.
-		return nil, fmt.Errorf("%w: %v", ErrPlantNetUnavailable, err)
+		// handler advances to the Plant.id fallback. Sanitize first: the raw
+		// *url.Error embeds the request URL, which carries the secret api-key
+		// query param (see sanitizePlantNetErr).
+		return nil, fmt.Errorf("%w: %v", ErrPlantNetUnavailable, sanitizePlantNetErr(err))
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 
 	switch {
 	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:

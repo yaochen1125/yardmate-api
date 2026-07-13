@@ -565,8 +565,13 @@ func (c *VisionClient) DiagnosePlant(ctx context.Context, image []byte, mime str
 	user := "Diagnose the plant in this image."
 
 	body := openAIChatRequest{
-		Model:     c.Model,
-		MaxTokens: 900,
+		Model: c.Model,
+		// 1400 (was 900): up to 3 issues, each with cause + description + three
+		// treatment arrays, LOCALIZED (non-English prose runs longer). At 900 the
+		// reply could be truncated (finish_reason=length) → invalid JSON → silent
+		// degrade to the L08 safety net. 1400 leaves headroom without inviting
+		// runaway output.
+		MaxTokens: 1400,
 		Messages: []openAIChatRequestMsg{
 			{Role: "system", Content: sys},
 			{
@@ -771,8 +776,11 @@ func (c *VisionClient) postWith(ctx context.Context, body any, httpClient *http.
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("vision: status %d body=%s", resp.StatusCode, raw)
+		// Cap the echoed body (an upstream error page can be large) and scrub
+		// any "sk-…" token so a key-shaped fragment never reaches error strings
+		// / logs.
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("vision: status %d body=%s", resp.StatusCode, scrubOpenAISecret(string(raw)))
 	}
 	var apiResp openAIChatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
@@ -788,4 +796,28 @@ func (c *VisionClient) postWith(ctx context.Context, body any, httpClient *http.
 // `image_url` content part. Used by RerankIdentify (commit-3).
 func dataURL(mime string, image []byte) string {
 	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
+}
+
+// scrubOpenAISecret masks any "sk-…" token in s so an upstream error body that
+// echoes the Authorization key (or a key-shaped fragment) never reaches error
+// strings / logs. A token runs from "sk-" until the first non key-char (OpenAI
+// keys are [A-Za-z0-9_-]). "REDACTED" contains no "sk-", so the scan terminates.
+func scrubOpenAISecret(s string) string {
+	const marker = "sk-"
+	for {
+		i := strings.Index(s, marker)
+		if i < 0 {
+			return s
+		}
+		j := i + len(marker)
+		for j < len(s) && isKeyChar(s[j]) {
+			j++
+		}
+		s = s[:i] + "REDACTED" + s[j:]
+	}
+}
+
+// isKeyChar reports whether b is a character that can appear in an OpenAI API key.
+func isKeyChar(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_' || b == '-'
 }

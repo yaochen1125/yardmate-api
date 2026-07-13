@@ -689,9 +689,17 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 						s0.CommonNames = prependUnique(cn, s0.CommonNames)
 					}
 				} else if inat != nil {
-					if cn, ok := inat.PreferredCommonName(ctx, s0.ScientificName); ok {
+					// Best-effort common-name upgrade — MUST NOT dominate the
+					// identify latency budget. The species is already resolved;
+					// cap this to a short derived deadline so a slow iNat (its
+					// own client Timeout is 8 s) can't stall the response. A
+					// timeout just returns ("",false) and keeps upstream names.
+					const inatCommonNameTimeout = 3 * time.Second
+					inatCtx, inatCancel := context.WithTimeout(ctx, inatCommonNameTimeout)
+					if cn, ok := inat.PreferredCommonName(inatCtx, s0.ScientificName); ok {
 						s0.CommonNames = prependUnique(cn, s0.CommonNames)
 					}
+					inatCancel()
 				}
 			}
 		}
