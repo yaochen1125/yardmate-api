@@ -70,6 +70,16 @@ func newServer(
 	// default; BLOOM_TIEBREAK_ENABLED=false kill-switches it (tiebreak only,
 	// never overrides a clear confidence winner).
 	bloomTiebreakEnabled := vault.GetBool("BLOOM_TIEBREAK_ENABLED", true)
+	// L1 catalog-native vision-kNN signal (vision/README.md). OFF by default —
+	// a new, uncalibrated signal (P0_CONCLUSION: low-strength start, calibrate
+	// on staging). When VISION_KNN_ENABLED=true the same-host microservice client
+	// is built (VISION_KNN_ENDPOINT overrides the localhost default); a nil
+	// client makes HandleIdentify skip it. Fail-open: an unreachable/slow service
+	// never blocks the main cascade.
+	var visionKNN *proxy.VisionKNNClient
+	if vault.GetBool("VISION_KNN_ENABLED", false) {
+		visionKNN = proxy.NewVisionKNNClient(vault.Get("VISION_KNN_ENDPOINT"))
+	}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(realIPFromNginx)
@@ -140,7 +150,7 @@ func newServer(
 					// (fallback); register when EITHER engine is present
 					// (SPEC §1.1 / §7).
 					if plantNet != nil || plantID != nil {
-						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, spendGate))
+						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, visionKNN, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, spendGate))
 					}
 					// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
 					// assessment, SPEC §1.5) — still requires plantID.

@@ -193,7 +193,7 @@ type visionArbiterResult struct {
 // (ratelimit.GlobalGate).
 type SpendGate func(w http.ResponseWriter) bool
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled bool, spendGate SpendGate) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled bool, spendGate SpendGate) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -329,6 +329,20 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			go func() {
 				s, e := vision.IdentifyPlant(ctx, imgBytes, mime)
 				gptCh <- visionArbiterResult{sug: s, err: e}
+			}()
+		}
+
+		// --- Parallel L1 vision-kNN (catalog-native nearest-neighbour over a
+		//     real-photo reference index). Same concurrent shape as the GPT
+		//     arbiter so its CPU latency hides behind the engine cascade. nil
+		//     client (VISION_KNN_ENABLED off) → skipped. Buffered (cap 1) so the
+		//     goroutine never blocks if 7a-4 bails before reading it; fail-open. ---
+		var knnCh chan visionKNNResult
+		if visionKNN != nil {
+			knnCh = make(chan visionKNNResult, 1)
+			go func() {
+				resp, e := visionKNN.Identify(ctx, imgBytes, mime)
+				knnCh <- visionKNNResult{resp: resp, err: e}
 			}()
 		}
 
@@ -793,7 +807,15 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     (plant_id / scientific_name untouched). GPT missing / errored /
 		//     disagreeing → no-op (original behavior). Placed after the cultivar
 		//     reranks so it reflects the final chosen row.
-		if agreementBoostEnabled && !unknownSentinel && gptErr == nil && gptSug != nil &&
+		//     Codex #98: SKIP when the chosen row ITSELF came from the GPT arbiter
+		//     (engine "ai-catalog-override" / "ai-catalog-recovery" / "ai-raw-oob",
+		//     all "ai-"-prefixed). Comparing a GPT-sourced result back to the same
+		//     gptSug is circular self-agreement, not independent corroboration — it
+		//     would inflate a low-confidence ai-catalog-recovery straight to the
+		//     boost floor, defeating the recovery threshold. Only engine-sourced
+		//     (Pl@ntNet / Plant.id) in-catalog hits get the boost.
+		if agreementBoostEnabled && !unknownSentinel && !strings.HasPrefix(engine, "ai-") &&
+			gptErr == nil && gptSug != nil &&
 			len(result.Suggestions) > 0 && result.Suggestions[0].PlantID != nil {
 			s0 := &result.Suggestions[0]
 			engKey := speciesKey(s0.ScientificName)
@@ -802,6 +824,46 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					log.Printf("identify agreement boost: deviceID=%s plantId=%s engineConf=%.2f gptConf=%.2f boostedConf=%.2f",
 						deviceID, *s0.PlantID, s0.Confidence, gptSug.Confidence, boosted)
 					s0.Confidence = boosted
+				}
+			}
+		}
+
+		// 7a-4. L1 vision-kNN corroboration — VISION_KNN_ENABLED. The parallel
+		//     catalog-native nearest-neighbour pass (real-photo reference index)
+		//     ran for every identify. v1 is deliberately CONSERVATIVE (P0: a new,
+		//     uncalibrated signal): it ACTS only to RAISE confidence — via the
+		//     GENTLE visionKNNBoostedConfidence (a capped partial nudge toward the
+		//     visual similarity, NOT the GPT boost's 0.90 floor) — when vision
+		//     independently agrees with the chosen in-catalog row (never lowers,
+		//     never changes the plant). Unlike 7a-3 this signal IS independent of
+		//     the GPT arbiter, so it may corroborate a GPT-sourced recovery too, but
+		//     only gently. Every other outcome — disagreement inside the catalog, or
+		//     an out-of-catalog verdict against an in-catalog decision — is LOGGED
+		//     ONLY, to gather staging data before we let it override. Fail-open:
+		//     nil client / error / timeout → no-op.
+		if visionKNN != nil && knnCh != nil && !unknownSentinel && len(result.Suggestions) > 0 {
+			kr := <-knnCh
+			if kr.err != nil || kr.resp == nil {
+				log.Printf("identify vision-knn failed: deviceID=%s err=%v", deviceID, kr.err)
+			} else {
+				s0 := &result.Suggestions[0]
+				knnTopID, knnTopSim := "", 0.0
+				if len(kr.resp.Candidates) > 0 {
+					knnTopID, knnTopSim = kr.resp.Candidates[0].CatalogID, kr.resp.Candidates[0].VisionSim
+				}
+				decidedID := ""
+				if s0.PlantID != nil {
+					decidedID = *s0.PlantID
+				}
+				agrees := visionKNNAgreesWithDecision(s0, kr.resp)
+				log.Printf("identify vision-knn: deviceID=%s decidedId=%s knnTopId=%s knnTopSim=%.3f inCatalog=%v nnSim=%.3f agrees=%v",
+					deviceID, decidedID, knnTopID, knnTopSim, kr.resp.InCatalog, kr.resp.NNSim, agrees)
+				if agrees {
+					if boosted := visionKNNBoostedConfidence(s0.Confidence, knnTopSim); boosted > s0.Confidence {
+						log.Printf("identify vision-knn boost: deviceID=%s plantId=%s conf=%.2f knnSim=%.2f boostedConf=%.2f",
+							deviceID, *s0.PlantID, s0.Confidence, knnTopSim, boosted)
+						s0.Confidence = boosted
+					}
 				}
 			}
 		}

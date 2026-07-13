@@ -1,0 +1,7 @@
+# Server-built artifacts — never commit (rebuilt by pull_reference/build_index).
+venv/
+__pycache__/
+*.pyc
+index/
+*.bin
+reference/

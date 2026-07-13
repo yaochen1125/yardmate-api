@@ -66,6 +66,49 @@ var roseRerankSchema = map[string]any{
 	},
 }
 
+// cultivarRerankSchema is the plant-NEUTRAL structured-output spec for the
+// generic (non-Rosa) species-level cultivar disambiguation (RerankCultivar).
+// Structurally identical to roseRerankSchema but NO field description mentions
+// "rose": the rose schema instructs the model to return empty matches when the
+// photo is "not a rose", which — for every Juncus / Aeonium / Hosta / etc.
+// request, where the photo is by definition not a rose — could drive an empty
+// result that Decide then silently falls back on, disabling the non-Rosa
+// disambiguation entirely (Codex #97). Here the only empty case is a photo that
+// is not a plant at all.
+var cultivarRerankSchema = map[string]any{
+	"type": "json_schema",
+	"json_schema": map[string]any{
+		"name":   "cultivar_rerank",
+		"strict": true,
+		"schema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"cultivar_certain": map[string]any{
+					"type":        "boolean",
+					"description": "true ONLY if the photo shows a distinguishing trait (growth habit, leaf/stem shape, foliage colour, bloom form) that genuinely singles out ONE candidate; false if the candidates would look identical or the photo is unclear.",
+				},
+				"matches": map[string]any{
+					"type":        "array",
+					"maxItems":    rosererank.MaxMatches,
+					"description": "ALWAYS your top 1-3 most-likely candidates ranked by likelihood (most likely first), populated even when cultivar_certain is false — each with an honest per-item confidence. It is legitimate to pick the plain species itself when no distinctive cultivar trait shows. Only truly empty if the photo is not a plant at all.",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"plant_id":   map[string]any{"type": "string", "description": "The id of a candidate from the provided list, verbatim."},
+							"confidence": map[string]any{"type": "number", "description": "Honest 0..1 certainty this candidate matches the photo."},
+							"reason":     map[string]any{"type": "string", "description": "<= 15 words, English, the visible trait that drove the match."},
+						},
+						"required":             []string{"plant_id", "confidence", "reason"},
+						"additionalProperties": false,
+					},
+				},
+			},
+			"required":             []string{"cultivar_certain", "matches"},
+			"additionalProperties": false,
+		},
+	},
+}
+
 // roseCandidateLine is the compact per-candidate shape sent to the model. Shared
 // by the rose rerank and the generic cultivar disambiguation (RerankCultivar).
 type roseCandidateLine struct {
@@ -103,7 +146,7 @@ func (c *VisionClient) RerankRose(ctx context.Context, image []byte, mime string
 		return rosererank.RoseRerankResult{}, fmt.Errorf("vision: no rose candidates")
 	}
 	return c.rerankVision(ctx, image, mime, candidates, roseRerankSystemPrompt,
-		"Candidate cultivars (JSON):\n%s\n\nWhich candidate cultivar does this rose photo show?")
+		"Candidate cultivars (JSON):\n%s\n\nWhich candidate cultivar does this rose photo show?", roseRerankSchema)
 }
 
 // RerankCultivar disambiguates a single species' cultivar group (species + its
@@ -117,14 +160,14 @@ func (c *VisionClient) RerankCultivar(ctx context.Context, image []byte, mime st
 		return rosererank.RoseRerankResult{}, fmt.Errorf("vision: no cultivar candidates")
 	}
 	return c.rerankVision(ctx, image, mime, candidates, cultivarRerankSystemPrompt,
-		"Candidate plants (JSON):\n%s\n\nWhich candidate does this plant photo show?")
+		"Candidate plants (JSON):\n%s\n\nWhich candidate does this plant photo show?", cultivarRerankSchema)
 }
 
 // rerankVision is the shared vision-rerank plumbing behind RerankRose and
 // RerankCultivar: serialize the candidates, post the photo + candidate JSON
 // under the strict json_schema with the given system prompt, parse and clamp.
 // userTemplate must contain exactly one %s for the candidate JSON.
-func (c *VisionClient) rerankVision(ctx context.Context, image []byte, mime string, candidates []rosererank.RoseCandidate, sys, userTemplate string) (rosererank.RoseRerankResult, error) {
+func (c *VisionClient) rerankVision(ctx context.Context, image []byte, mime string, candidates []rosererank.RoseCandidate, sys, userTemplate string, schema map[string]any) (rosererank.RoseRerankResult, error) {
 	var zero rosererank.RoseRerankResult
 	if c == nil {
 		return zero, fmt.Errorf("vision: nil client")
@@ -166,7 +209,7 @@ func (c *VisionClient) rerankVision(ctx context.Context, image []byte, mime stri
 				map[string]any{"type": "image_url", "image_url": map[string]any{"url": dataURL(mime, image)}},
 			}},
 		},
-		ResponseFormat: roseRerankSchema,
+		ResponseFormat: schema,
 	}
 
 	raw, err := c.postWith(ctx, body, httpClient)
