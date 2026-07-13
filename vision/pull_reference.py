@@ -85,7 +85,7 @@ def main(idx_path, out_dir, per=40):
     zero_log = open(f"{out_dir}/_zero_coverage.txt", "a")
     manifest_path = f"{out_dir}/_manifest.json"
     manifest = json.load(open(manifest_path)) if os.path.exists(manifest_path) else {}
-    done = skipped = zero = 0
+    done = skipped = zero = transient = 0
     for pl in plants:
         cid, sci = pl["id"], pl["scientific_name"]
         # Resume (Codex #100): manifest 是"已处理"真源 —— 处理过的株(含无 taxon /
@@ -100,6 +100,7 @@ def main(idx_path, out_dir, per=40):
         q = species_query(sci)
         tx = resolve(q)
         if tx is False:  # 瞬时 taxa API 失败 → 不记 manifest, 保留现状, 下次重试(Codex #101)
+            transient += 1
             print(f"  transient resolve fail {cid}, retry next run")
             continue
         if tx is None:  # 确实查无此 taxon(区别于瞬时失败)
@@ -109,6 +110,7 @@ def main(idx_path, out_dir, per=40):
             tid, tname, trank = tx
             photos = pull(tid, outdir, per)  # obs 成功后才清目录干净重拉
             if photos is None:  # 瞬时 obs 失败 → 不记、保留已有参考图, 下次重试(Codex #101)
+                transient += 1
                 print(f"  transient fetch fail {cid}, retry next run")
                 continue
             if len(photos) == 0:
@@ -119,7 +121,10 @@ def main(idx_path, out_dir, per=40):
         if done % 20 == 0:
             print(f"progress: done={done} skipped={skipped} zero={zero} (last {cid})")
     _atomic_json(manifest, manifest_path)
-    print(f"DONE done={done} skipped={skipped} zero_coverage={zero} total={len(plants)}")
+    print(f"DONE done={done} skipped={skipped} zero_coverage={zero} transient={transient} total={len(plants)}")
+    return transient  # >0 = 本轮有株因瞬时失败被跳过未记 → caller 应重试直到 0(build_pipeline 靠 exit code)
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 40)
+    # 有瞬时跳过 → exit 1,让 build_pipeline 的可续重试循环真跑起来(否则漏株就建索引)。
+    left = main(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 40)
+    sys.exit(1 if left else 0)

@@ -33,7 +33,7 @@ def test_transient_resolve_preserves():
     idx, out = _fresh()
     pr.resolve = lambda q: False  # 瞬时 taxa API 失败
     pr.pull = lambda *a: (_ for _ in ()).throw(AssertionError("pull must not run on transient resolve"))
-    pr.main(idx, out, 25)
+    assert pr.main(idx, out, 25) == 1, "transient run must report skips (non-zero → pipeline retries)"
     assert "AAA0001" not in _manifest(out), "transient resolve must not record (retry next run)"
     assert os.path.exists(out + "/AAA0001/000.jpg"), "existing references must be preserved"
 
@@ -42,7 +42,7 @@ def test_transient_obs_preserves():
     idx, out = _fresh()
     pr.resolve = lambda q: (123, "Test", "species")
     pr.pull = lambda *a: None  # obs 成功前的瞬时失败 → None
-    pr.main(idx, out, 25)
+    assert pr.main(idx, out, 25) == 1, "transient obs run must report skips (non-zero → pipeline retries)"
     assert "AAA0001" not in _manifest(out), "transient obs must not record"
     assert os.path.exists(out + "/AAA0001/000.jpg"), "existing references preserved on transient obs"
 
@@ -51,14 +51,14 @@ def test_success_records():
     idx, out = _fresh()
     pr.resolve = lambda q: (123, "Test", "species")
     pr.pull = lambda tid, od, per: [{"file": "000.jpg"}]
-    pr.main(idx, out, 25)
+    assert pr.main(idx, out, 25) == 0, "clean run must report 0 transient skips (exit 0 → pipeline done)"
     assert _manifest(out).get("AAA0001", {}).get("n") == 1
 
 
 def test_genuine_no_taxon_records_zero():
     idx, out = _fresh()
     pr.resolve = lambda q: None  # 真查无 taxon(区别于瞬时 False)
-    pr.main(idx, out, 25)
+    assert pr.main(idx, out, 25) == 0, "genuine no-taxon is not transient (exit 0)"
     m = _manifest(out).get("AAA0001", {})
     assert m.get("n") == 0 and m.get("resolved") is None
 

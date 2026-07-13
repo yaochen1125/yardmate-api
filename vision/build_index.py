@@ -21,17 +21,23 @@ def main(data_root, out_dir):
     dirs = sorted(d for d in os.listdir(data_root)
                   if d.startswith("AAA") and "_" not in d and os.path.isdir(f"{data_root}/{d}"))
     vecs, labels, mapping = [], [], []
+    skipped_embed = 0
     for cid in dirs:
         imgs = sorted(glob.glob(f"{data_root}/{cid}/*.jpg")) + sorted(glob.glob(f"{data_root}/{cid}/*.png"))
         for p in imgs:
             try:
                 v = vision_embed.embed_path(p)
             except Exception as e:
-                print("skip", p, e); continue
+                skipped_embed += 1; print("skip", p, e); continue
             vecs.append(v); labels.append(len(mapping)); mapping.append({"catalog_id": cid, "photo": os.path.basename(p)})
         print(f"{cid}: {len(imgs)} imgs")
     if not vecs:
-        print("NO VECTORS"); return
+        # 零向量(如 BioCLIP 没加载成但 import 检查过了、或全部图损坏)→ 非零退出,
+        # 让 build_pipeline 记 FAILED + systemd Restart 重试;绝不写空/无 meta 当成功。
+        print(f"NO VECTORS — all {skipped_embed} embeds failed; failing so systemd retries")
+        sys.exit(2)
+    if skipped_embed:
+        print(f"WARN: {skipped_embed} images failed to embed; index built from {len(vecs)} vectors")
     X = np.vstack(vecs).astype(np.float32); dim = X.shape[1]
     idx = hnswlib.Index(space="cosine", dim=dim)
     idx.init_index(max_elements=len(X), ef_construction=200, M=32)
