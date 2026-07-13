@@ -3,8 +3,11 @@ package enrichment
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"unicode"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/yaochen1125/yardmate-api/proxy"
 )
@@ -23,6 +26,12 @@ var (
 // Maximum trimmed length for scientificName (SPEC §2.1).
 const maxScientificNameLen = 200
 
+// maxCommonNameLen bounds the caller-supplied common name before it reaches the
+// OpenAI prompt (token cost) and plants_pending.common_name. Over-length is
+// silently truncated (rune-safe), never an error — the common name is optional
+// prompt context, not an identity key.
+const maxCommonNameLen = 150
+
 // Source identifies which tier of GetOrGenerate's lookup produced the result.
 // Returned alongside the *PlantDetail so handlers can log the path taken
 // (SPEC §9 #10 forensic logging).
@@ -30,8 +39,8 @@ const (
 	SourceCache                          = "cache"
 	SourceCatalog                        = "catalog"
 	SourceSupabaseHit                    = "supabase_hit"
-	SourceSupabaseFallbackEn             = "supabase_fallback_en"           // requested lang missing, served English (§7)
-	SourceSupabaseTranslatedOnDemand     = "supabase_translated_on_demand"  // requested lang missing + no English yet, translated an existing other-language master (§7)
+	SourceSupabaseFallbackEn             = "supabase_fallback_en"          // requested lang missing, served English (§7)
+	SourceSupabaseTranslatedOnDemand     = "supabase_translated_on_demand" // requested lang missing + no English yet, translated an existing other-language master (§7)
 	SourceSupabaseMissGenerate           = "supabase_miss_generate"
 	SourceSupabaseMissGenerateRaceWinner = "supabase_miss_generate_race_winner"
 )
@@ -72,6 +81,11 @@ type Service struct {
 	inat       *proxy.INatClient   // optional iNat client; nil → skip name override (PR #24 follow-up, library-internal stays curated)
 	backfill   *Backfiller         // optional; nil → no async translation backfill (tests / DB-less mode)
 	diseaseIDs map[string]struct{} // for common_diseases_list whitelist
+
+	// sf coalesces concurrent first-callers for the same (plant, lang) so N
+	// simultaneous cache+DB misses pay ONE OpenAI generation/translation instead
+	// of N. Zero value is ready to use; keyed by cacheKey (preciseName|lang).
+	sf singleflight.Group
 }
 
 // SetBackfiller attaches the async translation backfiller (SPEC §7). Wired by
@@ -141,6 +155,11 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	}
 	lang := NormalizeLang(req.Lang)
 
+	// Bound the optional common name (rune-safe) before it feeds the LLM prompt or
+	// the plants_pending.common_name column. Over-length is truncated, not
+	// rejected — it is prompt context, not an identity key (SPEC §2.1).
+	req.CommonName = truncateRunes(strings.TrimSpace(req.CommonName), maxCommonNameLen)
+
 	// Cache key is the PRECISE (infraspecific-preserving) normalization PLUS the
 	// language (SPEC §9 #16 + #19). The catalog (Step 1) resolves distinct
 	// plantIds for sibling varieties via scientificNameToIDPrecise, and each
@@ -153,13 +172,10 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 
 	// iNat preferred_common_name override applies to ENGLISH rows only (SPEC §7
 	// common_name B): the iNat name is English, so injecting it into a localized
-	// row would force English back in. Skip the lookup entirely for non-English.
+	// row would force English back in. The lookup itself is deferred until AFTER
+	// the cache (Step 0) and catalog (Step 1) short-circuits so a hot-path hit
+	// pays no 8s iNat round-trip; iNatName stays "" (a no-op override) until then.
 	iNatName := ""
-	if lang == "en" && s.inat != nil {
-		if n, ok := s.inat.PreferredCommonName(ctx, name); ok {
-			iNatName = n
-		}
-	}
 	overrideINat := func(d *proxy.PlantDetail, source string) *proxy.PlantDetail {
 		if iNatName == "" || source == SourceCatalog || d == nil {
 			return d
@@ -197,6 +213,18 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		// No DB configured AND not in the catalog -> enrichment unavailable.
 		return nil, "", ErrEnrichmentUnavailable
 	}
+
+	// Deferred iNat lookup (#1): only reached on a cache + catalog miss, i.e. a
+	// request that will actually serve/generate a Supabase row. English-only —
+	// the iNat preferred_common_name is English, so it must not touch localized
+	// rows. Populated here so overrideINat refreshes Supabase/generated rows below
+	// (cache + catalog hits already returned above and never pay this round-trip).
+	if lang == "en" && s.inat != nil {
+		if n, ok := s.inat.PreferredCommonName(ctx, name); ok {
+			iNatName = n
+		}
+	}
+
 	row, err := s.db.Lookup(ctx, normalized, lang)
 	if err != nil {
 		return nil, "", err
@@ -210,6 +238,12 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	// exists (SPEC §7). Cache it under the ENGLISH key only, NEVER the requested
 	// lang key (SPEC §9 #20) so the real lang row is not masked once backfilled.
 	if lang != "en" {
+		// Check the cache under the ENGLISH key first (#5): a prior English request
+		// (or English fallback) may already hold the master, so serve it without a
+		// second DB round-trip. Same source tag + no override as the DB path below.
+		if enCached, ok := s.cache.Get(preciseName + "|en"); ok {
+			return enCached, SourceSupabaseFallbackEn, nil
+		}
 		enRow, err := s.db.Lookup(ctx, normalized, "en")
 		if err != nil {
 			return nil, "", err
@@ -224,114 +258,164 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	if s.llm == nil {
 		return nil, "", ErrEnrichmentUnavailable
 	}
-	hint := req.CommonName
-	if iNatName != "" { // only non-empty for English (gated above)
-		hint = iNatName
-	}
 
-	// Step 4: before generating a fresh master, check whether a master already
-	// exists for this plant in ANOTHER language — i.e. we are racing this plant's
-	// backfill (neither the exact lang nor English is present yet). If so,
-	// translate that master into `lang` rather than generating an independent
-	// second master, which would let care facts diverge across language rows
-	// (Codex P2 — the SPEC §7 one-master invariant). Only a true first-caller
-	// (no row in ANY language) reaches the Generate call below. The remaining
-	// concurrent-double-first-caller race (two langs generated at once) is the
-	// pre-existing accepted §7 race.
-	if existing, _, lookErr := s.db.LookupAny(ctx, normalized); lookErr != nil {
-		return nil, "", lookErr
-	} else if existing != nil {
-		if translated, reqID, tErr := s.llm.Translate(ctx, existing, lang); tErr == nil && translated != nil {
-			inserted, insErr := s.db.Insert(ctx, InsertParams{
-				Normalized:      normalized,
-				Lang:            lang,
-				ScientificName:  name,
-				CommonName:      hint,
-				Data:            translated,
-				Source:          TranslatedSourceTag,
-				SourceVersion:   PromptVersion,
-				GenerationReqID: reqID,
-			})
-			if insErr != nil {
-				return nil, "", insErr
-			}
-			if !inserted {
-				// Another caller wrote this lang first — return their row.
-				if row, _ := s.db.Lookup(ctx, normalized, lang); row != nil {
-					s.cache.Set(cacheKey, row)
-					return overrideINat(row, SourceSupabaseHit), SourceSupabaseHit, nil
-				}
-			}
-			s.cache.Set(cacheKey, translated)
-			return overrideINat(translated, SourceSupabaseTranslatedOnDemand), SourceSupabaseTranslatedOnDemand, nil
+	// Steps 4–7 are the expensive, uncached path: translate-on-demand or a fresh
+	// OpenAI master generation, plus INSERT + async backfill. Coalesce concurrent
+	// first-callers for the SAME (plant, lang) via singleflight so N simultaneous
+	// cache+DB misses pay ONE OpenAI round-trip; late followers reuse the leader's
+	// result. Key = cacheKey (preciseName|lang), matching the LRU key. On error
+	// every follower receives the leader's error. The result carries the raw
+	// detail + source; overrideINat is applied per-caller AFTER Do so each caller
+	// gets its own (copied) iNat-refreshed English name.
+	v, err, _ := s.sf.Do(cacheKey, func() (any, error) {
+		// A leader that finished while this follower was blocked entering Do has
+		// already populated the cache (callers arriving AFTER the leader returns do
+		// NOT coalesce) — re-check before paying for generation.
+		if cached, ok := s.cache.Get(cacheKey); ok {
+			return genResult{cached, SourceCache}, nil
 		}
-		// Translation failed (rare) → fall through to generate a master in `lang`.
-		// This is the only path that can produce a second independent master, and
-		// only on translation failure.
-	}
 
-	// Step 5: true first-caller (or translation-failure fallback) — generate the
-	// master in `lang`.
-	generated, requestID, err := s.llm.Generate(ctx, name, hint, lang)
-	if err != nil {
-		return nil, "", err
-	}
+		hint := req.CommonName
+		if iNatName != "" { // only non-empty for English (gated above)
+			hint = iNatName
+		}
 
-	// Whitelist common_diseases_list against the catalog (SPEC §1.1 + §7).
-	generated.CommonDiseasesList = s.filterCatalogDiseaseIDs(generated.CommonDiseasesList)
+		// Step 4: before generating a fresh master, check whether a master already
+		// exists for this plant in ANOTHER language — i.e. we are racing this
+		// plant's backfill (neither the exact lang nor English is present yet). If
+		// so, translate that master into `lang` rather than generating an
+		// independent second master, which would let care facts diverge across
+		// language rows (Codex P2 — the SPEC §7 one-master invariant). Only a true
+		// first-caller (no row in ANY language) reaches the Generate call below.
+		if existing, _, lookErr := s.db.LookupAny(ctx, normalized); lookErr != nil {
+			return nil, lookErr
+		} else if existing != nil {
+			if translated, reqID, tErr := s.llm.Translate(ctx, existing, lang); tErr == nil && translated != nil {
+				inserted, insErr := s.db.Insert(ctx, InsertParams{
+					Normalized:      normalized,
+					Lang:            lang,
+					ScientificName:  name,
+					CommonName:      hint,
+					Data:            translated,
+					Source:          TranslatedSourceTag,
+					SourceVersion:   translatedRowVersion(existing, translated),
+					GenerationReqID: reqID,
+				})
+				if insErr != nil {
+					return nil, insErr
+				}
+				if !inserted {
+					// Another caller wrote this lang first — return their row.
+					if row, _ := s.db.Lookup(ctx, normalized, lang); row != nil {
+						s.cache.Set(cacheKey, row)
+						return genResult{row, SourceSupabaseHit}, nil
+					}
+				}
+				s.cache.Set(cacheKey, translated)
+				return genResult{translated, SourceSupabaseTranslatedOnDemand}, nil
+			}
+			// Translation failed (rare) → fall through to generate a master in
+			// `lang`. This is the only path that can produce a second independent
+			// master, and only on translation failure.
+		}
 
-	// Patch the English master with the iNat name (the LLM may ignore the hint).
-	// Non-English masters keep their localized LLM common_name (iNatName == "").
-	if iNatName != "" {
-		generated.CommonName = iNatName
-		generated.CommonNameSource = "inaturalist"
-	}
+		// Step 5: true first-caller (or translation-failure fallback) — generate
+		// the master in `lang`.
+		generated, requestID, genErr := s.llm.Generate(ctx, name, hint, lang)
+		if genErr != nil {
+			return nil, genErr
+		}
 
-	// Step 6: INSERT ON CONFLICT (normalized, lang) DO NOTHING. On conflict,
-	// re-Lookup to pick up the master another concurrent caller just wrote — and
-	// let them own the backfill (SPEC §2.1 step 5).
-	inserted, err := s.db.Insert(ctx, InsertParams{
-		Normalized:      normalized,
-		Lang:            lang,
-		ScientificName:  name,
-		CommonName:      hint, // iNat-resolved hint when iNat hit (en), else upstream
-		Data:            generated,
-		Source:          SourceTag,
-		SourceVersion:   PromptVersion,
-		GenerationReqID: requestID,
+		// Whitelist common_diseases_list against the catalog (SPEC §1.1 + §7).
+		generated.CommonDiseasesList = s.filterCatalogDiseaseIDs(generated.CommonDiseasesList)
+
+		// Patch the English master with the iNat name (the LLM may ignore the
+		// hint). Non-English masters keep their localized common_name (iNatName == "").
+		if iNatName != "" {
+			generated.CommonName = iNatName
+			generated.CommonNameSource = "inaturalist"
+		}
+
+		// Step 6: INSERT ON CONFLICT (normalized, lang) DO NOTHING. On conflict,
+		// re-Lookup to pick up the master another concurrent caller just wrote — and
+		// let them own the backfill (SPEC §2.1 step 5).
+		inserted, insErr := s.db.Insert(ctx, InsertParams{
+			Normalized:      normalized,
+			Lang:            lang,
+			ScientificName:  name,
+			CommonName:      hint, // iNat-resolved hint when iNat hit (en), else upstream
+			Data:            generated,
+			Source:          SourceTag,
+			SourceVersion:   PromptVersion,
+			GenerationReqID: requestID,
+		})
+		if insErr != nil {
+			return nil, insErr
+		}
+
+		if !inserted {
+			// Concurrent race resolved by ON CONFLICT. The conflicting writer's
+			// master is now available — return that to keep all callers consistent.
+			if row, lookupErr := s.db.Lookup(ctx, normalized, lang); lookupErr == nil && row != nil {
+				s.cache.Set(cacheKey, row)
+				return genResult{row, SourceSupabaseMissGenerateRaceWinner}, nil
+			}
+			// Race re-Lookup also failed — return our generated copy. Same shape,
+			// just a different LLM sample. The conflicting writer owns the backfill.
+			s.cache.Set(cacheKey, generated)
+			return genResult{generated, SourceSupabaseMissGenerate}, nil
+		}
+
+		s.cache.Set(cacheKey, generated)
+
+		// Step 7: async backfill the other languages from this master (English
+		// first), translate-only-prose, ON CONFLICT DO NOTHING (SPEC §7 + §9 #18).
+		if s.backfill != nil {
+			s.backfill.Enqueue(BackfillJob{
+				Normalized:     normalized,
+				ScientificName: name,
+				CommonHint:     hint,
+				SourceLang:     lang,
+				Master:         generated,
+			})
+		}
+
+		return genResult{generated, SourceSupabaseMissGenerate}, nil
 	})
 	if err != nil {
 		return nil, "", err
 	}
+	res := v.(genResult)
+	return overrideINat(res.detail, res.source), res.source, nil
+}
 
-	if !inserted {
-		// Concurrent race resolved by ON CONFLICT. The conflicting writer's
-		// master is now available — return that to keep all callers consistent.
-		if row, lookupErr := s.db.Lookup(ctx, normalized, lang); lookupErr == nil && row != nil {
-			s.cache.Set(cacheKey, row)
-			return overrideINat(row, SourceSupabaseMissGenerateRaceWinner), SourceSupabaseMissGenerateRaceWinner, nil
-		}
-		// Race re-Lookup also failed — return our generated copy. Same shape,
-		// just a different LLM sample. The conflicting writer owns the backfill.
-		s.cache.Set(cacheKey, generated)
-		return generated, SourceSupabaseMissGenerate, nil
+// genResult bundles the (detail, source) pair returned through singleflight.Do,
+// whose func returns a single any — so concurrent followers share one generation.
+type genResult struct {
+	detail *proxy.PlantDetail
+	source string
+}
+
+// nativeRegionStaleVersion is stamped (instead of PromptVersion) on a translated
+// row whose native_region could NOT be localized: the translator returned a
+// mismatched element count so Translate (prompt.go) kept the master's
+// source-language regions verbatim. It sorts before PromptVersion ("v5"), keeping
+// the row selectable by ListNativeRegionBackfillRows (source_version < 'v5') so
+// the one-shot native_region backfill retries it — otherwise un-localized regions
+// would escape re-selection forever under a v5 stamp.
+const nativeRegionStaleVersion = "v4"
+
+// translatedRowVersion returns the source_version to stamp on a freshly translated
+// row: PromptVersion normally, or nativeRegionStaleVersion when the master carried
+// a non-empty native_region that Translate left unchanged (kept the master's
+// regions because the model returned the wrong element count).
+func translatedRowVersion(master, translated *proxy.PlantDetail) string {
+	if master != nil && translated != nil &&
+		len(master.NativeRegion) > 0 &&
+		slices.Equal(master.NativeRegion, translated.NativeRegion) {
+		return nativeRegionStaleVersion
 	}
-
-	s.cache.Set(cacheKey, generated)
-
-	// Step 7: async backfill the other languages from this master (English
-	// first), translate-only-prose, ON CONFLICT DO NOTHING (SPEC §7 + §9 #18).
-	if s.backfill != nil {
-		s.backfill.Enqueue(BackfillJob{
-			Normalized:     normalized,
-			ScientificName: name,
-			CommonHint:     hint,
-			SourceLang:     lang,
-			Master:         generated,
-		})
-	}
-
-	return generated, SourceSupabaseMissGenerate, nil
+	return PromptVersion
 }
 
 // filterCatalogDiseaseIDs preserves order, drops entries not in the catalog

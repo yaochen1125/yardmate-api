@@ -52,6 +52,14 @@ func NewFeedbackMailer(host, port, from, pass, to string) *FeedbackMailer {
 // notify composes and sends the feedback email. Runs on its own goroutine —
 // errors are logged, never surfaced to the client.
 func (m *FeedbackMailer) notify(id string, row feedbackRow) {
+	// Runs in a bare goroutine (feedback.go), so a panic here would crash the
+	// whole single-instance process. Recover and log — a dropped notification
+	// email must never take the server down.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("feedback mail panic recovered: id=%s panic=%v", id, r)
+		}
+	}()
 	if err := m.send(id, row); err != nil {
 		log.Printf("feedback mail err: id=%s err=%v", id, err)
 	}

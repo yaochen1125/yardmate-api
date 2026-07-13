@@ -63,6 +63,15 @@ func (s *Sweeper) Start(ctx context.Context) {
 }
 
 func (s *Sweeper) loop(ctx context.Context) {
+	// This loop is the only goroutine driving the sweep; an unrecovered panic here
+	// would crash the whole single-instance server. Recover at the top (last
+	// resort — the loop then exits, disabling further sweeps but keeping the
+	// process alive) AND per-tick below so one bad sweep never stops the schedule.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("enrichment sweep: loop panic recovered (sweeps disabled): %v", r)
+		}
+	}()
 	timer := time.NewTimer(sweepStartupDelay)
 	defer timer.Stop()
 	for {
@@ -70,7 +79,14 @@ func (s *Sweeper) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			s.runOnce(ctx)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("enrichment sweep: runOnce panic recovered: %v", r)
+					}
+				}()
+				s.runOnce(ctx)
+			}()
 			timer.Reset(s.interval)
 		}
 	}

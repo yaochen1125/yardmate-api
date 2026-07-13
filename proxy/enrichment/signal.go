@@ -96,6 +96,12 @@ func HandleSignal(db *DB) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "missing_scientific_name")
 			return
 		}
+		// Same 200-char ceiling the main enrichment path enforces (maxScientificNameLen):
+		// bound the value before it hits the DB, matching that validation's posture.
+		if len(normalized) > maxScientificNameLen {
+			writeError(w, http.StatusBadRequest, "scientific_name_too_long")
+			return
+		}
 		if !signalKinds[req.Kind] {
 			writeError(w, http.StatusBadRequest, "invalid_kind")
 			return

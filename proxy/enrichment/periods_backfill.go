@@ -155,10 +155,14 @@ func (d *DB) updateRowData(ctx context.Context, normalized, lang string, data *p
 	if err != nil {
 		return fmt.Errorf("enrichment/db: marshal data: %w", err)
 	}
+	// Match scanPendingRows' status filter: a row flipped to 'rejected' between the
+	// list scan and this write must NOT be overwritten (parity with
+	// disease_supabase.go UpdateDiseaseSeverity).
 	const stmt = `
 		UPDATE plants_pending
 		SET data = $3
-		WHERE scientific_name_normalized = $1 AND lang = $2`
+		WHERE scientific_name_normalized = $1 AND lang = $2
+		  AND status IN ('pending', 'approved')`
 	if _, err := d.pool.Exec(ctx, stmt, normalized, lang, raw); err != nil {
 		return fmt.Errorf("%w: update data: %v", ErrDBUnavailable, err)
 	}

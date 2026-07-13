@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,15 +30,21 @@ const inatBodyPrettyface = `{"results":[
 	{"name":"Triteleia ixioides","rank":"species","preferred_common_name":"Prettyface"}
 ]}`
 
-// TestGetOrGenerate_INatOverridesCacheHit pins down the PR #25 fix to the
-// symptom user saw on screen: a previously-cached PlantDetail (CommonName
-// "Ixia", commonNameSource "plantnet") is now post-patched with the iNat
-// preferred_common_name "Prettyface" on the way out, source stays SourceCache,
-// and the cached row itself is NOT mutated (override must copy so other
-// callers reading the same pointer don't see "Prettyface" written back).
-func TestGetOrGenerate_INatOverridesCacheHit(t *testing.T) {
-	inat, done := inatStub(t, inatBodyPrettyface)
-	defer done()
+// TestGetOrGenerate_CacheHitSkipsINat pins finding #1: a cache hit must NOT pay
+// an iNat round-trip. Before the fix, iNat ran on EVERY request (including cache
+// hits), so a slow/hung iNat added up to 8s to a hot-path hit. Now the cached
+// row is served verbatim and iNat is never contacted. This is correct because
+// production cache/DB rows already carry the iNat-resolved common name baked in
+// at generation time (service.go Step 5), so no per-hit re-patch is needed.
+func TestGetOrGenerate_CacheHitSkipsINat(t *testing.T) {
+	var inatCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&inatCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(inatBodyPrettyface))
+	}))
+	defer srv.Close()
+	inat := &proxy.INatClient{HTTP: srv.Client(), BaseURL: srv.URL}
 
 	cache := NewCache(10, time.Hour)
 	pre := &proxy.PlantDetail{CommonName: "Ixia", CommonNameSource: "plantnet"}
@@ -51,22 +58,15 @@ func TestGetOrGenerate_INatOverridesCacheHit(t *testing.T) {
 	if src != SourceCache {
 		t.Errorf("source = %q, want %q (cache hit path)", src, SourceCache)
 	}
-	if got.CommonName != "Prettyface" {
-		t.Errorf("commonName = %q, want Prettyface (iNat override)", got.CommonName)
+	// Cache is served as-is on the hot path — no iNat override applied.
+	if got.CommonName != "Ixia" {
+		t.Errorf("commonName = %q, want Ixia (cache served verbatim)", got.CommonName)
 	}
-	if got.CommonNameSource != "inaturalist" {
-		t.Errorf("commonNameSource = %q, want inaturalist", got.CommonNameSource)
+	if got.CommonNameSource != "plantnet" {
+		t.Errorf("commonNameSource = %q, want plantnet (cache served verbatim)", got.CommonNameSource)
 	}
-
-	// The cached row must NOT have been mutated — overrideINat copies before
-	// writing. If this fails, every other caller reading the same pointer
-	// would see the override leaked back.
-	cached, ok := cache.Get("triteleia ixioides|en")
-	if !ok {
-		t.Fatal("cached row vanished after GetOrGenerate")
-	}
-	if cached.CommonName != "Ixia" {
-		t.Errorf("cached row mutated: commonName = %q, want Ixia (override must copy)", cached.CommonName)
+	if n := atomic.LoadInt32(&inatCalls); n != 0 {
+		t.Errorf("iNat was contacted %d times on a cache hit — must be 0 (finding #1: no 8s round-trip on hot path)", n)
 	}
 }
 
