@@ -213,6 +213,19 @@ func newServer(
 			}
 			r.Post("/feedback", enrichment.HandleFeedback(enrichDB, feedbackMailer))
 		}
+
+		// /v1/attribution — Apple Search Ads (AdServices) install attribution.
+		// The iOS app posts an AAAttribution token; the server exchanges it at
+		// Apple's api-adservices endpoint and stores the campaign/keyword
+		// breakdown (proxy/enrichment/attribution.go), deduped per device
+		// install id (first write wins). Same posture as /v1/plants/signal:
+		// outside the per-device expensive-call group, bounded by this /v1
+		// scope's per-IP limit. No IDFA / ATT — a forged token just 404s at
+		// Apple (nothing stored). The handler requires + validates
+		// X-Device-Install-Id itself.
+		if enrichDB != nil {
+			r.Post("/attribution", enrichment.HandleAttribution(enrichDB, enrichment.NewAppleAdServicesClient()))
+		}
 	})
 
 	return &Server{
