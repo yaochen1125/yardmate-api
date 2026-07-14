@@ -35,6 +35,7 @@ func stripJPEGMetadata(in []byte) ([]byte, error) {
 	out := make([]byte, 0, len(in))
 	out = append(out, 0xFF, 0xD8) // SOI
 	i := 2
+	sawSOS := false // require actual scan data before we accept an EOI
 	for i+1 < len(in) {
 		if in[i] != 0xFF {
 			return nil, errNotJPEG
@@ -47,6 +48,11 @@ func stripJPEGMetadata(in []byte) ([]byte, error) {
 		}
 		switch {
 		case marker == 0xD9: // EOI — end of the primary image. Drop trailing frames.
+			if !sawSOS {
+				// SOI…EOI with no scan (e.g. FF D8 FF D9) sniffs as image/jpeg but
+				// has no image data — reject rather than store an undecodable file.
+				return nil, errNotJPEG
+			}
 			out = append(out, 0xFF, 0xD9)
 			return out, nil
 		case marker >= 0xD0 && marker <= 0xD7: // RSTn — standalone, no payload
@@ -65,6 +71,7 @@ func stripJPEGMetadata(in []byte) ([]byte, error) {
 			if segLen < 2 || i+2+segLen > len(in) {
 				return nil, errNotJPEG
 			}
+			sawSOS = true
 			out = append(out, in[i:i+2+segLen]...) // SOS header
 			i += 2 + segLen
 			// Copy entropy-coded data up to (not including) the next real marker.

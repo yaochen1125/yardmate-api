@@ -107,10 +107,11 @@ func TestStripDropsTrailingFrame(t *testing.T) {
 
 func TestStripRejectsNonJPEG(t *testing.T) {
 	cases := map[string][]byte{
-		"empty":     nil,
-		"png-magic": {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A},
-		"truncated": {0xFF, 0xD8, 0xFF, 0xE1, 0x00}, // SOI + start of APP1 then cut
-		"garbage":   []byte("not an image at all"),
+		"empty":        nil,
+		"png-magic":    {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A},
+		"truncated":    {0xFF, 0xD8, 0xFF, 0xE1, 0x00}, // SOI + start of APP1 then cut
+		"soi-eoi-only": {0xFF, 0xD8, 0xFF, 0xD9},       // SOI+EOI, no scan data (sniffs jpeg)
+		"garbage":      []byte("not an image at all"),
 	}
 	for name, in := range cases {
 		if _, err := stripJPEGMetadata(in); err == nil {

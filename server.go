@@ -88,6 +88,11 @@ func newServer(
 	// never reaching any engine). The iOS toggle is opt-in, so most requests carry
 	// no coords regardless — this switch is the server-side circuit breaker.
 	geoPriorEnabled := vault.GetBool("GEO_PRIOR_ENABLED", true)
+	// User-photo flywheel INTAKE gate (training/SPEC §2.1). Default OFF. The
+	// trainingStore is opened whenever intake is on OR a corpus already exists
+	// (main.buildTrainingStore) so DELETION stays available after a rollback; only
+	// the upload route is gated on this flag. A nil store disables everything.
+	trainingUploadEnabled := vault.GetBool("TRAINING_UPLOAD_ENABLED", false)
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(realIPFromNginx)
@@ -167,10 +172,11 @@ func newServer(
 					}
 					// /v1/training/photo — opt-in user photo flywheel intake
 					// (training/SPEC.md). Buffers a full image like identify, so it
-					// belongs in the inflight bound. OFF unless TRAINING_UPLOAD_ENABLED
-					// built the store (nil → unregistered). No paid upstream call, so
-					// it does NOT take the global spend gate.
-					if trainingStore != nil {
+					// belongs in the inflight bound. Gated on BOTH the store being
+					// open AND the intake flag: when the flag is flipped off the store
+					// may still be open (for deletion), but intake must stop. No paid
+					// upstream call, so it does NOT take the global spend gate.
+					if trainingStore != nil && trainingUploadEnabled {
 						r.Post("/training/photo", training.HandleUpload(trainingStore))
 					}
 				})

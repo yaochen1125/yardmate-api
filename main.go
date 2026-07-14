@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -612,23 +613,43 @@ func buildImageIngestService(vault *secrets.Vault, content *proxy.ContentIndex) 
 	return imageingest.NewService(ingestor, adminToken)
 }
 
-// buildTrainingStore opens the user-photo flywheel corpus when
-// TRAINING_UPLOAD_ENABLED is set (default OFF, same posture as
-// VISION_KNN_ENABLED). Returns nil when the flag is off. A store the operator
-// explicitly enabled but that fails to open is FATAL — silently disabling intake
-// the operator turned on would drop uploads without anyone noticing. The corpus
-// dir (YARDMATE_API_TRAINING_DIR, default /var/lib/yardmate-api/training) is
-// inside the systemd ReadWritePaths, so no unit change is needed (training/SPEC §1.5).
+// buildTrainingStore opens the user-photo flywheel corpus. The store backs BOTH
+// intake (TRAINING_UPLOAD_ENABLED, default OFF like VISION_KNN_ENABLED) AND
+// deletion. It is opened when EITHER the flag is on OR a corpus already exists on
+// disk — so that flipping the kill switch off after uploads exist (the rollback
+// path) still leaves /v1/training/delete + the account-deletion cascade able to
+// erase previously shared photos (GDPR/CCPA erasure must not depend on the intake
+// flag; Codex #105 P1). server.go gates the intake ROUTE on the flag separately.
+// Only when the flag is off AND nothing was ever collected do we skip entirely.
+//
+// A store the operator explicitly enabled but that fails to open is FATAL —
+// silently disabling intake the operator turned on would drop uploads unnoticed.
+// When only a pre-existing corpus is present (flag off), an open failure is a
+// WARN + nil (deletion unavailable but the service still runs). The corpus dir
+// (YARDMATE_API_TRAINING_DIR, default /var/lib/yardmate-api/training) is inside
+// the systemd ReadWritePaths, so no unit change is needed (training/SPEC §1.5).
 func buildTrainingStore(vault *secrets.Vault) *training.Store {
-	if !vault.GetBool("TRAINING_UPLOAD_ENABLED", false) {
-		return nil
-	}
 	dir := envOr("YARDMATE_API_TRAINING_DIR", defaultTrainingDir)
+	enabled := vault.GetBool("TRAINING_UPLOAD_ENABLED", false)
+	if !enabled {
+		// Off + no existing corpus → nothing to intake or delete; skip.
+		if _, err := os.Stat(filepath.Join(dir, "training_meta.db")); err != nil {
+			return nil
+		}
+	}
 	store, err := training.OpenStore(dir)
 	if err != nil {
-		log.Fatalf("training: TRAINING_UPLOAD_ENABLED=true but corpus store failed to open at %s: %v", dir, err)
+		if enabled {
+			log.Fatalf("training: TRAINING_UPLOAD_ENABLED=true but corpus store failed to open at %s: %v", dir, err)
+		}
+		log.Printf("WARN: training corpus exists at %s but failed to open (deletion paths unavailable): %v", dir, err)
+		return nil
 	}
-	log.Printf("training photo flywheel intake enabled: corpus=%s", dir)
+	if enabled {
+		log.Printf("training photo flywheel intake enabled: corpus=%s", dir)
+	} else {
+		log.Printf("training photo intake OFF but corpus exists: %s (deletion paths remain available)", dir)
+	}
 	return store
 }
 

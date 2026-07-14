@@ -233,9 +233,16 @@ func handleAccountDelete(vault *secrets.Vault, enrichDB *enrichment.DB, training
 		// Device-level photos without a userID are handled by the iOS client
 		// calling /v1/training/delete alongside this endpoint. Best-effort: a
 		// failure here must not fail an otherwise-complete account deletion. nil
-		// when TRAINING_UPLOAD_ENABLED is off. ----
+		// when no corpus exists (training off + nothing collected). Runs on its OWN
+		// fresh Background-derived deadline — NOT deleteCtx, which the load-bearing
+		// deletes above may have nearly exhausted; the auth user is already gone so
+		// the client cannot retry this cascade, so it must not be starved into a
+		// spurious deadline failure (Codex #105 P2). ----
 		if trainingStore != nil {
-			if n, err := trainingStore.DeleteByUserID(deleteCtx, userID); err != nil {
+			trainCtx, trainCancel := context.WithTimeout(context.Background(), bestEffortTimeout)
+			n, err := trainingStore.DeleteByUserID(trainCtx, userID)
+			trainCancel()
+			if err != nil {
 				log.Printf("account/delete: training photo cascade failed (best-effort, continuing): %v", err)
 			} else if n > 0 {
 				log.Printf("account/delete: removed %d training photo(s)", n)
