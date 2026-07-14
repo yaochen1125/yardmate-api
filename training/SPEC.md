@@ -119,9 +119,16 @@ orphans). `embedded=0`, `exported=0`, `deleted=0` at insert.
   account-deletion cascade (`DeleteByUserID`). Worst case, a client stamps
   someone else's userID on ITS OWN photo → that photo (which it owns) gets
   deleted when the other account is deleted. No cross-user disclosure, no ability
-  to delete another user's photos (delete-by-device uses the keychain install id;
-  delete-by-user runs only inside Bearer-verified `/v1/account/delete`). Photos
-  with no user_id are still covered by device-level delete.
+  to delete another user's photos via user_id (`DeleteByUserID` runs ONLY inside
+  Bearer-verified `/v1/account/delete`). Photos with no user_id are still covered
+  by device-level delete.
+- **`/v1/training/delete` is keyed on the `X-Device-Install-Id` header, which is
+  an UNAUTHENTICATED device identifier** (the same trust posture as the per-device
+  rate-limit key), NOT a secret. An attacker who learns a victim's install id can
+  delete that victim's OWN opt-in training photos — deletion only, no disclosure,
+  no read, no ability to touch a different device's photos. Consistent with the
+  rest of the API; acceptable because the impact is bounded to erasing data the
+  user already made deletable.
 - **Deletion = file removed immediately + row tombstoned** (`deleted=1`,
   `deleted_at`, PII columns nulled). The tombstone retains only `id` +
   `embedded` so the P2b index-cleanup can drop the vector; a full rebuild
@@ -184,7 +191,11 @@ concurrently with serving writes.
 - Strip metadata by DROPPING APPn segments, not by re-encoding — re-encoding a
   training photo adds JPEG artifacts that hurt L2 downstream.
 - Remove the file if the DB insert fails; insert the row only after the file is
-  durably renamed into place (no orphans, no dangling rows).
+  atomically renamed into place (readers never see a partial file; no orphans, no
+  dangling rows). Note: we do NOT fsync the file/dir — a power loss between the
+  WAL commit and the data reaching disk can leave a row pointing at a missing
+  file. The embed job (P2b) tolerates a missing file, and cold export is the
+  durability backstop, so fsync's cost isn't warranted for training data.
 
 ## 10. Implementation outline
 - `store.go` — `OpenStore(dir)`, `Insert`, `DeleteByInstallID`,

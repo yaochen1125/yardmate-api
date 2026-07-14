@@ -80,6 +80,31 @@ func TestStripKeepsCleanImageDecodable(t *testing.T) {
 	}
 }
 
+// A crafted multi-frame JPEG (frame1 EOI, then an appended frame carrying GPS)
+// must have the trailing frame — and its GPS — dropped. This is the gap a naive
+// "copy from SOS to end of buffer" leaves open for modified/non-iOS clients.
+func TestStripDropsTrailingFrame(t *testing.T) {
+	frame1 := baseJPEG(t)           // valid single frame, ends in EOI
+	frame2 := withExif(baseJPEG(t)) // second frame, carries GPSLATITUDE-SECRET in APP1
+	dirty := append(append([]byte{}, frame1...), frame2...)
+
+	clean, err := stripJPEGMetadata(dirty)
+	if err != nil {
+		t.Fatalf("strip: %v", err)
+	}
+	if bytes.Contains(clean, []byte("GPSLATITUDE-SECRET")) {
+		t.Error("GPS from an appended trailing frame survived stripping")
+	}
+	// Output must still be a decodable primary image.
+	if _, err := jpeg.Decode(bytes.NewReader(clean)); err != nil {
+		t.Fatalf("stripped multi-frame output no longer decodes: %v", err)
+	}
+	// Trailing frame dropped → output no larger than frame1 alone.
+	if len(clean) > len(frame1) {
+		t.Errorf("trailing frame not dropped: clean=%d frame1=%d", len(clean), len(frame1))
+	}
+}
+
 func TestStripRejectsNonJPEG(t *testing.T) {
 	cases := map[string][]byte{
 		"empty":     nil,
