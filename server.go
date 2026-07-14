@@ -15,6 +15,7 @@ import (
 	"github.com/yaochen1125/yardmate-api/proxy/imageingest"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
 	"github.com/yaochen1125/yardmate-api/secrets"
+	"github.com/yaochen1125/yardmate-api/training"
 )
 
 // Server bundles the chi router with the verifier, vault, rate limiter,
@@ -56,6 +57,7 @@ func newServer(
 	ingest *imageingest.Service,
 	enrichDB *enrichment.DB,
 	inflightLim *inflight.Limiter,
+	trainingStore *training.Store,
 ) *Server {
 	// Rose cultivar rerank is ON by default; ROSE_RERANK_ENABLED=false kill-switches it.
 	roseEnabled := vault.GetBool("ROSE_RERANK_ENABLED", true)
@@ -132,7 +134,7 @@ func newServer(
 		// /v1/account/delete also joins this group: it carries the same per-IP
 		// limit, passes through the per-device middleware (no device id → no-op,
 		// ratelimit/SPEC), and only needs the shared Supabase pool (enrichDB).
-		if plantNet != nil || plantID != nil || enrich != nil || ingest != nil || enrichDB != nil {
+		if plantNet != nil || plantID != nil || enrich != nil || ingest != nil || enrichDB != nil || trainingStore != nil {
 			r.Group(func(r chi.Router) {
 				r.Use(ratelimit.PerDeviceMiddleware(lim.PerDevice, "rate_limit_device"))
 				// /v1/identify + /v1/diagnose each buffer the uploaded image
@@ -163,6 +165,14 @@ func newServer(
 					if plantID != nil {
 						r.Post("/diagnose", proxy.HandleDiagnose(plantID, content, vision, diseaseEnricher, spendGate))
 					}
+					// /v1/training/photo — opt-in user photo flywheel intake
+					// (training/SPEC.md). Buffers a full image like identify, so it
+					// belongs in the inflight bound. OFF unless TRAINING_UPLOAD_ENABLED
+					// built the store (nil → unregistered). No paid upstream call, so
+					// it does NOT take the global spend gate.
+					if trainingStore != nil {
+						r.Post("/training/photo", training.HandleUpload(trainingStore))
+					}
 				})
 				if enrich != nil {
 					r.Post("/plants/enrichment", enrichment.HandleEnrichment(enrich))
@@ -180,7 +190,14 @@ func newServer(
 				// token revoke (account_delete.go). Registered only when the
 				// shared Supabase pool is present (row deletes need it).
 				if enrichDB != nil {
-					r.Post("/account/delete", handleAccountDelete(vault, enrichDB))
+					r.Post("/account/delete", handleAccountDelete(vault, enrichDB, trainingStore))
+				}
+				// /v1/training/delete — device-level "delete my uploaded photos"
+				// (training/SPEC §5). No image buffer → outside the inflight group.
+				// Needs no Bearer (keychain install id is the device key). The
+				// by-user cascade runs inside the Bearer-verified /v1/account/delete.
+				if trainingStore != nil {
+					r.Post("/training/delete", training.HandleDelete(trainingStore))
 				}
 			})
 		}
