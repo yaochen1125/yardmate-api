@@ -169,6 +169,13 @@ func (d *DB) DeleteUserRows(ctx context.Context, userID string) error {
 	if _, err := d.pool.Exec(ctx, `DELETE FROM garden_records WHERE user_id = $1`, userID); err != nil {
 		return fmt.Errorf("%w: delete garden_records: %v", ErrDBUnavailable, err)
 	}
+	// ad_attribution stores the Supabase auth user id when a signed-in install is
+	// attributed (attribution.go). Included in the hard-delete set so account
+	// deletion stays end-to-end: only the attributed row keyed to THIS user is
+	// removed (device-only / organic rows have user_id NULL and are untouched).
+	if _, err := d.pool.Exec(ctx, `DELETE FROM ad_attribution WHERE user_id = $1`, userID); err != nil {
+		return fmt.Errorf("%w: delete ad_attribution: %v", ErrDBUnavailable, err)
+	}
 	return nil
 }
 
