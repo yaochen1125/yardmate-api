@@ -187,12 +187,18 @@ func (d *DB) RecordAttribution(ctx context.Context, deviceID, userID string, rec
 	}
 	userIDPtr := nzStr(userID)
 
+	// Attribution fields are first-write-wins (install attribution is immutable),
+	// but user_id is backfilled once: if the first successful exchange happened
+	// while signed out (user_id NULL) a later signed-in report fills in the
+	// account id, so attributed installs can still be correlated. COALESCE keeps
+	// any existing non-NULL id and no-ops when the new report is also signed out.
 	const stmt = `
 		INSERT INTO ad_attribution
 		  (device_id, user_id, attribution, org_id, campaign_id, ad_group_id,
 		   ad_id, keyword_id, conversion_type, country_or_region, click_date)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-		ON CONFLICT (device_id) DO NOTHING`
+		ON CONFLICT (device_id) DO UPDATE
+		  SET user_id = COALESCE(ad_attribution.user_id, EXCLUDED.user_id)`
 	if _, err := d.pool.Exec(ctx, stmt,
 		deviceID, userIDPtr, rec.Attribution, orgID, campaignID, adGroupID,
 		adID, keywordID, conversionType, country, clickDate); err != nil {
