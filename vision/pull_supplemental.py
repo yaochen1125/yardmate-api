@@ -179,9 +179,11 @@ def main(index_dir, catalog_path, out_dir):
             pn_budget.take()
             pn_cands = src.plantnet_related(paths[0], species_of(sci), pn_key)
             if pn_cands:
+                import numpy as np
                 pev, ppath, pk = _embed_candidates(pn_cands, tmp + "/pn")
-                # 并进候选池(下方判据统一处理)。
-                evs += pev; paths += ppath; kept_cands += pk
+                for v, pth, c in zip(pev, ppath, pk):   # 并进候选池, 但去掉与已抓图的近重复(PlantNet 常和 GBIF/iNat 撞图)
+                    if not any(float(v @ e) > DUP_SIM for e in evs):
+                        evs.append(v); paths.append(pth); kept_cands.append(c)
 
         if not evs:
             manifest[cid] = {"sci": sci, "mode": mode, "n": 0}
@@ -198,16 +200,21 @@ def main(index_dir, catalog_path, out_dir):
                     keep_idx.append(j)
             keep_idx = keep_idx[:MAX_KEEP]
         else:
-            keep_idx = verify.verify_anchorfree(evs, paths, sci, commons.get(cid, ""),
-                                                api_key, budget, MAX_KEEP)
+            keep_idx, incomplete = verify.verify_anchorfree(evs, paths, sci, commons.get(cid, ""),
+                                                            api_key, budget, MAX_KEEP)
             spot.append(cid)
+            if incomplete and not keep_idx:
+                shutil.rmtree(tmp, ignore_errors=True)
+                continue   # 预算耗尽/GPT 报错 且一张没收 → 不记 done, 下轮新预算/恢复后重试
 
         # ── 落盘: 验证过的图 + manifest 条目 ──
+        dst = f"{out_dir}/{cid}"
+        shutil.rmtree(dst, ignore_errors=True)   # 先清旧图: 重跑(如删 manifest 条目后)收更少时, 免留孤儿被 fold 重收
         entries = []
         for out_i, j in enumerate(keep_idx, 1):
-            dst = f"{out_dir}/{cid}"; os.makedirs(dst, exist_ok=True)
+            os.makedirs(dst, exist_ok=True)
             fn = f"{dst}/{out_i:03d}.jpg"
-            os.replace(paths[j], fn)
+            shutil.move(paths[j], fn)   # 跨文件系统安全: tmp 常是 tmpfs, os.replace 会 EXDEV(Invalid cross-device link)
             e = kept_cands[j].as_manifest(); e["file"] = f"{out_i:03d}.jpg"
             entries.append(e)
         manifest[cid] = {"sci": sci, "mode": mode, "n": len(entries), "images": entries}

@@ -39,6 +39,15 @@ def test_license_rejects_nc_nd_and_unknown():
     assert src.classify_license("ARR") is None
     assert src.classify_license("GFDL") is None                         # 只 GFDL → 拒
     assert src.classify_license("", "Public domain") == "PD"            # 老文件只有短名
+    # ★回归: 机读 code 为空、NC/ND 只写在 short_name(老 Commons 文件)—— 曾把这些误判成 CC-BY 折进
+    #   商用索引(违铁律)。NC/ND veto 必须对 code+短名 一并查。
+    assert src.classify_license("", "CC BY-NC 2.0") is None
+    assert src.classify_license("", "CC BY-NC-SA 3.0") is None
+    assert src.classify_license("", "CC BY-ND 4.0") is None
+    assert src.classify_license("", "CC BY-NC-ND 4.0") is None
+    assert src.classify_license("cc-by", "CC BY-NC-SA 3.0") is None     # code 没 nc 但短名有 → 仍拒
+    assert src.classify_license("", "CC BY-SA 3.0") == "CC-BY-SA"       # 干净短名仍正常放行
+    assert src.classify_license("", "CC BY 4.0") == "CC-BY"
 
 
 def test_is_cultivar_and_species_of():
@@ -89,15 +98,57 @@ def test_cluster_consensus():
     base = unit([1, 0.02, 0, 0])
     vecs = [base, unit([1, 0.01, 0.01, 0]), unit([0.99, 0.03, 0, 0.01]),
             unit([1, 0.0, 0.02, 0]), unit([0, 1, 0, 0])]  # 最后一张正交 = 离群
-    cluster, medoid, outliers = verify.cluster_consensus(vecs)
+    cluster, medoid, outliers, med_sims = verify.cluster_consensus(vecs)
     assert medoid is not None and medoid in cluster
     assert cluster == {0, 1, 2, 3}, f"主簇应是前 4 张, got {cluster}"
     assert outliers == [4], f"第 5 张应离群, got {outliers}"
+    assert med_sims is not None and len(med_sims) == 5, "medoid_sims 供 verify 挑边界图"
 
-    # 全互不相似(< min_size)→ 无共识, medoid=None, 全体逐张判。
+    # 全互不相似(< min_size)→ 无共识, medoid=None, 全体逐张判, med_sims=None。
     singl = [unit([1, 0, 0, 0]), unit([0, 1, 0, 0]), unit([0, 0, 1, 0])]
-    c2, m2, o2 = verify.cluster_consensus(singl)
-    assert m2 is None and c2 == set() and o2 == [0, 1, 2]
+    c2, m2, o2, s2 = verify.cluster_consensus(singl)
+    assert m2 is None and c2 == set() and o2 == [0, 1, 2] and s2 is None
+
+
+def test_verify_anchorfree_gate():
+    try:
+        import numpy as np
+    except ImportError:
+        print("SKIP test_verify_anchorfree_gate (no numpy)")
+        return
+    import supp_verify as verify
+
+    def unit(x):
+        x = np.array(x, dtype=np.float32)
+        return x / np.linalg.norm(x)
+
+    # 4 张紧簇 + 1 张离群; img_paths 用占位串, gpt_verify 打桩(不联网)。
+    vecs = [unit([1, 0.02, 0, 0]), unit([1, 0.01, 0.01, 0]), unit([0.99, 0.03, 0, 0.01]),
+            unit([1, 0.0, 0.02, 0]), unit([0, 1, 0, 0])]
+    paths = [f"p{i}" for i in range(5)]
+    orig = verify.gpt_verify
+    try:
+        # 全过 → medoid+边界过 → 整簇收 + 离群也逐张过 → 全收; incomplete False。
+        verify.gpt_verify = lambda path, *a, **k: (True, {})
+        keep, inc = verify.verify_anchorfree(vecs, paths, "X", "", "key", verify.VLMBudget(100), 12)
+        assert set(keep) == {0, 1, 2, 3, 4} and inc is False, (keep, inc)
+
+        # 离群 p4 判否 → 簇仍收(medoid+边界都在簇内且过), p4 被拒。
+        verify.gpt_verify = lambda path, *a, **k: (path != "p4", {})
+        keep, inc = verify.verify_anchorfree(vecs, paths, "X", "", "key", verify.VLMBudget(100), 12)
+        assert set(keep) == {0, 1, 2, 3} and inc is False, (keep, inc)
+
+        # medoid 判否 → 不信主簇, 退化逐张; 这里逐张也否 → 一张不收。
+        verify.gpt_verify = lambda path, *a, **k: (False, {})
+        keep, inc = verify.verify_anchorfree(vecs, paths, "X", "", "key", verify.VLMBudget(100), 12)
+        assert keep == [] and inc is False, (keep, inc)
+
+        # 全部 skip(预算耗尽/报错)→ incomplete=True(调用方据此不记 done)。
+        verify.gpt_verify = lambda path, *a, **k: (False, {"skip": "budget"})
+        keep, inc = verify.verify_anchorfree(vecs, paths, "X", "", "key", verify.VLMBudget(100), 12)
+        assert keep == [] and inc is True, (keep, inc)
+    finally:
+        verify.gpt_verify = orig
 
 
 if __name__ == "__main__":

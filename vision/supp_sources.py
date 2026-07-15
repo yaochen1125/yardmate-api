@@ -72,11 +72,15 @@ def classify_license(code_or_url, short_name=""):
     m = _CC_URL_RE.search(raw)
     body = m.group(1) if m else raw
 
-    # 拆 token: 连字符/下划线/斜杠/空格/点 都是分隔(覆盖 'cc-by-sa' 与 GBIF 'CC_BY_SA_4_0')。
+    # 拆 token —— ★code 和 short_name **一起**拆。命门(否则违铁律): 老 Wikimedia 文件机读 License
+    # 码常为空, 许可只写在 LicenseShortName(如 'CC BY-NC 2.0'); 只查 code 会漏掉短名里的 NC/ND
+    # → 把 NC 图误判 CC-BY 折进商用索引。连字符/下划线/斜杠/空格/点 都是分隔(覆盖 'cc-by-sa'/
+    # GBIF 'CC_BY_SA_4_0'/短名 'CC BY-SA 3.0')。
     toks = set(t for t in re.split(r"[-_/ .]+", body) if t)
+    toks |= set(t for t in re.split(r"[-_/ .]+", sn) if t)
 
-    # NC/ND 命中即拒 —— 最高优先级, 挡在所有"允许"之前。
-    if "nc" in toks or "nd" in toks:
+    # NC/ND 命中即拒 —— 最高优先级, 对 code + 短名 一并查, 挡在所有"允许"之前。
+    if toks & {"nc", "nd", "noncommercial", "noderivs", "noderivatives"}:
         return None
 
     if "cc0" in toks or "zero" in toks:
@@ -84,15 +88,10 @@ def classify_license(code_or_url, short_name=""):
     if "pd" in toks or "publicdomain" in body or "public domain" in sn:
         return "PD"
 
-    # 是否像 CC 许可: 来自 CC URL, 或带 'cc' token, 或短名含 'cc'。防把随机 'by' 文本误判。
-    is_cc = bool(m) or ("cc" in toks) or ("cc" in sn) or ("creativecommons" in raw)
+    # 是否像 CC 许可: 来自 CC URL, 或带 'cc' token(code 或短名)。防把随机 'by' 文本误判。
+    is_cc = bool(m) or ("cc" in toks) or ("creativecommons" in raw)
     if is_cc and "by" in toks:
         return "CC-BY-SA" if "sa" in toks else "CC-BY"
-    # 短名兜底(老 Wikimedia 文件只有 LicenseShortName, 如 'CC BY-SA 3.0')。
-    if "cc by-sa" in sn or "cc-by-sa" in sn:
-        return "CC-BY-SA"
-    if "cc by" in sn or "cc-by" in sn:
-        return "CC-BY"
     return None
 
 
@@ -127,8 +126,11 @@ def download(url, path):
               or (sig[:4] == b"RIFF" and sig[8:12] == b"WEBP"))  # WEBP
     if not is_img:
         return False
-    with open(path, "wb") as f:
-        f.write(data)
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+    except OSError:
+        return False   # 磁盘满/路径竞争等: 当下载失败处理, 不炸整个 build
     return True
 
 

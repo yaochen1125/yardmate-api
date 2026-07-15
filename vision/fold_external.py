@@ -230,13 +230,22 @@ def _atomic_json(obj, path):
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    # 逐个解析: --cdn/--supp **连同其值**一起吃掉, 别把 flag 的值误当位置参(否则 `--supp /dir INAT ...`
+    # 会把 /dir 当 index_dir → 读错索引/崩)。位置参 = 非 -- 且不是被吃掉的 flag 值。
+    argv = sys.argv[1:]
     cdn = "https://images.yardmate.ai/plant_images"
-    if "--cdn" in sys.argv:
-        cdn = sys.argv[sys.argv.index("--cdn") + 1]
     supp_dir = None
-    if "--supp" in sys.argv:                     # Phase B: 深挖并已验证的库外图目录
-        supp_dir = sys.argv[sys.argv.index("--supp") + 1]
+    args = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--cdn":
+            cdn = argv[i + 1] if i + 1 < len(argv) else cdn; i += 2; continue
+        if a == "--supp":                        # Phase B: 深挖并已验证的库外图目录
+            supp_dir = argv[i + 1] if i + 1 < len(argv) else None; i += 2; continue
+        if a.startswith("--"):
+            i += 1; continue
+        args.append(a); i += 1
     if len(args) < 3:
         print(__doc__); sys.exit(2)
     main(args[0], args[1], args[2], cdn, supp_dir)

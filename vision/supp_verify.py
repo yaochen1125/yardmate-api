@@ -30,22 +30,23 @@ OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
 def cluster_consensus(vecs, sim=CLUSTER_SIM, min_size=MIN_CLUSTER):
     """vecs: list[np.ndarray] 单位向量。贪心取度最高节点为 medoid, 其 sim≥阈值 邻居 = 主簇。
-    返回 (cluster_idx:set, medoid_idx:int|None, outliers:list[int])。
+    返回 (cluster_idx:set, medoid_idx:int|None, outliers:list[int], medoid_sims:list|None)。
+    medoid_sims = medoid 对各候选的相似度(供 verify 挑簇内边界图); 无共识时 None。
     主簇 < min_size → 视作无共识(medoid=None, 全部算 outliers 逐张判)。"""
     import numpy as np
     n = len(vecs)
     if n == 0:
-        return set(), None, []
+        return set(), None, [], None
     X = np.vstack(vecs).astype(np.float32)
     S = X @ X.T                      # 余弦(已单位化)
     np.fill_diagonal(S, -1.0)        # 不把自己算进度
     deg = (S >= sim).sum(axis=1)
     medoid = int(deg.argmax())
     if int(deg[medoid]) + 1 < min_size:   # 最好的节点都凑不齐 min_size → 无共识
-        return set(), None, list(range(n))
+        return set(), None, list(range(n)), None
     cluster = {medoid} | {j for j in range(n) if S[medoid, j] >= sim}
     outliers = [i for i in range(n) if i not in cluster]
-    return cluster, medoid, outliers
+    return cluster, medoid, outliers, S[medoid]
 
 
 # ────────────────────────────── GPT-4o 视觉判图 ──────────────────────────────
@@ -92,7 +93,12 @@ _SCHEMA = {
 def _data_url(path):
     with open(path, "rb") as f:
         b = f.read()
-    mime = "image/png" if b[:4] == b"\x89PNG" else "image/jpeg"
+    if b[:4] == b"\x89PNG":
+        mime = "image/png"
+    elif b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        mime = "image/webp"    # download() 收 WEBP; 别误标 jpeg(OpenAI 会 400 → 白花预算)
+    else:
+        mime = "image/jpeg"
     return "data:" + mime + ";base64," + base64.b64encode(b).decode()
 
 
@@ -114,53 +120,68 @@ def gpt_verify(img_path, scientific_name, common_name, api_key, budget):
     user = (f"Target taxon: {target}. Is this image a real photo of that plant, and a plant photo at all? "
             "For a named cultivar, accept a photo consistent with that cultivar's known appearance; "
             "reject maps, diagrams, illustrations, herbarium sheets, labels, people, or a different species.")
-    body = {
-        "model": GPT_MODEL, "max_tokens": 60,
-        "messages": [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": [
-                {"type": "text", "text": user},
-                {"type": "image_url", "image_url": {"url": _data_url(img_path), "detail": "low"}},
-            ]},
-        ],
-        "response_format": _SCHEMA,
-    }
+    # ★整段(含 _data_url 读图 + 请求 + 解析 + 判定)都在 try 内: 读不到图 / 200 但回 null 或非 dict /
+    #   confidence 为 null 等异常都归为"没判成"(errors++ + 安全拒), 绝不因单张畸形响应炸掉数小时的 build。
     try:
+        body = {
+            "model": GPT_MODEL, "max_tokens": 60,
+            "messages": [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": [
+                    {"type": "text", "text": user},
+                    {"type": "image_url", "image_url": {"url": _data_url(img_path), "detail": "low"}},
+                ]},
+            ],
+            "response_format": _SCHEMA,
+        }
         req = urllib.request.Request(
             OPENAI_URL, data=json.dumps(body).encode(),
             headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as r:
             resp = json.load(r)
-        content = resp["choices"][0]["message"]["content"]
-        v = json.loads(content)
+        v = json.loads(resp["choices"][0]["message"]["content"])
+        if not isinstance(v, dict):
+            raise ValueError("non-dict reply")
+        accept = (bool(v.get("is_plant")) and bool(v.get("matches"))
+                  and float(v.get("confidence") or 0) >= GPT_CONF)
     except Exception as e:
         budget.errors += 1
         return False, {"skip": "err", "err": str(e)[:120]}
-    accept = bool(v.get("is_plant")) and bool(v.get("matches")) and float(v.get("confidence", 0)) >= GPT_CONF
     return accept, v
 
 
 def verify_anchorfree(evs, img_paths, scientific_name, common_name, api_key, budget, max_keep):
-    """无锚点株整套判据: 聚类粗筛 + GPT 定边界。返回要收下的下标 list(≤ max_keep)。
-    evs: list[np.ndarray] 候选向量; img_paths: 对应图路径(GPT 用)。同序对齐。"""
-    cluster, medoid, outliers = cluster_consensus(evs)
+    """无锚点株整套判据: 聚类粗筛 + GPT 定边界。返回 (keep:list[int] 有序≤max_keep, incomplete:bool)。
+    incomplete=True 表示有候选因**预算耗尽/GPT 报错/无 key**没判成(≠ GPT 判否)—— 调用方据此别把该株
+    记成 done(留给下轮重试), 免把可验证的株误永久跳过。evs 与 img_paths 同序对齐。"""
+    cluster, medoid, outliers, med_sims = cluster_consensus(evs)
     keep = []
+    incomplete = False
+
+    def gv(i):
+        nonlocal incomplete
+        ok, v = gpt_verify(img_paths[i], scientific_name, common_name, api_key, budget)
+        if v.get("skip") in ("budget", "err", "no_key"):
+            incomplete = True     # 没判成(非判否)
+        return ok
 
     if medoid is not None:
-        # 有主簇: 先 GPT 验 medoid 一张, 防"整簇错种"。
-        ok, _ = gpt_verify(img_paths[medoid], scientific_name, common_name, api_key, budget)
-        if ok:
-            keep = list(cluster)                     # 主簇整收
+        members = sorted(cluster)
+        # ★不再"单张 medoid 过就整簇收"(单点故障: medoid 判错 → 整簇错种折进索引)。
+        #   验 medoid + 簇内离 medoid **最远**的 ≤2 张(边界最可能是别的东西); 全过才整簇收,
+        #   任一不过 → 不信这簇, 退化为逐张判全体。probe 全在预算内; 成本仍 ~3 次/簇。
+        far = sorted((m for m in members if m != medoid), key=lambda m: med_sims[m])[:2]
+        if all(gv(i) for i in [medoid] + far):
+            keep = list(members)
         else:
-            outliers = list(range(len(evs)))         # 主簇不可信 → 全部逐张判
             keep = []
+            outliers = list(range(len(evs)))         # 主簇不可信 → 全体逐张判
 
-    # 边界图(离群/小簇, 或主簇被否后的全体)逐张 GPT, 过了才收, 直到 max_keep 或预算耗尽。
+    # 离群/小簇(或主簇被否后的全体)逐张 GPT, 过了才收, 直到 max_keep 或预算耗尽。
     for i in outliers:
         if len(keep) >= max_keep:
             break
-        ok, _ = gpt_verify(img_paths[i], scientific_name, common_name, api_key, budget)
-        if ok:
+        if i not in keep and gv(i):
             keep.append(i)
 
-    return keep[:max_keep]
+    return sorted(set(keep))[:max_keep], incomplete   # 有序去重 → 结果确定、可复现

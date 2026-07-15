@@ -32,6 +32,16 @@ def _top1(idx, vec, k=1):
     return int(lab[0][0]), 1 - float(dist[0][0])
 
 
+def _top1_excl_self(idx, mapping, vec, thresh=0.9999):
+    """top-1 catalog_id, 但跳过 sim≥thresh 的"同图副本"。BEFORE 用: serve 的 iNat 向量是 iNat 库的
+    逐字拷贝, 不排掉的话 anchored 株的 query 会自匹配到 sim~1 的副本 → 虚高 before、低估增益。"""
+    lab, dist = idx.knn_query(vec.reshape(1, -1), k=2)
+    for j in range(len(lab[0])):
+        if 1 - float(dist[0][j]) < thresh:
+            return mapping[int(lab[0][j])]["catalog_id"]
+    return mapping[int(lab[0][0])]["catalog_id"]   # 全是自副本(极罕见)→ 退回 top-1
+
+
 def main(inat_dir, serve_dir, supp_manifest=None):
     serve, smap, smeta = _load(serve_dir)
     inat, imap, imeta = _load(inat_dir)
@@ -70,9 +80,8 @@ def main(inat_dir, serve_dir, supp_manifest=None):
             finally:
                 serve.unmark_deleted(li)
             hit += int(ok); tot += 1; after_hit += int(ok); after_tot += 1
-            # BEFORE: 同一 query 拿去查纯 iNat 索引。
-            bt_i, _ = _top1(inat, v)
-            b_ok = imap[bt_i]["catalog_id"] == cid
+            # BEFORE: 同一 query 查纯 iNat 索引, 排掉同图副本(否则 anchored 株自匹配 sim~1 虚高)。
+            b_ok = _top1_excl_self(inat, imap, v) == cid
             before_hit += int(b_ok); before_tot += 1
             if cid not in inat_cids:
                 before_absent += 1
