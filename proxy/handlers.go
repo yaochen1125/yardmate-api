@@ -57,6 +57,12 @@ const aiCatalogRecoveryMinConfidence = 0.10
 // "engine is very sure" bar; see SPEC §7 resolved decisions.
 const plantnetConfidentSkipAIConfidence = 0.80
 
+// gptOnDemandSkipConfidence — GPT_ARBITER_ON_DEMAND 模式下，引擎库内命中的置信度
+// ≥ 此值时跳过 GPT 交叉验证（省 arbiter 成本）。取 0.85：PlantNet 库内命中的
+// confidence 多落在 0.85+，此阈值能省掉大部分 arbiter 调用；代价是放弃这些高置信
+// 命中的 GPT boost / override。最优值需 prod confidence 分布标定，先取保守可用值。
+const gptOnDemandSkipConfidence = 0.85
+
 // --- P1C fusion-accuracy tuning (identify #3 / #5) ---
 
 // Engine↔GPT agreement boost (#3, AGREEMENT_BOOST_ENABLED). When the parallel
@@ -222,7 +228,7 @@ func parseCoord(s string, min, max float64) *float64 {
 	return &v
 }
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled bool, spendGate SpendGate) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand bool, spendGate SpendGate) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -371,7 +377,9 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     for EVERY identify now — the arbiter is universal, no ai_enhance /
 		//     free-vs-paid branch (free is gated only by request count). ---
 		var gptCh chan visionArbiterResult
-		if vision != nil {
+		// GPT_ARBITER_ON_DEMAND: on-demand 模式不预 fire —— 改为级联后按需串行调，
+		// 高置信库内命中时省掉这次调用（always 模式并行 fire，行为不变）。
+		if vision != nil && !arbiterOnDemand {
 			gptCh = make(chan visionArbiterResult, 1)
 			go func() {
 				s, e := vision.IdentifyPlant(ctx, imgBytes, mime)
@@ -505,6 +513,21 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		// the err == nil path; nil when vision == nil or the cascade failed.
 		var gptSug *Suggestion
 		var gptErr error
+		// [GPT_ARBITER_ON_DEMAND] 需求1：两引擎全挂（err != nil，如 key 失效/超时/限流
+		// 到底）时，不再直接 502 —— 串行调 GPT 兜底，构造空候选让下方 cascade 的
+		// branch 3/4（ai-raw-oob / ai-catalog-recovery）接管出结果。GPT 也失败则 err
+		// 保留 → 走原 502。推翻旧 locked decision "AI never substitutes for
+		// engine-unavailable"（always 模式 err != nil 仍直接 502，行为不变）。
+		if arbiterOnDemand && err != nil && vision != nil {
+			engErr := err
+			if s, e := vision.IdentifyPlant(ctx, imgBytes, mime); e == nil && s != nil {
+				result = &IdentifyResult{IsPlant: true, IsPlantConfidence: 1.0}
+				gptSug = s
+				engine = "ai-fallback"
+				err = nil
+			}
+			log.Printf("identify gpt on-demand fallback: deviceID=%s enginesDownErr=%v rescued=%v", deviceID, engErr, err == nil)
+		}
 		if err == nil {
 			// Await the parallel GPT arbiter fired at cascade start (gptSug is nil
 			// when vision == nil). Errors are handled per-case below (best-effort:
@@ -605,6 +628,26 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			engineTopConf := -1.0
 			if len(cands) > 0 {
 				engineTopConf = cands[0].Confidence
+			}
+
+			// [GPT_ARBITER_ON_DEMAND] 需求2：此时（已知 bestIdx / bestConf）才决定是否
+			// 调 GPT。always 模式 gptSug 已在上方并行 await（此块跳过，gptCh != nil 时
+			// gptSug 已填）；on-demand 模式引擎高置信命中库内（bestConf ≥
+			// gptOnDemandSkipConfidence）→ 跳过 GPT（省 arbiter 成本，放弃那次罕见的
+			// ai-catalog-override）；否则（库外 / 弱命中 / confident-oob）串行调 GPT，供
+			// 下方 override / confident-oob cross-check / recovery 分支使用。
+			if arbiterOnDemand && gptSug == nil && gptErr == nil && vision != nil {
+				highConfCatalog := bestIdx >= 0 && cands[bestIdx].Confidence >= gptOnDemandSkipConfidence
+				if !highConfCatalog {
+					if s, e := vision.IdentifyPlant(ctx, imgBytes, mime); e != nil {
+						gptErr = e
+					} else {
+						gptSug = s
+					}
+					log.Printf("identify gpt on-demand: deviceID=%s CALLED bestIdx=%d engineTopConf=%.2f", deviceID, bestIdx, engineTopConf)
+				} else {
+					log.Printf("identify gpt on-demand: deviceID=%s SKIPPED high-conf catalog bestConf=%.2f", deviceID, cands[bestIdx].Confidence)
+				}
 			}
 
 			switch {
