@@ -71,11 +71,23 @@ DINOv2 84%. In/out AUC 0.995. Bio-specialized + retains a text tower (L2 fine-tu
 - P1b: build full-catalog real-photo index (server; `pull_reference.py` + `build_index.py`).
 - P1d: staging calibration of the in/out threshold (0.80 prior) + boost strength on real traffic.
 - P1-follow: enable override for in-group disambiguation once staging data supports it.
-- P2 flywheel: iOS accept/correct (userID-isolated history) → real photos append to the index.
-- L2: fine-tune BioCLIP on own catalog + user photos → domain-robust "own plant model".
+- P2b (SHIPPED 2026-07-14, `fold_external.py` = build step 3): fold catalog real **external gallery**
+  photos (iNat/Wikimedia CC0/BY/SA, R2 `{id}/external/`) into the index for under-covered plants
+  (iNat ≤ 20) + fix cultivar-on-species mislabels. Relative-NN filter (abs threshold fails — same-plant
+  vs diff-plant sim overlap heavily: same p5≈0.80 vs diff p95≈0.81) + current-catalog gate (drops
+  stale removed ids). NOT user photos — no correction signal (accept ≠ correct) would poison the
+  index; dropped. NOT AI-generated main images (P0 铁律).
+- L2 (future): fine-tune BioCLIP on own catalog real photos → domain-robust "own plant model".
 
 ## 7. Pitfalls (don't re-rediscover)
 - Generated art in the index looks like it works offline but collapses real queries by style.
 - BioCLIP-2 is ViT-L: ~2 GB resident + ~1-2 s/img CPU on the 4-core box. Runs concurrent with
   engines so latency hides, but measure on the server (§README perf) — consider ONNX/INT8.
-- iNat has no cultivar taxa; `pull_reference.py` queries species-level (strips the cultivar).
+- iNat has no cultivar taxa; `pull_reference.py` queries species-level (strips the cultivar) →
+  a VISUALLY-DISTINCTIVE cultivar (Juncus effusus 'Spiralis' corkscrew, Tulipa 'Queen of Night'
+  black tulip → iNat even matched *Liriodendron tulipifera* the tulip TREE) gets its parent-SPECIES
+  photos MISLABELED as the cultivar in the index → active mis-ID (this was the founding corkscrew
+  bug's root cause). `fold_external.py` (build step 3) auto-detects it — the cultivar's external
+  gallery photo is dissimilar to its iNat centroid — and REPLACES the mislabeled species vectors
+  with the correct external photos. Subtle cultivars (look like their species) keep both. Don't
+  "fix" taxonomic synonyms (Aloe→Aristaloe, Anemone→Anemonoides): same plant, correct photos.
