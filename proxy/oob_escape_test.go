@@ -215,6 +215,11 @@ func TestHandleIdentify_OOBEscape_BloomTiebreak_MarginUsesStrongestCatalogHit(t 
 	// results[0] out-of-catalog 0.90 (different genus); A 0.41 (non-blooming,
 	// strongest catalog hit); B 0.40 (blooming near-tie). bloom tiebreak swaps
 	// bestIdx A→B; the escape must still compare 0.90−0.41 = 0.49 < 0.50 → NO escape.
+	// NOTE (review r3584457237): this test's power to distinguish fixed vs buggy
+	// code rests on IEEE754 giving 0.90-0.40 == 0.5 EXACTLY (the buggy pre-fix
+	// margin hits the inclusive `>= 0.50` gate) while 0.90-0.41 == 0.49 < 0.50. Do
+	// NOT "tidy" these confidences or change the gate to a strict `>`: either would
+	// make the buggy code pass too and silently void this regression.
 	pnBody := fmt.Sprintf(`{
   "bestMatch": "Fakeplant nonexistus",
   "results": [
@@ -248,5 +253,64 @@ func TestHandleIdentify_OOBEscape_BloomTiebreak_MarginUsesStrongestCatalogHit(t 
 	}
 	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != idB {
 		t.Errorf("Suggestions[0].PlantID = %v, want %s (in-catalog, not escaped)", result.Suggestions[0].PlantID, idB)
+	}
+}
+
+// (e) Regression for the genus guard (review r3584457237). The escape must NOT
+// fire when a LOWER-confidence SAME-genus catalog candidate exists, even though
+// a DIFFERENT-genus catalog candidate is the strongest hit. Comparing only
+// against the strongest hit (pre-fix) would wrongly escape past a curated
+// same-genus species (the intra-genus-wobble the guard is meant to protect).
+func TestHandleIdentify_OOBEscape_SameGenusNotStrongest_NoEscape(t *testing.T) {
+	content, err := LoadContent()
+	if err != nil {
+		t.Fatalf("LoadContent: %v", err)
+	}
+	// Find a round-tripping catalog species whose genus is NOT Abelia — the
+	// different-genus strongest hit. Abelia chinensis (AAA0001) is the same-genus
+	// lower-confidence hit that must block the escape.
+	names := content.CatalogScientificNames()
+	var diffSci, diffID string
+	for id, sci := range names {
+		if g, ok := resolvePlantID(content, sci); ok && g == id && genusOf(sci) != "Abelia" {
+			diffSci, diffID = sci, id
+			break
+		}
+	}
+	if diffSci == "" {
+		t.Skip("no non-Abelia catalog species found")
+	}
+	// top out-of-catalog Abelia @0.95; different-genus catalog hit @0.44 (strongest,
+	// margin 0.51 ≥ 0.50); same-genus Abelia chinensis @0.30. Pre-fix (strongest-only
+	// genus check) escapes; fixed code sees the same-genus Abelia and does NOT.
+	pnBody := fmt.Sprintf(`{
+  "bestMatch": "Abelia zzznonexistus",
+  "results": [
+    {"score": 0.95, "species": {"scientificNameWithoutAuthor": "Abelia zzznonexistus", "scientificName": "Abelia zzznonexistus Auth.", "commonNames": []}},
+    {"score": 0.44, "species": {"scientificNameWithoutAuthor": %q, "scientificName": %q, "commonNames": ["Diff"]}},
+    {"score": 0.30, "species": {"scientificNameWithoutAuthor": "Abelia chinensis", "scientificName": "Abelia chinensis R.Br.", "commonNames": ["Chinese Abelia"]}}
+  ],
+  "remainingIdentificationRequests": 480
+}`, diffSci, diffSci)
+	pnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, pnBody)
+	}))
+	defer pnSrv.Close()
+	pn := &PlantNetClient{APIKey: "k", Endpoint: pnSrv.URL, Lang: "en", NbResults: 10, HTTP: pnSrv.Client()}
+	h := HandleIdentify(pn, nil, content, nil, nil, nil, false, false, false, false, false, true, nil)
+
+	rec := doCascadeReq(t, h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var result IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// No escape → result is the strongest in-catalog hit (different-genus), PlantID
+	// set, NOT the out-of-catalog Abelia top.
+	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != diffID {
+		t.Errorf("Suggestions[0].PlantID = %v, want %s (in-catalog; a same-genus candidate must block the escape)",
+			result.Suggestions[0].PlantID, diffID)
 	}
 }
