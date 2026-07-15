@@ -35,7 +35,11 @@ import vision_embed
 
 UNDERCOVERED_MAX = 20      # iNat 图数 ≤ 此值才补 external(其上已饱和, kNN 加图边际≈0)
 NN_FLOOR = 0.72            # 相对 NN 过滤的相似度下限(同株 sim p5≈0.80, 留余量挡非植物)
-CULTIVAR_MISLABEL_SIM = 0.70  # external vs iNat 质心 < 此 → 独特品种、iNat 母种图误标 → 删
+CULTIVAR_MISLABEL_SIM = 0.78  # external vs iNat 质心 < 此 → 独特品种、iNat 母种图误标 → 删
+                              # 标定(prod 8 个带 iNat 的品种, 2026-07-15): 真误标旗舰螺旋灯心草
+                              # 0.737 / 黑郁金香 0.746, 下一簇(深色变种, 母种确实相似)≥0.829 —— 0.70
+                              # 太低两旗舰漏检(母种误标被拉回). 0.78 落在 0.746→0.829 空档正中,
+                              # 只删两真误标旗舰, 深色变种保留两者(见 keep_both 设计)。
 DUP_SIM = 0.98            # 近重复
 MAX_EXTERNAL = 8         # 每株最多探测的 external 张数
 
