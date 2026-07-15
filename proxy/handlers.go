@@ -57,11 +57,17 @@ const aiCatalogRecoveryMinConfidence = 0.10
 // "engine is very sure" bar; see SPEC §7 resolved decisions.
 const plantnetConfidentSkipAIConfidence = 0.80
 
-// gptOnDemandSkipConfidence — GPT_ARBITER_ON_DEMAND 模式下，引擎库内命中的置信度
-// ≥ 此值时跳过 GPT 交叉验证（省 arbiter 成本）。取 0.85：PlantNet 库内命中的
-// confidence 多落在 0.85+，此阈值能省掉大部分 arbiter 调用；代价是放弃这些高置信
-// 命中的 GPT boost / override。最优值需 prod confidence 分布标定，先取保守可用值。
+// gptOnDemandSkipConfidence — GPT_ARBITER_ON_DEMAND 模式下，跳过 GPT 的 PlantNet 侧
+// 门槛：引擎库内命中的最强置信 ≥ 此值。单独不足以跳（PlantNet 会自信认错）——必须
+// 叠加 KNN 印证（见下）。最优值需 prod confidence 分布标定，先取保守可用值。
 const gptOnDemandSkipConfidence = 0.85
+
+// gptOnDemandKNNSimFloor — on-demand 双信号印证的 KNN 侧门槛：跳过 GPT 还要求 KNN
+// 独立命中同一库内 id 且视觉相似度 ≥ 此值。KNN sim 尺度：库内外分界 0.80、同株中位
+// ~0.92，取 0.85 = 稳妥的"确实同株"线。两个独立信号（PlantNet + KNN）对上同一 id 时
+// GPT 的边际价值最低 → 跳它最安全。KNN 未开（knnCh==nil，prod 现状）→ 印证永不成立
+// → 不跳、只保留引擎全挂兜底，避免"单个引擎自信就跳"那版的精度险。
+const gptOnDemandKNNSimFloor = 0.85
 
 // --- P1C fusion-accuracy tuning (identify #3 / #5) ---
 
@@ -513,6 +519,10 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		// the err == nil path; nil when vision == nil or the cascade failed.
 		var gptSug *Suggestion
 		var gptErr error
+		// on-demand 双信号印证会把并行 KNN 结果提前读到这里（switch 前需要它做跳过判据），
+		// 供下方 7a-4 复用，避免二次读已空的 knnCh。always 模式两者不动，7a-4 照旧读 knnCh。
+		var knnPreRead visionKNNResult
+		knnPreReadDone := false
 		// [GPT_ARBITER_ON_DEMAND] 需求1：两引擎全挂（err != nil，如 key 失效/超时/限流
 		// 到底）时，不再直接 502 —— 串行调 GPT 兜底，构造空候选让下方 cascade 的
 		// branch 3/4（ai-raw-oob / ai-catalog-recovery）接管出结果。GPT 也失败则 err
@@ -650,20 +660,40 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			// ai-catalog-override）；否则（库外 / 弱命中 / confident-oob）串行调 GPT，供
 			// 下方 override / confident-oob cross-check / recovery 分支使用。
 			if arbiterOnDemand && gptSug == nil && gptErr == nil && vision != nil {
-				// 用 maxCatalogConf（bloom-tiebreak 前捕获的最强库内命中置信），不用
-				// cands[bestIdx].Confidence —— 后者在 tiebreak 把 bestIdx 换成 within-epsilon
-				// 的开花近似候选后会偏低，令跳过决策在阈值边界抖动。语义上"高置信命中
-				// 库内"就该看最强命中有多确信。
-				highConfCatalog := bestIdx >= 0 && maxCatalogConf >= gptOnDemandSkipConfidence
-				if !highConfCatalog {
+				// 双信号印证省钱：仅当 ①PlantNet 高置信命中库内（maxCatalogConf ≥ 阈值，用
+				// bloom-tiebreak 前捕获的最强库内置信，避免 tiebreak 换 bestIdx 后的边界抖动）
+				// 且 ②KNN 独立命中同一 plant_id、sim ≥ gptOnDemandKNNSimFloor 时，才跳过 GPT。
+				// 单个引擎自信不足以跳（arbiter 的价值正是抓 PlantNet 自信认错）；两个独立信号
+				// 对上同一库内 id 时 GPT 边际价值最低 → 安全跳。KNN 未开（knnCh==nil，prod 现状）
+				// → 印证不成立 → 照常调 GPT（等于只保留兜底、不冒单信号省钱的精度险）。
+				plantnetConfident := bestIdx >= 0 && maxCatalogConf >= gptOnDemandSkipConfidence
+				knnSim := 0.0
+				knnCorroborates := false
+				if plantnetConfident && knnCh != nil {
+					// 提前读并行 KNN（带 wait budget，超时视为未印证），存给下方 7a-4 复用。
+					select {
+					case knnPreRead = <-knnCh:
+					case <-time.After(visionKNNWaitBudget):
+						knnPreRead = visionKNNResult{}
+					}
+					knnPreReadDone = true
+					if knnPreRead.err == nil && knnPreRead.resp != nil && len(knnPreRead.resp.Candidates) > 0 {
+						c := knnPreRead.resp.Candidates[0]
+						knnSim = c.VisionSim
+						knnCorroborates = c.CatalogID == bestPID && c.VisionSim >= gptOnDemandKNNSimFloor
+					}
+				}
+				if plantnetConfident && knnCorroborates {
+					log.Printf("identify gpt on-demand: deviceID=%s SKIPPED dual-signal maxCatalogConf=%.2f knnSim=%.3f id=%s",
+						deviceID, maxCatalogConf, knnSim, bestPID)
+				} else {
 					if s, e := vision.IdentifyPlant(ctx, imgBytes, mime); e != nil {
 						gptErr = e
 					} else {
 						gptSug = s
 					}
-					log.Printf("identify gpt on-demand: deviceID=%s CALLED bestIdx=%d engineTopConf=%.2f maxCatalogConf=%.2f", deviceID, bestIdx, engineTopConf, maxCatalogConf)
-				} else {
-					log.Printf("identify gpt on-demand: deviceID=%s SKIPPED high-conf catalog maxCatalogConf=%.2f", deviceID, maxCatalogConf)
+					log.Printf("identify gpt on-demand: deviceID=%s CALLED bestIdx=%d maxCatalogConf=%.2f knnCorrob=%v",
+						deviceID, bestIdx, maxCatalogConf, knnCorroborates)
 				}
 			}
 
@@ -1013,14 +1043,30 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     an out-of-catalog verdict against an in-catalog decision — is LOGGED
 		//     ONLY, to gather staging data before we let it override. Fail-open:
 		//     nil client / error / timeout → no-op.
-		if visionKNN != nil && knnCh != nil && !unknownSentinel && len(result.Suggestions) > 0 {
+		if visionKNN != nil && !unknownSentinel && len(result.Suggestions) > 0 && (knnCh != nil || knnPreReadDone) {
 			// Bounded wait (Codex #100): the goroutine ran concurrently with the
 			// whole cascade, so a healthy local service is usually already done
 			// here. Cap the extra wait at visionKNNWaitBudget so a slow/wedged
 			// service can't add its full HTTP timeout to the already-decided user
 			// response — skip the optional signal instead of blocking on it.
-			select {
-			case kr := <-knnCh:
+			// on-demand 双信号印证已把 KNN 结果提前读到 knnPreRead（knnCh 已排空）→ 直接复用；
+			// 否则（always / 未提前读）原逻辑带 wait budget 从 knnCh 读。
+			var kr visionKNNResult
+			ready := false
+			if knnPreReadDone {
+				kr, ready = knnPreRead, true
+			} else {
+				select {
+				case kr = <-knnCh:
+					ready = true
+				case <-time.After(visionKNNWaitBudget):
+					// Still running past the grace budget — skip rather than delay the
+					// response. The buffered goroutine finishes into knnCh and is GC'd;
+					// ctx-cancel on return aborts the in-flight call.
+					log.Printf("identify vision-knn: deviceID=%s SKIPPED-not-ready-within=%v", deviceID, visionKNNWaitBudget)
+				}
+			}
+			if ready {
 				if kr.err != nil || kr.resp == nil {
 					log.Printf("identify vision-knn failed: deviceID=%s err=%v", deviceID, kr.err)
 				} else {
@@ -1044,11 +1090,6 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 						}
 					}
 				}
-			case <-time.After(visionKNNWaitBudget):
-				// Still running past the grace budget — skip rather than delay the
-				// response. The buffered goroutine finishes into knnCh and is GC'd;
-				// ctx-cancel on return aborts the in-flight call.
-				log.Printf("identify vision-knn: deviceID=%s SKIPPED-not-ready-within=%v", deviceID, visionKNNWaitBudget)
 			}
 		}
 
