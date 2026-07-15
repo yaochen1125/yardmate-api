@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/yaochen1125/yardmate-api/proxy/imageingest/sources"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
 	"github.com/yaochen1125/yardmate-api/secrets"
+	"github.com/yaochen1125/yardmate-api/training"
 )
 
 const (
@@ -28,6 +30,7 @@ const (
 	defaultDBPath      = "/var/lib/yardmate-api/credentials.db"
 	defaultSecretsPath = "/etc/yardmate-api/secrets.env"
 	defaultAppID       = "PMX32RG52M.com.chenyao.plantapp"
+	defaultTrainingDir = "/var/lib/yardmate-api/training"
 
 	// Rate-limit defaults (see ratelimit/SPEC §3).
 	// per-IP gates ALL /v1 endpoints incl. the cheap App-Attest/secrets
@@ -248,7 +251,18 @@ func main() {
 	log.Printf("inflight: maxConcurrent=%d maxWait=%d waitBudget=%s",
 		maxInflight, inflightMaxWait, inflightWait)
 
-	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim)
+	// User-photo flywheel intake (training/SPEC.md). OFF by default —
+	// TRAINING_UPLOAD_ENABLED opens the local corpus store; nil leaves both
+	// /v1/training/photo and /v1/training/delete unregistered and skips the
+	// account-deletion cascade. A construction failure is fatal only when the
+	// flag asked for it (a misconfigured corpus dir must not silently disable
+	// intake the operator turned on).
+	trainingStore := buildTrainingStore(vault)
+	if trainingStore != nil {
+		defer trainingStore.Close()
+	}
+
+	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim, trainingStore)
 
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream) with 5 s headroom = 35 s base.
@@ -597,6 +611,46 @@ func buildImageIngestService(vault *secrets.Vault, content *proxy.ContentIndex) 
 	log.Printf("image ingest service ready: R2 bucket=%s ledger pool + iNat/Wikimedia cascade (allowAttribution=%v)",
 		r2Cfg.Bucket, cfg.AllowAttributionLicenses)
 	return imageingest.NewService(ingestor, adminToken)
+}
+
+// buildTrainingStore opens the user-photo flywheel corpus. The store backs BOTH
+// intake (TRAINING_UPLOAD_ENABLED, default OFF like VISION_KNN_ENABLED) AND
+// deletion. It is opened when EITHER the flag is on OR a corpus already exists on
+// disk — so that flipping the kill switch off after uploads exist (the rollback
+// path) still leaves /v1/training/delete + the account-deletion cascade able to
+// erase previously shared photos (GDPR/CCPA erasure must not depend on the intake
+// flag; Codex #105 P1). server.go gates the intake ROUTE on the flag separately.
+// Only when the flag is off AND nothing was ever collected do we skip entirely.
+//
+// A store the operator explicitly enabled but that fails to open is FATAL —
+// silently disabling intake the operator turned on would drop uploads unnoticed.
+// When only a pre-existing corpus is present (flag off), an open failure is a
+// WARN + nil (deletion unavailable but the service still runs). The corpus dir
+// (YARDMATE_API_TRAINING_DIR, default /var/lib/yardmate-api/training) is inside
+// the systemd ReadWritePaths, so no unit change is needed (training/SPEC §1.5).
+func buildTrainingStore(vault *secrets.Vault) *training.Store {
+	dir := envOr("YARDMATE_API_TRAINING_DIR", defaultTrainingDir)
+	enabled := vault.GetBool("TRAINING_UPLOAD_ENABLED", false)
+	if !enabled {
+		// Off + no existing corpus → nothing to intake or delete; skip.
+		if _, err := os.Stat(filepath.Join(dir, "training_meta.db")); err != nil {
+			return nil
+		}
+	}
+	store, err := training.OpenStore(dir)
+	if err != nil {
+		if enabled {
+			log.Fatalf("training: TRAINING_UPLOAD_ENABLED=true but corpus store failed to open at %s: %v", dir, err)
+		}
+		log.Printf("WARN: training corpus exists at %s but failed to open (deletion paths unavailable): %v", dir, err)
+		return nil
+	}
+	if enabled {
+		log.Printf("training photo flywheel intake enabled: corpus=%s", dir)
+	} else {
+		log.Printf("training photo intake OFF but corpus exists: %s (deletion paths remain available)", dir)
+	}
+	return store
 }
 
 // vaultDurationOr / vaultIntOr read tuning knobs from the secrets Vault (the
