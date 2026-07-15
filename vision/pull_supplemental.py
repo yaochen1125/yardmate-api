@@ -11,10 +11,11 @@ Phase B(这里)= 超出那 ~4 张, 从 Wikimedia(深挖)/GBIF/PlantNet 主动多
 ★铁律: 只收真实图 + 只收 CC0/CC-BY/CC-BY-SA(supp_sources.classify_license 把关, NC/ND 绝不用)。
 ★质量>数量: 每株封顶 MAX_KEEP, 优先 0-iNat + cultivar + 真正稀薄的种; 已够覆盖的常见种不狂抓。
 
-用法: pull_supplemental.py <inat_index_dir> <catalog.json> <supp_out_dir>
+用法: pull_supplemental.py <inat_index_dir> <catalog.json> <supp_out_dir> [--limit N]
   inat_index_dir: build_index 产出的纯 iNat 索引(index.bin/mapping.json/meta.json)—— 定覆盖 + 锚点 NN。
   catalog.json:   当前权威 catalog(id + scientific_name)。
   supp_out_dir:   输出 {cid}/NNN.jpg(验证过的图, 供 fold) + _manifest.json(可续 + 存档)。
+  --limit N:      本轮最多处理 N 株(优先级序, 可续)—— 卡时间窗分批跑 / 先小批验证时用。
 env: OPENAI_API_KEY(GPT 判据, 无则无锚点株跳过—— 绝不折未验证图)。
      PLANTNET_API_KEY(可选图源, 仅非品种种级用); PLANTNET_MAX_IDENTIFY(默认 60, =0 关)。
 """
@@ -127,7 +128,7 @@ def _gather(sci, is_cult):
     return cands
 
 
-def main(index_dir, catalog_path, out_dir):
+def main(index_dir, catalog_path, out_dir, limit=None):
     import numpy as np
     import hnswlib
     os.makedirs(out_dir, exist_ok=True)
@@ -161,14 +162,18 @@ def main(index_dir, catalog_path, out_dir):
     st = {"anchored_kept": 0, "anchorfree_kept": 0, "skipped_done": 0,
           "no_key_skip": 0, "empty": 0, "plants_covered": 0}
     spot = []
+    processed = 0   # 本轮实际动手处理的株数(不含 manifest 跳过); --limit 用它封顶
 
     for cid, sci, mode in targets:
+        if limit and processed >= limit:
+            break   # --limit: 本轮到量收工(可续: 下轮从 manifest 之后接着跑)
         if cid in manifest:
             st["skipped_done"] += 1; continue
         if mode == "anchorfree" and not api_key:
             st["no_key_skip"] += 1; continue   # 无 GPT → 不碰无锚点株
         if mode == "anchorfree" and not budget.ok():
             continue   # GPT 预算耗尽: 不记 done, 留给下轮新预算重试(绝不记成 done-with-zero 永久跳过)
+        processed += 1
 
         tmp = f"/tmp/supp/{cid}"
         cands = _gather(sci, is_cultivar(sci))
@@ -236,7 +241,18 @@ def main(index_dir, catalog_path, out_dir):
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    # --limit N: 本轮最多动手 N 株(优先级序: 0-iNat → cultivar → 稀薄种); 可续。用于卡时间窗的分批跑。
+    argv = sys.argv[1:]
+    limit = None
+    args = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--limit":
+            limit = int(argv[i + 1]); i += 2; continue
+        if a.startswith("--"):
+            i += 1; continue
+        args.append(a); i += 1
     if len(args) < 3:
         print(__doc__); sys.exit(2)
-    main(args[0], args[1], args[2])
+    main(args[0], args[1], args[2], limit)
