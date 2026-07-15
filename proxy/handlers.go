@@ -234,7 +234,7 @@ func parseCoord(s string, min, max float64) *float64 {
 	return &v
 }
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand bool, spendGate SpendGate) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand, plantIDIdentifyFallback bool, spendGate SpendGate) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -450,7 +450,14 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				errors.Is(err, ErrPlantNetUnauthorized) ||
 				errors.Is(err, ErrPlantNetBadResponse))
 
-		if (plantNet == nil || plantNetFellBack) && plantID != nil {
+		// PLANTID_IDENTIFY_FALLBACK=false：Pl@ntNet 失败（超限/宕机/失效）时跳过贵的
+		// Plant.id，保留 err 让下方 on-demand 的 GPT 兜底接管（省钱：溢出量走 GPT ~$4/1000
+		// 而非 Plant.id 的 credit）。只作用于 plantNetFellBack —— plantNet==nil 的
+		// Plant.id-only 部署不受影响（那种情况 Plant.id 是主引擎，不能跳）。诊病仍用 Plant.id。
+		if plantNetFellBack && !plantIDIdentifyFallback {
+			log.Printf("identify plantid-skip: deviceID=%s plantnetErr=%v → 跳过 Plant.id, GPT 兜底接管", deviceID, err)
+		}
+		if (plantNet == nil || (plantNetFellBack && plantIDIdentifyFallback)) && plantID != nil {
 			if plantNetFellBack {
 				log.Printf("identify plantnet fallback: deviceID=%s err=%v", deviceID, err)
 				engine = "plantid-fallback"
