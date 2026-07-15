@@ -372,13 +372,14 @@ func (c *ContentIndex) currentNames() *catalogNameTable {
 
 // ReloadCatalogNames parses a fresh plants_index.json payload and atomically
 // swaps the name→id lookup table (SPEC §9.4). version is a provenance tag (the
-// CDN ETag) recorded on the new table for logging. It returns the new row count
-// on success. On any failure — a JSON parse error, an empty payload, or a
-// truncation (the new count is below half the currently-loaded count) — it
-// returns an error and leaves the current table UNTOUCHED (SPEC §9.5 fail-safe),
-// so a half-published or corrupt CDN object can never shrink or empty identify
-// coverage. Safe to call concurrently with request-path reads; the swap is a
-// single atomic pointer store and readers are never blocked.
+// CDN ETag) recorded on the new table for logging. It returns the new usable
+// plant count on success. On any failure — a JSON parse error, an empty /
+// wrong-shape payload that indexes no resolvable names, or a truncation (the new
+// count is below half the currently-loaded count) — it returns an error and
+// leaves the current table UNTOUCHED (SPEC §9.5 fail-safe), so a half-published
+// or corrupt CDN object can never shrink or empty identify coverage. Safe to
+// call concurrently with request-path reads; the swap is a single atomic pointer
+// store and readers are never blocked.
 func (c *ContentIndex) ReloadCatalogNames(raw []byte, version string) (int, error) {
 	if c == nil {
 		return 0, fmt.Errorf("content: reload on nil index")
@@ -387,12 +388,21 @@ func (c *ContentIndex) ReloadCatalogNames(raw []byte, version string) (int, erro
 	if err != nil {
 		return 0, err
 	}
-	if nt.count == 0 {
-		return 0, fmt.Errorf("content: refusing reload: indexed 0 usable catalog plants (empty / wrong-shape payload)")
+	// Empty / wrong-shape guard: the PRIMARY name→id lookup map that LookupPlantID
+	// reads must be populated. A valid-JSON but degenerate payload — rows missing
+	// or with renamed id / scientific_name fields, or names that all normalize
+	// away — parses fine yet indexes ZERO resolvable names, so swapping it in
+	// would make every /v1/identify catalog lookup miss. Validate the effective
+	// lookup map, not the raw parsed-row count, so a same-sized schema change
+	// keeps the prior/embed table instead. (This subsumes an empty array, and
+	// non-empty scientificNameToID implies non-empty scientificNameToIDPrecise +
+	// sciByID, so the whole read path is covered.)
+	if len(nt.scientificNameToID) == 0 {
+		return 0, fmt.Errorf("content: refusing reload: 0 resolvable name keys (empty / wrong-shape payload)")
 	}
 	// Truncation guard: never swap in a table that lost most of the catalog. A
 	// legitimate grow (1633 → 1643) passes; a partial publish that happens to be
-	// valid JSON but collapsed to a fraction of the rows is rejected.
+	// valid JSON but collapsed to a fraction of the usable plants is rejected.
 	if prev := c.currentNames(); prev != nil && nt.count*2 < prev.count {
 		return 0, fmt.Errorf("content: refusing reload: new count %d < half of current %d (truncation guard)", nt.count, prev.count)
 	}

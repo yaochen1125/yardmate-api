@@ -190,6 +190,33 @@ func TestReloadCatalogNames_RejectsWrongShape(t *testing.T) {
 	}
 }
 
+// TestReloadCatalogNames_RejectsNormalizeAwayNames pins the guard to the
+// EFFECTIVE lookup map, not a raw/valid-row count: every row here has a
+// non-empty scientific_name ("×", a bare hybrid marker) that TrimSpace keeps
+// (so sciByID is fully populated) but normalizeScientificName folds to "" (so
+// scientificNameToID — the map LookupPlantID reads — is empty). A count-based
+// guard would pass this; the primary-lookup-map guard must reject it.
+func TestReloadCatalogNames_RejectsNormalizeAwayNames(t *testing.T) {
+	c := loadContentForTests(t)
+	before, _ := c.LookupPlantID("Abelia chinensis")
+
+	var rows []map[string]any
+	if err := json.Unmarshal(plantsIndexRaw, &rows); err != nil {
+		t.Fatalf("unmarshal embed: %v", err)
+	}
+	for _, r := range rows {
+		r["scientific_name"] = "×" // non-empty, but normalizes to "" → no lookup key
+	}
+	degenerate, _ := json.Marshal(rows)
+
+	if _, err := c.ReloadCatalogNames(degenerate, "normaway"); err == nil {
+		t.Fatalf("expected rejection: %d rows all normalize to empty lookup keys", len(rows))
+	}
+	if id, ok := c.LookupPlantID("Abelia chinensis"); !ok || id != before {
+		t.Errorf("normalize-away reload corrupted the live table: (%q,%v), want (%q,true)", id, ok, before)
+	}
+}
+
 // etagIndexHandler serves a plants_index.json body with a fixed strong ETag and
 // honors If-None-Match with 304 — the exact Cloudflare behaviour the poller's
 // conditional-GET version gate relies on (SPEC §9.3).
