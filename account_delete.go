@@ -44,7 +44,6 @@ import (
 
 	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
 	"github.com/yaochen1125/yardmate-api/secrets"
-	"github.com/yaochen1125/yardmate-api/training"
 )
 
 // uuidPattern matches an RFC 4122 canonical UUID — the shape Supabase uses for
@@ -131,7 +130,7 @@ func loadAccountDeleteSecrets(vault *secrets.Vault) (accountDeleteSecrets, bool)
 // the shared Supabase pgx pool (same pool the enrichment service uses); it may
 // be nil if the DB was never configured — in that case account deletion can't
 // run its row deletes, so we 500 (server_error) rather than silently skipping.
-func handleAccountDelete(vault *secrets.Vault, enrichDB *enrichment.DB, trainingStore *training.Store) http.HandlerFunc {
+func handleAccountDelete(vault *secrets.Vault, enrichDB *enrichment.DB) http.HandlerFunc {
 	// Build the JWKS verifier once (long-lived cache) from SUPABASE_URL. Access
 	// tokens are ES256, verified against the project's public JWKS.
 	jwks := newJWKSCache(strings.TrimRight(vault.Get("SUPABASE_URL"), "/"))
@@ -226,27 +225,6 @@ func handleAccountDelete(vault *secrets.Vault, enrichDB *enrichment.DB, training
 			log.Printf("account/delete: delete auth user failed: %v", err)
 			writeError(w, http.StatusInternalServerError, "server_error")
 			return
-		}
-
-		// ---- 5b. cascade to flywheel training photos (BEST-EFFORT). Deletes any
-		// training photos this user tagged with their userID (training/SPEC §5).
-		// Device-level photos without a userID are handled by the iOS client
-		// calling /v1/training/delete alongside this endpoint. Best-effort: a
-		// failure here must not fail an otherwise-complete account deletion. nil
-		// when no corpus exists (training off + nothing collected). Runs on its OWN
-		// fresh Background-derived deadline — NOT deleteCtx, which the load-bearing
-		// deletes above may have nearly exhausted; the auth user is already gone so
-		// the client cannot retry this cascade, so it must not be starved into a
-		// spurious deadline failure (Codex #105 P2). ----
-		if trainingStore != nil {
-			trainCtx, trainCancel := context.WithTimeout(context.Background(), bestEffortTimeout)
-			n, err := trainingStore.DeleteByUserID(trainCtx, userID)
-			trainCancel()
-			if err != nil {
-				log.Printf("account/delete: training photo cascade failed (best-effort, continuing): %v", err)
-			} else if n > 0 {
-				log.Printf("account/delete: removed %d training photo(s)", n)
-			}
 		}
 
 		// ---- 6. success ----
