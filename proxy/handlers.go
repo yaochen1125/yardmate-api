@@ -557,6 +557,18 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				}
 			}
 
+			// #21 OOB escape compares against the STRONGEST in-catalog hit,
+			// captured BEFORE the bloom tiebreak below may swap bestIdx to a
+			// lower-confidence blooming near-tie (within bloomTiebreakEpsilon).
+			// Using the post-tiebreak bestConf would inflate the OOB margin by up
+			// to that epsilon and let the escape bypass rule B's intended boundary.
+			maxCatalogConf := -1.0
+			maxCatalogSci := ""
+			if bestIdx >= 0 {
+				maxCatalogConf = cands[bestIdx].Confidence
+				maxCatalogSci = cands[bestIdx].ScientificName
+			}
+
 			// #5 bloom tiebreak — BLOOM_TIEBREAK_ENABLED. When ≥2 in-catalog
 			// candidates are within bloomTiebreakEpsilon of the confidence best
 			// and the best does NOT bloom this month, prefer a near-tie candidate
@@ -599,8 +611,8 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					_, top0InCat := resolvePlantID(content, cands[0].ScientificName)
 					if !top0InCat &&
 						engineTopConf >= oobEscapeMinConfidence &&
-						engineTopConf-bestConf >= oobEscapeMinMargin &&
-						genusOf(cands[0].ScientificName) != genusOf(cands[bestIdx].ScientificName) {
+						engineTopConf-maxCatalogConf >= oobEscapeMinMargin &&
+						genusOf(cands[0].ScientificName) != genusOf(maxCatalogSci) {
 						// GPT arbiter — OBSERVE ONLY, does not gate the decision.
 						gptSci, gptConf, gptInCat := "nil", 0.0, false
 						if gptSug != nil {
