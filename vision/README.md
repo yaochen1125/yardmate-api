@@ -16,6 +16,7 @@
 - `vision_embed.py` — BioCLIP-2 嵌入单例(建库/推理共用)
 - `pull_reference.py` — 全 catalog 从 iNat 拉真实照片(resumable/限流/记零覆盖)
 - `build_index.py` — 真实照片 → hnswlib 余弦索引(index.bin + mapping.json + meta.json)
+- `fold_external.py` — P2b: 折入 catalog 真实 external gallery 图(欠覆盖补真图 + 视觉独特品种删母种误标换正确图),build 第 3 步
 - `app.py` — FastAPI: `POST /v1/vision/identify` + `GET /health`
 - `yardmate-vision.service` — systemd(CPU, 限内存 2.6G)
 
@@ -41,7 +42,9 @@ venv/bin/pip install open_clip_torch hnswlib fastapi "uvicorn[standard]" python-
 # 1) 建库:pull 可续 + 瞬时失败重试;build_index 幂等。生产用 systemd 全程托管
 #    (build_pipeline.sh + yardmate-vision-build.service:pull→embed,开机自启 + 失败重试):
 venv/bin/python pull_reference.py /path/to/plants_index.json /root/yardmate-vision-ref 25
-venv/bin/python build_index.py /root/yardmate-vision-ref /root/yardmate-vision-index
+venv/bin/python build_index.py /root/yardmate-vision-ref /root/yardmate-vision-index-inat
+# P2b 第 3 步: 折入 catalog 真实 external 图 + 修品种误标 → serve 目录(见 fold_external.py / build_pipeline.sh 幂等)
+venv/bin/python fold_external.py /root/yardmate-vision-index-inat /path/to/plants_index.json /root/yardmate-vision-index
 # 2) 起服务
 cp yardmate-vision.service /etc/systemd/system/ && systemctl enable --now yardmate-vision
 curl -s localhost:8099/health

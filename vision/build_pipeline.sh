@@ -30,16 +30,31 @@ until ./venv/bin/python -c "import torch,open_clip,hnswlib" 2>/dev/null; do
 done
 echo "VENV_READY $(date -u)" >> "$LOG"
 
-# 3) 建索引(幂等:meta.json 最后写,存在=已建成 → 跳;半成品无 meta → 干净重建)。
-#    H1: 传播失败码 —— build_index 挂了就 exit 1 让 Restart=on-failure 真生效(原来只 log rc、
-#    脚本仍 exit 0,systemd 永不重试 → 无索引、serve 崩溃循环)。
-if [ -f /root/yardmate-vision-index/meta.json ]; then
+# 3) 建 iNat 纯真照索引 → INAT_DIR(幂等:meta.json 最后写,存在=已建成 → 跳;半成品无 meta →
+#    干净重建)。H1: 传播失败码 —— build_index 挂了就 exit 1 让 Restart=on-failure 真生效。
+#    ★注意: 输出改到 INAT_DIR(不是 serve 目录) —— serve 目录由 step 4 折入后产出。
+INAT_DIR=/root/yardmate-vision-index-inat
+SERVE_DIR=/root/yardmate-vision-index
+if [ -f "$INAT_DIR/meta.json" ]; then
   echo "INDEX_EXISTS_SKIP $(date -u)" >> "$LOG"
 else
-  if OMP_NUM_THREADS=4 nice -n 10 ./venv/bin/python build_index.py /root/yardmate-vision-ref /root/yardmate-vision-index >> build_index.log 2>&1; then
+  if OMP_NUM_THREADS=4 nice -n 10 ./venv/bin/python build_index.py /root/yardmate-vision-ref "$INAT_DIR" >> build_index.log 2>&1; then
     echo "BUILD_INDEX_DONE $(date -u)" >> "$LOG"
   else
     echo "BUILD_INDEX_FAILED $(date -u)" >> "$LOG"; exit 1
   fi
+fi
+
+# 4) 折入 catalog 真实 external gallery 图(P2b): 欠覆盖株补真图 + 视觉独特品种删母种误标向量
+#    换正确 external(见 fold_external.py)。INAT_DIR → SERVE_DIR。serve 指向 SERVE_DIR。
+#    plants_index.json = 当前权威 catalog(做 catalog 门 + 品种判定), 与 pull_reference 同一份。
+#    ★不做 mtime 幂等跳过(Codex #109): fold 每次都从 INAT_DIR 重建(不在已折索引上再折 → 重跑不
+#    重复加向量), 这样 R2 新增/变更的 external 图、catalog 门变化都能被最新一次 fold 吸收(只比
+#    INAT 时间戳会漏掉这些)。build_index 的重活(数小时)仍靠 INAT_DIR/meta 幂等跳过; fold 是分钟级
+#    (rclone 列 external + 只嵌欠覆盖/品种株的图), 每轮重跑代价可接受。
+if nice -n 10 ./venv/bin/python fold_external.py "$INAT_DIR" plants_index.json "$SERVE_DIR" >> fold_external.log 2>&1; then
+  echo "FOLD_DONE $(date -u)" >> "$LOG"
+else
+  echo "FOLD_FAILED $(date -u)" >> "$LOG"; exit 1
 fi
 echo "PIPELINE_COMPLETE $(date -u)" >> "$LOG"
