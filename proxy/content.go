@@ -7,6 +7,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/yaochen1125/yardmate-api/proxy/rosererank"
 )
@@ -35,10 +36,14 @@ var plantsDetailRaw []byte
 //go:embed data/diseases.json
 var diseasesRaw []byte
 
-// ContentIndex provides fast in-memory lookups over the YardMate plant + disease
-// catalog. Built once at startup from embedded JSON. Read-only, safe for
-// concurrent use by multiple request handlers.
-type ContentIndex struct {
+// catalogNameTable holds the plants_index.json-derived name→id lookup maps.
+// It is the ONLY part of ContentIndex that hot-reloads (SPEC §9): identify
+// resolves an engine-reported scientific name to a curated AAA plantId through
+// these, and a freshly catalog-promoted plant must become resolvable without a
+// redeploy. A table is IMMUTABLE once built; the hot-loader swaps a WHOLE new
+// table via ContentIndex.names (an atomic.Pointer), so a reader always sees a
+// fully-built, self-consistent snapshot — never a half-populated map.
+type catalogNameTable struct {
 	// scientificNameToID maps the species-level normalized scientific_name
 	// (var./subsp./cv./f. rank markers stripped) to plantId.
 	// e.g. "monstera deliciosa" -> "AAA1234". Used as the fuzzy fallback for
@@ -56,6 +61,41 @@ type ContentIndex struct {
 	// colliding on "brassica oleracea". LookupPlantID consults this first.
 	scientificNameToIDPrecise map[string]string
 
+	// commonByID gives the curated common_name by plantId (from plants_index).
+	// Drives the "catalog hit -> curated common name" step of /v1/identify name
+	// resolution (SPEC §2.1): a catalog hit prefers this over iNat / upstream.
+	commonByID map[string]string
+
+	// sciByID maps a curated catalog id (AAA-id) to its authoritative, VERBATIM
+	// scientific_name from plants_index.json — the reverse of the name->id indexes
+	// above (normalization is intentionally NOT applied: the value is fed straight
+	// into the iNat/Wikimedia cascade search). imageingest's /v1/plants/catalog-images
+	// reads it (via CatalogScientificNames) to derive the search name server-side
+	// from catalog_id, ignoring the client-supplied name — so a tampered attested
+	// client cannot pair a real id with an unrelated species to poison that plant's
+	// supplementary external/ gallery (imageingest SPEC §2.8, Codex P1).
+	sciByID map[string]string
+
+	// version is a provenance tag for logs — "embed" for the cold-start baseline
+	// or the CDN ETag on a hot-loaded table (SPEC §9.3). count is the number of
+	// parsed catalog rows, kept for reload logging + the truncation guard (§9.5).
+	version string
+	count   int
+}
+
+// ContentIndex provides fast in-memory lookups over the YardMate plant + disease
+// catalog. Built once at startup from embedded JSON. The plants_index-derived
+// name→id maps (behind `names`) may additionally be hot-swapped at runtime with
+// zero downtime (SPEC §9); the plants_detail + diseases maps below are immutable
+// after LoadContent. Read-only from a request's perspective, safe for concurrent
+// use by multiple request handlers.
+type ContentIndex struct {
+	// names holds the hot-swappable plants_index-derived lookup table. Read via
+	// currentNames() on every LookupPlantID / LookupCommonName /
+	// CatalogScientificNames call; replaced wholesale by ReloadCatalogNames.
+	// Always non-nil after LoadContent (seeded with the embed baseline).
+	names atomic.Pointer[catalogNameTable]
+
 	// plantToCommonDiseases maps plantId to its ordered common_diseases_list
 	// (catalog ids). Used by the F-option-2 异常 fallback in /v1/diagnose.
 	plantToCommonDiseases map[string][]string
@@ -71,21 +111,6 @@ type ContentIndex struct {
 	// Used by the enrichment path-1 lookup (proxy/enrichment/SPEC §2.1
 	// step 2) to short-circuit Supabase + LLM for plants in the 1522 catalog.
 	fullPlantByID map[string]*PlantDetail
-
-	// commonByID gives the curated common_name by plantId (from plants_index).
-	// Drives the "catalog hit -> curated common name" step of /v1/identify name
-	// resolution (SPEC §2.1): a catalog hit prefers this over iNat / upstream.
-	commonByID map[string]string
-
-	// sciByID maps a curated catalog id (AAA-id) to its authoritative, VERBATIM
-	// scientific_name from plants_index.json — the reverse of the name->id indexes
-	// above (normalization is intentionally NOT applied: the value is fed straight
-	// into the iNat/Wikimedia cascade search). imageingest's /v1/plants/catalog-images
-	// reads it (via CatalogScientificNames) to derive the search name server-side
-	// from catalog_id, ignoring the client-supplied name — so a tampered attested
-	// client cannot pair a real id with an unrelated species to poison that plant's
-	// supplementary external/ gallery (imageingest SPEC §2.8, Codex P1).
-	sciByID map[string]string
 
 	// stepByID / remedyByID are the shared treatment-step (S01–S44) and
 	// home-remedy (K01–K15) pools from diseases.json `shared`. Disease enrichment
@@ -154,15 +179,20 @@ type DiseaseNameRef struct {
 	Description string // short symptom hint (shortDescription) for LLM disambiguation
 }
 
-// LoadContent parses the embedded JSON files and builds the lookup maps.
-// Returns a *ContentIndex usable across goroutines. Call once at startup.
-func LoadContent() (*ContentIndex, error) {
+// buildCatalogNameTable parses a plants_index.json payload and builds the
+// hot-swappable name→id lookup maps (SPEC §9). It is the single source of the
+// plants_index index-building rules, shared by the embed baseline (LoadContent)
+// and the runtime reload (ReloadCatalogNames) so both stay byte-identical.
+// version is a provenance tag for logs ("embed" or the CDN ETag). The payload
+// is a superset schema — extra fields beyond id/scientific_name/common_name are
+// ignored by json.Unmarshal (SPEC §1.5 CDN bullet).
+func buildCatalogNameTable(raw []byte, version string) (*catalogNameTable, error) {
 	var plants []struct {
 		ID             string `json:"id"`
 		ScientificName string `json:"scientific_name"`
 		CommonName     string `json:"common_name"`
 	}
-	if err := json.Unmarshal(plantsIndexRaw, &plants); err != nil {
+	if err := json.Unmarshal(raw, &plants); err != nil {
 		return nil, fmt.Errorf("content: plants_index: %w", err)
 	}
 	// Two indexes over the same rows. Both are built first-write-wins so the
@@ -201,6 +231,26 @@ func LoadContent() (*ContentIndex, error) {
 		if p.CommonName != "" {
 			common[p.ID] = p.CommonName
 		}
+	}
+	return &catalogNameTable{
+		scientificNameToID:        sci,
+		scientificNameToIDPrecise: sciPrecise,
+		commonByID:                common,
+		sciByID:                   sciByID,
+		version:                   version,
+		count:                     len(plants),
+	}, nil
+}
+
+// LoadContent parses the embedded JSON files and builds the lookup maps.
+// Returns a *ContentIndex usable across goroutines. Call once at startup. The
+// plants_index-derived name table is seeded from the embed as the cold-start
+// baseline (SPEC §9.5); catalog hot-load may later swap it via
+// ReloadCatalogNames without a restart.
+func LoadContent() (*ContentIndex, error) {
+	names, err := buildCatalogNameTable(plantsIndexRaw, "embed")
+	if err != nil {
+		return nil, err
 	}
 
 	// Parse the full plants_detail.json into typed PlantDetail entries.
@@ -286,19 +336,59 @@ func LoadContent() (*ContentIndex, error) {
 		dnam[key] = id
 	}
 
-	return &ContentIndex{
-		scientificNameToID:        sci,
-		scientificNameToIDPrecise: sciPrecise,
-		plantToCommonDiseases:     pdis,
-		diseaseNameToID:           dnam,
-		diseaseByID:               diseaseFile.Diseases,
-		fullPlantByID:             fpd,
-		commonByID:                common,
-		sciByID:                   sciByID,
-		stepByID:                  diseaseFile.Shared.Steps,
-		remedyByID:                diseaseFile.Shared.Remedies,
-		speciesGroups:             groups,
-	}, nil
+	ci := &ContentIndex{
+		plantToCommonDiseases: pdis,
+		diseaseNameToID:       dnam,
+		diseaseByID:           diseaseFile.Diseases,
+		fullPlantByID:         fpd,
+		stepByID:              diseaseFile.Shared.Steps,
+		remedyByID:            diseaseFile.Shared.Remedies,
+		speciesGroups:         groups,
+	}
+	ci.names.Store(names) // seed the hot-swappable name table with the embed baseline
+	return ci, nil
+}
+
+// currentNames returns the live plants_index-derived name table via a single
+// atomic load, or nil on a nil receiver / an index that was never seeded. Every
+// name→id read path (LookupPlantID / LookupCommonName / CatalogScientificNames)
+// goes through this so a concurrent hot-swap (ReloadCatalogNames) is observed
+// atomically — a caller sees either the whole old table or the whole new one.
+func (c *ContentIndex) currentNames() *catalogNameTable {
+	if c == nil {
+		return nil
+	}
+	return c.names.Load()
+}
+
+// ReloadCatalogNames parses a fresh plants_index.json payload and atomically
+// swaps the name→id lookup table (SPEC §9.4). version is a provenance tag (the
+// CDN ETag) recorded on the new table for logging. It returns the new row count
+// on success. On any failure — a JSON parse error, an empty payload, or a
+// truncation (the new count is below half the currently-loaded count) — it
+// returns an error and leaves the current table UNTOUCHED (SPEC §9.5 fail-safe),
+// so a half-published or corrupt CDN object can never shrink or empty identify
+// coverage. Safe to call concurrently with request-path reads; the swap is a
+// single atomic pointer store and readers are never blocked.
+func (c *ContentIndex) ReloadCatalogNames(raw []byte, version string) (int, error) {
+	if c == nil {
+		return 0, fmt.Errorf("content: reload on nil index")
+	}
+	nt, err := buildCatalogNameTable(raw, version)
+	if err != nil {
+		return 0, err
+	}
+	if nt.count == 0 {
+		return 0, fmt.Errorf("content: refusing reload: parsed 0 catalog rows (empty/degenerate payload)")
+	}
+	// Truncation guard: never swap in a table that lost most of the catalog. A
+	// legitimate grow (1633 → 1643) passes; a partial publish that happens to be
+	// valid JSON but collapsed to a fraction of the rows is rejected.
+	if prev := c.currentNames(); prev != nil && nt.count*2 < prev.count {
+		return 0, fmt.Errorf("content: refusing reload: new count %d < half of current %d (truncation guard)", nt.count, prev.count)
+	}
+	c.names.Store(nt)
+	return nt.count, nil
 }
 
 // SpeciesGroupFor returns the cultivar-disambiguation group for a bare species
@@ -328,7 +418,8 @@ func (c *ContentIndex) SpeciesGroupFor(key string) ([]rosererank.RoseCandidate, 
 // Returns ("", false) on miss — iOS detail page must tolerate plantId=null
 // (renders Plant.id-only data without YardMate cross-reference).
 func (c *ContentIndex) LookupPlantID(scientificName string) (string, bool) {
-	if c == nil {
+	nt := c.currentNames()
+	if nt == nil {
 		return "", false
 	}
 	// Tier 1: precise (infraspecific-preserving) match. Distinguishes the five
@@ -336,7 +427,7 @@ func (c *ContentIndex) LookupPlantID(scientificName string) (string, bool) {
 	// when the query carries the variety (Pl@ntNet emits e.g. "Brassica
 	// oleracea var. italica" via scientificNameWithoutAuthor).
 	if pkey := normalizeScientificNamePrecise(scientificName); pkey != "" {
-		if id, ok := c.scientificNameToIDPrecise[pkey]; ok {
+		if id, ok := nt.scientificNameToIDPrecise[pkey]; ok {
 			return id, true
 		}
 	}
@@ -348,7 +439,7 @@ func (c *ContentIndex) LookupPlantID(scientificName string) (string, bool) {
 	if key == "" {
 		return "", false
 	}
-	if id, ok := c.scientificNameToID[key]; ok {
+	if id, ok := nt.scientificNameToID[key]; ok {
 		return id, true
 	}
 	return "", false
@@ -359,18 +450,18 @@ func (c *ContentIndex) LookupPlantID(scientificName string) (string, bool) {
 // catalog name over iNat / upstream when a suggestion resolves to the 1522
 // catalog. Returns ("", false) on a nil index, empty id, or missing name.
 func (c *ContentIndex) LookupCommonName(plantID string) (string, bool) {
-	if c == nil || plantID == "" {
+	nt := c.currentNames()
+	if nt == nil || plantID == "" {
 		return "", false
 	}
-	if name, ok := c.commonByID[plantID]; ok && name != "" {
+	if name, ok := nt.commonByID[plantID]; ok && name != "" {
 		return name, true
 	}
 	return "", false
 }
 
 // CatalogScientificNames returns a fresh copy of the authoritative catalog-id ->
-// scientific_name map for the curated 1522 (verbatim from the embedded
-// plants_index.json).
+// scientific_name map for the curated catalog (verbatim from plants_index.json).
 //
 // proxy/imageingest consumes it (injected as imageingest.Config.CatalogNames via
 // main.buildImageIngestService) to derive the SERVER-SIDE search name for
@@ -380,12 +471,18 @@ func (c *ContentIndex) LookupCommonName(plantID string) (string, bool) {
 // species name and poison that curated plant's external/ supplementary gallery
 // (imageingest SPEC §2.8). A copy is returned so the consumer can never mutate
 // the shared, read-only index.
+//
+// Reflects the live (hot-loaded) name table if called after a reload — but note
+// main.buildImageIngestService copies it ONCE at startup, so imageingest holds a
+// snapshot and does NOT see hot updates (SPEC §9.2 sciByID note). That is
+// unchanged from pre-hot-load behaviour and acceptable.
 func (c *ContentIndex) CatalogScientificNames() map[string]string {
-	if c == nil {
+	nt := c.currentNames()
+	if nt == nil {
 		return nil
 	}
-	out := make(map[string]string, len(c.sciByID))
-	for id, name := range c.sciByID {
+	out := make(map[string]string, len(nt.sciByID))
+	for id, name := range nt.sciByID {
 		out[id] = name
 	}
 	return out

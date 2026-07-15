@@ -15,7 +15,7 @@ func loadContentForTests(t *testing.T) *ContentIndex {
 
 func TestLoadContent_IndexBuildsAllThreeMaps(t *testing.T) {
 	c := loadContentForTests(t)
-	if len(c.scientificNameToID) == 0 {
+	if len(c.currentNames().scientificNameToID) == 0 {
 		t.Error("scientificNameToID empty after load")
 	}
 	if len(c.plantToCommonDiseases) == 0 {

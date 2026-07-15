@@ -203,6 +203,15 @@ func main() {
 	}
 	log.Printf("content loaded: catalog ready")
 
+	// Catalog name-index hot-load (proxy/SPEC.md §9). OFF by default: with
+	// CATALOG_HOTLOAD_ENABLED unset/false the embedded plants_index baseline
+	// (just loaded) is the sole source and no goroutine runs. When enabled it
+	// polls the CDN plants_index.json and atomically swaps the name→id maps on
+	// `content` so a freshly catalog-promoted plant becomes identify-resolvable
+	// without a redeploy, zero downtime. Fail-safe: any poll error keeps the
+	// embed/last-good table.
+	startCatalogReloader(vault, content)
+
 	// Shared Supabase pgx pool — opened ONCE from SUPABASE_DB_URL, independent
 	// of OpenAI/enrichment gating. Consumed by the enrichment service (only when
 	// OPENAI_API_KEY is also present), the inline disease enrichment, AND the
@@ -489,6 +498,43 @@ func startEnrichmentSweep(vault *secrets.Vault, db *enrichment.DB, enrichSvc *en
 		diseaseBF = ds.Backfiller()
 	}
 	enrichment.NewSweeper(db, plantBF, diseaseBF, interval).Start(context.Background())
+}
+
+// Catalog name-index hot-load defaults (proxy/SPEC.md §9). The URL default is
+// the prod CDN object published by yardmate-content/publish.sh; staging
+// overrides it to the content-staging/ prefix via CATALOG_HOTLOAD_URL.
+const (
+	defaultCatalogHotloadURL      = "https://images.yardmate.ai/content/plants_index.json"
+	defaultCatalogHotloadInterval = 10 * time.Minute
+	minCatalogHotloadInterval     = 1 * time.Minute
+)
+
+// startCatalogReloader wires runtime catalog name-index hot-load (proxy/SPEC.md
+// §9). OFF by default (kill-switch): with CATALOG_HOTLOAD_ENABLED unset/false it
+// logs and returns — the embedded plants_index baseline is the sole source and
+// no goroutine starts, byte-identical to pre-hot-load behaviour. When enabled it
+// starts a background poller that conditional-GETs the CDN plants_index.json
+// (ETag version gate) and atomically swaps the name→id maps on `content`, so a
+// catalog-promoted plant is recognised by /v1/identify within one poll interval
+// with zero downtime and no redeploy. All three knobs read the secrets vault
+// (not os.Getenv) so they live in secrets.env with the other feature flags
+// (Codex #23: vault-only config read via os.Getenv silently no-ops).
+func startCatalogReloader(vault *secrets.Vault, content *proxy.ContentIndex) {
+	if !vault.GetBool("CATALOG_HOTLOAD_ENABLED", false) {
+		log.Printf("catalog hot-load: disabled (CATALOG_HOTLOAD_ENABLED unset/false); identify uses embedded plants_index")
+		return
+	}
+	url := vault.Get("CATALOG_HOTLOAD_URL")
+	if url == "" {
+		url = defaultCatalogHotloadURL
+	}
+	interval := vaultDurationOr(vault, "CATALOG_HOTLOAD_INTERVAL", defaultCatalogHotloadInterval)
+	if interval < minCatalogHotloadInterval {
+		log.Printf("catalog hot-load: interval %v below %v floor; clamping to floor", interval, minCatalogHotloadInterval)
+		interval = minCatalogHotloadInterval
+	}
+	proxy.NewCatalogReloader(content, url, interval).Start(context.Background())
+	log.Printf("catalog hot-load: enabled url=%s interval=%s", url, interval)
 }
 
 // buildEnrichmentService wires the /v1/plants/enrichment dependencies: the
