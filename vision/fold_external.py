@@ -76,7 +76,30 @@ def external_vecs(cid, cdn, tmp):
     return out
 
 
-def main(index_dir, catalog_path, out_dir, cdn):
+def _fold_supp(supp_dir, current, add, st):
+    """折入 pull_supplemental 深挖并**已验证**的库外图(Phase B)。这些图正确性已在 pull_supplemental
+    判定过(相对 NN / 聚类+GPT), 这里只做"嵌入 + 自去近重复 + 加向量", 不再重判。catalog 门仍生效。"""
+    import glob
+    if not supp_dir or not os.path.isdir(supp_dir):
+        return
+    for cid in sorted(os.listdir(supp_dir)):
+        d = os.path.join(supp_dir, cid)
+        if not os.path.isdir(d) or cid not in current:   # catalog 门 + 跳过 _manifest.json 等文件
+            continue
+        added = []
+        for p in sorted(glob.glob(f"{d}/*.jpg")) + sorted(glob.glob(f"{d}/*.png")):
+            try:
+                v = vision_embed.embed_path(p).astype(np.float32)
+            except Exception as e:
+                print("  supp embed err", p, e); continue
+            if any(float(v @ k) > DUP_SIM for k in added):
+                continue
+            added.append(v); add.append((v, cid))
+        if added:
+            st["supp_added"] += len(added)
+
+
+def main(index_dir, catalog_path, out_dir, cdn, supp_dir=None):
     os.makedirs(out_dir, exist_ok=True)
     tmp = "/tmp/fold_external"; os.makedirs(tmp, exist_ok=True)
 
@@ -98,7 +121,7 @@ def main(index_dir, catalog_path, out_dir, cdn):
     drop = set()          # 要删的现有向量下标(误标母种图)
     add = []              # [(vec, cid)] 要加的 external
     st = {"undercov_kept": 0, "undercov_rej": 0, "cultivar_replaced": 0,
-          "cultivar_kept_both": 0, "zero_added": 0, "stale_skipped": 0}
+          "cultivar_kept_both": 0, "zero_added": 0, "stale_skipped": 0, "supp_added": 0}
     spot = []             # 0-iNat 折入的 id → 待抽查
 
     ext_ids = _list_external_ids(cdn, current)  # 现役 catalog 里哪些有 external
@@ -143,8 +166,10 @@ def main(index_dir, catalog_path, out_dir, cdn):
             else:
                 st["undercov_rej"] += 1
 
+    _fold_supp(supp_dir, current, add, st)   # Phase B: 折入深挖并已验证的库外图
+
     print("stats:", st, flush=True)
-    print(f"删误标向量 {len(drop)} | 加 external {len(add)} | 0-iNat待抽查 {len(spot)}", flush=True)
+    print(f"删误标向量 {len(drop)} | 加向量 {len(add)}(含 supp {st['supp_added']}) | 0-iNat待抽查 {len(spot)}", flush=True)
     json.dump(sorted(spot), open(f"{out_dir}/_spotcheck.json", "w"))
 
     # 重建: 原始(去掉 drop 的误标 + 过时已删 id) + external add。
@@ -209,6 +234,9 @@ if __name__ == "__main__":
     cdn = "https://images.yardmate.ai/plant_images"
     if "--cdn" in sys.argv:
         cdn = sys.argv[sys.argv.index("--cdn") + 1]
+    supp_dir = None
+    if "--supp" in sys.argv:                     # Phase B: 深挖并已验证的库外图目录
+        supp_dir = sys.argv[sys.argv.index("--supp") + 1]
     if len(args) < 3:
         print(__doc__); sys.exit(2)
-    main(args[0], args[1], args[2], cdn)
+    main(args[0], args[1], args[2], cdn, supp_dir)

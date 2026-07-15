@@ -77,6 +77,17 @@ DINOv2 84%. In/out AUC 0.995. Bio-specialized + retains a text tower (L2 fine-tu
   vs diff-plant sim overlap heavily: same p5≈0.80 vs diff p95≈0.81) + current-catalog gate (drops
   stale removed ids). NOT user photos — no correction signal (accept ≠ correct) would poison the
   index; dropped. NOT AI-generated main images (P0 铁律).
+- P2b **Phase B** (`pull_supplemental.py` = build step 3.5, default-OFF `VISION_SUPP_ENABLED`): go BEYOND
+  the ~4 curated external images and **actively deep-mine** more real photos for still-thin plants —
+  Wikimedia Commons deep (past imageingest's top-4) + GBIF occurrence media + PlantNet related-images.
+  Only CC0/CC-BY/CC-BY-SA (`supp_sources.classify_license`; NC/ND never — commercial app). **Correctness
+  gate is the crux** (search results carry noise: maps / diagrams / herbarium sheets / wrong species /
+  non-plants): iNat-anchored thin *species* → relative-NN (free); **anchor-free** plants (0-iNat + ALL
+  cultivars — the parent-species anchor is unreliable, would mis-reject true cultivar photos) →
+  **embedding-cluster consensus + GPT-4o (`detail:low`) borderline verifier** (`supp_verify`), hard-capped
+  by `VISION_SUPP_MAX_VLM`. **Index-only**: verified images cached on the build box (+ license/attribution
+  manifest), only their vectors folded (`fold_external --supp`) — user galleries + the public bucket
+  untouched. Staging-validate the lift with `eval_holdout.py` (LOO top-1, `mark_deleted`) before prod.
 - L2 (future): fine-tune BioCLIP on own catalog real photos → domain-robust "own plant model".
 
 ## 7. Pitfalls (don't re-rediscover)
@@ -91,3 +102,14 @@ DINOv2 84%. In/out AUC 0.995. Bio-specialized + retains a text tower (L2 fine-tu
   gallery photo is dissimilar to its iNat centroid — and REPLACES the mislabeled species vectors
   with the correct external photos. Subtle cultivars (look like their species) keep both. Don't
   "fix" taxonomic synonyms (Aloe→Aristaloe, Anemone→Anemonoides): same plant, correct photos.
+- **GBIF media license ≠ occurrence license (Phase B landmine).** The `occurrence/search?license=` param
+  filters the *record's* data license, NOT the *photo's* license. Measured: `license=CC_BY_4_0` returned
+  records whose `media[].license` was `cc-by-nc` (iNat photos are overwhelmingly NC on GBIF). So the
+  server-side filter is both wrong-field AND rejects repeated `license` params with HTTP 400. `supp_sources`
+  filters ONLY on per-`media[].license` (`classify_license`). Net GBIF yield of usable CC0/BY/SA photos is
+  therefore modest (most iNat-sourced media correctly rejected) — that's the license rule working, not a bug.
+- **Cultivars are anchor-free even WITH iNat parent vectors (Phase B).** `pull_supplemental` routes ALL
+  cultivars to the cluster+GPT gate, never relative-NN: the parent-species anchor may be a visually-distinct
+  mislabel (corkscrew rush vs straight rush), so NN-against-parent would reject the TRUE cultivar photos and
+  keep the wrong ones — the exact bug `fold_external` exists to fix. Search cultivars by their FULL name
+  (Commons/GBIF do carry some cultivar photos, unlike iNat's species-only taxa); GPT confirms cultivar identity.

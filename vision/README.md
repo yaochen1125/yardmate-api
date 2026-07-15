@@ -16,7 +16,10 @@
 - `vision_embed.py` — BioCLIP-2 嵌入单例(建库/推理共用)
 - `pull_reference.py` — 全 catalog 从 iNat 拉真实照片(resumable/限流/记零覆盖)
 - `build_index.py` — 真实照片 → hnswlib 余弦索引(index.bin + mapping.json + meta.json)
-- `fold_external.py` — P2b: 折入 catalog 真实 external gallery 图(欠覆盖补真图 + 视觉独特品种删母种误标换正确图),build 第 3 步
+- `fold_external.py` — P2b: 折入 catalog 真实 external gallery 图(欠覆盖补真图 + 视觉独特品种删母种误标换正确图),build 第 3 步。`--supp <dir>` 额外折入 Phase B 深挖图
+- `pull_supplemental.py` — P2b **Phase B**(build 第 3.5 步,默认关):给欠覆盖株深挖更多真实库外图(Wikimedia 深挖/GBIF/PlantNet)+ 正确性过滤(锚点株相对 NN;无锚点株聚类+GPT-4o)。只进索引不存图
+- `supp_sources.py` / `supp_verify.py` — Phase B 的图源+许可分类 / 聚类共识+GPT 判据
+- `eval_holdout.py` — Phase B 效果验证(LOO top-1,先 staging 副本跑,确认提升再上 prod)
 - `app.py` — FastAPI: `POST /v1/vision/identify` + `GET /health`
 - `yardmate-vision.service` — systemd(CPU, 限内存 2.6G)
 
@@ -43,8 +46,16 @@ venv/bin/pip install open_clip_torch hnswlib fastapi "uvicorn[standard]" python-
 #    (build_pipeline.sh + yardmate-vision-build.service:pull→embed,开机自启 + 失败重试):
 venv/bin/python pull_reference.py /path/to/plants_index.json /root/yardmate-vision-ref 25
 venv/bin/python build_index.py /root/yardmate-vision-ref /root/yardmate-vision-index-inat
-# P2b 第 3 步: 折入 catalog 真实 external 图 + 修品种误标 → serve 目录(见 fold_external.py / build_pipeline.sh 幂等)
-venv/bin/python fold_external.py /root/yardmate-vision-index-inat /path/to/plants_index.json /root/yardmate-vision-index
+# P2b Phase B(可选, 第 3.5 步): 深挖更多真实库外图 + 正确性过滤 → SUPP_DIR(只进索引不存图)。
+#   ★花 GPT 调用($) + PlantNet 配额 + 数小时 → 先在 staging/副本手动跑 + eval 验证, 别挂 systemd 反复触发。
+#   需 OPENAI_API_KEY(无锚点株的 GPT 判据); 可选 PLANTNET_API_KEY(PlantNet 图源, PLANTNET_MAX_IDENTIFY=0 关)。
+OPENAI_API_KEY=sk-... PLANTNET_API_KEY=... \
+  venv/bin/python pull_supplemental.py /root/yardmate-vision-index-inat /path/to/plants_index.json /root/yardmate-vision-supp
+# P2b 第 3(+4)步: 折入 catalog 真实 external 图 + 修品种误标 + Phase B 深挖图 → serve 目录(幂等)
+venv/bin/python fold_external.py /root/yardmate-vision-index-inat /path/to/plants_index.json /root/yardmate-vision-index --supp /root/yardmate-vision-supp
+# 验证 Phase B 提升(LOO top-1, 对比纯 iNat vs 折入后; 先副本跑, 满意再指向 serve):
+venv/bin/python eval_holdout.py /root/yardmate-vision-index-inat /root/yardmate-vision-index /root/yardmate-vision-supp/_manifest.json
+# systemd 全程托管时: VISION_SUPP_ENABLED=1 才自动跑第 3.5 步(默认关); 关掉时 fold 仍吸收 SUPP_DIR 已有图。
 # 2) 起服务
 cp yardmate-vision.service /etc/systemd/system/ && systemctl enable --now yardmate-vision
 curl -s localhost:8099/health
