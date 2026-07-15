@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net/http"
@@ -33,6 +34,12 @@ type CatalogReloader struct {
 	// (If-None-Match). Read and written ONLY by the single poll goroutine, so
 	// it needs no synchronization.
 	etag string
+	// lastHash is an FNV-64 fingerprint of the last successfully-loaded body. It
+	// is a SECONDARY gate for a CDN that omits/strips the ETag (SPEC §9.3): with
+	// no ETag every poll returns 200, so this short-circuits the redundant
+	// re-parse + re-swap when the bytes are unchanged. Same single-goroutine
+	// ownership as etag. 0 until the first successful load.
+	lastHash uint64
 }
 
 // NewCatalogReloader builds a reloader for the given CDN index URL + poll
@@ -55,11 +62,20 @@ func (r *CatalogReloader) Start(ctx context.Context) {
 		return
 	}
 	go func() {
+		// This is the only goroutine driving reloads; an unrecovered panic here
+		// would crash the whole single-instance server (mirrors the enrichment
+		// sweeper convention). Recover at the top (last resort — the loop then
+		// exits, disabling further reloads but keeping the process + embed/last-
+		// good table alive) AND per-poll below so one bad poll never stops the
+		// schedule.
+		defer func() {
+			if p := recover(); p != nil {
+				log.Printf("WARN catalog hot-load: loop panic recovered (reloads disabled): %v", p)
+			}
+		}()
 		// Immediate first poll — async, does not block startup or serving. The
 		// embed baseline already serves until (and if) this succeeds.
-		if _, err := r.pollOnce(ctx); err != nil {
-			log.Printf("WARN catalog hot-load: initial poll failed: %v (serving embed baseline)", err)
-		}
+		r.safePoll(ctx, "initial poll failed: %v (serving embed baseline)")
 		t := time.NewTicker(r.interval)
 		defer t.Stop()
 		for {
@@ -67,12 +83,24 @@ func (r *CatalogReloader) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if _, err := r.pollOnce(ctx); err != nil {
-					log.Printf("WARN catalog hot-load: poll failed: %v (kept last good table)", err)
-				}
+				r.safePoll(ctx, "poll failed: %v (kept last good table)")
 			}
 		}
 	}()
+}
+
+// safePoll runs one pollOnce with its own panic recovery so a single bad poll
+// (now, or from a future change) is logged and skipped rather than unwinding the
+// loop's top-level recover and disabling reloads for the process lifetime.
+func (r *CatalogReloader) safePoll(ctx context.Context, errFmt string) {
+	defer func() {
+		if p := recover(); p != nil {
+			log.Printf("WARN catalog hot-load: poll panic recovered: %v", p)
+		}
+	}()
+	if _, err := r.pollOnce(ctx); err != nil {
+		log.Printf("WARN catalog hot-load: "+errFmt, err)
+	}
 }
 
 // pollOnce performs one conditional GET and, on a changed 200 response, rebuilds
@@ -115,14 +143,33 @@ func (r *CatalogReloader) pollOnce(ctx context.Context) (bool, error) {
 	}
 
 	etag := resp.Header.Get("ETag")
+
+	// Secondary content gate for an ETag-less CDN (SPEC §9.3): if the bytes match
+	// the last successfully-loaded index, skip the redundant parse + swap + log.
+	// Harmless (redundant) when the ETag gate already 304'd unchanged content.
+	sum := fnvHash(body)
+	if r.lastHash != 0 && sum == r.lastHash {
+		r.etag = etag // adopt any ETag so a future poll can 304 short-circuit
+		return false, nil
+	}
+
 	n, err := r.content.ReloadCatalogNames(body, etag)
 	if err != nil {
 		// Parse error / truncation guard / empty payload — keep the current
-		// table and do NOT record the ETag, so the next tick re-fetches and
-		// re-attempts instead of 304-skipping a bad object.
+		// table and do NOT record the ETag or fingerprint, so the next tick
+		// re-fetches and re-attempts instead of skipping a bad object.
 		return false, err
 	}
 	r.etag = etag
-	log.Printf("catalog hot-load: reloaded rows=%d etag=%q from %s", n, etag, r.url)
+	r.lastHash = sum
+	log.Printf("catalog hot-load: reloaded plants=%d etag=%q from %s", n, etag, r.url)
 	return true, nil
+}
+
+// fnvHash returns a 64-bit FNV-1a fingerprint of b, used to detect an unchanged
+// index body when the CDN provides no ETag to gate on.
+func fnvHash(b []byte) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write(b)
+	return h.Sum64()
 }

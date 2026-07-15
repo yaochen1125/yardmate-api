@@ -78,7 +78,12 @@ type catalogNameTable struct {
 
 	// version is a provenance tag for logs — "embed" for the cold-start baseline
 	// or the CDN ETag on a hot-loaded table (SPEC §9.3). count is the number of
-	// parsed catalog rows, kept for reload logging + the truncation guard (§9.5).
+	// USABLE indexed catalog plants (rows with a non-empty id + scientific_name,
+	// == len(sciByID)) — NOT the raw parsed-array length. It backs the reload
+	// logging + the empty/truncation fail-safe (§9.5), which must key off real
+	// identify coverage: a valid-JSON payload whose rows all lack a name/id
+	// indexes nothing, so counting raw rows would let it slip past the guard and
+	// swap in an all-empty table that misses every lookup.
 	version string
 	count   int
 }
@@ -238,7 +243,11 @@ func buildCatalogNameTable(raw []byte, version string) (*catalogNameTable, error
 		commonByID:                common,
 		sciByID:                   sciByID,
 		version:                   version,
-		count:                     len(plants),
+		// Count USABLE indexed plants (len(sciByID)), not len(plants): the
+		// fail-safe guards below must reflect real identify coverage so a valid
+		// but degenerate payload (all rows missing id/scientific_name → every
+		// map empty) is rejected instead of silently swapping in an empty table.
+		count: len(sciByID),
 	}, nil
 }
 
@@ -379,7 +388,7 @@ func (c *ContentIndex) ReloadCatalogNames(raw []byte, version string) (int, erro
 		return 0, err
 	}
 	if nt.count == 0 {
-		return 0, fmt.Errorf("content: refusing reload: parsed 0 catalog rows (empty/degenerate payload)")
+		return 0, fmt.Errorf("content: refusing reload: indexed 0 usable catalog plants (empty / wrong-shape payload)")
 	}
 	// Truncation guard: never swap in a table that lost most of the catalog. A
 	// legitimate grow (1633 → 1643) passes; a partial publish that happens to be

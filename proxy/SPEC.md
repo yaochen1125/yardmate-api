@@ -501,7 +501,7 @@ Deliberately narrow (per the design constraint): a whole-`ContentIndex` swap wou
 ### 9.3 Data source + version gate
 
 - **Source:** `CATALOG_HOTLOAD_URL`, default `https://images.yardmate.ai/content/plants_index.json`. Staging overrides it to `…/content-staging/plants_index.json`.
-- **Version gate = HTTP `ETag` conditional GET.** The poller keeps the last-seen `ETag` and sends `If-None-Match: <etag>`. Cloudflare returns **`304 Not Modified`** when unchanged → the poller does nothing (no parse, no alloc, no swap). A **`200`** carries a new body + new `ETag` → rebuild + swap. This is per-file and precise: it fires only when `plants_index.json` itself changes, unlike the repo-global `content/version.txt` shard tag (which also bumps when only `diseases.json` / `stories.json` change). `version.txt` is the documented **alternative** gate if a CDN/proxy ever strips `ETag`; ETag is preferred while it is present (verified live: `ETag: "…"` + `Last-Modified` are served).
+- **Version gate = HTTP `ETag` conditional GET.** The poller keeps the last-seen `ETag` and sends `If-None-Match: <etag>`. Cloudflare returns **`304 Not Modified`** when unchanged → the poller does nothing (no parse, no alloc, no swap). A **`200`** carries a new body + new `ETag` → rebuild + swap. This is per-file and precise: it fires only when `plants_index.json` itself changes, unlike the repo-global `content/version.txt` shard tag (which also bumps when only `diseases.json` / `stories.json` change). ETag is preferred (verified live: `ETag: "…"` + `Last-Modified` are served). **Secondary gate:** the poller also keeps an FNV-64 fingerprint of the last successfully-loaded body and skips the parse + swap when a `200` body is byte-identical — so a CDN that ever omits/strips the `ETag` (returning `200` every poll) still doesn't churn an identical table. `content/version.txt` remains a documented alternative gate; the ETag + body-fingerprint pair covers the strip case without needing it.
 - **Freshness:** the CDN object has `max-age=60`; `publish.sh` also issues a Cloudflare purge, so a new index is visible within ~1 min of publish regardless of the poll interval.
 
 ### 9.4 Reload semantics (atomic, zero-downtime)
@@ -517,7 +517,7 @@ Layered so the process **always** has a usable name table:
 1. **Cold-start baseline = embed.** `LoadContent` builds the initial `catalogNameTable` from the embedded `plants_index.json` (tag `"embed"`) exactly as before. If hot-load is OFF, or the very first poll fails, identify runs on the embed — identical to pre-hot-load behaviour.
 2. **Reject-and-keep.** `ReloadCatalogNames` validates before swapping and, on any failure, returns an error and **leaves the current table in place**:
    - JSON parse error (truncated / half-published object) → keep current.
-   - **Truncation guard:** a *valid but degenerate* payload is refused — `count == 0`, or `count < ½` of the currently-loaded count (a partial publish that shrank the catalog must not shrink identify coverage). A legitimate grow (1633 → 1643) passes; a collapse to a handful does not.
+   - **Truncation / wrong-shape guard:** a *valid but degenerate* payload is refused — `count == 0`, or `count < ½` of the currently-loaded count (a partial publish that shrank the catalog must not shrink identify coverage). Crucially `count` is the number of **usable indexed plants** (rows with a non-empty id + scientific_name, `== len(sciByID)`), NOT the raw parsed-array length — so a full-length payload whose rows all lost their `scientific_name`/`id` (a field rename or export bug) indexes 0 plants and is rejected, instead of slipping past a raw-row count and swapping in an all-empty table. A legitimate grow (1633 → 1643) passes; a collapse to a handful, or a wrong-shape all-empty index, does not.
 3. **Poll errors are non-fatal.** Network error / non-200-non-304 / body over the 8 MB read cap → WARN-logged, current table retained, next tick retries. A reload failure never takes the process down and never empties the index.
 
 ### 9.6 Configuration (all via the `secrets` vault, `XXX_ENABLED` style)
@@ -535,7 +535,7 @@ Default-OFF is intentional: ship dark, validate on staging (§9.8), then flip pr
 ### 9.7 Implementation map (files)
 
 - `proxy/content.go` — `catalogNameTable` struct + `names atomic.Pointer[catalogNameTable]` on `ContentIndex`; `buildCatalogNameTable(raw, version)` (the existing `plants_index` parse loop, factored out); `ReloadCatalogNames(raw, version)` (validate → swap); read methods consult `names.Load()`.
-- `proxy/catalog_reload.go` — `CatalogReloader` (background goroutine, `time.Ticker`, conditional GET with the ETag gate, 8 MB read cap, WARN-on-error). Started once from `main`.
+- `proxy/catalog_reload.go` — `CatalogReloader` (background goroutine, `time.Ticker`, conditional GET with the ETag gate + FNV-64 body-fingerprint fallback, 8 MB read cap, WARN-on-error, panic-recovered loop per the enrichment-sweeper convention so a poll panic disables reloads rather than crashing the single-instance server). Started once from `main`.
 - `main.go` — `startCatalogReloader(vault, content)`: gated on `CATALOG_HOTLOAD_ENABLED`; builds the reloader with URL/interval; the embed baseline load (`proxy.LoadContent`) is unchanged and always runs first.
 - `deploy/secrets.env.example` — documents the three keys (commented, default-off).
 

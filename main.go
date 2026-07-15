@@ -203,15 +203,6 @@ func main() {
 	}
 	log.Printf("content loaded: catalog ready")
 
-	// Catalog name-index hot-load (proxy/SPEC.md §9). OFF by default: with
-	// CATALOG_HOTLOAD_ENABLED unset/false the embedded plants_index baseline
-	// (just loaded) is the sole source and no goroutine runs. When enabled it
-	// polls the CDN plants_index.json and atomically swaps the name→id maps on
-	// `content` so a freshly catalog-promoted plant becomes identify-resolvable
-	// without a redeploy, zero downtime. Fail-safe: any poll error keeps the
-	// embed/last-good table.
-	startCatalogReloader(vault, content)
-
 	// Shared Supabase pgx pool — opened ONCE from SUPABASE_DB_URL, independent
 	// of OpenAI/enrichment gating. Consumed by the enrichment service (only when
 	// OPENAI_API_KEY is also present), the inline disease enrichment, AND the
@@ -248,6 +239,17 @@ func main() {
 	// `content` supplies the authoritative catalog id→scientific_name map used by
 	// the /v1/plants/catalog-images server-side name resolution (SPEC §2.8).
 	ingestSvc := buildImageIngestService(vault, content)
+
+	// Catalog name-index hot-load (proxy/SPEC.md §9). OFF by default: with
+	// CATALOG_HOTLOAD_ENABLED unset/false the embedded plants_index baseline
+	// (loaded above) is the sole source and no goroutine runs. When enabled it
+	// polls the CDN plants_index.json and atomically swaps the name→id maps on
+	// `content` so a freshly catalog-promoted plant becomes identify-resolvable
+	// without a redeploy, zero downtime. Fail-safe: any poll error keeps the
+	// embed/last-good table. Started AFTER buildImageIngestService so imageingest's
+	// one-time CatalogScientificNames() snapshot deterministically captures the
+	// embed baseline (SPEC §9.2 sciByID note), not a racing first-poll swap.
+	startCatalogReloader(vault, content)
 
 	// In-flight concurrency bound for the two image-buffering endpoints
 	// (inflight/SPEC). Caps peak memory so a burst sheds cleanly (503) instead

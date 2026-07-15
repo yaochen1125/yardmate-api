@@ -162,6 +162,34 @@ func TestReloadCatalogNames_ConcurrentReadsDuringSwap(t *testing.T) {
 	}
 }
 
+// TestReloadCatalogNames_RejectsWrongShape: a full-length, valid-JSON payload
+// whose rows all LOST their scientific_name (a field rename / export bug)
+// indexes 0 usable plants and must be refused — the guard keys off usable
+// indexed plants, not the raw parsed-array length, so this can't slip past.
+func TestReloadCatalogNames_RejectsWrongShape(t *testing.T) {
+	c := loadContentForTests(t)
+	before, _ := c.LookupPlantID("Abelia chinensis")
+
+	// Reserialize every embedded row but drop the scientific_name field: a full
+	// ~1633-row array that still parses, yet yields an all-empty name index.
+	var rows []map[string]any
+	if err := json.Unmarshal(plantsIndexRaw, &rows); err != nil {
+		t.Fatalf("unmarshal embed: %v", err)
+	}
+	for _, r := range rows {
+		delete(r, "scientific_name")
+	}
+	wrong, _ := json.Marshal(rows)
+
+	if _, err := c.ReloadCatalogNames(wrong, "wrongshape"); err == nil {
+		t.Fatalf("expected wrong-shape rejection for a %d-row all-empty-name payload", len(rows))
+	}
+	// Table preserved: identify still resolves through the prior good table.
+	if id, ok := c.LookupPlantID("Abelia chinensis"); !ok || id != before {
+		t.Errorf("wrong-shape reload corrupted the live table: (%q,%v), want (%q,true)", id, ok, before)
+	}
+}
+
 // etagIndexHandler serves a plants_index.json body with a fixed strong ETag and
 // honors If-None-Match with 304 — the exact Cloudflare behaviour the poller's
 // conditional-GET version gate relies on (SPEC §9.3).
@@ -211,6 +239,42 @@ func TestCatalogReloader_PollSwapsThenNotModified(t *testing.T) {
 	}
 	if changed {
 		t.Error("second pollOnce swapped despite 304 Not Modified")
+	}
+}
+
+// noETagIndexHandler serves the body with NO ETag header (simulates a CDN that
+// strips ETag, SPEC §9.3) — every request gets a fresh 200.
+func noETagIndexHandler(body []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}
+}
+
+// TestCatalogReloader_NoETagFingerprintDedup: with no ETag the conditional-GET
+// gate can't fire (every poll is 200), so the FNV-64 body fingerprint must
+// short-circuit the redundant re-parse + re-swap when the bytes are unchanged.
+func TestCatalogReloader_NoETagFingerprintDedup(t *testing.T) {
+	c := loadContentForTests(t)
+	srv := httptest.NewServer(noETagIndexHandler(freshIndexBytes(t)))
+	defer srv.Close()
+
+	r := NewCatalogReloader(c, srv.URL, time.Minute)
+	ctx := context.Background()
+
+	// First poll: 200, new content → swap.
+	changed, err := r.pollOnce(ctx)
+	if err != nil || !changed {
+		t.Fatalf("first pollOnce: changed=%v err=%v, want changed=true nil", changed, err)
+	}
+	// Second poll: 200 again (no ETag → no 304), identical body → fingerprint
+	// dedup skips the swap.
+	changed, err = r.pollOnce(ctx)
+	if err != nil {
+		t.Fatalf("second pollOnce: %v", err)
+	}
+	if changed {
+		t.Error("second pollOnce re-swapped identical body despite the fingerprint gate")
 	}
 }
 
