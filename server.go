@@ -88,6 +88,11 @@ func newServer(
 	// never reaching any engine). The iOS toggle is opt-in, so most requests carry
 	// no coords regardless — this switch is the server-side circuit breaker.
 	geoPriorEnabled := vault.GetBool("GEO_PRIOR_ENABLED", true)
+	// #21 High-confidence out-of-catalog escape from rule B. Default OFF — a new
+	// selection change. Enable on staging first (OOB_ESCAPE_ENABLED=true) and read
+	// the "identify oob-escape" logs (incl. gptInCat) before prod; the GPT arbiter
+	// is logged but does NOT gate the decision yet (proxy/SPEC §7 #21).
+	oobEscapeEnabled := vault.GetBool("OOB_ESCAPE_ENABLED", false)
 	// User-photo flywheel INTAKE gate (training/SPEC §2.1). Default OFF. The
 	// trainingStore is opened whenever intake is on OR a corpus already exists
 	// (main.buildTrainingStore) so DELETION stays available after a rollback; only
@@ -163,7 +168,7 @@ func newServer(
 					// (fallback); register when EITHER engine is present
 					// (SPEC §1.1 / §7).
 					if plantNet != nil || plantID != nil {
-						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, visionKNN, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, spendGate))
+						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, visionKNN, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, spendGate))
 					}
 					// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
 					// assessment, SPEC §1.5) — still requires plantID.

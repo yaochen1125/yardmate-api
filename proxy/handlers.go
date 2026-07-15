@@ -77,6 +77,19 @@ const (
 // overridden — this is a tiebreak, not a hard filter.
 const bloomTiebreakEpsilon = 0.05
 
+// #21 High-confidence out-of-catalog escape from rule B (OOB_ESCAPE_ENABLED,
+// default OFF). Rule B normally prefers ANY in-catalog hit over a
+// higher-confidence out-of-catalog top (no threshold — reviewed-data
+// preference). The escape is a NARROW exception: when the engine's ORIGINAL top
+// is out-of-catalog AND at least oobEscapeMinConfidence confident AND the best
+// in-catalog hit is at least oobEscapeMinMargin weaker AND a DIFFERENT genus,
+// trust the confident out-of-catalog engine top (→ iOS enrichment) instead of
+// forcing a likely-wrong catalog near-miss. The parallel GPT arbiter opinion is
+// LOGGED for calibration (gptInCat) but does NOT gate the decision yet — staging
+// data decides whether to promote it to a hard gate (SPEC §7 #21).
+const oobEscapeMinConfidence = 0.90
+const oobEscapeMinMargin = 0.50
+
 // nowMonth returns the current month used by the bloom tiebreak. It is a var so
 // tests can pin a deterministic month; production uses the wall clock. Northern
 // hemisphere only (no lat/long → no hemisphere flip), matching the tiebreak's
@@ -208,7 +221,7 @@ func parseCoord(s string, min, max float64) *float64 {
 	return &v
 }
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled bool, spendGate SpendGate) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled bool, spendGate SpendGate) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -575,6 +588,33 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				// This wins even over a higher-confidence out-of-catalog top
 				// (no threshold here — rule B precedence, unchanged from #20).
 				bestConf := cands[bestIdx].Confidence
+				// #21 OOB escape (OOB_ESCAPE_ENABLED, default OFF). Narrow
+				// exception to rule B: keep the engine's ORIGINAL top when it is a
+				// CONFIDENT out-of-catalog species and the best in-catalog hit is
+				// far weaker AND a different genus. break exits the switch, so the
+				// catalog promote below is skipped and Suggestions[0] stays the
+				// engine top (PlantID nil → iOS enrichment). bestIdx==0 (top itself
+				// in catalog) is self-excluded: top0InCat is then true.
+				if oobEscapeEnabled {
+					_, top0InCat := resolvePlantID(content, cands[0].ScientificName)
+					if !top0InCat &&
+						engineTopConf >= oobEscapeMinConfidence &&
+						engineTopConf-bestConf >= oobEscapeMinMargin &&
+						genusOf(cands[0].ScientificName) != genusOf(cands[bestIdx].ScientificName) {
+						// GPT arbiter — OBSERVE ONLY, does not gate the decision.
+						gptSci, gptConf, gptInCat := "nil", 0.0, false
+						if gptSug != nil {
+							gptSci, gptConf = gptSug.ScientificName, gptSug.Confidence
+							if _, ok := resolvePlantID(content, gptSug.ScientificName); ok {
+								gptInCat = true
+							}
+						}
+						log.Printf("identify oob-escape: deviceID=%s topSci=%q topConf=%.2f droppedCatId=%s bestConf=%.2f gptSci=%q gptConf=%.2f gptInCat=%v",
+							deviceID, cands[0].ScientificName, engineTopConf, bestPID, bestConf, gptSci, gptConf, gptInCat)
+						engine = base + "-oob-escape"
+						break
+					}
+				}
 				if bestIdx != 0 {
 					result.Suggestions[0], result.Suggestions[bestIdx] =
 						result.Suggestions[bestIdx], result.Suggestions[0]
