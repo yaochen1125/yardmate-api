@@ -518,15 +518,28 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		// branch 3/4（ai-raw-oob / ai-catalog-recovery）接管出结果。GPT 也失败则 err
 		// 保留 → 走原 502。推翻旧 locked decision "AI never substitutes for
 		// engine-unavailable"（always 模式 err != nil 仍直接 502，行为不变）。
-		if arbiterOnDemand && err != nil && vision != nil {
+		if arbiterOnDemand && err != nil && vision != nil &&
+			!errors.Is(err, ErrPlantNetImageRejected) && !errors.Is(err, ErrPlantIDImageRejected) {
+			// image-rejection（坏图 / 不支持格式）不是引擎 outage —— 保持原 400
+			// bad_image 让用户重拍，绝不送 GPT（否则坏图被 GPT 转成 200 结果）。Codex #111-1。
 			engErr := err
-			if s, e := vision.IdentifyPlant(ctx, imgBytes, mime); e == nil && s != nil {
+			s, e := vision.IdentifyPlant(ctx, imgBytes, mime)
+			switch {
+			case e == nil && s != nil:
 				result = &IdentifyResult{IsPlant: true, IsPlantConfidence: 1.0}
 				gptSug = s
 				engine = "ai-fallback"
 				err = nil
+			case errors.Is(e, ErrVisionNotAPlant):
+				// GPT 有效判定"不是植物" → 清引擎 outage + 保留 sentinel error，让下方
+				// cascade 的 ErrVisionNotAPlant 分支返回 Unknown sentinel（而非原 502）。Codex #111-2。
+				result = &IdentifyResult{IsPlant: true, IsPlantConfidence: 1.0}
+				gptErr = ErrVisionNotAPlant
+				engine = "ai-fallback"
+				err = nil
 			}
-			log.Printf("identify gpt on-demand fallback: deviceID=%s enginesDownErr=%v rescued=%v", deviceID, engErr, err == nil)
+			log.Printf("identify gpt on-demand fallback: deviceID=%s enginesDownErr=%v rescued=%v notPlant=%v",
+				deviceID, engErr, err == nil, errors.Is(gptErr, ErrVisionNotAPlant))
 		}
 		if err == nil {
 			// Await the parallel GPT arbiter fired at cascade start (gptSug is nil
@@ -637,16 +650,20 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			// ai-catalog-override）；否则（库外 / 弱命中 / confident-oob）串行调 GPT，供
 			// 下方 override / confident-oob cross-check / recovery 分支使用。
 			if arbiterOnDemand && gptSug == nil && gptErr == nil && vision != nil {
-				highConfCatalog := bestIdx >= 0 && cands[bestIdx].Confidence >= gptOnDemandSkipConfidence
+				// 用 maxCatalogConf（bloom-tiebreak 前捕获的最强库内命中置信），不用
+				// cands[bestIdx].Confidence —— 后者在 tiebreak 把 bestIdx 换成 within-epsilon
+				// 的开花近似候选后会偏低，令跳过决策在阈值边界抖动。语义上"高置信命中
+				// 库内"就该看最强命中有多确信。
+				highConfCatalog := bestIdx >= 0 && maxCatalogConf >= gptOnDemandSkipConfidence
 				if !highConfCatalog {
 					if s, e := vision.IdentifyPlant(ctx, imgBytes, mime); e != nil {
 						gptErr = e
 					} else {
 						gptSug = s
 					}
-					log.Printf("identify gpt on-demand: deviceID=%s CALLED bestIdx=%d engineTopConf=%.2f", deviceID, bestIdx, engineTopConf)
+					log.Printf("identify gpt on-demand: deviceID=%s CALLED bestIdx=%d engineTopConf=%.2f maxCatalogConf=%.2f", deviceID, bestIdx, engineTopConf, maxCatalogConf)
 				} else {
-					log.Printf("identify gpt on-demand: deviceID=%s SKIPPED high-conf catalog bestConf=%.2f", deviceID, cands[bestIdx].Confidence)
+					log.Printf("identify gpt on-demand: deviceID=%s SKIPPED high-conf catalog maxCatalogConf=%.2f", deviceID, maxCatalogConf)
 				}
 			}
 
