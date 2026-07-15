@@ -77,6 +77,20 @@ const (
 // overridden — this is a tiebreak, not a hard filter.
 const bloomTiebreakEpsilon = 0.05
 
+// #21 High-confidence out-of-catalog escape from rule B (OOB_ESCAPE_ENABLED,
+// default OFF). Rule B normally prefers ANY in-catalog hit over a
+// higher-confidence out-of-catalog top (no threshold — reviewed-data
+// preference). The escape is a NARROW exception: when the engine's ORIGINAL top
+// is out-of-catalog AND at least oobEscapeMinConfidence confident AND the best
+// in-catalog hit is at least oobEscapeMinMargin weaker AND NO in-catalog
+// candidate shares the engine top's genus,
+// trust the confident out-of-catalog engine top (→ iOS enrichment) instead of
+// forcing a likely-wrong catalog near-miss. The parallel GPT arbiter opinion is
+// LOGGED for calibration (gptInCat) but does NOT gate the decision yet — staging
+// data decides whether to promote it to a hard gate (SPEC §7 #21).
+const oobEscapeMinConfidence = 0.90
+const oobEscapeMinMargin = 0.50
+
 // nowMonth returns the current month used by the bloom tiebreak. It is a var so
 // tests can pin a deterministic month; production uses the wall clock. Northern
 // hemisphere only (no lat/long → no hemisphere flip), matching the tiebreak's
@@ -208,7 +222,7 @@ func parseCoord(s string, min, max float64) *float64 {
 	return &v
 }
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled bool, spendGate SpendGate) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled bool, spendGate SpendGate) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -391,6 +405,9 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		// post-processing (rerank / plant_id resolution / common-name upgrade),
 		// which would otherwise overwrite the hardcoded AAA0000 sentinel fields.
 		unknownSentinel := false
+		// #21 Set true when the OOB escape fires; gates the post-switch rose
+		// rerank (7a-1) from re-cataloging the escaped out-of-catalog top.
+		oobEscaped := false
 		err = nil
 
 		// Effective geographic prior: forwarded to the engine ONLY when the
@@ -512,6 +529,17 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			// is nil-safe and reports no catalog.
 			bestIdx := -1
 			var bestPID string
+			// #21 OOB escape genus guard: the escape must NOT fire when ANY
+			// in-catalog candidate shares the engine top's genus (intra-genus
+			// wobble — the correct species may be the curated same-genus one).
+			// Comparing only against the single strongest hit would miss a
+			// lower-confidence same-genus catalog candidate, so track it across
+			// the whole loop (empty top genus ⇒ never blocks — degenerate input).
+			topGenus := ""
+			if len(cands) > 0 {
+				topGenus = genusOf(cands[0].ScientificName)
+			}
+			topGenusInCatalog := false
 			// #5 bloom tiebreak — collect every in-catalog candidate so a
 			// near-tie can prefer the one blooming this month (built only when
 			// the switch is on; empty/nil otherwise → zero overhead + no-op).
@@ -526,6 +554,9 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				id, ok := resolvePlantID(content, cands[i].ScientificName)
 				if !ok {
 					continue
+				}
+				if topGenus != "" && genusOf(cands[i].ScientificName) == topGenus {
+					topGenusInCatalog = true
 				}
 				pos := -1
 				if bloomTiebreakEnabled {
@@ -542,6 +573,16 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					bestPID = id
 					bestPos = pos
 				}
+			}
+
+			// #21 OOB escape compares against the STRONGEST in-catalog hit,
+			// captured BEFORE the bloom tiebreak below may swap bestIdx to a
+			// lower-confidence blooming near-tie (within bloomTiebreakEpsilon).
+			// Using the post-tiebreak bestConf would inflate the OOB margin by up
+			// to that epsilon and let the escape bypass rule B's intended boundary.
+			maxCatalogConf := -1.0
+			if bestIdx >= 0 {
+				maxCatalogConf = cands[bestIdx].Confidence
 			}
 
 			// #5 bloom tiebreak — BLOOM_TIEBREAK_ENABLED. When ≥2 in-catalog
@@ -575,6 +616,34 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				// This wins even over a higher-confidence out-of-catalog top
 				// (no threshold here — rule B precedence, unchanged from #20).
 				bestConf := cands[bestIdx].Confidence
+				// #21 OOB escape (OOB_ESCAPE_ENABLED, default OFF). Narrow
+				// exception to rule B: keep the engine's ORIGINAL top when it is a
+				// CONFIDENT out-of-catalog species and the best in-catalog hit is
+				// far weaker AND no in-catalog candidate shares its genus. break exits the switch, so the
+				// catalog promote below is skipped and Suggestions[0] stays the
+				// engine top (PlantID nil → iOS enrichment). bestIdx==0 (top itself
+				// in catalog) is self-excluded: top0InCat is then true.
+				if oobEscapeEnabled {
+					_, top0InCat := resolvePlantID(content, cands[0].ScientificName)
+					if !top0InCat &&
+						engineTopConf >= oobEscapeMinConfidence &&
+						engineTopConf-maxCatalogConf >= oobEscapeMinMargin &&
+						!topGenusInCatalog {
+						// GPT arbiter — OBSERVE ONLY, does not gate the decision.
+						gptSci, gptConf, gptInCat := "nil", 0.0, false
+						if gptSug != nil {
+							gptSci, gptConf = gptSug.ScientificName, gptSug.Confidence
+							if _, ok := resolvePlantID(content, gptSug.ScientificName); ok {
+								gptInCat = true
+							}
+						}
+						log.Printf("identify oob-escape: deviceID=%s topSci=%q topConf=%.2f droppedCatId=%s bestConf=%.2f gptSci=%q gptConf=%.2f gptInCat=%v",
+							deviceID, cands[0].ScientificName, engineTopConf, bestPID, bestConf, gptSci, gptConf, gptInCat)
+						engine = base + "-oob-escape"
+						oobEscaped = true
+						break
+					}
+				}
 				if bestIdx != 0 {
 					result.Suggestions[0], result.Suggestions[bestIdx] =
 						result.Suggestions[bestIdx], result.Suggestions[0]
@@ -771,7 +840,7 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		// 7a-1. Rose cultivar rerank — ROSE_RERANK_ENABLED=false kill-switches it.
 		//     Genus-wide (all ~110 Rosa candidates), for the "every rose comes back
 		//     as generic China Rose" problem (rosererank SPEC).
-		if roseEnabled && !unknownSentinel && vision != nil &&
+		if roseEnabled && !unknownSentinel && !oobEscaped && vision != nil &&
 			len(result.Suggestions) > 0 && len(roseCands) > 0 &&
 			genusOf(result.Suggestions[0].ScientificName) == "Rosa" {
 			budget := roseBudget(ctx, reqStart)
