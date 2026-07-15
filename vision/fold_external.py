@@ -147,8 +147,16 @@ def main(index_dir, catalog_path, out_dir, cdn):
     print(f"删误标向量 {len(drop)} | 加 external {len(add)} | 0-iNat待抽查 {len(spot)}", flush=True)
     json.dump(sorted(spot), open(f"{out_dir}/_spotcheck.json", "w"))
 
-    # 重建: 原始(去掉 drop) + external add
-    keep = [(base_vecs[i], mapping[i]) for i in range(base) if i not in drop]
+    # 重建: 原始(去掉 drop 的误标 + 过时已删 id) + external add。
+    # ★当前 catalog 门也要作用于 base iNat 向量(Codex #109): pull_reference 从不删旧 ref 目录、
+    #   build_index 索引每个 AAA* 目录, 所以从 catalog 删掉的株其 iNat 向量仍在 base + meta.catalog_ids
+    #   → 会被 /identify 返回。这里按 current 过滤 base, 保证 catalog 门对 base+external 都生效。
+    stale_base = sum(1 for i in range(base)
+                     if i not in drop and mapping[i]["catalog_id"] not in current)
+    if stale_base:
+        print(f"剔除已删 id 的过时 base 向量: {stale_base}", flush=True)
+    keep = [(base_vecs[i], mapping[i]) for i in range(base)
+            if i not in drop and mapping[i]["catalog_id"] in current]
     new_vecs = [v for v, _ in keep] + [v for v, _ in add]
     new_map = [m for _, m in keep] + [{"catalog_id": c, "src": "ext"} for _, c in add]
     N = len(new_vecs)
@@ -164,9 +172,23 @@ def main(index_dir, catalog_path, out_dir, cdn):
     print(f"final: {N} vecs / {len(nm['catalog_ids'])} ids (原 {base}/{len(set(meta['catalog_ids']))})", flush=True)
 
 
+R2_EXTERNAL_PREFIX = "r2:yardmate-static/plant_images/"
+
+
 def _list_external_ids(cdn, current):
-    """哪些现役 id 有 external。优先读 R2 清单; 无则按 catalog 逐个探测 external/1.png。
-    (探测走 dl_img 的 magic-bytes 校验, 不存在的 CDN 会返错误页被挡。)"""
+    """现役 catalog 里哪些 id 有 external。优先 rclone 一次列 R2(秒级); 失败退化为逐个 CDN
+    探测(慢, ~O(catalog) 次 curl)。当前 catalog 门在此已应用(只留 current 的 id)。"""
+    try:
+        out = subprocess.run(
+            ["rclone", "lsf", "-R", "--include", "*/external/index.json", R2_EXTERNAL_PREFIX],
+            capture_output=True, text=True, timeout=180, check=True).stdout
+        ids = {ln.split("/")[0] for ln in out.splitlines() if ln.strip()}
+        got = sorted(ids & current)
+        if got:
+            return got
+        print("rclone 列到 0 个 external, 退化探测", flush=True)
+    except Exception as e:
+        print("rclone 列 R2 失败, 退化逐个探测:", e, flush=True)
     ids = []
     tmp = "/tmp/fold_probe"; os.makedirs(tmp, exist_ok=True)
     for cid in sorted(current):
