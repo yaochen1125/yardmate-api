@@ -37,7 +37,7 @@ func newOOBEscapeHandler(t *testing.T, plantNetUp http.HandlerFunc) (http.Handle
 		t.Fatalf("LoadContent: %v", err)
 	}
 	// Flags: rose/disambig/agreement/bloom/geoPrior OFF, oobEscape ON.
-	h := HandleIdentify(pnClient, nil, content, nil, nil, nil, false, false, false, false, false, true, false, nil)
+	h := HandleIdentify(pnClient, nil, content, nil, nil, nil, false, false, false, false, false, true, false, true, nil)
 	return h, pnSrv.Close
 }
 
@@ -235,7 +235,7 @@ func TestHandleIdentify_OOBEscape_BloomTiebreak_MarginUsesStrongestCatalogHit(t 
 	defer pnSrv.Close()
 	pn := &PlantNetClient{APIKey: "k", Endpoint: pnSrv.URL, Lang: "en", NbResults: 10, HTTP: pnSrv.Client()}
 	// bloom ON (default) + oobEscape ON; everything else off.
-	h := HandleIdentify(pn, nil, content, nil, nil, nil, false, false, false, true, false, true, false, nil)
+	h := HandleIdentify(pn, nil, content, nil, nil, nil, false, false, false, true, false, true, false, true, nil)
 
 	rec := doCascadeReq(t, h)
 	if rec.Code != http.StatusOK {
@@ -297,7 +297,7 @@ func TestHandleIdentify_OOBEscape_SameGenusNotStrongest_NoEscape(t *testing.T) {
 	}))
 	defer pnSrv.Close()
 	pn := &PlantNetClient{APIKey: "k", Endpoint: pnSrv.URL, Lang: "en", NbResults: 10, HTTP: pnSrv.Client()}
-	h := HandleIdentify(pn, nil, content, nil, nil, nil, false, false, false, false, false, true, false, nil)
+	h := HandleIdentify(pn, nil, content, nil, nil, nil, false, false, false, false, false, true, false, true, nil)
 
 	rec := doCascadeReq(t, h)
 	if rec.Code != http.StatusOK {
