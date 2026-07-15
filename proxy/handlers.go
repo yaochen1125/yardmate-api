@@ -454,10 +454,15 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		// Plant.id，保留 err 让下方 on-demand 的 GPT 兜底接管（省钱：溢出量走 GPT ~$4/1000
 		// 而非 Plant.id 的 credit）。只作用于 plantNetFellBack —— plantNet==nil 的
 		// Plant.id-only 部署不受影响（那种情况 Plant.id 是主引擎，不能跳）。诊病仍用 Plant.id。
-		if plantNetFellBack && !plantIDIdentifyFallback {
+		//
+		// 守卫（Codex #112）：只有当 GPT 兜底真能接管（arbiterOnDemand 开 + vision 可用）
+		// 时才允许跳过 Plant.id；否则（错配：flag=false 但 on-demand 关 / 无 OPENAI key）
+		// 保留 Plant.id 兜底，避免 PlantNet 失败既跳过 Plant.id 又无 GPT → 直接 502。
+		usePlantIDFallback := plantIDIdentifyFallback || !arbiterOnDemand || vision == nil
+		if plantNetFellBack && !usePlantIDFallback {
 			log.Printf("identify plantid-skip: deviceID=%s plantnetErr=%v → 跳过 Plant.id, GPT 兜底接管", deviceID, err)
 		}
-		if (plantNet == nil || (plantNetFellBack && plantIDIdentifyFallback)) && plantID != nil {
+		if (plantNet == nil || (plantNetFellBack && usePlantIDFallback)) && plantID != nil {
 			if plantNetFellBack {
 				log.Printf("identify plantnet fallback: deviceID=%s err=%v", deviceID, err)
 				engine = "plantid-fallback"
