@@ -57,6 +57,18 @@ const aiCatalogRecoveryMinConfidence = 0.10
 // "engine is very sure" bar; see SPEC §7 resolved decisions.
 const plantnetConfidentSkipAIConfidence = 0.80
 
+// gptOnDemandSkipConfidence — GPT_ARBITER_ON_DEMAND 模式下，跳过 GPT 的 PlantNet 侧
+// 门槛：引擎库内命中的最强置信 ≥ 此值。单独不足以跳（PlantNet 会自信认错）——必须
+// 叠加 KNN 印证（见下）。最优值需 prod confidence 分布标定，先取保守可用值。
+const gptOnDemandSkipConfidence = 0.85
+
+// gptOnDemandKNNSimFloor — on-demand 双信号印证的 KNN 侧门槛：跳过 GPT 还要求 KNN
+// 独立命中同一库内 id 且视觉相似度 ≥ 此值。KNN sim 尺度：库内外分界 0.80、同株中位
+// ~0.92，取 0.85 = 稳妥的"确实同株"线。两个独立信号（PlantNet + KNN）对上同一 id 时
+// GPT 的边际价值最低 → 跳它最安全。KNN 未开（knnCh==nil，prod 现状）→ 印证永不成立
+// → 不跳、只保留引擎全挂兜底，避免"单个引擎自信就跳"那版的精度险。
+const gptOnDemandKNNSimFloor = 0.85
+
 // --- P1C fusion-accuracy tuning (identify #3 / #5) ---
 
 // Engine↔GPT agreement boost (#3, AGREEMENT_BOOST_ENABLED). When the parallel
@@ -222,7 +234,7 @@ func parseCoord(s string, min, max float64) *float64 {
 	return &v
 }
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled bool, spendGate SpendGate) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand, plantIDIdentifyFallback bool, spendGate SpendGate) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -371,7 +383,9 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     for EVERY identify now — the arbiter is universal, no ai_enhance /
 		//     free-vs-paid branch (free is gated only by request count). ---
 		var gptCh chan visionArbiterResult
-		if vision != nil {
+		// GPT_ARBITER_ON_DEMAND: on-demand 模式不预 fire —— 改为级联后按需串行调，
+		// 高置信库内命中时省掉这次调用（always 模式并行 fire，行为不变）。
+		if vision != nil && !arbiterOnDemand {
 			gptCh = make(chan visionArbiterResult, 1)
 			go func() {
 				s, e := vision.IdentifyPlant(ctx, imgBytes, mime)
@@ -436,7 +450,19 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				errors.Is(err, ErrPlantNetUnauthorized) ||
 				errors.Is(err, ErrPlantNetBadResponse))
 
-		if (plantNet == nil || plantNetFellBack) && plantID != nil {
+		// PLANTID_IDENTIFY_FALLBACK=false：Pl@ntNet 失败（超限/宕机/失效）时跳过贵的
+		// Plant.id，保留 err 让下方 on-demand 的 GPT 兜底接管（省钱：溢出量走 GPT ~$4/1000
+		// 而非 Plant.id 的 credit）。只作用于 plantNetFellBack —— plantNet==nil 的
+		// Plant.id-only 部署不受影响（那种情况 Plant.id 是主引擎，不能跳）。诊病仍用 Plant.id。
+		//
+		// 守卫（Codex #112）：只有当 GPT 兜底真能接管（arbiterOnDemand 开 + vision 可用）
+		// 时才允许跳过 Plant.id；否则（错配：flag=false 但 on-demand 关 / 无 OPENAI key）
+		// 保留 Plant.id 兜底，避免 PlantNet 失败既跳过 Plant.id 又无 GPT → 直接 502。
+		usePlantIDFallback := plantIDIdentifyFallback || !arbiterOnDemand || vision == nil
+		if plantNetFellBack && !usePlantIDFallback {
+			log.Printf("identify plantid-skip: deviceID=%s plantnetErr=%v → 跳过 Plant.id, GPT 兜底接管", deviceID, err)
+		}
+		if (plantNet == nil || (plantNetFellBack && usePlantIDFallback)) && plantID != nil {
 			if plantNetFellBack {
 				log.Printf("identify plantnet fallback: deviceID=%s err=%v", deviceID, err)
 				engine = "plantid-fallback"
@@ -505,6 +531,38 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		// the err == nil path; nil when vision == nil or the cascade failed.
 		var gptSug *Suggestion
 		var gptErr error
+		// on-demand 双信号印证会把并行 KNN 结果提前读到这里（switch 前需要它做跳过判据），
+		// 供下方 7a-4 复用，避免二次读已空的 knnCh。always 模式两者不动，7a-4 照旧读 knnCh。
+		var knnPreRead visionKNNResult
+		knnPreReadDone := false
+		// [GPT_ARBITER_ON_DEMAND] 需求1：两引擎全挂（err != nil，如 key 失效/超时/限流
+		// 到底）时，不再直接 502 —— 串行调 GPT 兜底，构造空候选让下方 cascade 的
+		// branch 3/4（ai-raw-oob / ai-catalog-recovery）接管出结果。GPT 也失败则 err
+		// 保留 → 走原 502。推翻旧 locked decision "AI never substitutes for
+		// engine-unavailable"（always 模式 err != nil 仍直接 502，行为不变）。
+		if arbiterOnDemand && err != nil && vision != nil &&
+			!errors.Is(err, ErrPlantNetImageRejected) && !errors.Is(err, ErrPlantIDImageRejected) {
+			// image-rejection（坏图 / 不支持格式）不是引擎 outage —— 保持原 400
+			// bad_image 让用户重拍，绝不送 GPT（否则坏图被 GPT 转成 200 结果）。Codex #111-1。
+			engErr := err
+			s, e := vision.IdentifyPlant(ctx, imgBytes, mime)
+			switch {
+			case e == nil && s != nil:
+				result = &IdentifyResult{IsPlant: true, IsPlantConfidence: 1.0}
+				gptSug = s
+				engine = "ai-fallback"
+				err = nil
+			case errors.Is(e, ErrVisionNotAPlant):
+				// GPT 有效判定"不是植物" → 清引擎 outage + 保留 sentinel error，让下方
+				// cascade 的 ErrVisionNotAPlant 分支返回 Unknown sentinel（而非原 502）。Codex #111-2。
+				result = &IdentifyResult{IsPlant: true, IsPlantConfidence: 1.0}
+				gptErr = ErrVisionNotAPlant
+				engine = "ai-fallback"
+				err = nil
+			}
+			log.Printf("identify gpt on-demand fallback: deviceID=%s enginesDownErr=%v rescued=%v notPlant=%v",
+				deviceID, engErr, err == nil, errors.Is(gptErr, ErrVisionNotAPlant))
+		}
 		if err == nil {
 			// Await the parallel GPT arbiter fired at cascade start (gptSug is nil
 			// when vision == nil). Errors are handled per-case below (best-effort:
@@ -605,6 +663,50 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			engineTopConf := -1.0
 			if len(cands) > 0 {
 				engineTopConf = cands[0].Confidence
+			}
+
+			// [GPT_ARBITER_ON_DEMAND] 需求2：此时（已知 bestIdx / bestConf）才决定是否
+			// 调 GPT。always 模式 gptSug 已在上方并行 await（此块跳过，gptCh != nil 时
+			// gptSug 已填）；on-demand 模式引擎高置信命中库内（bestConf ≥
+			// gptOnDemandSkipConfidence）→ 跳过 GPT（省 arbiter 成本，放弃那次罕见的
+			// ai-catalog-override）；否则（库外 / 弱命中 / confident-oob）串行调 GPT，供
+			// 下方 override / confident-oob cross-check / recovery 分支使用。
+			if arbiterOnDemand && gptSug == nil && gptErr == nil && vision != nil {
+				// 双信号印证省钱：仅当 ①PlantNet 高置信命中库内（maxCatalogConf ≥ 阈值，用
+				// bloom-tiebreak 前捕获的最强库内置信，避免 tiebreak 换 bestIdx 后的边界抖动）
+				// 且 ②KNN 独立命中同一 plant_id、sim ≥ gptOnDemandKNNSimFloor 时，才跳过 GPT。
+				// 单个引擎自信不足以跳（arbiter 的价值正是抓 PlantNet 自信认错）；两个独立信号
+				// 对上同一库内 id 时 GPT 边际价值最低 → 安全跳。KNN 未开（knnCh==nil，prod 现状）
+				// → 印证不成立 → 照常调 GPT（等于只保留兜底、不冒单信号省钱的精度险）。
+				plantnetConfident := bestIdx >= 0 && maxCatalogConf >= gptOnDemandSkipConfidence
+				knnSim := 0.0
+				knnCorroborates := false
+				if plantnetConfident && knnCh != nil {
+					// 提前读并行 KNN（带 wait budget，超时视为未印证），存给下方 7a-4 复用。
+					select {
+					case knnPreRead = <-knnCh:
+					case <-time.After(visionKNNWaitBudget):
+						knnPreRead = visionKNNResult{}
+					}
+					knnPreReadDone = true
+					if knnPreRead.err == nil && knnPreRead.resp != nil && len(knnPreRead.resp.Candidates) > 0 {
+						c := knnPreRead.resp.Candidates[0]
+						knnSim = c.VisionSim
+						knnCorroborates = c.CatalogID == bestPID && c.VisionSim >= gptOnDemandKNNSimFloor
+					}
+				}
+				if plantnetConfident && knnCorroborates {
+					log.Printf("identify gpt on-demand: deviceID=%s SKIPPED dual-signal maxCatalogConf=%.2f knnSim=%.3f id=%s",
+						deviceID, maxCatalogConf, knnSim, bestPID)
+				} else {
+					if s, e := vision.IdentifyPlant(ctx, imgBytes, mime); e != nil {
+						gptErr = e
+					} else {
+						gptSug = s
+					}
+					log.Printf("identify gpt on-demand: deviceID=%s CALLED bestIdx=%d maxCatalogConf=%.2f knnCorrob=%v",
+						deviceID, bestIdx, maxCatalogConf, knnCorroborates)
+				}
 			}
 
 			switch {
@@ -953,14 +1055,30 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     an out-of-catalog verdict against an in-catalog decision — is LOGGED
 		//     ONLY, to gather staging data before we let it override. Fail-open:
 		//     nil client / error / timeout → no-op.
-		if visionKNN != nil && knnCh != nil && !unknownSentinel && len(result.Suggestions) > 0 {
+		if visionKNN != nil && !unknownSentinel && len(result.Suggestions) > 0 && (knnCh != nil || knnPreReadDone) {
 			// Bounded wait (Codex #100): the goroutine ran concurrently with the
 			// whole cascade, so a healthy local service is usually already done
 			// here. Cap the extra wait at visionKNNWaitBudget so a slow/wedged
 			// service can't add its full HTTP timeout to the already-decided user
 			// response — skip the optional signal instead of blocking on it.
-			select {
-			case kr := <-knnCh:
+			// on-demand 双信号印证已把 KNN 结果提前读到 knnPreRead（knnCh 已排空）→ 直接复用；
+			// 否则（always / 未提前读）原逻辑带 wait budget 从 knnCh 读。
+			var kr visionKNNResult
+			ready := false
+			if knnPreReadDone {
+				kr, ready = knnPreRead, true
+			} else {
+				select {
+				case kr = <-knnCh:
+					ready = true
+				case <-time.After(visionKNNWaitBudget):
+					// Still running past the grace budget — skip rather than delay the
+					// response. The buffered goroutine finishes into knnCh and is GC'd;
+					// ctx-cancel on return aborts the in-flight call.
+					log.Printf("identify vision-knn: deviceID=%s SKIPPED-not-ready-within=%v", deviceID, visionKNNWaitBudget)
+				}
+			}
+			if ready {
 				if kr.err != nil || kr.resp == nil {
 					log.Printf("identify vision-knn failed: deviceID=%s err=%v", deviceID, kr.err)
 				} else {
@@ -984,11 +1102,6 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 						}
 					}
 				}
-			case <-time.After(visionKNNWaitBudget):
-				// Still running past the grace budget — skip rather than delay the
-				// response. The buffered goroutine finishes into knnCh and is GC'd;
-				// ctx-cancel on return aborts the in-flight call.
-				log.Printf("identify vision-knn: deviceID=%s SKIPPED-not-ready-within=%v", deviceID, visionKNNWaitBudget)
 			}
 		}
 

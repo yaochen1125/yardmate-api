@@ -91,6 +91,13 @@ func newServer(
 	// the "identify oob-escape" logs (incl. gptInCat) before prod; the GPT arbiter
 	// is logged but does NOT gate the decision yet (proxy/SPEC §7 #21).
 	oobEscapeEnabled := vault.GetBool("OOB_ESCAPE_ENABLED", false)
+	// GPT_ARBITER_ON_DEMAND（默认 false = 现状：GPT arbiter 每次并行调）。true 时改为
+	// 按需调：引擎高置信命中库内→跳过 GPT（省 arbiter 成本）；引擎全挂→GPT 兜底（不 502）。
+	// prod 先保持 false，staging 验证 true 稳了再切。
+	arbiterOnDemand := vault.GetBool("GPT_ARBITER_ON_DEMAND", false)
+	// PLANTID_IDENTIFY_FALLBACK（默认 true=现状：PlantNet 失败兜底到 Plant.id）。设 false
+	// 则 PlantNet 失败时跳过贵的 Plant.id、直接走 GPT 兜底（省钱，需 GPT_ARBITER_ON_DEMAND 才有兜底）。
+	plantIDIdentifyFallback := vault.GetBool("PLANTID_IDENTIFY_FALLBACK", true)
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(realIPFromNginx)
@@ -161,7 +168,7 @@ func newServer(
 					// (fallback); register when EITHER engine is present
 					// (SPEC §1.1 / §7).
 					if plantNet != nil || plantID != nil {
-						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, visionKNN, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, spendGate))
+						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, visionKNN, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand, plantIDIdentifyFallback, spendGate))
 					}
 					// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
 					// assessment, SPEC §1.5) — still requires plantID.

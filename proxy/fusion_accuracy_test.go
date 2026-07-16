@@ -107,7 +107,7 @@ func TestHandleIdentify_AgreementBoost(t *testing.T) {
 
 	doReq := func(vision *VisionClient, boostEnabled bool) IdentifyResult {
 		// rose + disambig OFF, bloom OFF; only the agreement boost varies.
-		h := HandleIdentify(pn, nil, content, vision, nil, nil, false, false, boostEnabled, false, false, false, nil)
+		h := HandleIdentify(pn, nil, content, vision, nil, nil, false, false, boostEnabled, false, false, false, false, true, nil)
 		body, ct := buildMultipart(t, "image", jpegMagic)
 		req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
 		req.Header.Set("Content-Type", ct)
@@ -291,7 +291,7 @@ func TestHandleIdentify_BloomTiebreak(t *testing.T) {
 
 	doReq := func(bloomEnabled bool) IdentifyResult {
 		// vision nil (no arbiter needed), rose/disambig/boost OFF.
-		h := HandleIdentify(pn, nil, content, nil, nil, nil, false, false, false, bloomEnabled, false, false, nil)
+		h := HandleIdentify(pn, nil, content, nil, nil, nil, false, false, false, bloomEnabled, false, false, false, true, nil)
 		body, ct := buildMultipart(t, "image", jpegMagic)
 		req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
 		req.Header.Set("Content-Type", ct)

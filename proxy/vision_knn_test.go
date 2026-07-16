@@ -136,7 +136,7 @@ func TestHandleIdentify_VisionKNN_BoostAndFailOpen(t *testing.T) {
 	}
 
 	doReq := func(knn *VisionKNNClient) IdentifyResult {
-		h := HandleIdentify(pn, nil, content, nil, nil, knn, false, false, false, false, false, false, nil)
+		h := HandleIdentify(pn, nil, content, nil, nil, knn, false, false, false, false, false, false, false, true, nil)
 		var buf bytes.Buffer
 		w := multipart.NewWriter(&buf)
 		fw, _ := w.CreateFormFile("image", "a.jpg")
@@ -245,7 +245,7 @@ func TestHandleIdentify_VisionKNN_SlowServiceSkipped(t *testing.T) {
 	}
 
 	doReq := func(knn *VisionKNNClient) (IdentifyResult, time.Duration) {
-		h := HandleIdentify(pn, nil, content, nil, nil, knn, false, false, false, false, false, false, nil)
+		h := HandleIdentify(pn, nil, content, nil, nil, knn, false, false, false, false, false, false, false, true, nil)
 		var buf bytes.Buffer
 		w := multipart.NewWriter(&buf)
 		fw, _ := w.CreateFormFile("image", "a.jpg")
