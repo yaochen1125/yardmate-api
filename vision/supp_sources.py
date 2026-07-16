@@ -215,19 +215,21 @@ def _gbif_interpret(d, name):
 
 
 def gbif_resolve(name):
-    """species/match → (taxon_key, accepted_name, specific)。无匹配/网络失败 → None(调用方退化用原名)。"""
+    """species/match → (taxon_key, accepted_name, specific)。真·无匹配 → None; **网络失败 → raise**。
+    ★不吞网络错误(Codex P2): 否则瞬时失败会被当"无匹配"→ 调用方误判为"成功空源"→ 漏建该株。
+    调用方需 try 包住, 把 raise 计入源错误。"""
     url = _GBIF + "/species/match?" + urllib.parse.urlencode({"name": name})
-    try:
-        d = _get_json(url)
-    except Exception as e:
-        print("  [gbif] match err", name, e)
-        return None
+    d = _get_json(url)   # 网络错误在此抛出, 不 catch
     return _gbif_interpret(d, name)
 
 
 def gbif_media(species, limit=60):
-    """按名解析 → 按 taxon key 取 media(见 gbif_media_by_key)。"""
-    r = gbif_resolve(species)
+    """按名解析 → 按 taxon key 取 media。解析瞬时失败 → None(≠无匹配的 []), 与 None=瞬时错误 约定一致。"""
+    try:
+        r = gbif_resolve(species)
+    except Exception as e:
+        print("  [gbif] media resolve err", species, e)
+        return None
     if not r or not r[0]:
         return []
     return gbif_media_by_key(r[0], limit)

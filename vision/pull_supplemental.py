@@ -111,7 +111,11 @@ def _gather(sci, is_cult):
     GBIF 一次解析: 同义词→接受名(Azalea→Rhododendron 也搜, 救学名过时的收 0 株)+ 属级/泛指
     ('Petunia spp.'/'x hybrida')判定(非品种时跳, 免拉泛属噪声)+ 复用 taxon key(免二次解析)。"""
     sp = species_of(sci)
-    r = src.gbif_resolve(sp)                       # (taxon_key, accepted_name, specific) | None
+    gbif_err = False
+    try:
+        r = src.gbif_resolve(sp)                   # None=真·无匹配; raise=瞬时网络失败
+    except Exception as e:
+        print("  [gbif] resolve err", sp, e); r = None; gbif_err = True
     if (not is_cult) and r is not None and not r[2]:
         return [], False                           # 非品种但名字是属级/泛指 → 不深挖(真·跳过, 非瞬时失败)
     accepted = r[1] if r else sp
@@ -140,7 +144,14 @@ def _gather(sci, is_cult):
         time.sleep(0.6)
         add(src.wikimedia_search(accepted, limit=30))
     time.sleep(0.6)
-    add(src.gbif_media_by_key(key, 60) if key else src.gbif_media(sp, 60))
+    # GBIF media: 有 key 按 key 取; 无 key 时 —— 解析**瞬时失败**(gbif_err)记一次源错误(别用 by-name
+    # 掩盖: 那样会返回 [] 被当"成功空源" → 漏建, Codex P2); 解析成功但真·无 taxon 才记一次成功空源。
+    if key:
+        add(src.gbif_media_by_key(key, 60))
+    elif gbif_err:
+        n_src[0] += 1; n_err[0] += 1
+    else:
+        n_src[0] += 1
     # all_failed = 所有源调用都报错 → 候选空不可信(瞬时), 调用方别记 n:0(免永久跳过, Codex P2)。
     all_failed = n_src[0] > 0 and n_err[0] == n_src[0]
     return cands, all_failed
