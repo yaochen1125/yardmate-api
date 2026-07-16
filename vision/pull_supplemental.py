@@ -107,8 +107,16 @@ def _embed_candidates(cands, tmp):
 
 
 def _gather(sci, is_cult):
-    """从三源收候选(已 license 门)。品种用**全名**偏向品种图 + 种级兜底; 非品种用种级。"""
+    """从三源收候选(已 license 门)。品种用**全名**偏向品种图 + 种级兜底; 非品种用种级。
+    GBIF 一次解析: 同义词→接受名(Azalea→Rhododendron 也搜, 救学名过时的收 0 株)+ 属级/泛指
+    ('Petunia spp.'/'x hybrida')判定(非品种时跳, 免拉泛属噪声)+ 复用 taxon key(免二次解析)。"""
     sp = species_of(sci)
+    r = src.gbif_resolve(sp)                       # (taxon_key, accepted_name, specific) | None
+    if (not is_cult) and r is not None and not r[2]:
+        return []                                  # 非品种但名字是属级/泛指 → 不深挖(GBIF 判 HIGHERRANK)
+    accepted = r[1] if r else sp
+    key = r[0] if r else None
+
     cands, seen = [], set()
 
     def add(lst):
@@ -123,8 +131,11 @@ def _gather(sci, is_cult):
         add(src.wikimedia_search(sp, limit=20))       # 种级兜底(GPT 会滤掉母种噪声)
     else:
         add(src.wikimedia_search(sp, limit=50))
+    if accepted and accepted.lower() != sp.lower():   # 同义词的接受名(如 Rhododendron calendulaceum)也搜
+        time.sleep(0.6)
+        add(src.wikimedia_search(accepted, limit=30))
     time.sleep(0.6)
-    add(src.gbif_media(sp, limit=60))
+    add(src.gbif_media_by_key(key, 60) if key else src.gbif_media(sp, 60))
     return cands
 
 

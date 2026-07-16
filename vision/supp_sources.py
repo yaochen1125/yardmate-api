@@ -192,35 +192,58 @@ def wikimedia_search(name, limit=50):
 _GBIF = "https://api.gbif.org/v1"
 
 
-def gbif_taxon_key(species):
-    """species/match → usageKey(taxonKey)。无匹配返回 None。"""
-    url = _GBIF + "/species/match?" + urllib.parse.urlencode({"name": species})
+def _gbif_interpret(d, name):
+    """纯函数(可单测): 从 species/match 响应决定 (taxon_key, accepted_name, specific)。
+      - specific: 是否解析到种级(GENUS/HIGHERRANK → False, 泛指名 'Petunia spp.'/'x hybrida' 不深挖)。
+      - accepted_name: 若 **EXACT** 匹配到 SYNONYM, 换成其接受名(Azalea calendulacea→Rhododendron
+        calendulaceum; Hosta fortunei→Hosta sieboldiana), 让 Wikimedia 能按正名搜到真图。FUZZY 同义词
+        有误配风险(flammea→flava), 保守不换。否则 == 原名。
+    d 空 / matchType NONE → None。"""
+    if not d or d.get("matchType") in (None, "NONE"):
+        return None
+    rank = d.get("rank")
+    specific = (rank in ("SPECIES", "SUBSPECIES", "VARIETY", "FORM")
+                and d.get("matchType") != "HIGHERRANK")
+    key = d.get("usageKey")
+    accepted = name
+    if d.get("status") == "SYNONYM" and d.get("matchType") == "EXACT":
+        acc = d.get("species")
+        if acc:
+            accepted = acc
+            key = d.get("speciesKey") or d.get("acceptedUsageKey") or key
+    return (key, accepted, specific)
+
+
+def gbif_resolve(name):
+    """species/match → (taxon_key, accepted_name, specific)。无匹配/网络失败 → None(调用方退化用原名)。"""
+    url = _GBIF + "/species/match?" + urllib.parse.urlencode({"name": name})
     try:
         d = _get_json(url)
     except Exception as e:
-        print("  [gbif] match err", species, e)
+        print("  [gbif] match err", name, e)
         return None
-    # 只接受种级/种下精确匹配, 拒模糊/高阶(防拉一堆泛属图)。
-    if d.get("matchType") == "NONE" or d.get("rank") not in (
-            "SPECIES", "SUBSPECIES", "VARIETY", "FORM"):
-        return None
-    return d.get("usageKey")
+    return _gbif_interpret(d, name)
 
 
 def gbif_media(species, limit=60):
+    """按名解析 → 按 taxon key 取 media(见 gbif_media_by_key)。"""
+    r = gbif_resolve(species)
+    if not r or not r[0]:
+        return []
+    return gbif_media_by_key(r[0], limit)
+
+
+def gbif_media_by_key(key, limit=60):
     """occurrence media(StillImage, HUMAN_OBSERVATION —— 排标本压制图)。逐图 license 分类,
     只留 CC0/BY/SA。GBIF media 聚合自 iNat/Observation.org/标本馆等; iNat 来的多是 NC → 会被逐图拒,
-    留下的是非 NC 的真照(数量不多但正确, 质量>数量)。"""
-    key = gbif_taxon_key(species)
-    if not key:
-        return []
+    留下的是非 NC 的真照(数量不多但正确, 质量>数量)。key 已解析(同义词已换接受 taxon)。"""
     q = [("taxonKey", str(key)), ("mediaType", "StillImage"),
          ("limit", str(min(limit, 100))), ("basisOfRecord", "HUMAN_OBSERVATION")]
     url = _GBIF + "/occurrence/search?" + urllib.parse.urlencode(q)
     try:
         d = _get_json(url)
     except Exception as e:
-        print("  [gbif] media err", species, e)
+        print("  [gbif] media err key", key, e)
         return []
     out = []
     seen = set()

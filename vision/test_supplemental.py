@@ -50,6 +50,30 @@ def test_license_rejects_nc_nd_and_unknown():
     assert src.classify_license("", "CC BY 4.0") == "CC-BY"
 
 
+def test_gbif_interpret_synonym_and_genus():
+    gi = src._gbif_interpret
+    # EXACT 同义词 → 换接受名 + 接受 taxon key(实测响应)
+    d = {"rank": "SPECIES", "status": "SYNONYM", "matchType": "EXACT",
+         "usageKey": 2883038, "acceptedUsageKey": 2883036,
+         "species": "Rhododendron calendulaceum", "speciesKey": 2883036}
+    key, acc, spec = gi(d, "Azalea calendulacea")
+    assert acc == "Rhododendron calendulaceum" and key == 2883036 and spec is True
+    # 属级/泛指(HIGHERRANK)→ specific False(非品种时调用方会跳)
+    _, _, spec = gi({"rank": "GENUS", "status": "ACCEPTED", "matchType": "HIGHERRANK"}, "Petunia spp.")
+    assert spec is False
+    # 正常种(ACCEPTED, 非同义词)→ 名字不变, specific True(别把 Lavandula x intermedia 误跳)
+    key, acc, spec = gi({"rank": "SPECIES", "status": "ACCEPTED", "matchType": "EXACT",
+                         "usageKey": 9, "species": "Lavandula intermedia"}, "Lavandula x intermedia")
+    assert acc == "Lavandula x intermedia" and spec is True and key == 9
+    # FUZZY 同义词 → 保守不换名(防误配 flammea→flava)
+    key, acc, spec = gi({"rank": "SPECIES", "status": "SYNONYM", "matchType": "FUZZY",
+                         "usageKey": 4164196, "species": "Rhododendron luteum"}, "Azalea flammea")
+    assert acc == "Azalea flammea" and key == 4164196 and spec is True
+    # 无匹配 / 空 → None
+    assert gi({"matchType": "NONE"}, "x") is None
+    assert gi({}, "x") is None
+
+
 def test_is_cultivar_and_species_of():
     assert ps.is_cultivar("Juncus effusus 'Spiralis'")
     assert ps.is_cultivar("Brassica oleracea var. acephala")
