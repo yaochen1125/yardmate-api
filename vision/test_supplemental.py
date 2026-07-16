@@ -107,43 +107,44 @@ def test_select_targets_priority_and_mode():
 
 
 def test_gather_transient_vs_empty():
-    # _gather 必须区分"全源瞬时失败"(all_failed=True, 别记 n:0)与"真空"(all_failed=False)。全 mock, 无网络。
+    # _gather 返回 any_err: **任一**源报错就 True → 调用方在无候选时别记 n:0(那个挂掉的源可能才有图)。
+    # 只有全源**干净**返回空才 False(真·无图)。全 mock, 无网络。
     orig = (src.gbif_resolve, src.wikimedia_search, src.gbif_media_by_key, src.gbif_media, ps.time.sleep)
     try:
         ps.time.sleep = lambda *a, **k: None
         src.gbif_resolve = lambda name: (123, name, True)     # 种级, 无同义词
         cand = lambda k: src.Candidate("wikimedia_commons", "u", "p", "CC0", "", k)
 
-        # A: 所有源报错(None) → all_failed True, 无候选
-        src.wikimedia_search = lambda *a, **k: None
-        src.gbif_media_by_key = lambda *a, **k: None
-        c, af = ps._gather("Rosa chinensis", False)
-        assert af is True and c == [], (af, c)
-
-        # B: 一源有货、一源报错 → all_failed False(有可信读)
-        src.wikimedia_search = lambda *a, **k: [cand("x1")]
-        c, af = ps._gather("Rosa chinensis", False)
-        assert af is False and len(c) == 1, (af, c)
-
-        # C: 所有源正常返回空 → all_failed False(真空, 可记 n:0)
+        # 全源干净返回空 → any_err False(真·无图, 可记 n:0)
         src.wikimedia_search = lambda *a, **k: []
         src.gbif_media_by_key = lambda *a, **k: []
-        c, af = ps._gather("Rosa chinensis", False)
-        assert af is False and c == [], (af, c)
+        c, ae = ps._gather("Rosa chinensis", False)
+        assert ae is False and c == [], ("clean-empty", ae, c)
 
-        # D: gbif_resolve 瞬时失败(raise, 无 key) + wikimedia 也挂 → all_failed True(Codex 二轮: 别用
-        #    by-name 掩盖成"成功空源" → 漏建)。
+        # ★Codex 收窄点: 一源报错(None) + 另一源干净空 → any_err True(挂的源可能才有图, 别记 n:0)
+        src.wikimedia_search = lambda *a, **k: None
+        src.gbif_media_by_key = lambda *a, **k: []
+        c, ae = ps._gather("Rosa chinensis", False)
+        assert ae is True and c == [], ("partial-err", ae, c)
+
+        # 全源报错 → any_err True
+        src.wikimedia_search = lambda *a, **k: None
+        src.gbif_media_by_key = lambda *a, **k: None
+        c, ae = ps._gather("Rosa chinensis", False)
+        assert ae is True and c == [], ("all-err", ae, c)
+
+        # gbif_resolve raise(无 key) + wikimedia 也挂 → any_err True(别用 by-name 掩盖成成功空源)
         def boom(name):
             raise RuntimeError("gbif down")
         src.gbif_resolve = boom
         src.wikimedia_search = lambda *a, **k: None
-        c, af = ps._gather("Rosa chinensis", False)
-        assert af is True and c == [], ("D", af, c)
+        c, ae = ps._gather("Rosa chinensis", False)
+        assert ae is True and c == [], ("resolve-err", ae, c)
 
-        # E: gbif 解析挂 但 wikimedia 有货 → all_failed False(有可信读)
+        # 有候选时(哪怕别的源报错)→ 收到候选; main 有候选就正常走, 不看 any_err
         src.wikimedia_search = lambda *a, **k: [cand("y1")]
-        c, af = ps._gather("Rosa chinensis", False)
-        assert af is False and len(c) == 1, ("E", af, c)
+        c, ae = ps._gather("Rosa chinensis", False)
+        assert len(c) == 1, ("has-cands", ae, c)
     finally:
         (src.gbif_resolve, src.wikimedia_search, src.gbif_media_by_key, src.gbif_media, ps.time.sleep) = orig
 
