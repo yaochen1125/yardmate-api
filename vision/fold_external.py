@@ -81,17 +81,24 @@ def external_vecs(cid, cdn, tmp):
 
 
 def _fold_supp(supp_dir, current, add, st):
-    """折入 pull_supplemental 深挖并**已验证**的库外图(Phase B)。这些图正确性已在 pull_supplemental
-    判定过(相对 NN / 聚类+GPT), 这里只做"嵌入 + 自去近重复 + 加向量", 不再重判。catalog 门仍生效。"""
-    import glob
-    if not supp_dir or not os.path.isdir(supp_dir):
+    """折入 pull_supplemental 深挖并**已验证**的库外图(Phase B)。★以 _manifest.json 为准 —— 只折
+    manifest 里记的图, 不扫目录: 重跑失败/删条目后残留的孤儿图不会被误折进 serve 索引(Codex P2)。
+    正确性已在 pull_supplemental 判过, 这里只嵌入 + 自去近重复 + 加向量; catalog 门仍生效。"""
+    mpath = os.path.join(supp_dir or "", "_manifest.json")
+    if not supp_dir or not os.path.isfile(mpath):
         return
-    for cid in sorted(os.listdir(supp_dir)):
-        d = os.path.join(supp_dir, cid)
-        if not os.path.isdir(d) or cid not in current:   # catalog 门 + 跳过 _manifest.json 等文件
+    try:
+        manifest = json.load(open(mpath))
+    except Exception as e:
+        print("  supp manifest 读失败, 跳过 Phase B 折入:", e); return
+    for cid, rec in sorted(manifest.items()):
+        if not isinstance(rec, dict) or cid not in current:   # catalog 门(+ 天然跳过非 dict 的元数据键)
             continue
         added = []
-        for p in sorted(glob.glob(f"{d}/*.jpg")) + sorted(glob.glob(f"{d}/*.png")):
+        for img in rec.get("images", []):
+            p = os.path.join(supp_dir, cid, img.get("file", ""))
+            if not os.path.isfile(p):
+                continue
             try:
                 v = vision_embed.embed_path(p).astype(np.float32)
             except Exception as e:

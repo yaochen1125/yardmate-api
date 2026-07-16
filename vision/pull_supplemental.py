@@ -113,13 +113,18 @@ def _gather(sci, is_cult):
     sp = species_of(sci)
     r = src.gbif_resolve(sp)                       # (taxon_key, accepted_name, specific) | None
     if (not is_cult) and r is not None and not r[2]:
-        return []                                  # 非品种但名字是属级/泛指 → 不深挖(GBIF 判 HIGHERRANK)
+        return [], False                           # 非品种但名字是属级/泛指 → 不深挖(真·跳过, 非瞬时失败)
     accepted = r[1] if r else sp
     key = r[0] if r else None
 
     cands, seen = [], set()
+    n_src = [0]; n_err = [0]    # 源调用计数 / 报错计数(源出错返回 None; 全错=疑瞬时, 见下)
 
     def add(lst):
+        n_src[0] += 1
+        if lst is None:         # 源瞬时失败(网络/5xx)—— 与"正常返回空"区分
+            n_err[0] += 1
+            return
         for c in lst:
             if c.dedup_key not in seen:
                 seen.add(c.dedup_key)
@@ -136,7 +141,9 @@ def _gather(sci, is_cult):
         add(src.wikimedia_search(accepted, limit=30))
     time.sleep(0.6)
     add(src.gbif_media_by_key(key, 60) if key else src.gbif_media(sp, 60))
-    return cands
+    # all_failed = 所有源调用都报错 → 候选空不可信(瞬时), 调用方别记 n:0(免永久跳过, Codex P2)。
+    all_failed = n_src[0] > 0 and n_err[0] == n_src[0]
+    return cands, all_failed
 
 
 def main(index_dir, catalog_path, out_dir, limit=None):
@@ -192,7 +199,7 @@ def main(index_dir, catalog_path, out_dir, limit=None):
         processed += 1
 
         tmp = f"/tmp/supp/{cid}"
-        cands = _gather(sci, is_cultivar(sci))
+        cands, all_failed = _gather(sci, is_cultivar(sci))
         evs, paths, kept_cands = _embed_candidates(cands, tmp)
 
         # PlantNet 图源(可选, 仅非品种种级, seed=已有第一张, 消耗线上配额)。
@@ -207,7 +214,12 @@ def main(index_dir, catalog_path, out_dir, limit=None):
                         evs.append(v); paths.append(pth); kept_cands.append(c)
 
         if not evs:
-            manifest[cid] = {"sci": sci, "mode": mode, "n": 0}
+            # 区分"真·无图"(源正常返回空)与"瞬时失败"(全源报错, 或有候选但全下载失败)。
+            # 后者绝不记 n:0 —— 否则一次 API/CDN 抖动就把该株永久跳过、静默漏建(Codex P2)。
+            if all_failed or cands:
+                shutil.rmtree(tmp, ignore_errors=True)
+                continue   # 疑瞬时: 不记 done, 留待下轮重试
+            manifest[cid] = {"sci": sci, "mode": mode, "n": 0}   # 真空(源正常返回 0 候选)→ 记, 免每轮白试
             _atomic_json(manifest, manifest_path); shutil.rmtree(tmp, ignore_errors=True)
             st["empty"] += 1; continue
 

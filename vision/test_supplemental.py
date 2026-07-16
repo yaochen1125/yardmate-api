@@ -106,6 +106,34 @@ def test_select_targets_priority_and_mode():
     assert modes["AAA5"] == "anchored" and modes["AAA6"] == "anchored"
 
 
+def test_gather_transient_vs_empty():
+    # _gather 必须区分"全源瞬时失败"(all_failed=True, 别记 n:0)与"真空"(all_failed=False)。全 mock, 无网络。
+    orig = (src.gbif_resolve, src.wikimedia_search, src.gbif_media_by_key, src.gbif_media, ps.time.sleep)
+    try:
+        ps.time.sleep = lambda *a, **k: None
+        src.gbif_resolve = lambda name: (123, name, True)     # 种级, 无同义词
+        cand = lambda k: src.Candidate("wikimedia_commons", "u", "p", "CC0", "", k)
+
+        # A: 所有源报错(None) → all_failed True, 无候选
+        src.wikimedia_search = lambda *a, **k: None
+        src.gbif_media_by_key = lambda *a, **k: None
+        c, af = ps._gather("Rosa chinensis", False)
+        assert af is True and c == [], (af, c)
+
+        # B: 一源有货、一源报错 → all_failed False(有可信读)
+        src.wikimedia_search = lambda *a, **k: [cand("x1")]
+        c, af = ps._gather("Rosa chinensis", False)
+        assert af is False and len(c) == 1, (af, c)
+
+        # C: 所有源正常返回空 → all_failed False(真空, 可记 n:0)
+        src.wikimedia_search = lambda *a, **k: []
+        src.gbif_media_by_key = lambda *a, **k: []
+        c, af = ps._gather("Rosa chinensis", False)
+        assert af is False and c == [], (af, c)
+    finally:
+        (src.gbif_resolve, src.wikimedia_search, src.gbif_media_by_key, src.gbif_media, ps.time.sleep) = orig
+
+
 def test_cluster_consensus():
     try:
         import numpy as np
