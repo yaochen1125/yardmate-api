@@ -251,6 +251,13 @@ def main(index_dir, catalog_path, out_dir, limit=None):
                 shutil.rmtree(tmp, ignore_errors=True)
                 continue   # 预算耗尽/GPT 报错 且一张没收 → 不记 done, 下轮新预算/恢复后重试
 
+        # 有源报错(any_err)且一张没收(候选全被 NN/GPT 判据拒)→ 那个挂掉的源可能才有正确图, 别记
+        # n:0/空条目永久跳过(Codex: any_err 守卫也要覆盖"有候选但全被判据拒"这条路, 不止"零候选")。
+        # → 至此"记零图"仅在**无任何瞬时错误**(源 + GPT 都干净)时发生, 即真·无可用图, 不变量完备。
+        if not keep_idx and any_err:
+            shutil.rmtree(tmp, ignore_errors=True)
+            continue   # 疑瞬时(部分源失败)→ 不记 done, 留待下轮重试
+
         # ── 落盘: 验证过的图 + manifest 条目 ──
         dst = f"{out_dir}/{cid}"
         shutil.rmtree(dst, ignore_errors=True)   # 先清旧图: 重跑(如删 manifest 条目后)收更少时, 免留孤儿被 fold 重收
