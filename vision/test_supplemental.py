@@ -106,6 +106,49 @@ def test_select_targets_priority_and_mode():
     assert modes["AAA5"] == "anchored" and modes["AAA6"] == "anchored"
 
 
+def test_gather_transient_vs_empty():
+    # _gather 返回 any_err: **任一**源报错就 True → 调用方在无候选时别记 n:0(那个挂掉的源可能才有图)。
+    # 只有全源**干净**返回空才 False(真·无图)。全 mock, 无网络。
+    orig = (src.gbif_resolve, src.wikimedia_search, src.gbif_media_by_key, src.gbif_media, ps.time.sleep)
+    try:
+        ps.time.sleep = lambda *a, **k: None
+        src.gbif_resolve = lambda name: (123, name, True)     # 种级, 无同义词
+        cand = lambda k: src.Candidate("wikimedia_commons", "u", "p", "CC0", "", k)
+
+        # 全源干净返回空 → any_err False(真·无图, 可记 n:0)
+        src.wikimedia_search = lambda *a, **k: []
+        src.gbif_media_by_key = lambda *a, **k: []
+        c, ae = ps._gather("Rosa chinensis", False)
+        assert ae is False and c == [], ("clean-empty", ae, c)
+
+        # ★Codex 收窄点: 一源报错(None) + 另一源干净空 → any_err True(挂的源可能才有图, 别记 n:0)
+        src.wikimedia_search = lambda *a, **k: None
+        src.gbif_media_by_key = lambda *a, **k: []
+        c, ae = ps._gather("Rosa chinensis", False)
+        assert ae is True and c == [], ("partial-err", ae, c)
+
+        # 全源报错 → any_err True
+        src.wikimedia_search = lambda *a, **k: None
+        src.gbif_media_by_key = lambda *a, **k: None
+        c, ae = ps._gather("Rosa chinensis", False)
+        assert ae is True and c == [], ("all-err", ae, c)
+
+        # gbif_resolve raise(无 key) + wikimedia 也挂 → any_err True(别用 by-name 掩盖成成功空源)
+        def boom(name):
+            raise RuntimeError("gbif down")
+        src.gbif_resolve = boom
+        src.wikimedia_search = lambda *a, **k: None
+        c, ae = ps._gather("Rosa chinensis", False)
+        assert ae is True and c == [], ("resolve-err", ae, c)
+
+        # 有候选时(哪怕别的源报错)→ 收到候选; main 有候选就正常走, 不看 any_err
+        src.wikimedia_search = lambda *a, **k: [cand("y1")]
+        c, ae = ps._gather("Rosa chinensis", False)
+        assert len(c) == 1, ("has-cands", ae, c)
+    finally:
+        (src.gbif_resolve, src.wikimedia_search, src.gbif_media_by_key, src.gbif_media, ps.time.sleep) = orig
+
+
 def test_cluster_consensus():
     try:
         import numpy as np

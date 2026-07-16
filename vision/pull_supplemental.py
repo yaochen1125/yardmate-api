@@ -111,15 +111,23 @@ def _gather(sci, is_cult):
     GBIF 一次解析: 同义词→接受名(Azalea→Rhododendron 也搜, 救学名过时的收 0 株)+ 属级/泛指
     ('Petunia spp.'/'x hybrida')判定(非品种时跳, 免拉泛属噪声)+ 复用 taxon key(免二次解析)。"""
     sp = species_of(sci)
-    r = src.gbif_resolve(sp)                       # (taxon_key, accepted_name, specific) | None
+    gbif_err = False
+    try:
+        r = src.gbif_resolve(sp)                   # None=真·无匹配; raise=瞬时网络失败
+    except Exception as e:
+        print("  [gbif] resolve err", sp, e); r = None; gbif_err = True
     if (not is_cult) and r is not None and not r[2]:
-        return []                                  # 非品种但名字是属级/泛指 → 不深挖(GBIF 判 HIGHERRANK)
+        return [], False                           # 非品种但名字是属级/泛指 → 不深挖(真·跳过, 非瞬时失败)
     accepted = r[1] if r else sp
     key = r[0] if r else None
 
     cands, seen = [], set()
+    n_err = [0]    # 源报错计数(源出错返回 None; 任一报错 → 无候选时别记 n:0, 见下)
 
     def add(lst):
+        if lst is None:         # 源瞬时失败(网络/5xx)—— 与"正常返回空"区分
+            n_err[0] += 1
+            return
         for c in lst:
             if c.dedup_key not in seen:
                 seen.add(c.dedup_key)
@@ -135,8 +143,17 @@ def _gather(sci, is_cult):
         time.sleep(0.6)
         add(src.wikimedia_search(accepted, limit=30))
     time.sleep(0.6)
-    add(src.gbif_media_by_key(key, 60) if key else src.gbif_media(sp, 60))
-    return cands
+    # GBIF media: 有 key 按 key 取; 无 key 时 —— 解析**瞬时失败**(gbif_err)记一次源错误(别用 by-name
+    # 掩盖: 那样会返回 [] 被当"成功空源" → 漏建, Codex P2); 解析成功但真·无 taxon 才记一次成功空源。
+    if key:
+        add(src.gbif_media_by_key(key, 60))
+    elif gbif_err:
+        n_err[0] += 1
+    # else: 解析成功但真·无 taxon → 无 GBIF 图可取, 不算源(不影响 any_err)
+    # any_err = **任一**源报错 → 无候选时别记 n:0: 那个挂掉的源可能才有图, 记 n:0 会漏建。
+    # 只有全源**干净**返回空(n_err==0)才是真·无图(Codex: 部分失败也不能当真空, 不能要求全源都挂)。
+    any_err = n_err[0] > 0
+    return cands, any_err
 
 
 def main(index_dir, catalog_path, out_dir, limit=None):
@@ -171,7 +188,7 @@ def main(index_dir, catalog_path, out_dir, limit=None):
     budget = verify.VLMBudget(MAX_VLM_CALLS)
     pn_budget = verify.VLMBudget(PLANTNET_MAX_IDENTIFY)   # 复用计数器当 PlantNet 配额
     st = {"anchored_kept": 0, "anchorfree_kept": 0, "skipped_done": 0,
-          "no_key_skip": 0, "empty": 0, "plants_covered": 0}
+          "no_key_skip": 0, "empty": 0, "plants_covered": 0, "transient_skipped": 0}
     spot = []
     processed = 0   # 本轮实际动手处理的株数(不含 manifest 跳过); --limit 用它封顶
 
@@ -188,11 +205,12 @@ def main(index_dir, catalog_path, out_dir, limit=None):
         if mode == "anchorfree" and not api_key:
             st["no_key_skip"] += 1; continue   # 无 GPT → 不碰无锚点株
         if mode == "anchorfree" and not budget.ok():
+            st["transient_skipped"] += 1
             continue   # GPT 预算耗尽: 不记 done, 留给下轮新预算重试(绝不记成 done-with-zero 永久跳过)
         processed += 1
 
         tmp = f"/tmp/supp/{cid}"
-        cands = _gather(sci, is_cultivar(sci))
+        cands, any_err = _gather(sci, is_cultivar(sci))
         evs, paths, kept_cands = _embed_candidates(cands, tmp)
 
         # PlantNet 图源(可选, 仅非品种种级, seed=已有第一张, 消耗线上配额)。
@@ -207,6 +225,12 @@ def main(index_dir, catalog_path, out_dir, limit=None):
                         evs.append(v); paths.append(pth); kept_cands.append(c)
 
         if not evs:
+            # 只有**全源干净返回空**才算真·无图(记 n:0, 免每轮白试)。任一源报错(它可能才有图)、
+            # 或有候选但全下载失败 → 疑瞬时 → 绝不记 n:0(否则一次 API/CDN 抖动就把该株永久跳过、
+            # 静默漏建, Codex 一路收窄至此: 部分失败也不能当真空)。
+            if any_err or cands:
+                shutil.rmtree(tmp, ignore_errors=True); st["transient_skipped"] += 1
+                continue   # 疑瞬时: 不记 done, 留待下轮重试
             manifest[cid] = {"sci": sci, "mode": mode, "n": 0}
             _atomic_json(manifest, manifest_path); shutil.rmtree(tmp, ignore_errors=True)
             st["empty"] += 1; continue
@@ -225,8 +249,15 @@ def main(index_dir, catalog_path, out_dir, limit=None):
                                                             api_key, budget, MAX_KEEP)
             spot.append(cid)
             if incomplete and not keep_idx:
-                shutil.rmtree(tmp, ignore_errors=True)
+                shutil.rmtree(tmp, ignore_errors=True); st["transient_skipped"] += 1
                 continue   # 预算耗尽/GPT 报错 且一张没收 → 不记 done, 下轮新预算/恢复后重试
+
+        # 有源报错(any_err)且一张没收(候选全被 NN/GPT 判据拒)→ 那个挂掉的源可能才有正确图, 别记
+        # n:0/空条目永久跳过(Codex: any_err 守卫也要覆盖"有候选但全被判据拒"这条路, 不止"零候选")。
+        # → 至此"记零图"仅在**无任何瞬时错误**(源 + GPT 都干净)时发生, 即真·无可用图, 不变量完备。
+        if not keep_idx and any_err:
+            shutil.rmtree(tmp, ignore_errors=True); st["transient_skipped"] += 1
+            continue   # 疑瞬时(部分源失败)→ 不记 done, 留待下轮重试
 
         # ── 落盘: 验证过的图 + manifest 条目 ──
         dst = f"{out_dir}/{cid}"
@@ -250,6 +281,13 @@ def main(index_dir, catalog_path, out_dir, limit=None):
     _atomic_json(manifest, manifest_path)
     _atomic_json(sorted(spot), f"{out_dir}/_spotcheck.json")
     print(f"DONE {st} | GPT calls {budget.spent}/{budget.max} | PlantNet {pn_budget.spent}/{pn_budget.max}", flush=True)
+    # ★退出码契约(镜像 pull_reference): 有株因瞬时错误(源/GPT 抖动、预算耗尽)被跳过 → 返回非零, 让
+    #   上层(staging_run 的 `|| exit 1` / build_pipeline 的软失败日志)**surfacing"本轮不完整, 需重跑"**,
+    #   而不是拿个静默漏建的集合去 fold/eval 还报成功(Codex)。这些株没记 manifest, 重跑(可续)即补齐。
+    if st["transient_skipped"]:
+        print(f"INCOMPLETE: {st['transient_skipped']} 株因瞬时错误跳过(未记 manifest); 重跑(可续)补齐。退出码 1。", flush=True)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
@@ -267,4 +305,4 @@ if __name__ == "__main__":
         args.append(a); i += 1
     if len(args) < 3:
         print(__doc__); sys.exit(2)
-    main(args[0], args[1], args[2], limit)
+    sys.exit(main(args[0], args[1], args[2], limit))   # 非零=有瞬时跳过, 需重跑(见 main 末尾契约)
