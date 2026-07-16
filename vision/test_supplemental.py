@@ -130,6 +130,20 @@ def test_gather_transient_vs_empty():
         src.gbif_media_by_key = lambda *a, **k: []
         c, af = ps._gather("Rosa chinensis", False)
         assert af is False and c == [], (af, c)
+
+        # D: gbif_resolve 瞬时失败(raise, 无 key) + wikimedia 也挂 → all_failed True(Codex 二轮: 别用
+        #    by-name 掩盖成"成功空源" → 漏建)。
+        def boom(name):
+            raise RuntimeError("gbif down")
+        src.gbif_resolve = boom
+        src.wikimedia_search = lambda *a, **k: None
+        c, af = ps._gather("Rosa chinensis", False)
+        assert af is True and c == [], ("D", af, c)
+
+        # E: gbif 解析挂 但 wikimedia 有货 → all_failed False(有可信读)
+        src.wikimedia_search = lambda *a, **k: [cand("y1")]
+        c, af = ps._gather("Rosa chinensis", False)
+        assert af is False and len(c) == 1, ("E", af, c)
     finally:
         (src.gbif_resolve, src.wikimedia_search, src.gbif_media_by_key, src.gbif_media, ps.time.sleep) = orig
 
