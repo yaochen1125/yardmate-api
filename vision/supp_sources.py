@@ -157,7 +157,7 @@ def wikimedia_search(name, limit=50):
         resp = _get_json(url)
     except Exception as e:
         print("  [wikimedia] err", name, e)
-        return []
+        return None    # 瞬时失败(网络/5xx)返回 None(≠正常空 []); 让 _gather 区分"真空"与"全源挂"
     pages = (resp.get("query") or {}).get("pages") or {}
     out = []
     for page in pages.values():
@@ -244,7 +244,7 @@ def gbif_media_by_key(key, limit=60):
         d = _get_json(url)
     except Exception as e:
         print("  [gbif] media err key", key, e)
-        return []
+        return None    # 瞬时失败返回 None(≠正常空); _gather 据此区分"真空"与"全源挂"
     out = []
     seen = set()
     for rec in d.get("results", []):
