@@ -33,14 +33,19 @@ fi
 
 echo "[$(ts)] Phase B staging  LIMIT=$LIMIT  SUPP=$SUPP_DIR  SERVE=$STAGING_SERVE  PLANTNET_MAX=$PLANTNET_MAX_IDENTIFY"
 
+# ★每个 stage 失败即中止(pipefail 让 `python|tee` 反映 python 退出码; 无此则失败/半成品会被后续步骤
+#   当成"验证通过", 还打印"完成" —— Codex P2)。
 echo "[$(ts)] 1/3 深挖 + 正确性过滤 (pull_supplemental --limit $LIMIT) — 头 15 分钟看节奏决定够不够 ..."
-nice -n 15 $PY pull_supplemental.py "$INAT_DIR" "$CATALOG" "$SUPP_DIR" --limit "$LIMIT" 2>&1 | tee supp.log
+nice -n 15 $PY pull_supplemental.py "$INAT_DIR" "$CATALOG" "$SUPP_DIR" --limit "$LIMIT" 2>&1 | tee supp.log \
+  || { echo "[$(ts)] ✗ step1 pull_supplemental 失败, 中止(见 supp.log)"; exit 1; }
 
 echo "[$(ts)] 2/3 折入 staging 索引 (fold_external --supp; 阈值 0.78; 不动 live serve) ..."
-nice -n 10 $PY fold_external.py "$INAT_DIR" "$CATALOG" "$STAGING_SERVE" --supp "$SUPP_DIR" 2>&1 | tee fold_staging.log
+nice -n 10 $PY fold_external.py "$INAT_DIR" "$CATALOG" "$STAGING_SERVE" --supp "$SUPP_DIR" 2>&1 | tee fold_staging.log \
+  || { echo "[$(ts)] ✗ step2 fold_external 失败, 中止(见 fold_staging.log)"; exit 1; }
 
 echo "[$(ts)] 3/3 量增益 (eval_holdout: BEFORE 纯 iNat vs AFTER staging, LOO top-1) ..."
-$PY eval_holdout.py "$INAT_DIR" "$STAGING_SERVE" "$SUPP_DIR/_manifest.json" 2>&1 | tee eval.log
+$PY eval_holdout.py "$INAT_DIR" "$STAGING_SERVE" "$SUPP_DIR/_manifest.json" 2>&1 | tee eval.log \
+  || { echo "[$(ts)] ✗ step3 eval_holdout 失败(见 eval.log)"; exit 1; }
 
 echo "[$(ts)] 完成。"
 echo "  ▸ 增益看上面 eval_holdout: AFTER 明显高于 BEFORE = Phase B 生效(0-iNat/品种株 BEFORE 应接近 0)。"

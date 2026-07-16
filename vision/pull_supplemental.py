@@ -178,6 +178,11 @@ def main(index_dir, catalog_path, out_dir, limit=None):
     for cid, sci, mode in targets:
         if limit and processed >= limit:
             break   # --limit: 本轮到量收工(可续: 下轮从 manifest 之后接着跑)
+        if budget.mostly_failing():
+            # GPT 连续几乎全失败(疑 key 失效/OpenAI 挂)→ 中止。★放循环顶: 即使某株走 continue
+            # (incomplete/预算耗尽)也拦得住, 不会绕过这道闸把后面成百上千株全白试一遍(Codex P2)。
+            raise RuntimeError(f"GPT 判据几乎全失败 ({budget.errors}/{budget.spent}) —— 疑 OPENAI_API_KEY "
+                               f"失效或 OpenAI 不可用; 中止(已处理株已存 manifest, 修好后删对应条目重跑)")
         if cid in manifest:
             st["skipped_done"] += 1; continue
         if mode == "anchorfree" and not api_key:
@@ -241,10 +246,6 @@ def main(index_dir, catalog_path, out_dir, limit=None):
             st["anchored_kept" if mode == "anchored" else "anchorfree_kept"] += len(entries)
         print(f"  {cid} {mode} {sci[:40]}: 候选 {len(evs)} → 收 {len(entries)} "
               f"[GPT {budget.spent}/{budget.max}]", flush=True)
-        if budget.mostly_failing():
-            # GPT 连续几乎全失败(疑 key 失效/OpenAI 挂)→ 中止, 免把后面成百上千株误记 done-with-zero。
-            raise RuntimeError(f"GPT 判据几乎全失败 ({budget.errors}/{budget.spent}) —— 疑 OPENAI_API_KEY "
-                               f"失效或 OpenAI 不可用; 中止(已处理株已存 manifest, 修好后删对应条目重跑)")
 
     _atomic_json(manifest, manifest_path)
     _atomic_json(sorted(spot), f"{out_dir}/_spotcheck.json")
