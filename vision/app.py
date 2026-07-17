@@ -22,6 +22,10 @@ _THRESHOLD_ENV = os.environ.get("VISION_IN_OUT_THRESHOLD", "")           # M4: �
 _MAX_CONCURRENT = max(1, int(os.environ.get("VISION_MAX_CONCURRENT_EMBED", "1")))  # H3
 _ADMIN_TOKEN = os.environ.get("VISION_ADMIN_TOKEN", "")                  # 未设=admin 端点关(404)
 _CDN = os.environ.get("VISION_EXTERNAL_CDN", "https://images.yardmate.ai/plant_images")
+# build/fold 用的 catalog 快照(做 catalog 门)。增量 add 后把新 id 记进来, 防后续全库 build 的 fold
+# 用**过时** plants_index(该 id 未同步进来)把它当已删 id drop 掉(Codex #116)。默认 = 与 app 同目录。
+_CATALOG_PATH = os.environ.get(
+    "VISION_CATALOG_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "plants_index.json"))
 _CID_RE = re.compile(r"^[A-Z]{3}\d{4,}$")  # cid 进 curl URL, 严格校验防注入
 
 # S = 可原子 swap 的索引快照 {meta, mapping, idx, threshold}; reload/add 换新 dict 后 rebind。
@@ -137,6 +141,30 @@ async def _reload_locked():
     return snap["meta"]["count"]
 
 
+def _pin_catalog_id(cid, sci):
+    """Best-effort：把 flywheel 增量加的 id 记进 build 用的 plants_index.json —— 否则后续全库 build 的
+    fold catalog 门(用可能过时的 plants_index)会把这个未同步进来的 id 当已删 id, 从 base 里 drop 掉
+    → 增量成果被一次陈旧 fold 抹掉(reload/restart 后消失, Codex #116)。幂等 + 原子写; 缺文件/任何异常
+    只 warn(pin 是保险, 失败不该毁已成功的 add)。返回 pinned/present/None。"""
+    try:
+        if not _CATALOG_PATH or not os.path.isfile(_CATALOG_PATH):
+            return None
+        cat = json.load(open(_CATALOG_PATH))
+        if not isinstance(cat, list):
+            return None
+        if any(isinstance(p, dict) and p.get("id") == cid for p in cat):
+            return "present"
+        cat.append({"id": cid, "scientific_name": sci or ""})
+        tmp = _CATALOG_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cat, f, ensure_ascii=False)
+        os.replace(tmp, _CATALOG_PATH)
+        return "pinned"
+    except Exception as e:  # noqa: BLE001 —— pin 失败不影响已成功的 add
+        print(f"pin catalog id {cid} failed (non-fatal): {e}")
+        return None
+
+
 @app.post("/admin/knn/reload")
 async def admin_reload(x_vision_admin_token: str = Header(None)):
     """从盘热重载索引(全库 build / standalone incremental_add 改盘后免 restart 生效)。"""
@@ -147,15 +175,22 @@ async def admin_reload(x_vision_admin_token: str = Header(None)):
 
 
 @app.post("/admin/knn/add")
-async def admin_add(catalog_id: str, x_vision_admin_token: str = Header(None)):
+async def admin_add(catalog_id: str, scientific_name: str = "", x_vision_admin_token: str = Header(None)):
     """增量: 拉 catalog_id 的 external 真照 add 进索引 + 热重载(零停机, 复用已加载模型)。
-    幂等(re-trigger 刷新)。写盘走 incremental.add_plant_to_index(flock 与全库 build 互斥)。"""
+    幂等(re-trigger 刷新)。写盘走 incremental.add_plant_to_index(flock 与全库 build 互斥)。
+    scientific_name(可选): 记进 build catalog 快照防陈旧 fold drop(_pin_catalog_id)。"""
     _require_admin(x_vision_admin_token)
     if not _CID_RE.match(catalog_id or ""):
         raise HTTPException(400, "bad catalog_id (want ^[A-Z]{3}\\d{4,}$)")
     async with _WRITE_LOCK:            # 串行化: 同时只一个 add/reload 写 SERVE_DIR + rebind
-        async with _SEM:               # 与 identify 争嵌入资源: 有界并发, 复用常驻模型
-            stats = await asyncio.to_thread(
-                add_plant_to_index, INDEX_DIR, catalog_id, _CDN, vision_embed.embed_path)
-        count = await _reload_locked() if stats.get("added", 0) > 0 else stats.get("count")
+        # 不占 identify 的 _SEM: 下载 external(curl 可慢/超时到 25s×N)期间不该卡住 identify 嵌入
+        # (否则 Go 侧等 vision 超时, Codex #116)。并发上界仍受控: _WRITE_LOCK 串行 add(≤1) +
+        # identify _SEM=1(≤1) → 至多 2 个并发嵌入; 模型只读前向线程安全、激活内存有界(<MemoryMax)。
+        stats = await asyncio.to_thread(
+            add_plant_to_index, INDEX_DIR, catalog_id, _CDN, vision_embed.embed_path)
+        if stats.get("added", 0) > 0:
+            stats["pinned"] = await asyncio.to_thread(_pin_catalog_id, catalog_id, scientific_name)
+            count = await _reload_locked()
+        else:
+            count = stats.get("count")
     return {**stats, "reloaded": stats.get("added", 0) > 0, "count": count}

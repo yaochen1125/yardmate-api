@@ -41,7 +41,11 @@
 - cid 不在索引 → `resize_index(count+n)` + `add_items`（快路径 <1s）。
 - cid 已在索引（re-trigger/重试）→ drop 该 cid 现有向量 + 重建（保留其余）→ 刷新（~秒级到几十秒，罕见事件可接受）。
 
-**并发/锁**：增量写 SERVE_DIR 与全库 build 的 fold 写 SERVE_DIR 可能撞。用 **flock `{SERVE_DIR}/.write.lock`**：增量核心写时持锁；fold_external 最终写也持同锁。全库 build 罕见，且即使增量基于稍旧 base 被 fold 覆盖也不丢东西（fold 也从 R2 external 复现该株，最终一致）。原子写保证任何时刻无半截索引。
+**并发/锁**：增量写 SERVE_DIR 与全库 build 的 fold 写 SERVE_DIR 可能撞。用 **flock `{SERVE_DIR}/.write.lock`**：增量核心写、fold_external 最终写、serve `_load_snapshot` 读 都持同锁（读也持锁 → 防 fold 三次 os.replace 插在 reload 三次读之间读到错配集）。原子写保证任何时刻无半截索引。
+
+**陈旧 fold 不能抹掉增量成果（Codex #116）**：fold 的 catalog 门用服务器上的 `plants_index.json`——它可能**比刚晋升的株旧**（promote 只更新 admin 机的 plants_index）。若此时跑全库 build，fold 会把这个「不在 catalog 门里」的新 id 当已删 id 从 base drop 掉 → 增量成果被抹。修：**admin/add 成功后把 id（+sci）pin 进服务器 `plants_index.json`**（`_pin_catalog_id`，幂等原子，env `VISION_CATALOG_PATH`）→ 后续 fold 的 catalog 门认它、保留它。删除仍生效（operator 用 source-of-truth 全量覆盖 plants_index 时，被删株不在其中 → fold 正常 drop）。
+
+**add 不占 identify 的嵌入 sem（Codex #116）**：admin/add 下载 external（curl 可慢/超时）期间**不持** `_SEM`，否则 identify 嵌入全卡在 sem 上、Go 侧等 vision 超时。并发上界仍受控：`_WRITE_LOCK` 串行 add（≤1）+ identify `_SEM=1`（≤1）→ 至多 2 个并发嵌入，模型只读前向线程安全、激活内存有界。
 
 **实现**：`incremental.py`（纯磁盘核心 + 注入 embed_fn，无 torch 依赖）+ `incremental_add.py`（standalone CLI，自带模型，服务器可手测）。**同一核心**避免漂移；serve 的 admin 端点也调这个核心但注入**已加载的模型**（省第二次 torch load）。
 
@@ -53,7 +57,7 @@
 ### Piece 1 — 晋升钩子 + 跨机触发
 
 - `promote.py._promote_plant` 末尾（`plan["applied"]=True` 后，promote.py:219）加 `_trigger_knn_build(pid, sci)`，仿 `_refresh_distribution`/`_refresh_shards` 的 **best-effort fire、warn 不 block**。
-- **跨机认证 = SSH（复用现成）**：admin 机已有 root 免密 SSH 到服务器（7788 quota 面板已在用）。触发 = `ssh {host} 'curl -sS -m N -X POST -H "X-Vision-Admin-Token: T" http://127.0.0.1:8099/admin/knn/add -d cid'`。**vision 端点保持 localhost-only**（不新开公网口 = 最小攻击面）；SSH key 是认证边界，token 是纵深防御。
+- **跨机认证 = SSH（复用现成）**：admin 机已有 root 免密 SSH 到服务器（7788 quota 面板已在用）。触发 = `ssh {host} 'curl -sS --fail-with-body -m N -X POST -H "X-Vision-Admin-Token: T" "http://127.0.0.1:8099/admin/knn/add?catalog_id=AAA####&scientific_name=..."'`（cid/sci 走 **query 参数**，非 `-d` body；`--fail-with-body` 让 HTTP 4xx/5xx → curl 非零退出 → 钩子 warn 不误报成功）。**vision 端点保持 localhost-only**（不新开公网口 = 最小攻击面）；SSH key 是认证边界，token 是纵深防御。
 - **默认 off / 保守**：
   - vision admin 端点由 env `VISION_ADMIN_TOKEN` 门控：**未设 = 端点 404（功能关）**；设了才启用并校验 token。
   - promote 钩子由 `cfg["knn_flywheel"]`（`enabled`/`ssh_host`/`token`/`endpoint`）门控：未配置/`enabled:false` → skip（返回 note，不 block 晋升）。
