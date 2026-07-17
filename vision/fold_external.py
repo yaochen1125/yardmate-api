@@ -199,12 +199,17 @@ def main(index_dir, catalog_path, out_dir, cdn, supp_dir=None):
     idx = hnswlib.Index(space="cosine", dim=dim)
     idx.init_index(max_elements=N + 10, ef_construction=200, M=32); idx.set_ef(64)
     idx.add_items(np.vstack(new_vecs), np.arange(N))
-    # 原子写, meta 最后(build_index 同幂等约定)
-    idx.save_index(f"{out_dir}/index.bin.tmp"); os.replace(f"{out_dir}/index.bin.tmp", f"{out_dir}/index.bin")
-    _atomic_json(new_map, f"{out_dir}/mapping.json")
     nm = dict(meta); nm["count"] = N
     nm["catalog_ids"] = sorted(set(m["catalog_id"] for m in new_map))
-    _atomic_json(nm, f"{out_dir}/meta.json")
+    # 原子写, meta 最后(build_index 同幂等约定)。★三文件写在 {out_dir}/.write.lock 内 —— 与飞轮
+    #   增量 add(incremental.add_plant_to_index 持同锁)互斥, 防全库 build 的 fold 写与增量 add 交错
+    #   写导致 index.bin 与 mapping.json 向量数错配(见 KNN_FLYWHEEL_SPEC.md「Piece 2 并发/锁」)。
+    #   惰性导入避免 incremental<->fold_external 循环导入。
+    from incremental import _write_lock
+    with _write_lock(out_dir):
+        idx.save_index(f"{out_dir}/index.bin.tmp"); os.replace(f"{out_dir}/index.bin.tmp", f"{out_dir}/index.bin")
+        _atomic_json(new_map, f"{out_dir}/mapping.json")
+        _atomic_json(nm, f"{out_dir}/meta.json")
     print(f"final: {N} vecs / {len(nm['catalog_ids'])} ids (原 {base}/{len(set(meta['catalog_ids']))})", flush=True)
 
 
