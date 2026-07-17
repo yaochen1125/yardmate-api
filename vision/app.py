@@ -168,6 +168,7 @@ async def admin_add(catalog_id: str, scientific_name: str = "", x_vision_admin_t
             catalog_path=_CATALOG_PATH, sci=scientific_name)
         if stats.get("added", 0) > 0:
             count = await _reload_locked()
-        else:
-            count = stats.get("count")
-    return {**stats, "reloaded": stats.get("added", 0) > 0, "count": count}
+            return {**stats, "reloaded": True, "count": count}
+    # added==0(external 缺/CDN 未同步/全部嵌入失败): 该株**没进 KNN**。返 422(非 2xx)让触发端
+    # curl --fail-with-body 非零退出 → 晋升钩子 warn + operator 知道要重试(如等 CDN 传播), 不误报成功(Codex #116)。
+    raise HTTPException(422, detail={**stats, "reloaded": False})
