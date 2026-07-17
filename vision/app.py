@@ -141,30 +141,6 @@ async def _reload_locked():
     return snap["meta"]["count"]
 
 
-def _pin_catalog_id(cid, sci):
-    """Best-effort：把 flywheel 增量加的 id 记进 build 用的 plants_index.json —— 否则后续全库 build 的
-    fold catalog 门(用可能过时的 plants_index)会把这个未同步进来的 id 当已删 id, 从 base 里 drop 掉
-    → 增量成果被一次陈旧 fold 抹掉(reload/restart 后消失, Codex #116)。幂等 + 原子写; 缺文件/任何异常
-    只 warn(pin 是保险, 失败不该毁已成功的 add)。返回 pinned/present/None。"""
-    try:
-        if not _CATALOG_PATH or not os.path.isfile(_CATALOG_PATH):
-            return None
-        cat = json.load(open(_CATALOG_PATH))
-        if not isinstance(cat, list):
-            return None
-        if any(isinstance(p, dict) and p.get("id") == cid for p in cat):
-            return "present"
-        cat.append({"id": cid, "scientific_name": sci or ""})
-        tmp = _CATALOG_PATH + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(cat, f, ensure_ascii=False)
-        os.replace(tmp, _CATALOG_PATH)
-        return "pinned"
-    except Exception as e:  # noqa: BLE001 —— pin 失败不影响已成功的 add
-        print(f"pin catalog id {cid} failed (non-fatal): {e}")
-        return None
-
-
 @app.post("/admin/knn/reload")
 async def admin_reload(x_vision_admin_token: str = Header(None)):
     """从盘热重载索引(全库 build / standalone incremental_add 改盘后免 restart 生效)。"""
@@ -186,10 +162,11 @@ async def admin_add(catalog_id: str, scientific_name: str = "", x_vision_admin_t
         # 不占 identify 的 _SEM: 下载 external(curl 可慢/超时到 25s×N)期间不该卡住 identify 嵌入
         # (否则 Go 侧等 vision 超时, Codex #116)。并发上界仍受控: _WRITE_LOCK 串行 add(≤1) +
         # identify _SEM=1(≤1) → 至多 2 个并发嵌入; 模型只读前向线程安全、激活内存有界(<MemoryMax)。
+        # catalog_path/sci: 核心在同一 flock 内写索引后 pin 进 build catalog(原子, 防陈旧 fold 抹掉)。
         stats = await asyncio.to_thread(
-            add_plant_to_index, INDEX_DIR, catalog_id, _CDN, vision_embed.embed_path)
+            add_plant_to_index, INDEX_DIR, catalog_id, _CDN, vision_embed.embed_path,
+            catalog_path=_CATALOG_PATH, sci=scientific_name)
         if stats.get("added", 0) > 0:
-            stats["pinned"] = await asyncio.to_thread(_pin_catalog_id, catalog_id, scientific_name)
             count = await _reload_locked()
         else:
             count = stats.get("count")

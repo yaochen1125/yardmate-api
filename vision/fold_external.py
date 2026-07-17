@@ -193,24 +193,61 @@ def main(index_dir, catalog_path, out_dir, cdn, supp_dir=None):
         print(f"剔除已删 id 的过时 base 向量: {stale_base}", flush=True)
     keep = [(base_vecs[i], mapping[i]) for i in range(base)
             if i not in drop and mapping[i]["catalog_id"] in current]
-    new_vecs = [v for v, _ in keep] + [v for v, _ in add]
-    new_map = [m for _, m in keep] + [{"catalog_id": c, "src": "ext"} for _, c in add]
-    N = len(new_vecs)
-    idx = hnswlib.Index(space="cosine", dim=dim)
-    idx.init_index(max_elements=N + 10, ef_construction=200, M=32); idx.set_ef(64)
-    idx.add_items(np.vstack(new_vecs), np.arange(N))
-    nm = dict(meta); nm["count"] = N
-    nm["catalog_ids"] = sorted(set(m["catalog_id"] for m in new_map))
-    # 原子写, meta 最后(build_index 同幂等约定)。★三文件写在 {out_dir}/.write.lock 内 —— 与飞轮
-    #   增量 add(incremental.add_plant_to_index 持同锁)互斥, 防全库 build 的 fold 写与增量 add 交错
-    #   写导致 index.bin 与 mapping.json 向量数错配(见 KNN_FLYWHEEL_SPEC.md「Piece 2 并发/锁」)。
-    #   惰性导入避免 incremental<->fold_external 循环导入。
+    fold_vecs = [v for v, _ in keep] + [v for v, _ in add]
+    fold_map = [m for _, m in keep] + [{"catalog_id": c, "src": "ext"} for _, c in add]
+    # ★建索引 + 三文件写 全部在 {out_dir}/.write.lock 内 —— 与飞轮增量 add(incremental.add_plant_to_index
+    #   持同锁)互斥。仅锁写会 index/mapping 错配; 更要命的是**陈旧 fold 覆盖抹掉并发 admin/add**(Codex
+    #   #116 P1): fold 用启动时的 catalog 快照算 fold_map, 运行期间(分钟级)admin/add 可能已把新株加进
+    #   当前 serve 索引 + pin 进 catalog(二者在 add 的同一 flock 内原子完成)。这里在锁内 _carry_admin_adds:
+    #   重读**当前 serve 索引 + 新鲜 catalog**, 把「新鲜 catalog 认、external-only、fold 没算到」的 cid 的
+    #   向量搬进来, 再建索引 —— 不复活已删株(仍受新鲜 catalog 门), 不丢飞轮增量成果。惰性导入避免循环。
     from incremental import _write_lock
     with _write_lock(out_dir):
+        cvecs, cmap = _carry_admin_adds(out_dir, catalog_path, {m["catalog_id"] for m in fold_map}, dim)
+        new_vecs = fold_vecs + cvecs
+        new_map = fold_map + cmap
+        N = len(new_vecs)
+        idx = hnswlib.Index(space="cosine", dim=dim)
+        idx.init_index(max_elements=N + 10, ef_construction=200, M=32); idx.set_ef(64)
+        idx.add_items(np.vstack(new_vecs), np.arange(N))
+        nm = dict(meta); nm["count"] = N
+        nm["catalog_ids"] = sorted(set(m["catalog_id"] for m in new_map))
+        # 原子写, meta 最后(build_index 同幂等约定)。
         idx.save_index(f"{out_dir}/index.bin.tmp"); os.replace(f"{out_dir}/index.bin.tmp", f"{out_dir}/index.bin")
         _atomic_json(new_map, f"{out_dir}/mapping.json")
         _atomic_json(nm, f"{out_dir}/meta.json")
+    if cvecs:
+        print(f"carry 并发 admin/add: {len(cvecs)} 向量 / {len(set(m['catalog_id'] for m in cmap))} ids", flush=True)
     print(f"final: {N} vecs / {len(nm['catalog_ids'])} ids (原 {base}/{len(set(meta['catalog_ids']))})", flush=True)
+
+
+def _carry_admin_adds(out_dir, catalog_path, fold_cids, dim):
+    """在写锁内: 把当前 serve 索引里「新鲜 catalog 认、external-only(src==ext)、fold 没算到(不在 fold_cids)」
+    的 cid 的向量搬出来, 供并进新 fold 索引 —— 兜住 fold 运行期间并发 admin/add 加的新株, 防陈旧 fold
+    覆盖抹掉(Codex #116 P1)。不复活已删株: 仍要求 cid 在**新鲜重读**的 catalog 里(admin/add 在同一 flock
+    内已 pin, 故索引有 cid ⟺ catalog 有 cid, 一致可见)。任何异常 → carry 空(降级为原 fold 行为, 不崩)。
+    返回 (vecs:list[np.float32], map:list[dict])。"""
+    try:
+        idx_path = f"{out_dir}/index.bin"
+        map_path = f"{out_dir}/mapping.json"
+        if not (os.path.isfile(idx_path) and os.path.isfile(map_path) and os.path.isfile(catalog_path)):
+            return [], []
+        fresh = {p["id"] for p in json.load(open(catalog_path)) if isinstance(p, dict) and p.get("id")}
+        cur_map = json.load(open(map_path))
+        want = [i for i, m in enumerate(cur_map)
+                if m.get("src") == "ext" and m.get("catalog_id") in fresh
+                and m.get("catalog_id") not in fold_cids]
+        if not want:
+            return [], []
+        cur = hnswlib.Index(space="cosine", dim=dim)
+        cur.load_index(idx_path)
+        if max(want) >= cur.get_current_count():   # mapping 与索引不一致 → 稳妥放弃 carry
+            return [], []
+        vecs = [np.asarray(v, dtype=np.float32) for v in cur.get_items(want)]
+        return vecs, [{"catalog_id": cur_map[i]["catalog_id"], "src": "ext"} for i in want]
+    except Exception as e:  # noqa: BLE001 —— carry 是兜底增强, 失败降级为原 fold 行为(不崩全库 build)
+        print("  _carry_admin_adds 跳过(非致命):", e, flush=True)
+        return [], []
 
 
 R2_EXTERNAL_PREFIX = "r2:yardmate-static/plant_images/"

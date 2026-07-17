@@ -56,6 +56,28 @@ def _save_index(index_dir, idx, mapping, meta):
     _atomic_json(meta, f"{index_dir}/meta.json", indent=2)
 
 
+def _pin_catalog(catalog_path, cid, sci):
+    """把 cid(+sci) 记进 build 用的 plants_index.json —— 否则后续全库 build 的 fold catalog 门(用可能
+    过时的 plants_index)会把这个未同步进来的新 id 当已删 id drop 掉 → 增量成果被抹(Codex #116)。
+    ★由 add_plant_to_index 在**同一 flock 内**、写索引之后调 → 索引有 cid 与 catalog 有 cid 对并发 fold
+    原子可见(fold 在锁内重读 catalog + carry 时看到一致状态)。幂等; 缺文件/异常只 warn(pin 是保险)。
+    返回 pinned/present/None。"""
+    try:
+        if not catalog_path or not os.path.isfile(catalog_path):
+            return None
+        cat = json.load(open(catalog_path))
+        if not isinstance(cat, list):
+            return None
+        if any(isinstance(p, dict) and p.get("id") == cid for p in cat):
+            return "present"
+        cat.append({"id": cid, "scientific_name": sci or ""})
+        _atomic_json(cat, catalog_path, ensure_ascii=False)
+        return "pinned"
+    except Exception as e:  # noqa: BLE001 —— pin 失败不影响已成功的 add
+        print("pin catalog id", cid, "failed (non-fatal):", e, flush=True)
+        return None
+
+
 def _external_vecs(cid, cdn, embed_fn, tmp_dir, max_external=MAX_EXTERNAL):
     """下载 {cdn}/{cid}/external/{i}.png 真照并嵌入, 同株内去近重复。返回 [np.float32 vec]。
     只 external/(P0: 绝不碰 {id}/{slot}.png 生成主图)。"""
@@ -77,11 +99,13 @@ def _external_vecs(cid, cdn, embed_fn, tmp_dir, max_external=MAX_EXTERNAL):
 
 
 def add_plant_to_index(index_dir, cid, cdn, embed_fn, *, tmp_dir="/tmp/incremental_add",
-                       max_external=MAX_EXTERNAL):
+                       max_external=MAX_EXTERNAL, catalog_path=None, sci=""):
     """把 cid 的 external 真照加进 index_dir 的索引(原地, 原子写)。幂等:
       - cid 不在索引 → resize_index + add_items(快路径)。
       - cid 已在索引(re-trigger/重试) → drop 该 cid 旧向量 + 重建(保留其余) → 刷新。
-    返回 stats dict。整个 load→写在 flock 内, 与全库 fold 写互斥。"""
+    catalog_path(可选): 写索引后在**同一 flock 内**把 cid(+sci) pin 进该 plants_index.json,
+      防陈旧 fold 覆盖抹掉(见 _pin_catalog / Codex #116)。给了才 pin(standalone 手测可不给)。
+    返回 stats dict。整个 load→写(+pin)在 flock 内, 与全库 fold 的 carry+写互斥。"""
     with _write_lock(index_dir):
         meta = json.load(open(f"{index_dir}/meta.json"))
         mapping = json.load(open(f"{index_dir}/mapping.json"))
@@ -132,5 +156,7 @@ def add_plant_to_index(index_dir, cid, cdn, embed_fn, *, tmp_dir="/tmp/increment
         new_meta["count"] = N
         new_meta["catalog_ids"] = sorted(set(m["catalog_id"] for m in new_map))
         _save_index(index_dir, idx, new_map, new_meta)
-        return {"cid": cid, "added": len(evs), "count": N, "mode": mode,
+        # pin 进 build catalog —— 仍在 flock 内 → 索引写 + catalog pin 对并发 fold 原子可见(见 docstring)。
+        pinned = _pin_catalog(catalog_path, cid, sci) if catalog_path else None
+        return {"cid": cid, "added": len(evs), "count": N, "mode": mode, "pinned": pinned,
                 "in_catalog_ids": cid in set(new_meta["catalog_ids"])}
