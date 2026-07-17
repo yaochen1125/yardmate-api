@@ -203,7 +203,8 @@ def main(index_dir, catalog_path, out_dir, cdn, supp_dir=None):
     #   向量搬进来, 再建索引 —— 不复活已删株(仍受新鲜 catalog 门), 不丢飞轮增量成果。惰性导入避免循环。
     from incremental import _write_lock
     with _write_lock(out_dir):
-        cvecs, cmap = _carry_admin_adds(out_dir, catalog_path, {m["catalog_id"] for m in fold_map}, dim)
+        cvecs, cmap = _carry_admin_adds(out_dir, catalog_path, {m["catalog_id"] for m in fold_map},
+                                        current, dim)
         new_vecs = fold_vecs + cvecs
         new_map = fold_map + cmap
         N = len(new_vecs)
@@ -221,12 +222,16 @@ def main(index_dir, catalog_path, out_dir, cdn, supp_dir=None):
     print(f"final: {N} vecs / {len(nm['catalog_ids'])} ids (原 {base}/{len(set(meta['catalog_ids']))})", flush=True)
 
 
-def _carry_admin_adds(out_dir, catalog_path, fold_cids, dim):
-    """在写锁内: 把当前 serve 索引里「新鲜 catalog 认、external-only(src==ext)、fold 没算到(不在 fold_cids)」
-    的 cid 的向量搬出来, 供并进新 fold 索引 —— 兜住 fold 运行期间并发 admin/add 加的新株, 防陈旧 fold
-    覆盖抹掉(Codex #116 P1)。不复活已删株: 仍要求 cid 在**新鲜重读**的 catalog 里(admin/add 在同一 flock
-    内已 pin, 故索引有 cid ⟺ catalog 有 cid, 一致可见)。任何异常 → carry 空(降级为原 fold 行为, 不崩)。
-    返回 (vecs:list[np.float32], map:list[dict])。"""
+def _carry_admin_adds(out_dir, catalog_path, fold_cids, fold_current, dim):
+    """在写锁内: 把当前 serve 索引里的 external-only(src==ext) 向量里, 属于「fold 本轮**根本没见过**的
+    并发 admin/add 新株」的搬出来, 供并进新 fold 索引 —— 兜住 fold 运行期间并发 admin/add 加的新株,
+    防陈旧 fold 覆盖抹掉(Codex #116 P1)。判据(三者皆需):
+      - cid 在**新鲜重读**的 catalog 里(fresh): 不复活已删株(admin/add 同 flock 内已 pin, 索引有 cid ⟺ catalog 有 cid)。
+      - cid 不在 fold_cids: fold 本轮没给它产出向量。
+      - **cid 不在 fold_current**(fold 启动时的 catalog 快照): fold 本轮**没见过**它 → 它缺席是「快照陈旧」
+        而非「fold 见过它、但故意给 0 向量(如 external 被删/失效)」。少了这条会把「fold 已决定丢弃的
+        0-iNat 陈旧 external」当 admin/add 错误搬回(Codex #116 四轮 P2)。
+    任何异常 → carry 空(降级为原 fold 行为, 不崩)。返回 (vecs, map)。"""
     try:
         idx_path = f"{out_dir}/index.bin"
         map_path = f"{out_dir}/mapping.json"
@@ -236,7 +241,8 @@ def _carry_admin_adds(out_dir, catalog_path, fold_cids, dim):
         cur_map = json.load(open(map_path))
         want = [i for i, m in enumerate(cur_map)
                 if m.get("src") == "ext" and m.get("catalog_id") in fresh
-                and m.get("catalog_id") not in fold_cids]
+                and m.get("catalog_id") not in fold_cids
+                and m.get("catalog_id") not in fold_current]
         if not want:
             return [], []
         cur = hnswlib.Index(space="cosine", dim=dim)
