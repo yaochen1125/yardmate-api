@@ -38,6 +38,14 @@ server {
         proxy_pass http://127.0.0.1:8080;
     }
 
+    # 运维动作入口：告警邮件里的按钮打到这里（deploy/ops-agent/）。ops-agent
+    # 只监听 127.0.0.1，链接带 HMAC 签名 + 一次性 token，GET 只出确认页。
+    location /ops/ {
+        limit_req zone=ops_rl burst=5 nodelay;
+
+        proxy_pass http://127.0.0.1:8090;
+    }
+
     # 其余一律不转发（含 /internal/*）。404 而非 403：不确认路径是否存在。
     location / {
         return 404;

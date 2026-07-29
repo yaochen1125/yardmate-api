@@ -28,6 +28,8 @@ MANIFEST=(
     "watchdog/yardmate-notify.sh|/usr/local/bin/yardmate-notify.sh|755"
     "watchdog/yardmate-healthcheck.service|/etc/systemd/system/yardmate-healthcheck.service|644"
     "watchdog/yardmate-healthcheck.timer|/etc/systemd/system/yardmate-healthcheck.timer|644"
+    "ops-agent/yardmate-ops-agent.py|/usr/local/bin/yardmate-ops-agent.py|755"
+    "ops-agent/yardmate-ops-agent.service|/etc/systemd/system/yardmate-ops-agent.service|644"
 )
 
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; RST=$'\033[0m'
