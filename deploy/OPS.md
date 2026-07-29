@@ -9,7 +9,7 @@
 
 | repo | 服务器 | 是什么 |
 |---|---|---|
-| `nginx/api.yardmate.ai` | `/etc/nginx/sites-enabled/api.yardmate.ai` | API 反代到 `127.0.0.1:8080`，限流、9M body cap |
+| `nginx/api.yardmate.ai` | `/etc/nginx/sites-available/api.yardmate.ai` | API 反代到 `127.0.0.1:8080`，限流、9M body cap、路径白名单 |
 | `nginx/yardmate.ai` | `/etc/nginx/sites-available/yardmate.ai` | 官网静态站 + `/content/` 同源反代 CDN |
 | `nginx/api-staging.yardmate.ai` | `/etc/nginx/sites-available/api-staging.yardmate.ai` | staging API 反代到 `127.0.0.1:8081` |
 | `nginx/conf.d/ratelimit.conf` | `/etc/nginx/conf.d/ratelimit.conf` | 限流 zone 定义（被 api vhost 引用） |
@@ -38,17 +38,30 @@ ssh root@5.78.183.252 'systemctl daemon-reload && systemctl reload nginx'
 
 **定期跑 `--check`。** 把文件塞进 git 只解决了「有备份」，没解决「git 里这份是不是真的」。只要有人 ssh 上去顺手改一行，repo 就变成一份看起来权威、实际过期的假真相 —— 下次照着它 `--push` 会把线上的修复覆盖掉。
 
-## 两个陷阱
+## 三个陷阱
 
-### 1. `sites-enabled/api.yardmate.ai` 是普通文件，不是 symlink
+### 1. 公网只放行 `/v1/*` 和 `/healthz`
 
-另外两个 vhost 都是 `sites-enabled/x -> sites-available/x` 的软链，唯独 api 这个是**独立的普通文件**，而 `sites-available/` 里还躺着一份同名的影子副本。
+`server.go` 和 `proxy/imageingest/SPEC.md` 都写着 `/internal/*` 是「internal-only, behind nginx」「unreachable externally even before the token check」，并**据此让 `/internal/imageingest/run` 故意不挂限流中间件**。
 
-**改影子那份不会生效。** 目前两份内容一致，但一旦有人改错地方，就会出现「明明改了却没效果」的鬼故事。`--check` 每次都会检测这两份是否分叉。
+但两个 vhost 此前都是 `location /` 全转发，那个前提根本不成立 —— 该端点公网可达且零限流，只剩 admin token 一道防线（实测返回 401 而非 404）。这不是「有人写错了」，是文档描述的边界从来没有被真正实现过。
 
-要根治就把它换成 symlink（`--check` 会识别并报「问题不存在了」），但那是个独立的改动，需要单独验证。
+现在改成显式白名单，其余路径（含 `/internal/*`）一律 404。运维要用内部端点，**在服务器本机调**：
 
-### 2. nginx 的 upstream 别写字面域名
+```bash
+curl -X POST -H "X-Ingest-Admin-Token: $TOKEN" \
+  'http://127.0.0.1:8080/internal/imageingest/run?slug=xxx&name=Xxx+yyy'
+```
+
+**以后往 `/v1` 之外挂新路由，记得同步改这里，否则它不会被公网访问到。** 这是有意的默认拒绝。
+
+### 2. `sites-enabled` 三个 vhost 现在都是 symlink
+
+历史上 `api.yardmate.ai` 在 `sites-enabled` 里是**独立的普通文件**，而 `sites-available` 里还躺着一份同名影子副本 —— 改影子那份不生效，会出现「明明改了却没效果」的鬼故事。
+
+**已根治**：转换前先 `diff` 确认两份一致，再换成 symlink。`--check` 保留了这项检测（会报「问题不存在了」），万一将来有人又把它改回普通文件，能立刻发现。
+
+### 3. nginx 的 upstream 别写字面域名
 
 `proxy_pass https://images.yardmate.ai/...` 这种**字面域名**，nginx 会在**启动时**强制解析，解析不出来就 `[emerg] host not found in upstream`，**拒绝启动整个 nginx** —— 不是只让那一个 location 失败。
 
