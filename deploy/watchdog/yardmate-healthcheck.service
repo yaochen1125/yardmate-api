@@ -1,0 +1,5 @@
+[Unit]
+Description=YardMate healthz watchdog
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/yardmate-healthcheck.sh

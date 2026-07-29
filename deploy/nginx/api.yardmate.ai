@@ -1,0 +1,47 @@
+# proxy_pass to yardmate-api on 127.0.0.1:8080 (prod; ATTEST_ALLOW_DEV=false).
+server {
+    server_name api.yardmate.ai;
+
+    # Match the Go handler's identifyMaxBody (8 MB image + 1 MB multipart
+    # overhead). Was 5M, which silently 413'd legitimate 5–8 MB photos before
+    # they reached the app; the app's MaxBytesReader is now the single cap.
+    client_max_body_size 9M;
+
+    access_log /var/log/nginx/api.yardmate.ai.access.log;
+    error_log  /var/log/nginx/api.yardmate.ai.error.log warn;
+
+    # Flood shield (loose — see conf.d/ratelimit.conf). Trips only on volumetric
+    # abuse; precise bounds are the Go inflight semaphore + rate limiters. 429 so
+    # the iOS client maps it to .rateLimit ("slow down") rather than a hard error.
+    limit_req_status 429;
+    limit_conn_status 429;
+
+    location / {
+        limit_req  zone=api_rl burst=60 nodelay;
+        limit_conn api_conn 50;
+
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    listen [::]:443 ssl ipv6only=on; # managed by Certbot
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/api.yardmate.ai/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/api.yardmate.ai/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+}
+
+server {
+    if ($host = api.yardmate.ai) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+    listen 80;
+    listen [::]:80;
+    server_name api.yardmate.ai;
+    return 404; # managed by Certbot
+}
