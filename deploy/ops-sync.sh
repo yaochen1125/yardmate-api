@@ -19,7 +19,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # repo 相对路径 | 服务器绝对路径 | 权限
 MANIFEST=(
-    "nginx/api.yardmate.ai|/etc/nginx/sites-enabled/api.yardmate.ai|644"
+    "nginx/api.yardmate.ai|/etc/nginx/sites-available/api.yardmate.ai|644"
     "nginx/yardmate.ai|/etc/nginx/sites-available/yardmate.ai|644"
     "nginx/api-staging.yardmate.ai|/etc/nginx/sites-available/api-staging.yardmate.ai|644"
     "nginx/conf.d/ratelimit.conf|/etc/nginx/conf.d/ratelimit.conf|644"
@@ -55,12 +55,15 @@ check_shadow() {
         else
             echo NO_SHADOW
         fi' 2>/dev/null)
+    # 返回值必须被 do_check 计入 drift：否则「所有 manifest 文件都一致、只有影子
+    # 副本分叉」时会打印红叉却 exit 0，例行 --check 恰好告不了这个警 —— 而它正是
+    # 为此加的。
     case "$out" in
-        SYMLINK_NOW)     ok    "api.yardmate.ai 已是 symlink，影子副本问题不存在了" ;;
-        SHADOW_SAME)     warn  "sites-available/api.yardmate.ai 是影子副本（当前内容一致，但改它不生效 —— 要改请改 sites-enabled 那份）" ;;
-        SHADOW_DIVERGED) bad   "sites-available/api.yardmate.ai 与生效版本已分叉！有人改错了地方，改动没生效" ;;
-        NO_SHADOW)       ok    "无影子副本" ;;
-        *)               bad   "影子副本检查失败（连不上服务器？）" ;;
+        SYMLINK_NOW)     ok    "api.yardmate.ai 已是 symlink，影子副本问题不存在了"; return 0 ;;
+        SHADOW_SAME)     warn  "sites-available/api.yardmate.ai 是影子副本（当前内容一致，但改它不生效 —— 要改请改 sites-enabled 那份）"; return 0 ;;
+        SHADOW_DIVERGED) bad   "sites-available/api.yardmate.ai 与生效版本已分叉！有人改错了地方，改动没生效"; return 1 ;;
+        NO_SHADOW)       ok    "无影子副本"; return 0 ;;
+        *)               bad   "影子副本检查失败（连不上服务器？）"; return 1 ;;
     esac
 }
 
@@ -90,7 +93,7 @@ do_check() {
         rm -f "$remote_tmp"
     done
     echo
-    check_shadow
+    check_shadow || drift=1
     echo
     if [ "$drift" -eq 0 ]; then
         ok "无漂移：repo 与服务器一致"
@@ -101,21 +104,46 @@ do_check() {
 }
 
 do_pull() {
+    # 任何一个文件没拉下来都必须让整体失败：否则 repo 里会留下「一半新一半旧」
+    # 的混合快照，而输出说「拉取完成」、退出码还是 0 —— 有人照着它 commit，
+    # git 里那份就成了从未真实存在过的服务器状态。
+    local failed=0
     for entry in "${MANIFEST[@]}"; do
         IFS='|' read -r rel remote _mode <<< "$entry"
         mkdir -p "$(dirname "$HERE/$rel")"
         if scp -q "$HOST:$remote" "$HERE/$rel"; then
             ok "拉回 $rel"
         else
-            bad "拉取失败 $rel"
+            bad "拉取失败 $rel（repo 里仍是旧内容）"; failed=1
         fi
     done
     chmod +x "$HERE"/watchdog/*.sh 2>/dev/null
-    echo; ok "拉取完成 —— 用 git diff 看服务器上都被手改了什么"
+    echo
+    if [ "$failed" -eq 0 ]; then
+        ok "拉取完成 —— 用 git diff 看服务器上都被手改了什么"
+        return 0
+    fi
+    bad "拉取不完整 —— repo 现在是新旧混合快照，别 commit，修好连接后重跑"
+    return 1
+}
+
+rollback_push() {
+    local backup_dir="$1"
+    for entry in "${MANIFEST[@]}"; do
+        IFS='|' read -r _rel remote _mode <<< "$entry"
+        local flat="$backup_dir/$(echo "$remote" | tr / _)"
+        ssh -o ConnectTimeout=12 "$HOST" \
+            "[ -f '$flat' ] && cp -a '$flat' '$remote' || true"
+    done
+    if ssh -o ConnectTimeout=12 "$HOST" 'nginx -t >/dev/null 2>&1'; then
+        ok "已回滚，配置恢复可用（线上未 reload，本就没受影响）"
+    else
+        bad "回滚后 nginx -t 仍失败 —— 需要人工上机处理，备份在 $backup_dir"
+    fi
 }
 
 do_push() {
-    local stamp backup_dir
+    local stamp backup_dir failed=0
     stamp=$(date +%Y%m%d-%H%M%S)
     backup_dir="/root/ops-sync-backups/$stamp"
     ssh -o ConnectTimeout=12 "$HOST" "mkdir -p '$backup_dir'" || { bad "无法在服务器建备份目录"; return 1; }
@@ -123,7 +151,7 @@ do_push() {
     for entry in "${MANIFEST[@]}"; do
         IFS='|' read -r rel remote mode <<< "$entry"
         local local_file="$HERE/$rel"
-        [ -f "$local_file" ] || { bad "跳过 $rel（repo 里没有）"; continue; }
+        [ -f "$local_file" ] || { bad "$rel — repo 里没有这个文件"; failed=1; continue; }
         # 先备份线上原件（扁平化文件名，避免目录层级）
         ssh -o ConnectTimeout=12 "$HOST" \
             "[ -f '$remote' ] && cp -a '$remote' '$backup_dir/$(echo "$remote" | tr / _)' || true"
@@ -131,34 +159,34 @@ do_push() {
            ssh -o ConnectTimeout=12 "$HOST" "chmod $mode '$remote'"; then
             ok "推送 $rel → $remote"
         else
-            bad "推送失败 $rel"
+            bad "推送失败 $rel"; failed=1
         fi
     done
 
+    # 任何一个文件没推成功就整体回滚。半推上去的状态最危险：nginx -t 可能对着
+    # 旧文件通过（watchdog 脚本 / systemd unit 更是 nginx -t 根本不校验的），
+    # 于是脚本报成功、还叫人去 reload，实际生效的是一份没人设计过的混合配置。
+    if [ "$failed" -ne 0 ]; then
+        echo
+        bad "有文件未能推送 —— 整体回滚，不做部分部署"
+        rollback_push "$backup_dir"
+        return 1
+    fi
+
     echo
     echo "--- nginx -t ---"
-    if ssh -o ConnectTimeout=12 "$HOST" 'nginx -t' 2>&1 | tail -2; then
-        if ssh -o ConnectTimeout=12 "$HOST" 'nginx -t >/dev/null 2>&1'; then
-            ok "配置语法通过"
-            echo
-            warn "本脚本不会自动 reload。确认无误后手动执行："
-            echo "    ssh $HOST 'systemctl daemon-reload && systemctl reload nginx'"
-            echo "  （只改了 watchdog 脚本则无需 reload nginx；改了 .service/.timer/drop-in 需要 daemon-reload）"
-            echo "  备份在服务器 $backup_dir"
-            return 0
-        fi
+    ssh -o ConnectTimeout=12 "$HOST" 'nginx -t' 2>&1 | tail -2
+    if ssh -o ConnectTimeout=12 "$HOST" 'nginx -t >/dev/null 2>&1'; then
+        ok "配置语法通过"
+        echo
+        warn "本脚本不会自动 reload。确认无误后手动执行："
+        echo "    ssh $HOST 'systemctl daemon-reload && systemctl reload nginx'"
+        echo "  （只改了 watchdog 脚本则无需 reload nginx；改了 .service/.timer/drop-in 需要 daemon-reload）"
+        echo "  备份在服务器 $backup_dir"
+        return 0
     fi
     bad "nginx -t 未通过 —— 正在回滚"
-    for entry in "${MANIFEST[@]}"; do
-        IFS='|' read -r _rel remote _mode <<< "$entry"
-        ssh -o ConnectTimeout=12 "$HOST" \
-            "[ -f '$backup_dir/$(echo "$remote" | tr / _)' ] && cp -a '$backup_dir/$(echo "$remote" | tr / _)' '$remote' || true"
-    done
-    if ssh -o ConnectTimeout=12 "$HOST" 'nginx -t >/dev/null 2>&1'; then
-        ok "已回滚，配置恢复可用（线上未 reload，本就没受影响）"
-    else
-        bad "回滚后 nginx -t 仍失败 —— 需要人工上机处理，备份在 $backup_dir"
-    fi
+    rollback_push "$backup_dir"
     return 1
 }
 
