@@ -1,0 +1,53 @@
+server {
+    server_name yardmate.ai www.yardmate.ai;
+    root /var/www/yardmate;
+    index index.html;
+    access_log /var/log/nginx/yardmate.ai.access.log;
+    error_log  /var/log/nginx/yardmate.ai.error.log warn;
+    location / { try_files $uri $uri/ =404; }
+    # 反代 CDN 内容（含法律正文 privacy_policy.json/terms_of_use.json），让官网 JS
+    # 同源 fetch /content/*，避免跨域 CORS。CDN 仍是唯一数据源。
+    #
+    # upstream 走「变量 + resolver」而非字面域名：字面域名会在 nginx 启动时强制
+    # 解析，解析失败直接 [emerg] host not found in upstream 拒绝启动，整站（含
+    # api.yardmate.ai）陪葬。2026-07-28 06:03 UTC 就是这么挂了 22 小时。改成变量
+    # 后域名在请求期才解析，DNS 抖动最多让这一个 location 502，不影响 nginx 启动。
+    location ~ ^/content/(.*)$ {
+        resolver 127.0.0.53 valid=300s;
+        resolver_timeout 5s;
+        set $cdn_host images.yardmate.ai;
+        proxy_pass https://$cdn_host/content/$1$is_args$args;
+        proxy_set_header Host $cdn_host;
+        proxy_ssl_server_name on;
+        proxy_ssl_name $cdn_host;
+    }
+
+    listen [::]:443 ssl; # managed by Certbot
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/yardmate.ai/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/yardmate.ai/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+
+
+}
+server {
+    if ($host = www.yardmate.ai) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+
+    if ($host = yardmate.ai) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+
+    listen 80;
+    listen [::]:80;
+    server_name yardmate.ai www.yardmate.ai;
+    return 404; # managed by Certbot
+
+
+
+
+}

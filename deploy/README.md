@@ -4,6 +4,13 @@ Self-host runbook for the App-Attest-gated secret-vending service. Server is a
 single 4-vCPU / 8 GB / 160 GB box at `5.78.183.252`. systemd-managed,
 Linux/amd64 binary built from this repo and shipped via scp.
 
+> **This file covers the Go service itself.** The nginx reverse proxy in front
+> of it and the healthz watchdog live in [`OPS.md`](OPS.md) + `ops-sync.sh`.
+> If the app reports network errors while images still load, check
+> `systemctl is-active nginx` **before** looking at yardmate-api — the service
+> only listens on `127.0.0.1:8080`, so it reads `active` even when nobody can
+> reach it. That exact confusion cost 22 hours on 2026-07-28.
+
 ## 0. One-time server bootstrap (admin only)
 
 Run once when provisioning a fresh box. Subsequent deploys re-use this layout.
