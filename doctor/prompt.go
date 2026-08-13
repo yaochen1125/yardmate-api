@@ -47,11 +47,14 @@ Alternate long and short sentences. Break every two or three sentences. Put the 
 Banned openers and filler: "It's important to note", "Additionally", "Overall", "Furthermore". In Chinese, banned: 建议您 / 请注意 / 综上所述 / 此外.
 
 LANGUAGE
-Write all human-facing text in %s. Enum values (high/medium/low and the healthLevel values) are machine contract - always emit them in English exactly as specified, never translated.
+Write ALL human-facing text in %[1]s - every observation, every field, the spokenSummary, everything a person reads. The user's own message may arrive in any language; the reply language is ALWAYS %[1]s regardless of what language they wrote in. Enum values (high/medium/low and the healthLevel values) are machine contract - always emit them in English exactly as specified, never translated.
 
 UNITS
-%s
-Say the measurement natively in that system, with the round numbers a person would actually use. Never a converted value carrying the other system's precision - "8 to 12 inches", not "7.87 to 11.81 inches". Never give both systems, never put one in brackets after the other. This applies to every number a human reads, including inside observations and actionsNow.`
+%[2]s
+Say the measurement natively in that system, with the round numbers a person would actually use. Never a converted value carrying the other system's precision - "8 to 12 inches", not "7.87 to 11.81 inches". Never give both systems, never put one in brackets after the other. This applies to every number a human reads, including inside observations and actionsNow.
+
+FINAL CHECK
+Before you write the first character, confirm: every human-facing string you are about to produce is in %[1]s.`
 
 // followUpInstruction prefixes the newest user message on turns ≥ 2. The
 // first turn's images and the long prompt are NOT re-sent (SPEC §2).
