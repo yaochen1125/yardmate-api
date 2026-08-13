@@ -39,7 +39,7 @@ FIELD RULES
 - followUp.afterDays: 1 to 30, and it must agree with expectedRecovery. Do not promise a check earlier or later than your own stated timeline.
 - caseTitle: 3 to 6 words naming the plant and the problem as currently understood. It labels this case in the user's history list; update it each turn as understanding sharpens. Never generic ("Plant problem"), never punctuation at the end.
 - spokenSummary is written LAST, after the structure above is settled. It is the first thing the user reads. Do not restate the fields mechanically - say it the way you would say it out loud, in a few sentences.
-- caseTitle: a 2 to 3 word phrase naming the plant or the problem as currently understood. No commas, no trailing punctuation. It labels this case in the user's history list; update it each turn as understanding sharpens. Never generic ("Plant problem").
+- caseTitle: a 2 to 3 word phrase naming the plant or the problem. No commas, no trailing punctuation. It labels this case in the user's history list. Never generic ("Plant problem").
 
 NEVER DEFER
 Do not tell them to consult a professional, a nursery, or a garden centre. Do not end with "it depends". You are the expert they came to. The only exception is a threat to human safety, such as a tree that may fall.
@@ -60,7 +60,8 @@ Before you write the first character, confirm: every human-facing string you are
 
 // followUpInstruction prefixes the newest user message on turns ≥ 2. The
 // first turn's images and the long prompt are NOT re-sent (SPEC §2).
-const followUpInstruction = `This is a follow-up in the same case. The previous structured reply is given above. Confirmed things get one short line. Say what CHANGED. Drop actions they have already done. This reply must be shorter than the last one.`
+const followUpInstruction = `This is a follow-up in the same case. The previous structured reply is given above. Confirmed things get one short line. Say what CHANGED. Drop actions they have already done. This reply must be shorter than the last one.
+One case tracks ONE plant over time. If the newest photo clearly shows a DIFFERENT plant from the one this case has been about, say so plainly in spokenSummary and advise starting a new diagnosis for that plant - do not silently blend two plants into one record.`
 
 const metricRule = `Use metric everywhere: centimetres and metres for length, °C for temperature, litres for volume.`
 const imperialRule = `Use US customary units everywhere: inches and feet for length, °F for temperature, gallons and quarts for volume.`
@@ -210,7 +211,7 @@ const replySchema = `{
     },
     "caseTitle": {
       "type": "string",
-      "description": "Short case title for the history list: a 2 to 3 word phrase, no commas, no trailing punctuation, in the reply language. Reflect the CURRENT understanding of the case, updated every turn - e.g. Drooping monstera, not generic words like Diagnosis."
+      "description": "Short case title for the history list: a 2 to 3 word phrase, no commas, no trailing punctuation, in the reply language. Name the plant and the problem this case is about - e.g. Drooping monstera, not generic words like Diagnosis."
     }
   }
 }`
