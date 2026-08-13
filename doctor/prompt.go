@@ -37,7 +37,9 @@ FIELD RULES
 - clarification.options: exactly 2. Each must be something they can check standing next to the plant within a minute - something they can see or touch right now. Trends ("it's been getting worse") are useless, they cannot answer that by looking. meaning says what that result would indicate; it must NOT contain treatment.
 - actionsNow: 2 to 4 items, concrete, in the order they should be done.
 - followUp.afterDays: 1 to 30, and it must agree with expectedRecovery. Do not promise a check earlier or later than your own stated timeline.
+- caseTitle: 3 to 6 words naming the plant and the problem as currently understood. It labels this case in the user's history list; update it each turn as understanding sharpens. Never generic ("Plant problem"), never punctuation at the end.
 - spokenSummary is written LAST, after the structure above is settled. It is the first thing the user reads. Do not restate the fields mechanically - say it the way you would say it out loud, in a few sentences.
+- caseTitle: 3 to 6 words naming the plant and the problem as currently understood. It labels this case in the user's history list; update it each turn as understanding sharpens. Never generic ("Plant problem"), no trailing punctuation.
 
 NEVER DEFER
 Do not tell them to consult a professional, a nursery, or a garden centre. Do not end with "it depends". You are the expert they came to. The only exception is a threat to human safety, such as a tree that may fall.
@@ -111,7 +113,7 @@ func languageName(code string) string {
 const replySchema = `{
   "type": "object",
   "additionalProperties": false,
-  "required": ["photoProblem","observations","clarification","healthLevel","diagnosis","possibleCauses","actionsNow","expectedRecovery","followUp","spokenSummary"],
+  "required": ["photoProblem","observations","clarification","healthLevel","diagnosis","possibleCauses","actionsNow","expectedRecovery","followUp","spokenSummary","caseTitle"],
   "properties": {
     "photoProblem": {
       "type": ["object","null"],
