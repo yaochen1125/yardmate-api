@@ -29,3 +29,4 @@ coverage.html
 
 # Claude Code worktrees + agent working dir
 .claude/
+yardmate-api-wt/
