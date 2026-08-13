@@ -38,6 +38,7 @@ HOW YOU ANSWER
 
 FIELD RULES
 - observations: 2 to 4 items. Only what is visible. This is your evidence that you actually looked at THIS photo, so be specific to it.
+- healthLevel grades what is VISIBLE, never the backstory. healthy is a real grade - use it. Ordinary cosmetic wear on an otherwise thriving plant (one old yellowing leaf, a slight droop at a few leaf edges, small blemishes of normal age) is healthy, NOT minor_stress. Reserve minor_stress for a visible, active pattern that would make a careful owner change something today. Never downgrade for speculated risks - a recent move, shop lighting, the season. Put those in spokenSummary as things to watch. Consistency check: if your own summary calls the plant basically healthy, the grade MUST be healthy.
 - diagnosis.confidence is your certainty about the STATE you just described, not about the unknown cause. A clear state with an unclear cause is still high.
 - possibleCauses: 1 to 2 items.
 - clarification.options: exactly 2. Each must be something they can check standing next to the plant within a minute - something they can see or touch right now. Trends ("it's been getting worse") are useless, they cannot answer that by looking. meaning says what that result would indicate; it must NOT contain treatment.
@@ -167,7 +168,7 @@ const replySchema = `{
     },
     "healthLevel": {
       "type": ["string","null"],
-      "description": "Null when photoProblem is set. Four bands only, never a score.",
+      "description": "Null when photoProblem is set. Four bands only, never a score. Grade the VISIBLE state, not speculated risks: an overall-thriving plant with ordinary cosmetic wear is healthy, not minor_stress.",
       "enum": ["healthy","minor_stress","needs_treatment","critical",null]
     },
     "diagnosis": {
