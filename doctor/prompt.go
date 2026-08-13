@@ -119,14 +119,14 @@ const replySchema = `{
       "additionalProperties": false,
       "required": ["reason","whatToShoot"],
       "properties": {
-        "reason": { "type": "string", "description": "Why this photo cannot be read." },
-        "whatToShoot": { "type": "string", "description": "Exactly what to photograph instead." }
+        "reason": { "type": "string", "description": "Why this photo cannot be read. In the reply language." },
+        "whatToShoot": { "type": "string", "description": "Exactly what to photograph instead. In the reply language." }
       }
     },
     "observations": {
       "type": "array",
-      "description": "2 to 4 items. Only what is visibly present in THIS photo, no interpretation.",
-      "items": { "type": "string" }
+      "description": "2 to 4 items. Only what is visibly present in THIS photo, no interpretation. Each item written in the reply language.",
+      "items": { "type": "string", "description": "In the reply language." }
     },
     "clarification": {
       "type": ["object","null"],
@@ -134,7 +134,7 @@ const replySchema = `{
       "additionalProperties": false,
       "required": ["action","options"],
       "properties": {
-        "action": { "type": "string", "description": "One thing to check, answerable within a minute standing next to the plant." },
+        "action": { "type": "string", "description": "One thing to check, answerable within a minute standing next to the plant. In the reply language." },
         "options": {
           "type": "array",
           "description": "Exactly 2 possible results of that check.",
@@ -143,8 +143,8 @@ const replySchema = `{
             "additionalProperties": false,
             "required": ["label","meaning"],
             "properties": {
-              "label": { "type": "string", "description": "The result as they would see or feel it." },
-              "meaning": { "type": "string", "description": "What that result indicates. No treatment." }
+              "label": { "type": "string", "description": "The result as they would see or feel it. In the reply language." },
+              "meaning": { "type": "string", "description": "What that result indicates. No treatment. In the reply language." }
             }
           }
         }
@@ -160,7 +160,7 @@ const replySchema = `{
       "additionalProperties": false,
       "required": ["primary","confidence"],
       "properties": {
-        "primary": { "type": "string", "description": "The plant's current STATE, not the hidden cause." },
+        "primary": { "type": "string", "description": "The plant's current STATE, not the hidden cause. In the reply language." },
         "confidence": { "type": "string", "enum": ["high","medium","low"], "description": "Certainty about the stated state, not about the cause." }
       }
     },
@@ -172,24 +172,24 @@ const replySchema = `{
         "additionalProperties": false,
         "required": ["cause","likelihood","why"],
         "properties": {
-          "cause": { "type": "string" },
+          "cause": { "type": "string", "description": "In the reply language." },
           "likelihood": { "type": "string", "enum": ["high","medium","low"] },
-          "why": { "type": "string", "description": "The reasoning, in plain words." }
+          "why": { "type": "string", "description": "The reasoning, in plain words. In the reply language." }
         }
       }
     },
     "actionsNow": {
       "type": ["array","null"],
-      "description": "2 to 4 concrete steps in the order to do them. Null when clarification or photoProblem is set.",
-      "items": { "type": "string" }
+      "description": "2 to 4 concrete steps in the order to do them. Null when clarification or photoProblem is set. Each step in the reply language.",
+      "items": { "type": "string", "description": "In the reply language." }
     },
     "expectedRecovery": {
       "type": ["object","null"],
       "additionalProperties": false,
       "required": ["shortTerm","longTerm"],
       "properties": {
-        "shortTerm": { "type": "string", "description": "What should change within hours to a day." },
-        "longTerm": { "type": "string", "description": "What to watch over the coming weeks, including what will NOT recover." }
+        "shortTerm": { "type": "string", "description": "What should change within hours to a day. In the reply language." },
+        "longTerm": { "type": "string", "description": "What to watch over the coming weeks, including what will NOT recover. In the reply language." }
       }
     },
     "followUp": {
@@ -197,9 +197,9 @@ const replySchema = `{
       "additionalProperties": false,
       "required": ["reminderTitle","afterDays","whatToLookFor"],
       "properties": {
-        "reminderTitle": { "type": "string", "description": "Reads as a reminder title." },
+        "reminderTitle": { "type": "string", "description": "Reads as a reminder title. In the reply language." },
         "afterDays": { "type": "integer", "description": "1 to 30, must agree with expectedRecovery." },
-        "whatToLookFor": { "type": "string", "description": "One checkable question." }
+        "whatToLookFor": { "type": "string", "description": "One checkable question. In the reply language." }
       }
     },
     "spokenSummary": {

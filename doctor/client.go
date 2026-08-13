@@ -286,6 +286,10 @@ func buildBody(req StreamRequest) ([]byte, error) {
 		// direct library use.
 		parts = append(parts, oaPart{Type: "text", Text: "Here is the plant."})
 	}
+	// 语言钉子放在整个上下文的最末：4o-mini 对远处的 system 指令服从性差，
+	// 用户英文输入会把早期字段拽成英文（staging 实测），最近的指令最有效。
+	parts = append(parts, oaPart{Type: "text",
+		Text: fmt.Sprintf("Reply entirely in %s. Every field, including observations.", languageName(req.Language))})
 	messages = append(messages, oaMessage{Role: "user", Content: parts})
 
 	body := oaRequest{
