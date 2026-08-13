@@ -72,6 +72,9 @@ type HistoryTurn struct {
 // StreamRequest is one upstream generation.
 type StreamRequest struct {
 	Model    string
+	// gpt-5 系列的思考档位。minimal 的产出是模板腔（真机对比 ChatGPT 实锤：
+	// 无机理、无重构、行动放之四海皆准），默认提到 low；vault DOCTOR_REASONING_EFFORT 可调。
+	ReasoningEffort string
 	Language string
 	Units    string
 	History  []HistoryTurn
@@ -323,10 +326,13 @@ func buildBody(req StreamRequest) ([]byte, error) {
 		Messages:       messages,
 	}
 	// Only the gpt-5 family accepts reasoning_effort; other models 400 on it.
-	// The task needs no long-chain reasoning, and minimal halves latency
-	// (14.9 s → 7.7 s measured on gpt-5 in the PoC).
+	// 默认 low：minimal 虽再省一半延迟，但产出是模板腔 —— 无机理、无重构、
+	// 看不出「无根插穗养一大冠叶子」这类照片里的显性问题（真机对比实锤）。
 	if strings.HasPrefix(req.Model, "gpt-5") {
-		body.ReasoningEffort = "minimal"
+		body.ReasoningEffort = req.ReasoningEffort
+		if body.ReasoningEffort == "" {
+			body.ReasoningEffort = "low"
+		}
 	}
 	return json.Marshal(body)
 }

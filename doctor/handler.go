@@ -55,10 +55,13 @@ type Service struct {
 	Client        *Client
 	Model         string // default model (vault DOCTOR_MODEL)
 	AllowOverride bool   // vault DOCTOR_ALLOW_MODEL_OVERRIDE; prod stays false
+	// gpt-5 系列的思考档位（vault DOCTOR_REASONING_EFFORT；空 = low）。
+	ReasoningEffort string
 }
 
 // NewService wires the streaming client. endpoint == "" → OpenAI.
 func NewService(apiKey, endpoint, model string, allowOverride bool) *Service {
+	// ReasoningEffort 由 main 从 vault 注入（可缺省）
 	if !modelWhitelist[model] {
 		if model != "" {
 			log.Printf("WARN: DOCTOR_MODEL %q not in whitelist; using gpt-4o-mini", model)
@@ -226,7 +229,8 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 
 		obsCount := 0
 		reply, usage, err := svc.Client.Stream(ctx, StreamRequest{
-			Model:    resolved,
+			ReasoningEffort: svc.ReasoningEffort,
+		Model:    resolved,
 			Language: lang,
 			Units:    units,
 			History:  history,
