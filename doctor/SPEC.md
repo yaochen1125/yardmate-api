@@ -143,6 +143,7 @@ via `r.Context()` — we stop paying for tokens nobody will read.
 
 | key                          | default       | meaning                          |
 |------------------------------|---------------|----------------------------------|
+| `DOCTOR_ENABLED`             | `false`       | master switch — deploying the binary must not open the paid surface by itself; staging validates with `true`, prod flips at iOS release |
 | `OPENAI_API_KEY`             | — (required)  | absent → route unregistered      |
 | `DOCTOR_MODEL`               | `gpt-4o-mini` | must be in whitelist, else default + WARN |
 | `DOCTOR_ALLOW_MODEL_OVERRIDE`| `false`       | dev/staging only; prod stays false |

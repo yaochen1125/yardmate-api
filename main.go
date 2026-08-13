@@ -679,6 +679,15 @@ func buildImageIngestService(vault *secrets.Vault, content *proxy.ContentIndex) 
 // override request in prod is silently ignored, never an error), and
 // DOCTOR_HOURLY_BUDGET for the endpoint's own spend bucket.
 func buildDoctorService(vault *secrets.Vault) (*doctor.Service, *ratelimit.Bucket) {
+	// 默认关（同 OOB_ESCAPE / VISION_KNN 的新功能惯例）：把「部署二进制」和
+	// 「开放付费端点」拆成两个动作。prod 的 vault 里本就有 OPENAI_API_KEY，
+	// 没有这道闸，任何一次常规部署都会顺手把新付费面推上公网 —— 客户端还没
+	// 发版、没人该调它的时候。staging 显式 DOCTOR_ENABLED=true 验证，
+	// app 版本准备上架时 prod 再翻开。
+	if !vault.GetBool("DOCTOR_ENABLED", false) {
+		log.Printf("doctor: disabled (DOCTOR_ENABLED unset/false); /v1/doctor not registered")
+		return nil, nil
+	}
 	openaiKey := vault.Get("OPENAI_API_KEY")
 	if openaiKey == "" {
 		log.Printf("WARN: OPENAI_API_KEY missing; /v1/doctor disabled")
