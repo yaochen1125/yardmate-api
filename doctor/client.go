@@ -34,7 +34,7 @@ const (
 	// responseHeaderTimeout caps the wait for OpenAI's response HEADERS.
 	// First content token typically arrives 1–3 s in; 20 s means a hung
 	// upstream fails fast enough that the client's spinner is still honest.
-	responseHeaderTimeout = 20 * time.Second
+	responseHeaderTimeout = 60 * time.Second
 
 	// streamTimeout caps the WHOLE generation. A reply is ~300–700 output
 	// tokens; even a slow model finishes far inside 180 s. The handler
