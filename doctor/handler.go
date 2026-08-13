@@ -57,6 +57,10 @@ type Service struct {
 	AllowOverride bool   // vault DOCTOR_ALLOW_MODEL_OVERRIDE; prod stays false
 	// gpt-5 系列的思考档位（vault DOCTOR_REASONING_EFFORT；空 = low）。
 	ReasoningEffort string
+	// FollowupModel：第 LeadTurns+1 轮起改用的省钱档（空 = 全程 Model）。
+	FollowupModel string
+	// LeadTurns：主力模型负责的前几轮，默认 2。
+	LeadTurns int
 }
 
 // NewService wires the streaming client. endpoint == "" → OpenAI.
@@ -78,11 +82,18 @@ func NewService(apiKey, endpoint, model string, allowOverride bool) *Service {
 // resolveModel applies an override request against policy. Unauthorized or
 // unknown overrides fall back silently to the default — a stale debug build
 // must degrade, not break (SPEC §2).
-func (s *Service) resolveModel(requested string) string {
-	if requested == "" || !s.AllowOverride || !modelWhitelist[requested] {
-		return s.Model
+// resolveModel picks the model for this turn.
+// 档位策略（用户拍板 2026-08-13）：前 LeadTurns 轮走主力模型（看图定性 +
+// 用户看着照片补充信息的关键轮），之后走 FollowupModel 省钱 —— 追问多是
+// 执行确认。debug 覆盖（仅 AllowOverride 环境）仍然最高优先。
+func (s *Service) resolveModel(requested string, priorTurns int) string {
+	if requested != "" && s.AllowOverride && modelWhitelist[requested] {
+		return requested
 	}
-	return requested
+	if s.FollowupModel != "" && priorTurns >= s.LeadTurns {
+		return s.FollowupModel
+	}
+	return s.Model
 }
 
 // Handle returns the /v1/doctor handler. Per-IP / per-device rate limits and
@@ -197,7 +208,7 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 			return
 		}
 
-		resolved := svc.resolveModel(model)
+		resolved := svc.resolveModel(model, len(history))
 
 		flusher, ok := w.(http.Flusher)
 		if !ok {
@@ -230,12 +241,12 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 		obsCount := 0
 		reply, usage, err := svc.Client.Stream(ctx, StreamRequest{
 			ReasoningEffort: svc.ReasoningEffort,
-		Model:    resolved,
-			Language: lang,
-			Units:    units,
-			History:  history,
-			UserText: text,
-			Images:   images,
+			Model:           resolved,
+			Language:        lang,
+			Units:           units,
+			History:         history,
+			UserText:        text,
+			Images:          images,
 		}, func(index int, s string) {
 			obsCount++
 			out.event("observation", map[string]any{"index": index, "text": s})
@@ -360,3 +371,6 @@ func isUUID(s string) bool {
 	}
 	return true
 }
+
+// ModelAllowed exposes the whitelist for config validation in main.
+func ModelAllowed(m string) bool { return modelWhitelist[m] }

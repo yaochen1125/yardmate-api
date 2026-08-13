@@ -253,18 +253,39 @@ func TestHandleUpstreamFailureIsSSEError(t *testing.T) {
 
 func TestModelOverridePolicy(t *testing.T) {
 	locked := NewService("k", "", "gpt-4o-mini", false)
-	if got := locked.resolveModel("gpt-4o"); got != "gpt-4o-mini" {
+	if got := locked.resolveModel("gpt-4o", 0); got != "gpt-4o-mini" {
 		t.Fatalf("override without permission resolved to %q", got)
 	}
 	open := NewService("k", "", "gpt-4o-mini", true)
-	if got := open.resolveModel("gpt-4o"); got != "gpt-4o" {
+	if got := open.resolveModel("gpt-4o", 0); got != "gpt-4o" {
 		t.Fatalf("permitted override resolved to %q", got)
 	}
-	if got := open.resolveModel("gpt-999-experimental"); got != "gpt-4o-mini" {
+	if got := open.resolveModel("gpt-999-experimental", 0); got != "gpt-4o-mini" {
 		t.Fatalf("non-whitelisted override resolved to %q — whitelist must bound dev spend", got)
 	}
-	if got := open.resolveModel(""); got != "gpt-4o-mini" {
+	if got := open.resolveModel("", 0); got != "gpt-4o-mini" {
 		t.Fatalf("empty override resolved to %q", got)
+	}
+}
+
+// 分轮模型：前 LeadTurns 轮主力档，之后省钱档；覆盖仍最高优先；
+// FollowupModel 未设 = 全程主力档（部署不配即旧行为）。
+func TestTurnBasedModelRouting(t *testing.T) {
+	svc := NewService("k", "", "gpt-5", false)
+	svc.FollowupModel = "gpt-5-mini"
+	svc.LeadTurns = 2
+	for prior, want := range map[int]string{0: "gpt-5", 1: "gpt-5", 2: "gpt-5-mini", 7: "gpt-5-mini"} {
+		if got := svc.resolveModel("", prior); got != want {
+			t.Fatalf("prior=%d resolved %q, want %q", prior, got, want)
+		}
+	}
+	svc.AllowOverride = true
+	if got := svc.resolveModel("gpt-4o-mini", 0); got != "gpt-4o-mini" {
+		t.Fatalf("override should beat routing, got %q", got)
+	}
+	plain := NewService("k", "", "gpt-5-mini", false)
+	if got := plain.resolveModel("", 9); got != "gpt-5-mini" {
+		t.Fatalf("unset followup must keep single-model behaviour, got %q", got)
 	}
 }
 

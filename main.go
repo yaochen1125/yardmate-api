@@ -699,9 +699,18 @@ func buildDoctorService(vault *secrets.Vault) (*doctor.Service, *ratelimit.Bucke
 		vault.Get("DOCTOR_MODEL"),
 		vault.GetBool("DOCTOR_ALLOW_MODEL_OVERRIDE", false),
 	)
+	// 分轮模型：前 LeadTurns 轮 DOCTOR_MODEL，之后 DOCTOR_FOLLOWUP_MODEL（未设 = 不分轮）
+	if fm := vault.Get("DOCTOR_FOLLOWUP_MODEL"); fm != "" {
+		if doctor.ModelAllowed(fm) {
+			svc.FollowupModel = fm
+		} else {
+			log.Printf("WARN: DOCTOR_FOLLOWUP_MODEL %q not in whitelist; ignoring", fm)
+		}
+	}
+	svc.LeadTurns = vaultIntOr(vault, "DOCTOR_LEAD_TURNS", 2)
 	budget := ratelimit.NewBucket(vaultIntOr(vault, "DOCTOR_HOURLY_BUDGET", defaultDoctorHourlyBudget), time.Hour)
-	log.Printf("doctor service ready: model=%s override=%v budget=%d/h",
-		svc.Model, svc.AllowOverride, vaultIntOr(vault, "DOCTOR_HOURLY_BUDGET", defaultDoctorHourlyBudget))
+	log.Printf("doctor service ready: model=%s followup=%s leadTurns=%d override=%v budget=%d/h",
+		svc.Model, svc.FollowupModel, svc.LeadTurns, svc.AllowOverride, vaultIntOr(vault, "DOCTOR_HOURLY_BUDGET", defaultDoctorHourlyBudget))
 	return svc, budget
 }
 
