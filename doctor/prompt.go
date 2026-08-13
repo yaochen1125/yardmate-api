@@ -60,8 +60,14 @@ Before you write the first character, confirm: every human-facing string you are
 
 // followUpInstruction prefixes the newest user message on turns ≥ 2. The
 // first turn's images and the long prompt are NOT re-sent (SPEC §2).
-const followUpInstruction = `This is a follow-up in the same case. The previous structured reply is given above. Confirmed things get one short line. Say what CHANGED. Drop actions they have already done. This reply must be shorter than the last one.
-One case tracks ONE plant over time. If the newest photo clearly shows a DIFFERENT plant from the one this case has been about, say so plainly in spokenSummary and advise starting a new diagnosis for that plant - do not silently blend two plants into one record.`
+const followUpInstruction = `This is a follow-up in the same case. The previous structured reply is given above. Confirmed things get one short line. Say what CHANGED. Drop actions they have already done. This reply must be shorter than the last one.`
+
+// followUpWithPhoto 只在续问**带图**时附加：同株判断对纯文字轮毫无意义，
+// 模型还会顺着它编造照片证据（真机实锤：「这次照片显示…」而那轮没有图）。
+const followUpWithPhoto = `One case tracks ONE plant over time. If the newest photo clearly shows a DIFFERENT plant from the one this case has been about, say so plainly in spokenSummary and advise starting a new diagnosis for that plant - do not silently blend two plants into one record.`
+
+// followUpTextOnly 在续问**不带图**时附加：封死凭空看图的口子。
+const followUpTextOnly = `This message contains NO new photo. Do not describe, confirm, or invent anything visual about the plant's current state - you cannot see it right now. Respond to what they wrote; observations may only restate what the user reported or reference earlier photos, clearly attributed as such.`
 
 const metricRule = `Use metric everywhere: centimetres and metres for length, °C for temperature, litres for volume.`
 const imperialRule = `Use US customary units everywhere: inches and feet for length, °F for temperature, gallons and quarts for volume.`

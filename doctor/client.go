@@ -270,7 +270,13 @@ func buildBody(req StreamRequest) ([]byte, error) {
 
 	var parts []oaPart
 	if len(req.History) > 0 {
-		parts = append(parts, oaPart{Type: "text", Text: followUpInstruction})
+		inst := followUpInstruction
+		if len(req.Images) > 0 {
+			inst += "\n" + followUpWithPhoto
+		} else {
+			inst += "\n" + followUpTextOnly
+		}
+		parts = append(parts, oaPart{Type: "text", Text: inst})
 	}
 	if req.UserText != "" {
 		parts = append(parts, oaPart{Type: "text", Text: req.UserText})
