@@ -206,7 +206,11 @@ const replySchema = `{
     },
     "spokenSummary": {
       "type": "string",
-      "description": "Written LAST. The first thing the user reads. A few spoken sentences, not a restatement of the fields."
+      "description": "Written LAST. The first thing the user reads. A few spoken sentences, not a restatement of the fields. In the reply language."
+    },
+    "caseTitle": {
+      "type": "string",
+      "description": "Short case title for the history list: a 2 to 3 word phrase, no commas, no trailing punctuation, in the reply language. Reflect the CURRENT understanding of the case, updated every turn - e.g. Drooping monstera, not generic words like Diagnosis."
     }
   }
 }`
