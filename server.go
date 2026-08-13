@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/yaochen1125/yardmate-api/attest"
+	"github.com/yaochen1125/yardmate-api/doctor"
 	"github.com/yaochen1125/yardmate-api/inflight"
 	"github.com/yaochen1125/yardmate-api/proxy"
 	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
@@ -32,6 +33,7 @@ type Server struct {
 	enrich   *enrichment.Service   // optional; nil disables /v1/plants/enrichment
 	enrichDB *enrichment.DB        // optional; shared Supabase pgx pool. nil disables POST /v1/account/delete
 	ingest   *imageingest.Service  // optional; nil disables POST /v1/plants/imageingest + /internal/imageingest/run
+	doctor   *doctor.Service       // optional; nil disables POST /v1/doctor (no OPENAI_API_KEY)
 	router   chi.Router
 }
 
@@ -56,6 +58,9 @@ func newServer(
 	ingest *imageingest.Service,
 	enrichDB *enrichment.DB,
 	inflightLim *inflight.Limiter,
+	doctorSvc *doctor.Service,
+	doctorInflight *inflight.Limiter,
+	doctorBudget *ratelimit.Bucket,
 ) *Server {
 	// Rose cultivar rerank is ON by default; ROSE_RERANK_ENABLED=false kill-switches it.
 	roseEnabled := vault.GetBool("ROSE_RERANK_ENABLED", true)
@@ -144,7 +149,7 @@ func newServer(
 		// /v1/account/delete also joins this group: it carries the same per-IP
 		// limit, passes through the per-device middleware (no device id → no-op,
 		// ratelimit/SPEC), and only needs the shared Supabase pool (enrichDB).
-		if plantNet != nil || plantID != nil || enrich != nil || ingest != nil || enrichDB != nil {
+		if plantNet != nil || plantID != nil || enrich != nil || ingest != nil || enrichDB != nil || doctorSvc != nil {
 			r.Group(func(r chi.Router) {
 				r.Use(ratelimit.PerDeviceMiddleware(lim.PerDevice, "rate_limit_device"))
 				// /v1/identify + /v1/diagnose each buffer the uploaded image
@@ -193,6 +198,26 @@ func newServer(
 				// shared Supabase pool is present (row deletes need it).
 				if enrichDB != nil {
 					r.Post("/account/delete", handleAccountDelete(vault, enrichDB))
+				}
+
+				// /v1/doctor — conversational diagnosis over SSE (doctor/SPEC.md).
+				// Inside the per-device group (same rate-limit posture as
+				// identify/diagnose) but with TWO deliberate separations:
+				//   - its own inflight limiter: an SSE stream holds its slot for
+				//     the full 5–15 s generation, so sharing the identify/diagnose
+				//     bound would let a handful of chat streams starve the scan
+				//     pipeline whose calls finish in ~3 s;
+				//   - its own hourly spend bucket: streamed vision-chat economics
+				//     differ from Plant.id calls, and neither traffic class may
+				//     exhaust the other's budget (doctor/SPEC.md §4).
+				// Consumed inside the handler AFTER validation, same rationale
+				// as spendGate above.
+				if doctorSvc != nil {
+					r.Group(func(r chi.Router) {
+						r.Use(inflight.Middleware(doctorInflight, "server_busy"))
+						doctorGate := ratelimit.GlobalGate(doctorBudget, "rate_limit_global")
+						r.Post("/doctor", doctor.Handle(doctorSvc, doctor.SpendGate(doctorGate)))
+					})
 				}
 			})
 		}
@@ -243,7 +268,7 @@ func newServer(
 	return &Server{
 		verifier: verifier, vault: vault, limiter: lim,
 		plantNet: plantNet, plantID: plantID, vision: vision, content: content,
-		enrich: enrich, enrichDB: enrichDB, ingest: ingest, router: r,
+		enrich: enrich, enrichDB: enrichDB, ingest: ingest, doctor: doctorSvc, router: r,
 	}
 }
 

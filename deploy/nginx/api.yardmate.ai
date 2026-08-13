@@ -31,6 +31,25 @@ server {
         proxy_pass http://127.0.0.1:8080;
     }
 
+    # /v1/doctor 是 SSE 流式端点（doctor/SPEC.md §3）。单独一个 location，因为
+    # 精确匹配不继承 /v1/ 前缀块的指令，限流必须重写一遍；额外三件事：
+    #   - proxy_buffering off：缓冲会把逐条到达的 observation 事件攒成一坨，
+    #     流式退化回 15 秒白等（Go 侧还发 X-Accel-Buffering: no 双保险）
+    #   - proxy_read_timeout 200s：默认 60s 对连续输出的流够用，但留出模型
+    #     偶发慢启动的余量；Go 侧 streamTimeout=180s 先于它掐断
+    #   - proxy_http_version 1.1 + Connection ""：SSE 走 keep-alive 长连接
+    location = /v1/doctor {
+        limit_req  zone=api_rl burst=60 nodelay;
+        limit_conn api_conn 50;
+
+        proxy_buffering    off;
+        proxy_read_timeout 200s;
+        proxy_http_version 1.1;
+        proxy_set_header   Connection "";
+
+        proxy_pass http://127.0.0.1:8080;
+    }
+
     location /v1/ {
         limit_req  zone=api_rl burst=60 nodelay;
         limit_conn api_conn 50;

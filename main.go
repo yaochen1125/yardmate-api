@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/yaochen1125/yardmate-api/attest"
+	"github.com/yaochen1125/yardmate-api/doctor"
 	"github.com/yaochen1125/yardmate-api/inflight"
 	"github.com/yaochen1125/yardmate-api/proxy"
 	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
@@ -63,6 +64,18 @@ const (
 	defaultMaxInflight     = 30
 	defaultInflightMaxWait = 200
 	defaultInflightWait    = 5 * time.Second
+
+	// Doctor's own concurrency bound (doctor/SPEC.md §4): each SSE stream
+	// holds its slot for the full 5–15 s generation, so the cap is far lower
+	// than identify/diagnose's — 4 concurrent generations is plenty at launch
+	// and keeps peak memory (cap × ≤9 MB upload) negligible.
+	defaultDoctorInflight     = 4
+	defaultDoctorInflightWait = 8
+
+	// Doctor's hourly call ceiling (vault DOCTOR_HOURLY_BUDGET overrides).
+	// Separate from the identify/diagnose budget: neither traffic class may
+	// exhaust the other's.
+	defaultDoctorHourlyBudget = 200
 
 	// Below this many remaining Pl@ntNet daily-quota requests, each identify
 	// WARN-logs so the server-side watcher can email before exhaustion
@@ -259,7 +272,18 @@ func main() {
 	log.Printf("inflight: maxConcurrent=%d maxWait=%d waitBudget=%s",
 		maxInflight, inflightMaxWait, inflightWait)
 
-	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim)
+	// /v1/doctor — conversational diagnosis (doctor/SPEC.md). Own inflight
+	// bound (SSE streams hold slots for the whole 5–15 s generation) and own
+	// hourly spend bucket; nil service (no OPENAI_API_KEY) leaves the route
+	// unregistered.
+	doctorSvc, doctorBudget := buildDoctorService(vault)
+	doctorInflight := inflight.New(
+		envIntOr("YARDMATE_API_DOCTOR_INFLIGHT_MAX", defaultDoctorInflight),
+		envIntOr("YARDMATE_API_DOCTOR_INFLIGHT_MAX_WAIT", defaultDoctorInflightWait),
+		inflightWait,
+	)
+
+	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim, doctorSvc, doctorInflight, doctorBudget)
 
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream) with 5 s headroom = 35 s base.
@@ -645,6 +669,31 @@ func buildImageIngestService(vault *secrets.Vault, content *proxy.ContentIndex) 
 	log.Printf("image ingest service ready: R2 bucket=%s ledger pool + iNat/Wikimedia cascade (allowAttribution=%v)",
 		r2Cfg.Bucket, cfg.AllowAttributionLicenses)
 	return imageingest.NewService(ingestor, adminToken)
+}
+
+// buildDoctorService wires POST /v1/doctor (doctor/SPEC.md). Needs only the
+// OpenAI key; absent → nil + WARN and the route stays unregistered (same
+// degrade pattern as the other optional services). All knobs read the vault,
+// not os.Getenv (Codex #23): DOCTOR_MODEL (whitelist-checked in NewService,
+// default gpt-4o-mini), DOCTOR_ALLOW_MODEL_OVERRIDE (dev/staging only — an
+// override request in prod is silently ignored, never an error), and
+// DOCTOR_HOURLY_BUDGET for the endpoint's own spend bucket.
+func buildDoctorService(vault *secrets.Vault) (*doctor.Service, *ratelimit.Bucket) {
+	openaiKey := vault.Get("OPENAI_API_KEY")
+	if openaiKey == "" {
+		log.Printf("WARN: OPENAI_API_KEY missing; /v1/doctor disabled")
+		return nil, nil
+	}
+	svc := doctor.NewService(
+		openaiKey,
+		"", // default OpenAI endpoint
+		vault.Get("DOCTOR_MODEL"),
+		vault.GetBool("DOCTOR_ALLOW_MODEL_OVERRIDE", false),
+	)
+	budget := ratelimit.NewBucket(vaultIntOr(vault, "DOCTOR_HOURLY_BUDGET", defaultDoctorHourlyBudget), time.Hour)
+	log.Printf("doctor service ready: model=%s override=%v budget=%d/h",
+		svc.Model, svc.AllowOverride, vaultIntOr(vault, "DOCTOR_HOURLY_BUDGET", defaultDoctorHourlyBudget))
+	return svc, budget
 }
 
 // vaultDurationOr / vaultIntOr read tuning knobs from the secrets Vault (the
