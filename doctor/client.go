@@ -63,6 +63,10 @@ type HistoryTurn struct {
 	User      string          `json:"user"`
 	HadImages bool            `json:"had_images"`
 	Reply     json.RawMessage `json:"reply"`
+	// SentAt：该轮发出的 epoch 秒。0 = 旧客户端没带，不标时间。
+	// 「一周后观察新芽」这类医嘱，模型必须知道用户是第二天回来的
+	// 还是十天后回来的 —— 相对时间由服务端换算后注入（见 relativeAge）。
+	SentAt int64 `json:"sent_at"`
 }
 
 // StreamRequest is one upstream generation.
@@ -255,6 +259,8 @@ func buildBody(req StreamRequest) ([]byte, error) {
 	messages := []oaMessage{
 		{Role: "system", Content: SystemPrompt(req.Language, req.Units)},
 	}
+	now := time.Now()
+	var lastSent time.Time
 	for _, h := range req.History {
 		line := h.User
 		if h.HadImages {
@@ -264,6 +270,14 @@ func buildBody(req StreamRequest) ([]byte, error) {
 				line = "[sent a photo] " + line
 			}
 		}
+		// 历史行前缀相对时间（[5 days ago]），最后一轮的时刻留给续问指令
+		if h.SentAt > 0 {
+			ts := time.Unix(h.SentAt, 0)
+			if ts.Before(now) {
+				line = "[" + relativeAge(now.Sub(ts)) + "] " + line
+				lastSent = ts
+			}
+		}
 		messages = append(messages, oaMessage{Role: "user", Content: line})
 		messages = append(messages, oaMessage{Role: "assistant", Content: string(h.Reply)})
 	}
@@ -271,6 +285,9 @@ func buildBody(req StreamRequest) ([]byte, error) {
 	var parts []oaPart
 	if len(req.History) > 0 {
 		inst := followUpInstruction
+		if !lastSent.IsZero() {
+			inst += "\nIt is now " + relativeAge(now.Sub(lastSent)) + " since the previous exchange. Weigh your earlier timeline against this: enough time may (or may not) have passed for the changes you told them to watch for."
+		}
 		if len(req.Images) > 0 {
 			inst += "\n" + followUpWithPhoto
 		} else {
@@ -312,4 +329,19 @@ func buildBody(req StreamRequest) ([]byte, error) {
 		body.ReasoningEffort = "minimal"
 	}
 	return json.Marshal(body)
+}
+
+// relativeAge renders a duration for the prompt ("3 hours ago" / "5 days ago").
+// 粒度到天就够：医嘱的时间尺度是天/周，分钟级精度只添噪音。
+func relativeAge(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "moments ago"
+	case d < 90*time.Minute:
+		return fmt.Sprintf("%d minutes ago", int(d.Minutes()))
+	case d < 36*time.Hour:
+		return fmt.Sprintf("%d hours ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%d days ago", int(d.Hours()/24))
+	}
 }
