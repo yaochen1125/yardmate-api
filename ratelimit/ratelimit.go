@@ -209,6 +209,20 @@ func GlobalGate(b *Bucket, errCode string) func(http.ResponseWriter) bool {
 	}
 }
 
+// QuietGlobalGate draws from the same global budget as GlobalGate but writes
+// nothing — for callers that must charge a second paid upstream call after the
+// response has already started (e.g. an SSE stream retrying on a fallback
+// model, where a 429 can no longer be written). A nil bucket always allows.
+func QuietGlobalGate(b *Bucket) func() bool {
+	return func() bool {
+		if b == nil {
+			return true
+		}
+		allowed, _ := b.Allow(globalBudgetKey, time.Now())
+		return allowed
+	}
+}
+
 // Write429 writes the standard 429 response shape: Retry-After header (seconds,
 // always at least 1) + a JSON body {"error":"<code>"}. Exposed so handler-side
 // per-keyID denials produce identical wire shape.

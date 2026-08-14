@@ -152,8 +152,8 @@ func TestBuildBodyShape(t *testing.T) {
 	if !decoded.Stream || !decoded.StreamOptions["include_usage"] {
 		t.Fatal("stream/include_usage not set")
 	}
-	if decoded.ReasoningEffort != "minimal" {
-		t.Fatalf("gpt-5 family must send reasoning_effort=minimal, got %q", decoded.ReasoningEffort)
+	if decoded.ReasoningEffort != "low" {
+		t.Fatalf("gpt-5 family must default reasoning_effort=low, got %q", decoded.ReasoningEffort)
 	}
 	// system + (user, assistant) history pair + final user = 4
 	if len(decoded.Messages) != 4 {

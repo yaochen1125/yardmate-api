@@ -34,7 +34,7 @@ const (
 	// responseHeaderTimeout caps the wait for OpenAI's response HEADERS.
 	// First content token typically arrives 1–3 s in; 20 s means a hung
 	// upstream fails fast enough that the client's spinner is still honest.
-	responseHeaderTimeout = 20 * time.Second
+	responseHeaderTimeout = 60 * time.Second
 
 	// streamTimeout caps the WHOLE generation. A reply is ~300–700 output
 	// tokens; even a slow model finishes far inside 180 s. The handler
@@ -63,16 +63,23 @@ type HistoryTurn struct {
 	User      string          `json:"user"`
 	HadImages bool            `json:"had_images"`
 	Reply     json.RawMessage `json:"reply"`
+	// SentAt：该轮发出的 epoch 秒。0 = 旧客户端没带，不标时间。
+	// 「一周后观察新芽」这类医嘱，模型必须知道用户是第二天回来的
+	// 还是十天后回来的 —— 相对时间由服务端换算后注入（见 relativeAge）。
+	SentAt int64 `json:"sent_at"`
 }
 
 // StreamRequest is one upstream generation.
 type StreamRequest struct {
-	Model    string
-	Language string
-	Units    string
-	History  []HistoryTurn
-	UserText string
-	Images   [][]byte // sniffed jpeg/png/webp, ≤3 (validated by the handler)
+	Model string
+	// gpt-5 系列的思考档位。minimal 的产出是模板腔（真机对比 ChatGPT 实锤：
+	// 无机理、无重构、行动放之四海皆准），默认提到 low；vault DOCTOR_REASONING_EFFORT 可调。
+	ReasoningEffort string
+	Language        string
+	Units           string
+	History         []HistoryTurn
+	UserText        string
+	Images          [][]byte // sniffed jpeg/png/webp, ≤3 (validated by the handler)
 }
 
 // Client streams chat/completions. The zero value is not usable; NewClient
@@ -255,6 +262,8 @@ func buildBody(req StreamRequest) ([]byte, error) {
 	messages := []oaMessage{
 		{Role: "system", Content: SystemPrompt(req.Language, req.Units)},
 	}
+	now := time.Now()
+	var lastSent time.Time
 	for _, h := range req.History {
 		line := h.User
 		if h.HadImages {
@@ -264,13 +273,30 @@ func buildBody(req StreamRequest) ([]byte, error) {
 				line = "[sent a photo] " + line
 			}
 		}
+		// 历史行前缀相对时间（[5 days ago]），最后一轮的时刻留给续问指令
+		if h.SentAt > 0 {
+			ts := time.Unix(h.SentAt, 0)
+			if ts.Before(now) {
+				line = "[" + relativeAge(now.Sub(ts)) + "] " + line
+				lastSent = ts
+			}
+		}
 		messages = append(messages, oaMessage{Role: "user", Content: line})
 		messages = append(messages, oaMessage{Role: "assistant", Content: string(h.Reply)})
 	}
 
 	var parts []oaPart
 	if len(req.History) > 0 {
-		parts = append(parts, oaPart{Type: "text", Text: followUpInstruction})
+		inst := followUpInstruction
+		if !lastSent.IsZero() {
+			inst += "\nIt is now " + relativeAge(now.Sub(lastSent)) + " since the previous exchange. Weigh your earlier timeline against this: enough time may (or may not) have passed for the changes you told them to watch for."
+		}
+		if len(req.Images) > 0 {
+			inst += "\n" + followUpWithPhoto
+		} else {
+			inst += "\n" + followUpTextOnly
+		}
+		parts = append(parts, oaPart{Type: "text", Text: inst})
 	}
 	if req.UserText != "" {
 		parts = append(parts, oaPart{Type: "text", Text: req.UserText})
@@ -286,6 +312,10 @@ func buildBody(req StreamRequest) ([]byte, error) {
 		// direct library use.
 		parts = append(parts, oaPart{Type: "text", Text: "Here is the plant."})
 	}
+	// 语言钉子放在整个上下文的最末：4o-mini 对远处的 system 指令服从性差，
+	// 用户英文输入会把早期字段拽成英文（staging 实测），最近的指令最有效。
+	parts = append(parts, oaPart{Type: "text",
+		Text: fmt.Sprintf("Reply entirely in %s. Every field, including observations.", languageName(req.Language))})
 	messages = append(messages, oaMessage{Role: "user", Content: parts})
 
 	body := oaRequest{
@@ -296,10 +326,49 @@ func buildBody(req StreamRequest) ([]byte, error) {
 		Messages:       messages,
 	}
 	// Only the gpt-5 family accepts reasoning_effort; other models 400 on it.
-	// The task needs no long-chain reasoning, and minimal halves latency
-	// (14.9 s → 7.7 s measured on gpt-5 in the PoC).
+	// 默认 low：minimal 虽再省一半延迟，但产出是模板腔 —— 无机理、无重构、
+	// 看不出「无根插穗养一大冠叶子」这类照片里的显性问题（真机对比实锤）。
 	if strings.HasPrefix(req.Model, "gpt-5") {
-		body.ReasoningEffort = "minimal"
+		body.ReasoningEffort = req.ReasoningEffort
+		if body.ReasoningEffort == "" {
+			body.ReasoningEffort = "low"
+		}
+	}
+	// grok 系同样吃 reasoning_effort（low/medium/high/xhigh），且**不传默认
+	// high** —— 之前什么都没发，等于一直跑最重档，带图首字节 >60s 的另一半
+	// 真相。默认 low；xAI 无 minimal 档，操作员配了就地夹到 low。
+	if strings.HasPrefix(req.Model, "grok") {
+		body.ReasoningEffort = req.ReasoningEffort
+		if body.ReasoningEffort == "" || body.ReasoningEffort == "minimal" {
+			body.ReasoningEffort = "low"
+		}
 	}
 	return json.Marshal(body)
+}
+
+// XAIEndpoint is the OpenAI-compatible chat completions URL for xAI (grok).
+const XAIEndpoint = "https://api.x.ai/v1/chat/completions"
+
+// SetResponseHeaderTimeout 放宽首字节等待（仅该 client 自己的 transport）。
+// grok-4.6 带图推理 60s 内连响应头都不回（staging 实锤 59.9s upstream
+// timeout），xAI 客户端要 120s；OpenAI 客户端维持默认。
+func (c *Client) SetResponseHeaderTimeout(d time.Duration) {
+	if t, ok := c.http.Transport.(*http.Transport); ok {
+		t.ResponseHeaderTimeout = d
+	}
+}
+
+// relativeAge renders a duration for the prompt ("3 hours ago" / "5 days ago").
+// 粒度到天就够：医嘱的时间尺度是天/周，分钟级精度只添噪音。
+func relativeAge(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "moments ago"
+	case d < 90*time.Minute:
+		return fmt.Sprintf("%d minutes ago", int(d.Minutes()))
+	case d < 36*time.Hour:
+		return fmt.Sprintf("%d hours ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%d days ago", int(d.Hours()/24))
+	}
 }

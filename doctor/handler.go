@@ -32,6 +32,11 @@ const (
 	// 2 KB text) = 80 KB) so a maximal legal history is never truncated into
 	// invalid JSON by the LimitReader.
 	maxHistoryBytes = 96 << 10
+
+	// fallbackMinBudget：换灾备档重跑要求的最小剩余流预算。不足一次完整
+	// 生成就不重跑 —— 两跑叠着撞 streamTimeout，客户端要等满上限才拿到
+	// 错误，比立刻报错更糟。
+	fallbackMinBudget = 60 * time.Second
 )
 
 // modelWhitelist bounds what a model override can select even in dev —
@@ -41,6 +46,7 @@ var modelWhitelist = map[string]bool{
 	"gpt-4o":      true,
 	"gpt-5-mini":  true,
 	"gpt-5":       true,
+	"grok-4.6":    true,
 }
 
 // SpendGate is the hourly budget check (ratelimit.GlobalGate). Called AFTER
@@ -52,13 +58,32 @@ type SpendGate func(http.ResponseWriter) bool
 // Service carries the endpoint's configuration. Built once in main.go from
 // the secrets vault; nil Service → route unregistered.
 type Service struct {
-	Client        *Client
+	Client *Client
+	// XAIClient 服务 grok-* 系（api.x.ai，OpenAI 兼容线协议）。nil = 未配
+	// XAI_API_KEY，grok 选择静默回落 Model（部署不配即无 xAI 面）。
+	XAIClient     *Client
 	Model         string // default model (vault DOCTOR_MODEL)
 	AllowOverride bool   // vault DOCTOR_ALLOW_MODEL_OVERRIDE; prod stays false
+	// gpt-5 系列的思考档位（vault DOCTOR_REASONING_EFFORT；空 = low）。
+	ReasoningEffort string
+	// FollowupModel：第 LeadTurns+1 轮起改用的省钱档（空 = 全程 Model）。
+	FollowupModel string
+	// LeadTurns：主力模型负责的前几轮，默认 2。
+	LeadTurns int
+	// FallbackModel：当轮模型上游失败时的灾备档（vault DOCTOR_FALLBACK_MODEL，
+	// 空 = 不灾备）。任何 Stream 错误且客户端还在 → 换它整轮重跑，observation
+	// 续号转发，客户端无感（用户拍板 2026-08-13：全程零提示）。
+	FallbackModel string
+	// FallbackDraw：灾备重跑前的静默预算扣减（ratelimit.QuietGlobalGate）。
+	// 重跑是第二次付费上游调用，必须再吃一个小时预算名额（Codex P1：否则
+	// 上游大面积故障时实际付费调用可达预算上限 2×）；扣不到就不重跑 ——
+	// SSE 已开、429 写不进去，按主档错误收场。nil = 不记账（测试）。
+	FallbackDraw func() bool
 }
 
 // NewService wires the streaming client. endpoint == "" → OpenAI.
 func NewService(apiKey, endpoint, model string, allowOverride bool) *Service {
+	// ReasoningEffort 由 main 从 vault 注入（可缺省）
 	if !modelWhitelist[model] {
 		if model != "" {
 			log.Printf("WARN: DOCTOR_MODEL %q not in whitelist; using gpt-4o-mini", model)
@@ -75,11 +100,49 @@ func NewService(apiKey, endpoint, model string, allowOverride bool) *Service {
 // resolveModel applies an override request against policy. Unauthorized or
 // unknown overrides fall back silently to the default — a stale debug build
 // must degrade, not break (SPEC §2).
-func (s *Service) resolveModel(requested string) string {
-	if requested == "" || !s.AllowOverride || !modelWhitelist[requested] {
-		return s.Model
+// clientFor returns the upstream client for a resolved model.
+// grok-* → XAIClient；其余 → OpenAI Client。
+func (s *Service) clientFor(model string) *Client {
+	if strings.HasPrefix(model, "grok") && s.XAIClient != nil {
+		return s.XAIClient
 	}
-	return requested
+	return s.Client
+}
+
+// resolveModel picks the model for this turn.
+// 档位策略（用户拍板 2026-08-13）：前 LeadTurns 轮走主力模型（看图定性 +
+// 用户看着照片补充信息的关键轮），之后走 FollowupModel 省钱 —— 追问多是
+// 执行确认。debug 覆盖（仅 AllowOverride 环境）仍然最高优先。
+func (s *Service) resolveModel(requested string, priorTurns int) string {
+	if requested != "" && s.AllowOverride && modelWhitelist[requested] {
+		if strings.HasPrefix(requested, "grok") && s.XAIClient == nil {
+			log.Printf("doctor: override %q needs XAI_API_KEY (absent); ignoring", requested)
+		} else {
+			return requested
+		}
+	}
+	pick := s.Model
+	if s.FollowupModel != "" && priorTurns >= s.LeadTurns {
+		pick = s.FollowupModel
+	}
+	if strings.HasPrefix(pick, "grok") && s.XAIClient == nil {
+		log.Printf("doctor: model %q needs XAI_API_KEY (absent); falling back to gpt-4o-mini", pick)
+		return "gpt-4o-mini"
+	}
+	return pick
+}
+
+// fallbackFor returns the retry model after `resolved` failed ("" = none).
+// Self-retry is pointless, and a grok fallback without the xAI client can't run.
+func (s *Service) fallbackFor(resolved string) string {
+	fb := s.FallbackModel
+	if fb == "" || fb == resolved {
+		return ""
+	}
+	if strings.HasPrefix(fb, "grok") && s.XAIClient == nil {
+		return ""
+	}
+	return fb
 }
 
 // Handle returns the /v1/doctor handler. Per-IP / per-device rate limits and
@@ -194,7 +257,7 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 			return
 		}
 
-		resolved := svc.resolveModel(model)
+		resolved := svc.resolveModel(model, len(history))
 
 		flusher, ok := w.(http.Flusher)
 		if !ok {
@@ -224,18 +287,45 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), streamTimeout)
 		defer cancel()
 
+		req := StreamRequest{
+			ReasoningEffort: svc.ReasoningEffort,
+			Model:           resolved,
+			Language:        lang,
+			Units:           units,
+			History:         history,
+			UserText:        text,
+			Images:          images,
+		}
 		obsCount := 0
-		reply, usage, err := svc.Client.Stream(ctx, StreamRequest{
-			Model:    resolved,
-			Language: lang,
-			Units:    units,
-			History:  history,
-			UserText: text,
-			Images:   images,
-		}, func(index int, s string) {
+		reply, usage, err := svc.clientFor(resolved).Stream(ctx, req, func(index int, s string) {
 			obsCount++
 			out.event("observation", map[string]any{"index": index, "text": s})
 		})
+		usedModel := resolved
+
+		// 灾备链（grok-4.6 low → gpt-5-mini，用户拍板 2026-08-13）：主档任何
+		// Stream 错误且客户端还在 → 灾备档整轮重跑。observation 加 offset 续号
+		// —— 客户端只接受恰好接续的 index，续号让思考条无缝继续冒；重复文案由
+		// 客户端按内容去重。剩余预算不足一次完整生成则不重跑。
+		if err != nil && r.Context().Err() == nil {
+			if fb := svc.fallbackFor(resolved); fb != "" {
+				if dl, ok := ctx.Deadline(); ok && time.Until(dl) >= fallbackMinBudget &&
+					(svc.FallbackDraw == nil || svc.FallbackDraw()) {
+					log.Printf("doctor: device=%s model=%s obs=%d err=%v; retrying on %s",
+						deviceID, resolved, obsCount, err, fb)
+					// SSE 注释行：客户端按前缀忽略内容，字节本身重置其闲置计时。
+					out.comment("retry")
+					offset := obsCount
+					fbReq := req
+					fbReq.Model = fb
+					reply, usage, err = svc.clientFor(fb).Stream(ctx, fbReq, func(index int, s string) {
+						obsCount++
+						out.event("observation", map[string]any{"index": offset + index, "text": s})
+					})
+					usedModel = fb
+				}
+			}
+		}
 
 		ms := time.Since(start).Milliseconds()
 		if err != nil {
@@ -251,7 +341,7 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 			if r.Context().Err() == nil {
 				out.event("error", map[string]any{"code": code})
 			}
-			log.Printf("doctor: device=%s ms=%d model=%s obs=%d err=%v", deviceID, ms, resolved, obsCount, err)
+			log.Printf("doctor: device=%s ms=%d model=%s obs=%d err=%v", deviceID, ms, usedModel, obsCount, err)
 			return
 		}
 
@@ -264,7 +354,7 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 			in, outTok = usage.PromptTokens, usage.CompletionTokens
 		}
 		log.Printf("doctor: device=%s ms=%d model=%s obs=%d in=%d out=%d imgs=%d turns=%d",
-			deviceID, ms, resolved, obsCount, in, outTok, len(images), len(history))
+			deviceID, ms, usedModel, obsCount, in, outTok, len(images), len(history))
 	}
 }
 
@@ -317,6 +407,14 @@ func (s sseWriter) write(name string, data []byte) {
 	s.f.Flush()
 }
 
+// comment emits an SSE comment line. Clients skip it by contract (the iOS
+// transport matches only "event: "/"data: " prefixes) — its bytes exist to
+// reset the client's inter-byte idle timer across a fallback switch.
+func (s sseWriter) comment(text string) {
+	fmt.Fprintf(s.w, ": %s\n\n", text)
+	s.f.Flush()
+}
+
 // ---- small local copies of proxy helpers (unexported there) ----
 
 type errorResponse struct {
@@ -356,3 +454,6 @@ func isUUID(s string) bool {
 	}
 	return true
 }
+
+// ModelAllowed exposes the whitelist for config validation in main.
+func ModelAllowed(m string) bool { return modelWhitelist[m] }
