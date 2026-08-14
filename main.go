@@ -723,6 +723,8 @@ func buildDoctorService(vault *secrets.Vault) (*doctor.Service, *ratelimit.Bucke
 		log.Printf("doctor: xAI upstream ready (grok models selectable)")
 	}
 	budget := ratelimit.NewBucket(vaultIntOr(vault, "DOCTOR_HOURLY_BUDGET", defaultDoctorHourlyBudget), time.Hour)
+	// 灾备重跑同样是付费上游调用 → 从同一个小时预算静默扣减（SSE 已开写不了 429）。
+	svc.FallbackDraw = ratelimit.QuietGlobalGate(budget)
 	log.Printf("doctor service ready: model=%s followup=%s leadTurns=%d fallback=%s override=%v budget=%d/h",
 		svc.Model, svc.FollowupModel, svc.LeadTurns, svc.FallbackModel, svc.AllowOverride, vaultIntOr(vault, "DOCTOR_HOURLY_BUDGET", defaultDoctorHourlyBudget))
 	return svc, budget

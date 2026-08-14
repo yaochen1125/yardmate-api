@@ -74,6 +74,11 @@ type Service struct {
 	// 空 = 不灾备）。任何 Stream 错误且客户端还在 → 换它整轮重跑，observation
 	// 续号转发，客户端无感（用户拍板 2026-08-13：全程零提示）。
 	FallbackModel string
+	// FallbackDraw：灾备重跑前的静默预算扣减（ratelimit.QuietGlobalGate）。
+	// 重跑是第二次付费上游调用，必须再吃一个小时预算名额（Codex P1：否则
+	// 上游大面积故障时实际付费调用可达预算上限 2×）；扣不到就不重跑 ——
+	// SSE 已开、429 写不进去，按主档错误收场。nil = 不记账（测试）。
+	FallbackDraw func() bool
 }
 
 // NewService wires the streaming client. endpoint == "" → OpenAI.
@@ -304,7 +309,8 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 		// 客户端按内容去重。剩余预算不足一次完整生成则不重跑。
 		if err != nil && r.Context().Err() == nil {
 			if fb := svc.fallbackFor(resolved); fb != "" {
-				if dl, ok := ctx.Deadline(); ok && time.Until(dl) >= fallbackMinBudget {
+				if dl, ok := ctx.Deadline(); ok && time.Until(dl) >= fallbackMinBudget &&
+					(svc.FallbackDraw == nil || svc.FallbackDraw()) {
 					log.Printf("doctor: device=%s model=%s obs=%d err=%v; retrying on %s",
 						deviceID, resolved, obsCount, err, fb)
 					// SSE 注释行：客户端按前缀忽略内容，字节本身重置其闲置计时。

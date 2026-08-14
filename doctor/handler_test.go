@@ -385,6 +385,30 @@ func TestHandleFallbackBothFailIsSSEError(t *testing.T) {
 	}
 }
 
+// 灾备重跑是第二次付费调用：预算扣不到 → 不重跑，按主档错误收场（Codex P1）。
+func TestHandleFallbackRespectsBudget(t *testing.T) {
+	boom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer boom.Close()
+	good := fakeUpstream(t, []string{wireReply}, true)
+	defer good.Close()
+
+	svc := NewService("k", good.URL, "grok-4.6", false)
+	svc.XAIClient = NewClient("k", boom.URL)
+	svc.FallbackModel = "gpt-5-mini"
+	svc.FallbackDraw = func() bool { return false } // 预算已干
+
+	body, ct := buildMultipart(t, map[string]string{"text": "hi"}, nil)
+	rec := httptest.NewRecorder()
+	Handle(svc, allowGate)(rec, doctorRequest(t, body, ct))
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) != 1 || events[0][0] != "error" {
+		t.Fatalf("events = %v, want single error (no budget → no retry)", events)
+	}
+}
+
 // fallbackFor 策略：未配置 / 配成当轮自身 / grok 灾备缺 xAI client → 不重跑。
 func TestFallbackForPolicy(t *testing.T) {
 	svc := NewService("k", "", "grok-4.6", false)
