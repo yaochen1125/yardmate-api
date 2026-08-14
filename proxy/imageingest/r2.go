@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -112,6 +113,33 @@ func (c *R2Client) Put(ctx context.Context, key string, body []byte, contentType
 		return fmt.Errorf("imageingest/r2: put %q: %w", key, err)
 	}
 	return nil
+}
+
+// Get downloads the object at key and reports whether it exists: a missing
+// object (404 NotFound / NoSuchKey) returns (nil, false, nil) — same 404
+// mapping as Exists — so callers (rarity version read-modify-write) can
+// distinguish "first publish" from "R2 unreachable".
+func (c *R2Client) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	out, err := c.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) {
+			switch apiErr.ErrorCode() {
+			case "NotFound", "NoSuchKey":
+				return nil, false, nil
+			}
+		}
+		return nil, false, fmt.Errorf("imageingest/r2: get %q: %w", key, err)
+	}
+	defer out.Body.Close()
+	body, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, false, fmt.Errorf("imageingest/r2: get %q: read body: %w", key, err)
+	}
+	return body, true, nil
 }
 
 // Delete removes the object at key. A missing object (404 NotFound / NoSuchKey) is

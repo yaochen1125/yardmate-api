@@ -20,6 +20,7 @@ import (
 	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
 	"github.com/yaochen1125/yardmate-api/proxy/imageingest"
 	"github.com/yaochen1125/yardmate-api/proxy/imageingest/sources"
+	"github.com/yaochen1125/yardmate-api/proxy/rarity"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
@@ -261,6 +262,17 @@ func main() {
 	// embed baseline (SPEC §9.2 sciByID note), not a racing first-poll swap.
 	startCatalogReloader(vault, content)
 
+	// Plantdex rarity aggregation → CDN publisher (proxy/rarity/SPEC.md). OFF
+	// by default: RARITY_PUBLISH_ENABLED=true turns on the periodic
+	// dex_identify_daily → {prefix}/dex/rarity.json pass (quantile tiers +
+	// oneIn). Published flags.json-style — a fresh small object under the
+	// content prefix, deliberately NO version.txt bump (that file's single
+	// writer stays catalog-promote-tool/deploy_shards.sh; see SPEC §Gate).
+	// nil (WARN) when the flag is off or DB / R2 creds are missing, which also
+	// leaves POST /internal/rarity/rebuild unregistered.
+	rarityPub := buildRarityPublisher(vault, enrichDB)
+	rarityPub.Start(context.Background())
+
 	// In-flight concurrency bound for the two image-buffering endpoints
 	// (inflight/SPEC). Caps peak memory so a burst sheds cleanly (503) instead
 	// of OOM-killing the process; overflow first waits up to waitBudget for a
@@ -283,7 +295,7 @@ func main() {
 		inflightWait,
 	)
 
-	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim, doctorSvc, doctorInflight, doctorBudget)
+	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim, doctorSvc, doctorInflight, doctorBudget, rarityPub)
 
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream) with 5 s headroom = 35 s base.
@@ -669,6 +681,58 @@ func buildImageIngestService(vault *secrets.Vault, content *proxy.ContentIndex) 
 	log.Printf("image ingest service ready: R2 bucket=%s ledger pool + iNat/Wikimedia cascade (allowAttribution=%v)",
 		r2Cfg.Bucket, cfg.AllowAttributionLicenses)
 	return imageingest.NewService(ingestor, adminToken)
+}
+
+// buildRarityPublisher wires the Plantdex rarity aggregation→publish job
+// (proxy/rarity/SPEC.md): dex_identify_daily totals → quantile tiers + oneIn →
+// {RARITY_R2_PREFIX}/dex/rarity.json on the shared content R2 bucket. OFF by
+// default (RARITY_PUBLISH_ENABLED, same new-feature stance as DOCTOR_ENABLED /
+// VISION_KNN_ENABLED). Reuses the imageingest R2 credential set — the token is
+// already Object Read & Write on yardmate-static — but builds its own client so
+// the two services enable/disable independently. Staging MUST set
+// RARITY_R2_PREFIX=content-staging in secrets-staging.env: the bucket is shared
+// across environments and prefix routing is the only isolation
+// (staging-runbook known boundary — same gap as imageingest, here made
+// configurable). All knobs read the vault, not os.Getenv (Codex #23).
+func buildRarityPublisher(vault *secrets.Vault, db *enrichment.DB) *rarity.Publisher {
+	if !vault.GetBool("RARITY_PUBLISH_ENABLED", false) {
+		log.Printf("rarity publish: disabled (RARITY_PUBLISH_ENABLED unset/false)")
+		return nil
+	}
+	if db == nil {
+		log.Printf("WARN: RARITY_PUBLISH_ENABLED=true but Supabase pool unavailable; rarity publish disabled")
+		return nil
+	}
+	r2Cfg := imageingest.R2Config{
+		AccountID:       vault.Get("R2_ACCOUNT_ID"),
+		AccessKeyID:     vault.Get("R2_ACCESS_KEY_ID"),
+		SecretAccessKey: vault.Get("R2_SECRET_ACCESS_KEY"),
+		Bucket:          vault.Get("R2_BUCKET"),
+		Endpoint:        vault.Get("R2_ENDPOINT"),
+	}
+	if r2Cfg.AccessKeyID == "" || r2Cfg.SecretAccessKey == "" || r2Cfg.Bucket == "" ||
+		(r2Cfg.Endpoint == "" && r2Cfg.AccountID == "") {
+		log.Printf("WARN: RARITY_PUBLISH_ENABLED=true but R2 creds missing; rarity publish disabled")
+		return nil
+	}
+	r2Client, err := imageingest.NewR2Client(r2Cfg)
+	if err != nil {
+		log.Printf("WARN: rarity publish R2 init failed: %v; disabled", err)
+		return nil
+	}
+	cuts, err := rarity.ParseTierCuts(vault.Get("RARITY_TIER_CUTS"))
+	if err != nil {
+		log.Printf("WARN: RARITY_TIER_CUTS invalid (%v); using defaults %v", err, rarity.DefaultTierCuts)
+		cuts = rarity.DefaultTierCuts
+	}
+	return rarity.NewPublisher(db, r2Client, rarity.Config{
+		Prefix:     vault.Get("RARITY_R2_PREFIX"),
+		MinSample:  int64(vaultIntOr(vault, "RARITY_MIN_SAMPLE", rarity.DefaultMinSample)),
+		MinSpecies: vaultIntOr(vault, "RARITY_MIN_SPECIES", rarity.DefaultMinSpecies),
+		TierCuts:   cuts,
+		Interval:   vaultDurationOr(vault, "RARITY_PUBLISH_INTERVAL", rarity.DefaultInterval),
+		AdminToken: vault.Get("RARITY_ADMIN_TOKEN"),
+	})
 }
 
 // buildDoctorService wires POST /v1/doctor (doctor/SPEC.md). Needs only the

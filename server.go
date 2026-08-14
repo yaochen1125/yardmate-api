@@ -14,6 +14,7 @@ import (
 	"github.com/yaochen1125/yardmate-api/proxy"
 	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
 	"github.com/yaochen1125/yardmate-api/proxy/imageingest"
+	"github.com/yaochen1125/yardmate-api/proxy/rarity"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
@@ -34,6 +35,7 @@ type Server struct {
 	enrichDB *enrichment.DB        // optional; shared Supabase pgx pool. nil disables POST /v1/account/delete
 	ingest   *imageingest.Service  // optional; nil disables POST /v1/plants/imageingest + /internal/imageingest/run
 	doctor   *doctor.Service       // optional; nil disables POST /v1/doctor (no OPENAI_API_KEY)
+	rarity   *rarity.Publisher     // optional; nil disables POST /internal/rarity/rebuild
 	router   chi.Router
 }
 
@@ -61,6 +63,7 @@ func newServer(
 	doctorSvc *doctor.Service,
 	doctorInflight *inflight.Limiter,
 	doctorBudget *ratelimit.Bucket,
+	rarityPub *rarity.Publisher,
 ) *Server {
 	// Rose cultivar rerank is ON by default; ROSE_RERANK_ENABLED=false kill-switches it.
 	roseEnabled := vault.GetBool("ROSE_RERANK_ENABLED", true)
@@ -103,6 +106,21 @@ func newServer(
 	// PLANTID_IDENTIFY_FALLBACK（默认 true=现状：PlantNet 失败兜底到 Plant.id）。设 false
 	// 则 PlantNet 失败时跳过贵的 Plant.id、直接走 GPT 兜底（省钱，需 GPT_ARBITER_ON_DEMAND 才有兜底）。
 	plantIDIdentifyFallback := vault.GetBool("PLANTID_IDENTIFY_FALLBACK", true)
+	// Plantdex rarity identify counter (proxy/rarity/SPEC.md). OFF by default:
+	// RARITY_COUNT_ENABLED=true + a live enrichment DB pool enable the
+	// best-effort dex_identify_daily write on identify success. A nil recorder
+	// makes HandleIdentify skip counting entirely (no goroutine, no query).
+	var scanRecorder proxy.IdentifyScanRecorder
+	if vault.GetBool("RARITY_COUNT_ENABLED", false) {
+		if enrichDB != nil {
+			scanRecorder = enrichDB
+			log.Printf("dex identify counter: enabled (dex_identify_daily)")
+		} else {
+			log.Printf("WARN: RARITY_COUNT_ENABLED=true but enrichment DB unavailable; dex identify counter disabled")
+		}
+	} else {
+		log.Printf("dex identify counter: disabled (RARITY_COUNT_ENABLED unset/false)")
+	}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(realIPFromNginx)
@@ -119,6 +137,14 @@ func newServer(
 	// configured (R2 + DB + admin token present; nil otherwise → unregistered).
 	if ingest != nil {
 		r.Post("/internal/imageingest/run", imageingest.HandleRun(ingest))
+	}
+
+	// Internal Plantdex rarity rebuild (proxy/rarity/SPEC.md §Ops). Same
+	// stance as the imageingest internal route above: top-level, outside /v1
+	// (admin-token gated, nginx keeps it off the public vhost), registered
+	// only when the publisher is configured AND an admin token is set.
+	if rarityPub != nil && rarityPub.AdminToken() != "" {
+		r.Post("/internal/rarity/rebuild", rarityPub.HandleRebuild())
 	}
 
 	// All /v1 endpoints share the per-IP rate limit. Per-keyID is applied
@@ -173,7 +199,7 @@ func newServer(
 					// (fallback); register when EITHER engine is present
 					// (SPEC §1.1 / §7).
 					if plantNet != nil || plantID != nil {
-						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, visionKNN, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand, plantIDIdentifyFallback, spendGate))
+						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, visionKNN, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand, plantIDIdentifyFallback, spendGate, scanRecorder))
 					}
 					// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
 					// assessment, SPEC §1.5) — still requires plantID.
@@ -268,7 +294,8 @@ func newServer(
 	return &Server{
 		verifier: verifier, vault: vault, limiter: lim,
 		plantNet: plantNet, plantID: plantID, vision: vision, content: content,
-		enrich: enrich, enrichDB: enrichDB, ingest: ingest, doctor: doctorSvc, router: r,
+		enrich: enrich, enrichDB: enrichDB, ingest: ingest, doctor: doctorSvc,
+		rarity: rarityPub, router: r,
 	}
 }
 
