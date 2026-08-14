@@ -64,6 +64,7 @@ func newServer(
 	doctorInflight *inflight.Limiter,
 	doctorBudget *ratelimit.Bucket,
 	rarityPub *rarity.Publisher,
+	scanCounter *proxy.IdentifyScanCounter,
 ) *Server {
 	// Rose cultivar rerank is ON by default; ROSE_RERANK_ENABLED=false kill-switches it.
 	roseEnabled := vault.GetBool("ROSE_RERANK_ENABLED", true)
@@ -106,21 +107,6 @@ func newServer(
 	// PLANTID_IDENTIFY_FALLBACK（默认 true=现状：PlantNet 失败兜底到 Plant.id）。设 false
 	// 则 PlantNet 失败时跳过贵的 Plant.id、直接走 GPT 兜底（省钱，需 GPT_ARBITER_ON_DEMAND 才有兜底）。
 	plantIDIdentifyFallback := vault.GetBool("PLANTID_IDENTIFY_FALLBACK", true)
-	// Plantdex rarity identify counter (proxy/rarity/SPEC.md). OFF by default:
-	// RARITY_COUNT_ENABLED=true + a live enrichment DB pool enable the
-	// best-effort dex_identify_daily write on identify success. A nil recorder
-	// makes HandleIdentify skip counting entirely (no goroutine, no query).
-	var scanRecorder proxy.IdentifyScanRecorder
-	if vault.GetBool("RARITY_COUNT_ENABLED", false) {
-		if enrichDB != nil {
-			scanRecorder = enrichDB
-			log.Printf("dex identify counter: enabled (dex_identify_daily)")
-		} else {
-			log.Printf("WARN: RARITY_COUNT_ENABLED=true but enrichment DB unavailable; dex identify counter disabled")
-		}
-	} else {
-		log.Printf("dex identify counter: disabled (RARITY_COUNT_ENABLED unset/false)")
-	}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(realIPFromNginx)
@@ -199,7 +185,7 @@ func newServer(
 					// (fallback); register when EITHER engine is present
 					// (SPEC §1.1 / §7).
 					if plantNet != nil || plantID != nil {
-						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, visionKNN, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand, plantIDIdentifyFallback, spendGate, scanRecorder))
+						r.Post("/identify", proxy.HandleIdentify(plantNet, plantID, content, vision, inat, visionKNN, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand, plantIDIdentifyFallback, spendGate, scanCounter))
 					}
 					// /v1/diagnose is Plant.id-only (Pl@ntNet has no health
 					// assessment, SPEC §1.5) — still requires plantID.

@@ -28,6 +28,10 @@ const (
 	// minInterval floors RARITY_PUBLISH_INTERVAL (mirrors the catalog
 	// hot-load clamp stance; sub-10m republish of a daily aggregate is noise).
 	minInterval = 10 * time.Minute
+	// retryInterval is the shortened wait after a FAILED pass — a transient
+	// DB/R2 blip (e.g. boot racing the Supabase pooler) must not leave the
+	// artifact absent/stale for a whole publish interval (24h by default).
+	retryInterval = 10 * time.Minute
 	// publishTimeout bounds one publish pass (one aggregate query + one small
 	// R2 read + one small R2 write).
 	publishTimeout = 2 * time.Minute
@@ -132,6 +136,7 @@ func (p *Publisher) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+			next := p.cfg.Interval
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -141,10 +146,11 @@ func (p *Publisher) loop(ctx context.Context) {
 				pctx, cancel := context.WithTimeout(ctx, publishTimeout)
 				defer cancel()
 				if _, err := p.Publish(pctx); err != nil {
-					log.Printf("rarity publish: pass failed (next tick retries): %v", err)
+					next = retryInterval
+					log.Printf("rarity publish: pass failed (retry in %s): %v", next, err)
 				}
 			}()
-			timer.Reset(p.cfg.Interval)
+			timer.Reset(next)
 		}
 	}
 }
@@ -197,8 +203,12 @@ func (p *Publisher) nextVersion(ctx context.Context) (int, error) {
 	var prev struct {
 		Version int `json:"version"`
 	}
-	if err := json.Unmarshal(body, &prev); err != nil || prev.Version < 0 {
+	if err := json.Unmarshal(body, &prev); err != nil {
 		log.Printf("WARN: rarity: published %s unparseable (%v); restarting version at 1", p.key, err)
+		return 1, nil
+	}
+	if prev.Version < 0 {
+		log.Printf("WARN: rarity: published %s has negative version %d; restarting version at 1", p.key, prev.Version)
 		return 1, nil
 	}
 	return prev.Version + 1, nil
@@ -213,12 +223,12 @@ func (p *Publisher) HandleRebuild() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get(AdminTokenHeader)
 		if token == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing_admin_token"})
+			writeError(w, http.StatusUnauthorized, "missing_admin_token")
 			return
 		}
 		if p.cfg.AdminToken == "" ||
 			subtle.ConstantTimeCompare([]byte(token), []byte(p.cfg.AdminToken)) != 1 {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "bad_admin_token"})
+			writeError(w, http.StatusUnauthorized, "bad_admin_token")
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), rebuildTimeout)
@@ -226,7 +236,7 @@ func (p *Publisher) HandleRebuild() http.HandlerFunc {
 		m, err := p.Publish(ctx)
 		if err != nil {
 			log.Printf("rarity rebuild: %v", err)
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "publish_failed"})
+			writeError(w, http.StatusBadGateway, "publish_failed")
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -244,4 +254,14 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// errorResponse + writeError mirror proxy/enrichment/handlers.go so error
+// envelopes keep one code shape across packages ({"error": code}).
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
+func writeError(w http.ResponseWriter, status int, code string) {
+	writeJSON(w, status, errorResponse{Error: code})
 }

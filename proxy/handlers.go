@@ -234,7 +234,7 @@ func parseCoord(s string, min, max float64) *float64 {
 	return &v
 }
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand, plantIDIdentifyFallback bool, spendGate SpendGate, scanRecorder IdentifyScanRecorder) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand, plantIDIdentifyFallback bool, spendGate SpendGate, scanCounter *IdentifyScanCounter) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -1202,13 +1202,12 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		catalogHit := len(result.Suggestions) > 0 && result.Suggestions[0].PlantID != nil
 		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v engine=%s mime=%s isPlant=%v suggestions=%d plantIdsResolved=%d catalogHit=%v suggestionsWithImage=%d aiEnhanced=%v",
 			deviceID, appVer, attKeyID, attAssertPresent, engine, mime, result.IsPlant, len(result.Suggestions), plantIDsResolved, catalogHit, suggestionsWithImage, result.AIEnhancedAt != nil)
-		// Plantdex rarity counter (proxy/rarity/SPEC.md): best-effort detached
-		// write of the final in-catalog hit — fire-and-forget, never blocks or
-		// fails the response. The unknownSentinel guard is redundant with the
-		// AAA0000 check inside dexCountablePlantID; kept for explicitness.
-		if !unknownSentinel {
-			recordIdentifyScan(scanRecorder, dexCountablePlantID(result))
-		}
+		// Plantdex rarity counter (proxy/rarity/SPEC.md): best-effort in-memory
+		// increment of the final in-catalog hit, flushed in batches by ONE
+		// background worker — no goroutine, no IO, no failure mode on the
+		// response path. dexCountablePlantID filters out-of-catalog and the
+		// AAA0000 sentinel; nil counter / empty id are no-ops.
+		scanCounter.Add(dexCountablePlantID(result))
 		writeJSON(w, http.StatusOK, result)
 	}
 }

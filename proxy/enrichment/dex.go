@@ -5,25 +5,39 @@ import (
 	"fmt"
 )
 
-// RecordIdentifyScan increments the day-bucketed successful-identify counter
-// for an in-catalog species (dex_identify_daily, migration 012). One call per
-// successful /v1/identify whose top suggestion resolved to a curated AAA id —
-// every scan counts (repeats included), which is the Plantdex rarity metric
-// ("1 in {n} scans"), unlike the device-deduped catalog_signals engagement
-// rows. The day bucket is computed in UTC so the counter is client-timezone
-// independent. Nil-safe (ErrDBUnavailable when the shared pool is absent,
-// matching the enrichment DB contract).
-func (d *DB) RecordIdentifyScan(ctx context.Context, plantID string) error {
+// AddIdentifyScans applies one batch of Plantdex identify-counter increments
+// to dex_identify_daily (migration 012): one multi-row upsert per flush of
+// proxy.IdentifyScanCounter, NOT one round-trip per identify — the shared pool
+// (MaxConns 10) must never be fanned out on by the request path (SPEC §9 #18).
+// Every scan counts (repeats included) — the Plantdex rarity metric
+// ("1 in {n} scans") — unlike the device-deduped catalog_signals rows. The day
+// bucket is the flush day in UTC (≤ one flush interval of skew around
+// midnight, irrelevant to the all-time aggregation). Nil-safe
+// (ErrDBUnavailable when the shared pool is absent).
+func (d *DB) AddIdentifyScans(ctx context.Context, counts map[string]int64) error {
+	ids := make([]string, 0, len(counts))
+	ns := make([]int64, 0, len(counts))
+	for id, n := range counts {
+		if id == "" || n <= 0 {
+			continue
+		}
+		ids = append(ids, id)
+		ns = append(ns, n)
+	}
+	if len(ids) == 0 {
+		return nil // nothing to write — a no-op regardless of pool state
+	}
 	if d == nil || d.pool == nil {
 		return ErrDBUnavailable
 	}
 	const stmt = `
 		INSERT INTO dex_identify_daily (plant_id, day, count)
-		VALUES ($1, (now() AT TIME ZONE 'utc')::date, 1)
+		SELECT t.plant_id, (now() AT TIME ZONE 'utc')::date, t.cnt
+		FROM unnest($1::text[], $2::bigint[]) AS t(plant_id, cnt)
 		ON CONFLICT (plant_id, day) DO UPDATE
-		SET count = dex_identify_daily.count + 1`
-	if _, err := d.pool.Exec(ctx, stmt, plantID); err != nil {
-		return fmt.Errorf("%w: identify scan upsert: %v", ErrDBUnavailable, err)
+		SET count = dex_identify_daily.count + EXCLUDED.count`
+	if _, err := d.pool.Exec(ctx, stmt, ids, ns); err != nil {
+		return fmt.Errorf("%w: identify scan batch upsert: %v", ErrDBUnavailable, err)
 	}
 	return nil
 }

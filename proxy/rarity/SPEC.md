@@ -9,16 +9,20 @@ Plantdex（图鉴）只读消费。消费方契约真源：
 
 ```
 /v1/identify 成功（top suggestion 命中库内 AAA id，排除 AAA0000 哨兵）
-  → best-effort detached goroutine（proxy/dex.go recordIdentifyScan）
-  → dex_identify_daily (plant_id, day, count) 日桶 +1     [migration 012]
-  → Publisher 周期聚合（默认 24h，进程内 ticker，sweep 同款双层 recover）
+  → 进程内累加（proxy.IdentifyScanCounter.Add：mutex + map++，零 IO 零 goroutine）
+  → 单 worker 每 30s 批量 flush（一次 unnest 多行 upsert；失败合并回 pending 重试）
+  → dex_identify_daily (plant_id, day, count) 日桶累加     [migration 012]
+  → Publisher 周期聚合（默认 24h，进程内 ticker，sweep 同款双层 recover，
+    失败后 10m 短重试而非等满一轮）
   → SUM(count) per plant_id → 分位数 tier + oneIn → Manifest JSON
   → R2 Put {RARITY_R2_PREFIX}/dex/rarity.json（public, max-age=60）
   → iOS 冷启动直拉（flags.json 模式，见 §4）
 ```
 
-计数是 **best-effort**：goroutine 内 `context.Background()` + 5s 超时 +
-panic recover，任何失败只 log，识别响应永不受影响、永不变慢。
+计数是 **best-effort**：热路径只做内存自增，DB 往返被单个 flush worker 收敛
+（enrichment SPEC §9 #18：不许每请求起 goroutine 打共享池），flush 失败合并回
+内存下轮重试（pending 键数以目录物种数为上界，不会膨胀），任何失败只 log，
+识别响应永不受影响、永不变慢。进程崩溃的丢失窗口 ≤ 一个 flush 间隔（30s）。
 
 ## 2. 表（migration 012_dex_identify_daily.sql）
 
@@ -47,6 +51,9 @@ catalog_signals）；不用 catalog_signals 做冷启动种子（单位有偏，
 - `oneIn` = round(totalScans / count)，下限 1。
 - `version`：发布前读 R2 现值 +1；对象不存在 → 1；现值损坏 → WARN + 1
   （自愈优先于单调性）；R2 读失败 → 本轮中止（宁可跳过一轮也不回退版本号）。
+  read-modify-write 只有进程内 mutex 保护——**单实例部署是前提**（与本服务
+  「单实例 systemd」姿态一致）；蓝绿重叠窗口内两进程同时发布可能造成 version
+  重复/回跳，客户端不得把 version 当强一致新鲜度信号（max-age 才是）。
 - `generatedAt`：RFC3339 UTC。
 
 Wire 形状（字段名/档名是契约常量，勿改）：
@@ -86,7 +93,7 @@ copy` 不删除多余对象），本文件唯一写者是本服务——保持�
 |---|---|---|
 | `RARITY_COUNT_ENABLED` | `false` | 识别成功计数写入总闸（先跑 012 SQL 再开） |
 | `RARITY_PUBLISH_ENABLED` | `false` | 聚合发布总闸（复用 imageingest 的 R2_* 凭据） |
-| `RARITY_R2_PREFIX` | `content` | staging **必须**设 `content-staging`（桶共享，前缀是唯一隔离） |
+| `RARITY_R2_PREFIX` | `content` | staging **必须**设 `content-staging`（桶共享，前缀是唯一隔离）。防呆闸：`ATTEST_ALLOW_DEV=true` 的服务器上留空 → 拒绝启用发布（防 staging 空数据覆盖 prod 工件） |
 | `RARITY_MIN_SAMPLE` | 50 | 物种入选的最小 scan 数 |
 | `RARITY_MIN_SPECIES` | 100 | 发布 tier 的最少入选物种数（低于则发空 species） |
 | `RARITY_TIER_CUTS` | `0.40,0.70,0.85,0.95` | 五档分位切点（升序、(0,1)；坏值 WARN+默认） |
@@ -127,6 +134,10 @@ MinSpecies 下限自动发空直到样本够）。
    默认（50/100），**不要**把 staging 的放宽值带进 prod。
 
 ### 7.2 已知边界
+
+- **先跑 012 SQL 再开 `RARITY_COUNT_ENABLED`**：表不存在时无数据损坏、识别不受
+  影响，但 flush worker 每 30s 报一条
+  `dex identify counter: flush ... failed` 日志（publisher 同理每轮失败）。
 
 - staging 验证时若要对照其它内容文件，记得 `content-staging/` 是死快照，先跑
   staging-runbook.md:84 的 rclone 对齐；rarity.json 本身不受影响（本服务直写）。

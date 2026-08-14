@@ -162,7 +162,7 @@ func BuildManifest(counts map[string]int64, version int, generatedAt time.Time, 
 			eligible = append(eligible, sc{id: id, n: n})
 		}
 	}
-	if len(eligible) < cfg.MinSpecies || len(eligible) == 0 {
+	if len(eligible) < cfg.MinSpecies {
 		return m
 	}
 

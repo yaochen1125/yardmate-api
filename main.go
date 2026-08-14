@@ -273,6 +273,14 @@ func main() {
 	rarityPub := buildRarityPublisher(vault, enrichDB)
 	rarityPub.Start(context.Background())
 
+	// Plantdex identify counter (proxy/rarity/SPEC.md §1). OFF by default:
+	// RARITY_COUNT_ENABLED=true + the shared pool enable in-memory counting on
+	// /v1/identify success, flushed to dex_identify_daily by ONE background
+	// worker every 30s (enrichment SPEC §9 #18: never per-request goroutines
+	// against the shared pool). Apply migration 012 before flipping the flag.
+	scanCounter := buildIdentifyScanCounter(vault, enrichDB)
+	scanCounter.Start(context.Background())
+
 	// In-flight concurrency bound for the two image-buffering endpoints
 	// (inflight/SPEC). Caps peak memory so a burst sheds cleanly (503) instead
 	// of OOM-killing the process; overflow first waits up to waitBudget for a
@@ -295,7 +303,7 @@ func main() {
 		inflightWait,
 	)
 
-	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim, doctorSvc, doctorInflight, doctorBudget, rarityPub)
+	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim, doctorSvc, doctorInflight, doctorBudget, rarityPub, scanCounter)
 
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream) with 5 s headroom = 35 s base.
@@ -703,6 +711,15 @@ func buildRarityPublisher(vault *secrets.Vault, db *enrichment.DB) *rarity.Publi
 		log.Printf("WARN: RARITY_PUBLISH_ENABLED=true but Supabase pool unavailable; rarity publish disabled")
 		return nil
 	}
+	// Fat-finger guard: a dev/staging server (ATTEST_ALLOW_DEV=true) with no
+	// explicit prefix would default to the PROD content/ prefix and overwrite
+	// the production artifact with staging counts (the shared bucket has no
+	// per-environment credentials — prefix routing is the only isolation).
+	// Refuse instead; staging must set RARITY_R2_PREFIX=content-staging.
+	if vault.GetBool("ATTEST_ALLOW_DEV", false) && vault.Get("RARITY_R2_PREFIX") == "" {
+		log.Printf("WARN: RARITY_PUBLISH_ENABLED=true on a dev/staging server without RARITY_R2_PREFIX; refusing to default to the prod content/ prefix — rarity publish disabled")
+		return nil
+	}
 	r2Cfg := imageingest.R2Config{
 		AccountID:       vault.Get("R2_ACCOUNT_ID"),
 		AccessKeyID:     vault.Get("R2_ACCESS_KEY_ID"),
@@ -720,10 +737,11 @@ func buildRarityPublisher(vault *secrets.Vault, db *enrichment.DB) *rarity.Publi
 		log.Printf("WARN: rarity publish R2 init failed: %v; disabled", err)
 		return nil
 	}
+	// ParseTierCuts already falls back to DefaultTierCuts on malformed input;
+	// the WARN is the only thing left to do here.
 	cuts, err := rarity.ParseTierCuts(vault.Get("RARITY_TIER_CUTS"))
 	if err != nil {
-		log.Printf("WARN: RARITY_TIER_CUTS invalid (%v); using defaults %v", err, rarity.DefaultTierCuts)
-		cuts = rarity.DefaultTierCuts
+		log.Printf("WARN: RARITY_TIER_CUTS invalid (%v); using defaults %v", err, cuts)
 	}
 	return rarity.NewPublisher(db, r2Client, rarity.Config{
 		Prefix:     vault.Get("RARITY_R2_PREFIX"),
@@ -733,6 +751,23 @@ func buildRarityPublisher(vault *secrets.Vault, db *enrichment.DB) *rarity.Publi
 		Interval:   vaultDurationOr(vault, "RARITY_PUBLISH_INTERVAL", rarity.DefaultInterval),
 		AdminToken: vault.Get("RARITY_ADMIN_TOKEN"),
 	})
+}
+
+// buildIdentifyScanCounter wires the Plantdex identify counter
+// (proxy/rarity/SPEC.md §1): an in-memory accumulator on the identify success
+// path, batch-flushed to dex_identify_daily (migration 012) by one background
+// worker. OFF by default (RARITY_COUNT_ENABLED); nil (WARN when misconfigured)
+// keeps the identify hot path byte-identical to pre-feature behaviour.
+func buildIdentifyScanCounter(vault *secrets.Vault, db *enrichment.DB) *proxy.IdentifyScanCounter {
+	if !vault.GetBool("RARITY_COUNT_ENABLED", false) {
+		log.Printf("dex identify counter: disabled (RARITY_COUNT_ENABLED unset/false)")
+		return nil
+	}
+	if db == nil {
+		log.Printf("WARN: RARITY_COUNT_ENABLED=true but Supabase pool unavailable; dex identify counter disabled")
+		return nil
+	}
+	return proxy.NewIdentifyScanCounter(db)
 }
 
 // buildDoctorService wires POST /v1/doctor (doctor/SPEC.md). Needs only the
