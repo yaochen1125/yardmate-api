@@ -71,15 +71,15 @@ type HistoryTurn struct {
 
 // StreamRequest is one upstream generation.
 type StreamRequest struct {
-	Model    string
+	Model string
 	// gpt-5 系列的思考档位。minimal 的产出是模板腔（真机对比 ChatGPT 实锤：
 	// 无机理、无重构、行动放之四海皆准），默认提到 low；vault DOCTOR_REASONING_EFFORT 可调。
 	ReasoningEffort string
-	Language string
-	Units    string
-	History  []HistoryTurn
-	UserText string
-	Images   [][]byte // sniffed jpeg/png/webp, ≤3 (validated by the handler)
+	Language        string
+	Units           string
+	History         []HistoryTurn
+	UserText        string
+	Images          [][]byte // sniffed jpeg/png/webp, ≤3 (validated by the handler)
 }
 
 // Client streams chat/completions. The zero value is not usable; NewClient
@@ -335,6 +335,18 @@ func buildBody(req StreamRequest) ([]byte, error) {
 		}
 	}
 	return json.Marshal(body)
+}
+
+// XAIEndpoint is the OpenAI-compatible chat completions URL for xAI (grok).
+const XAIEndpoint = "https://api.x.ai/v1/chat/completions"
+
+// SetResponseHeaderTimeout 放宽首字节等待（仅该 client 自己的 transport）。
+// grok-4.6 带图推理 60s 内连响应头都不回（staging 实锤 59.9s upstream
+// timeout），xAI 客户端要 120s；OpenAI 客户端维持默认。
+func (c *Client) SetResponseHeaderTimeout(d time.Duration) {
+	if t, ok := c.http.Transport.(*http.Transport); ok {
+		t.ResponseHeaderTimeout = d
+	}
 }
 
 // relativeAge renders a duration for the prompt ("3 hours ago" / "5 days ago").

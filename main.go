@@ -708,6 +708,12 @@ func buildDoctorService(vault *secrets.Vault) (*doctor.Service, *ratelimit.Bucke
 		}
 	}
 	svc.LeadTurns = vaultIntOr(vault, "DOCTOR_LEAD_TURNS", 2)
+	// grok 系上游：配了 XAI_API_KEY 才建（缺省零 xAI 面；选 grok 自动回落并告警）
+	if xaiKey := vault.Get("XAI_API_KEY"); xaiKey != "" {
+		svc.XAIClient = doctor.NewClient(xaiKey, doctor.XAIEndpoint)
+		svc.XAIClient.SetResponseHeaderTimeout(120 * time.Second)
+		log.Printf("doctor: xAI upstream ready (grok models selectable)")
+	}
 	budget := ratelimit.NewBucket(vaultIntOr(vault, "DOCTOR_HOURLY_BUDGET", defaultDoctorHourlyBudget), time.Hour)
 	log.Printf("doctor service ready: model=%s followup=%s leadTurns=%d override=%v budget=%d/h",
 		svc.Model, svc.FollowupModel, svc.LeadTurns, svc.AllowOverride, vaultIntOr(vault, "DOCTOR_HOURLY_BUDGET", defaultDoctorHourlyBudget))

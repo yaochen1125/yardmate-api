@@ -41,6 +41,7 @@ var modelWhitelist = map[string]bool{
 	"gpt-4o":      true,
 	"gpt-5-mini":  true,
 	"gpt-5":       true,
+	"grok-4.6":    true,
 }
 
 // SpendGate is the hourly budget check (ratelimit.GlobalGate). Called AFTER
@@ -52,7 +53,10 @@ type SpendGate func(http.ResponseWriter) bool
 // Service carries the endpoint's configuration. Built once in main.go from
 // the secrets vault; nil Service → route unregistered.
 type Service struct {
-	Client        *Client
+	Client *Client
+	// XAIClient 服务 grok-* 系（api.x.ai，OpenAI 兼容线协议）。nil = 未配
+	// XAI_API_KEY，grok 选择静默回落 Model（部署不配即无 xAI 面）。
+	XAIClient     *Client
 	Model         string // default model (vault DOCTOR_MODEL)
 	AllowOverride bool   // vault DOCTOR_ALLOW_MODEL_OVERRIDE; prod stays false
 	// gpt-5 系列的思考档位（vault DOCTOR_REASONING_EFFORT；空 = low）。
@@ -82,18 +86,36 @@ func NewService(apiKey, endpoint, model string, allowOverride bool) *Service {
 // resolveModel applies an override request against policy. Unauthorized or
 // unknown overrides fall back silently to the default — a stale debug build
 // must degrade, not break (SPEC §2).
+// clientFor returns the upstream client for a resolved model.
+// grok-* → XAIClient；其余 → OpenAI Client。
+func (s *Service) clientFor(model string) *Client {
+	if strings.HasPrefix(model, "grok") && s.XAIClient != nil {
+		return s.XAIClient
+	}
+	return s.Client
+}
+
 // resolveModel picks the model for this turn.
 // 档位策略（用户拍板 2026-08-13）：前 LeadTurns 轮走主力模型（看图定性 +
 // 用户看着照片补充信息的关键轮），之后走 FollowupModel 省钱 —— 追问多是
 // 执行确认。debug 覆盖（仅 AllowOverride 环境）仍然最高优先。
 func (s *Service) resolveModel(requested string, priorTurns int) string {
 	if requested != "" && s.AllowOverride && modelWhitelist[requested] {
-		return requested
+		if strings.HasPrefix(requested, "grok") && s.XAIClient == nil {
+			log.Printf("doctor: override %q needs XAI_API_KEY (absent); ignoring", requested)
+		} else {
+			return requested
+		}
 	}
+	pick := s.Model
 	if s.FollowupModel != "" && priorTurns >= s.LeadTurns {
-		return s.FollowupModel
+		pick = s.FollowupModel
 	}
-	return s.Model
+	if strings.HasPrefix(pick, "grok") && s.XAIClient == nil {
+		log.Printf("doctor: model %q needs XAI_API_KEY (absent); falling back to gpt-4o-mini", pick)
+		return "gpt-4o-mini"
+	}
+	return pick
 }
 
 // Handle returns the /v1/doctor handler. Per-IP / per-device rate limits and
@@ -239,7 +261,7 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 		defer cancel()
 
 		obsCount := 0
-		reply, usage, err := svc.Client.Stream(ctx, StreamRequest{
+		reply, usage, err := svc.clientFor(resolved).Stream(ctx, StreamRequest{
 			ReasoningEffort: svc.ReasoningEffort,
 			Model:           resolved,
 			Language:        lang,
