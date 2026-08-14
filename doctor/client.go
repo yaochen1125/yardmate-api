@@ -334,6 +334,15 @@ func buildBody(req StreamRequest) ([]byte, error) {
 			body.ReasoningEffort = "low"
 		}
 	}
+	// grok 系同样吃 reasoning_effort（low/medium/high/xhigh），且**不传默认
+	// high** —— 之前什么都没发，等于一直跑最重档，带图首字节 >60s 的另一半
+	// 真相。默认 low；xAI 无 minimal 档，操作员配了就地夹到 low。
+	if strings.HasPrefix(req.Model, "grok") {
+		body.ReasoningEffort = req.ReasoningEffort
+		if body.ReasoningEffort == "" || body.ReasoningEffort == "minimal" {
+			body.ReasoningEffort = "low"
+		}
+	}
 	return json.Marshal(body)
 }
 
