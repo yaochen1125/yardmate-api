@@ -32,6 +32,11 @@ const (
 	// 2 KB text) = 80 KB) so a maximal legal history is never truncated into
 	// invalid JSON by the LimitReader.
 	maxHistoryBytes = 96 << 10
+
+	// fallbackMinBudget：换灾备档重跑要求的最小剩余流预算。不足一次完整
+	// 生成就不重跑 —— 两跑叠着撞 streamTimeout，客户端要等满上限才拿到
+	// 错误，比立刻报错更糟。
+	fallbackMinBudget = 60 * time.Second
 )
 
 // modelWhitelist bounds what a model override can select even in dev —
@@ -65,6 +70,10 @@ type Service struct {
 	FollowupModel string
 	// LeadTurns：主力模型负责的前几轮，默认 2。
 	LeadTurns int
+	// FallbackModel：当轮模型上游失败时的灾备档（vault DOCTOR_FALLBACK_MODEL，
+	// 空 = 不灾备）。任何 Stream 错误且客户端还在 → 换它整轮重跑，observation
+	// 续号转发，客户端无感（用户拍板 2026-08-13：全程零提示）。
+	FallbackModel string
 }
 
 // NewService wires the streaming client. endpoint == "" → OpenAI.
@@ -116,6 +125,19 @@ func (s *Service) resolveModel(requested string, priorTurns int) string {
 		return "gpt-4o-mini"
 	}
 	return pick
+}
+
+// fallbackFor returns the retry model after `resolved` failed ("" = none).
+// Self-retry is pointless, and a grok fallback without the xAI client can't run.
+func (s *Service) fallbackFor(resolved string) string {
+	fb := s.FallbackModel
+	if fb == "" || fb == resolved {
+		return ""
+	}
+	if strings.HasPrefix(fb, "grok") && s.XAIClient == nil {
+		return ""
+	}
+	return fb
 }
 
 // Handle returns the /v1/doctor handler. Per-IP / per-device rate limits and
@@ -260,8 +282,7 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), streamTimeout)
 		defer cancel()
 
-		obsCount := 0
-		reply, usage, err := svc.clientFor(resolved).Stream(ctx, StreamRequest{
+		req := StreamRequest{
 			ReasoningEffort: svc.ReasoningEffort,
 			Model:           resolved,
 			Language:        lang,
@@ -269,10 +290,36 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 			History:         history,
 			UserText:        text,
 			Images:          images,
-		}, func(index int, s string) {
+		}
+		obsCount := 0
+		reply, usage, err := svc.clientFor(resolved).Stream(ctx, req, func(index int, s string) {
 			obsCount++
 			out.event("observation", map[string]any{"index": index, "text": s})
 		})
+		usedModel := resolved
+
+		// 灾备链（grok-4.6 low → gpt-5-mini，用户拍板 2026-08-13）：主档任何
+		// Stream 错误且客户端还在 → 灾备档整轮重跑。observation 加 offset 续号
+		// —— 客户端只接受恰好接续的 index，续号让思考条无缝继续冒；重复文案由
+		// 客户端按内容去重。剩余预算不足一次完整生成则不重跑。
+		if err != nil && r.Context().Err() == nil {
+			if fb := svc.fallbackFor(resolved); fb != "" {
+				if dl, ok := ctx.Deadline(); ok && time.Until(dl) >= fallbackMinBudget {
+					log.Printf("doctor: device=%s model=%s obs=%d err=%v; retrying on %s",
+						deviceID, resolved, obsCount, err, fb)
+					// SSE 注释行：客户端按前缀忽略内容，字节本身重置其闲置计时。
+					out.comment("retry")
+					offset := obsCount
+					fbReq := req
+					fbReq.Model = fb
+					reply, usage, err = svc.clientFor(fb).Stream(ctx, fbReq, func(index int, s string) {
+						obsCount++
+						out.event("observation", map[string]any{"index": offset + index, "text": s})
+					})
+					usedModel = fb
+				}
+			}
+		}
 
 		ms := time.Since(start).Milliseconds()
 		if err != nil {
@@ -288,7 +335,7 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 			if r.Context().Err() == nil {
 				out.event("error", map[string]any{"code": code})
 			}
-			log.Printf("doctor: device=%s ms=%d model=%s obs=%d err=%v", deviceID, ms, resolved, obsCount, err)
+			log.Printf("doctor: device=%s ms=%d model=%s obs=%d err=%v", deviceID, ms, usedModel, obsCount, err)
 			return
 		}
 
@@ -301,7 +348,7 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 			in, outTok = usage.PromptTokens, usage.CompletionTokens
 		}
 		log.Printf("doctor: device=%s ms=%d model=%s obs=%d in=%d out=%d imgs=%d turns=%d",
-			deviceID, ms, resolved, obsCount, in, outTok, len(images), len(history))
+			deviceID, ms, usedModel, obsCount, in, outTok, len(images), len(history))
 	}
 }
 
@@ -351,6 +398,14 @@ func (s sseWriter) eventRaw(name string, raw json.RawMessage) {
 
 func (s sseWriter) write(name string, data []byte) {
 	fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", name, data)
+	s.f.Flush()
+}
+
+// comment emits an SSE comment line. Clients skip it by contract (the iOS
+// transport matches only "event: "/"data: " prefixes) — its bytes exist to
+// reset the client's inter-byte idle timer across a fallback switch.
+func (s sseWriter) comment(text string) {
+	fmt.Fprintf(s.w, ": %s\n\n", text)
 	s.f.Flush()
 }
 

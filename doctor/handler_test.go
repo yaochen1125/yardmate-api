@@ -295,3 +295,111 @@ func TestNewServiceRejectsUnknownDefaultModel(t *testing.T) {
 		t.Fatalf("unknown DOCTOR_MODEL resolved to %q, want gpt-4o-mini fallback", svc.Model)
 	}
 }
+
+// fakeBrokenUpstream streams `prefix` as one delta chunk, then closes the
+// response without [DONE] or a complete reply — a mid-generation death.
+func fakeBrokenUpstream(t *testing.T, prefix string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		chunk := map[string]any{
+			"choices": []map[string]any{{"delta": map[string]any{"content": prefix}}},
+		}
+		b, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		fl.Flush()
+	}))
+}
+
+// 灾备链（用户拍板 2026-08-13）：主档半途死 → FallbackModel 整轮重跑，
+// observation 续号（客户端序号闸恰好接续），usage/reply 照常，全程零提示。
+func TestHandleFallbackRetriesWithContinuedIndex(t *testing.T) {
+	// 主档（grok → XAIClient）：吐完第一条 observation 就断，reply 永不来。
+	cut := strings.Index(wireReply, `","Soil`) + 2
+	primary := fakeBrokenUpstream(t, wireReply[:cut])
+	defer primary.Close()
+	fallback := fakeUpstream(t, []string{wireReply}, true)
+	defer fallback.Close()
+
+	svc := NewService("k", fallback.URL, "grok-4.6", false)
+	svc.XAIClient = NewClient("k", primary.URL)
+	svc.FallbackModel = "gpt-5-mini"
+
+	body, ct := buildMultipart(t, map[string]string{"text": "hi"}, nil)
+	rec := httptest.NewRecorder()
+	Handle(svc, allowGate)(rec, doctorRequest(t, body, ct))
+
+	events := parseSSE(t, rec.Body.String())
+	type obs struct {
+		Index int    `json:"index"`
+		Text  string `json:"text"`
+	}
+	var seq []obs
+	var kinds []string
+	for _, e := range events {
+		kinds = append(kinds, e[0])
+		if e[0] == "observation" {
+			var o obs
+			if err := json.Unmarshal([]byte(e[1]), &o); err != nil {
+				t.Fatal(err)
+			}
+			seq = append(seq, o)
+		}
+	}
+	// 主跑 1 条（index 0）+ 灾备全量 2 条续号（index 1、2），然后 usage+reply。
+	want := []string{"observation", "observation", "observation", "usage", "reply"}
+	if strings.Join(kinds, ",") != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", kinds, want)
+	}
+	for i, o := range seq {
+		if o.Index != i {
+			t.Fatalf("observation %d has index %d — fallback must continue numbering, not restart", i, o.Index)
+		}
+	}
+	if seq[1].Text != "Leaves drooping" || seq[2].Text != "Soil pale and dry" {
+		t.Fatalf("fallback observations = %+v", seq)
+	}
+}
+
+func TestHandleFallbackBothFailIsSSEError(t *testing.T) {
+	boom := func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}
+	bad1 := httptest.NewServer(http.HandlerFunc(boom))
+	defer bad1.Close()
+	bad2 := httptest.NewServer(http.HandlerFunc(boom))
+	defer bad2.Close()
+
+	svc := NewService("k", bad2.URL, "grok-4.6", false)
+	svc.XAIClient = NewClient("k", bad1.URL)
+	svc.FallbackModel = "gpt-5-mini"
+
+	body, ct := buildMultipart(t, map[string]string{"text": "hi"}, nil)
+	rec := httptest.NewRecorder()
+	Handle(svc, allowGate)(rec, doctorRequest(t, body, ct))
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) != 1 || events[0][0] != "error" {
+		t.Fatalf("events = %v, want single error", events)
+	}
+}
+
+// fallbackFor 策略：未配置 / 配成当轮自身 / grok 灾备缺 xAI client → 不重跑。
+func TestFallbackForPolicy(t *testing.T) {
+	svc := NewService("k", "", "grok-4.6", false)
+	if got := svc.fallbackFor("grok-4.6"); got != "" {
+		t.Fatalf("unset FallbackModel returned %q", got)
+	}
+	svc.FallbackModel = "gpt-5-mini"
+	if got := svc.fallbackFor("gpt-5-mini"); got != "" {
+		t.Fatalf("self-fallback returned %q", got)
+	}
+	if got := svc.fallbackFor("grok-4.6"); got != "gpt-5-mini" {
+		t.Fatalf("fallback = %q, want gpt-5-mini", got)
+	}
+	svc.FallbackModel = "grok-4.6"
+	if got := svc.fallbackFor("gpt-5"); got != "" {
+		t.Fatalf("grok fallback without XAIClient returned %q", got)
+	}
+}

@@ -708,6 +708,14 @@ func buildDoctorService(vault *secrets.Vault) (*doctor.Service, *ratelimit.Bucke
 		}
 	}
 	svc.LeadTurns = vaultIntOr(vault, "DOCTOR_LEAD_TURNS", 2)
+	// 灾备档：当轮模型（主力或省钱档）上游失败 → 换它整轮重跑（未设 = 不灾备）。
+	if fb := vault.Get("DOCTOR_FALLBACK_MODEL"); fb != "" {
+		if doctor.ModelAllowed(fb) {
+			svc.FallbackModel = fb
+		} else {
+			log.Printf("WARN: DOCTOR_FALLBACK_MODEL %q not in whitelist; ignoring", fb)
+		}
+	}
 	// grok 系上游：配了 XAI_API_KEY 才建（缺省零 xAI 面；选 grok 自动回落并告警）
 	if xaiKey := vault.Get("XAI_API_KEY"); xaiKey != "" {
 		svc.XAIClient = doctor.NewClient(xaiKey, doctor.XAIEndpoint)
@@ -715,8 +723,8 @@ func buildDoctorService(vault *secrets.Vault) (*doctor.Service, *ratelimit.Bucke
 		log.Printf("doctor: xAI upstream ready (grok models selectable)")
 	}
 	budget := ratelimit.NewBucket(vaultIntOr(vault, "DOCTOR_HOURLY_BUDGET", defaultDoctorHourlyBudget), time.Hour)
-	log.Printf("doctor service ready: model=%s followup=%s leadTurns=%d override=%v budget=%d/h",
-		svc.Model, svc.FollowupModel, svc.LeadTurns, svc.AllowOverride, vaultIntOr(vault, "DOCTOR_HOURLY_BUDGET", defaultDoctorHourlyBudget))
+	log.Printf("doctor service ready: model=%s followup=%s leadTurns=%d fallback=%s override=%v budget=%d/h",
+		svc.Model, svc.FollowupModel, svc.LeadTurns, svc.FallbackModel, svc.AllowOverride, vaultIntOr(vault, "DOCTOR_HOURLY_BUDGET", defaultDoctorHourlyBudget))
 	return svc, budget
 }
 
