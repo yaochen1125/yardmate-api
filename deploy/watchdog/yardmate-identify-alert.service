@@ -1,0 +1,5 @@
+[Unit]
+Description=YardMate identify anomaly watchdog (502 / slow-200 / rescue failures)
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/yardmate-identify-alert.sh
