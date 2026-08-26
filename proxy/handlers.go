@@ -21,10 +21,36 @@ import (
 // Enforced by http.MaxBytesReader at handler entry per SPEC §4.2.
 const identifyMaxBody = 9 << 20 // 9 MiB
 
-// Hard timeout for the upstream Plant.id call (per SPEC §5.2). The chi
-// middleware.Timeout (10 s) is overridden via a per-request derived context
-// so Plant.id has up to 30 s — the proxy is the slow-path tenant.
-const identifyUpstreamTimeout = 30 * time.Second
+// Hard timeout for the upstream engine cascade (per SPEC §5.2); this route has
+// no chi Timeout — the handler manages its own deadline. 22s（原 30s）：iOS 侧
+// identify timeout 也是 30s，但它从发请求起算 —— 比 reqStart 早了连接建立 +
+// in-flight 限流排队（默认最多 5s，main.go defaultInflightWait）。服务端预算 =
+// 客户端预算时，服务端每一次"合法用满"都是客户端看不到的 200（2026-08-26 事故：
+// 28.1s `identify ok`，用户看到网络错误；Codex review P1）。22s + 5s 队列 +
+// 下行 ≈ 27s < 30s，回包时客户端必然在线。级联 ctx 用 WithDeadline(reqStart +
+// 本值) 锚定在 handler 入口（镜像 diagnose）—— multipart 上传在 reqStart 之后读，
+// 慢上传因此真正计入本预算（只 WithTimeout 会漏掉上传，Codex review P1 二连）。
+const identifyUpstreamTimeout = 22 * time.Second
+
+// identifyPlantNetTimeout — Pl@ntNet 单跳预算（22s 总预算的子集，var 供测试缩短）。
+// 2026-08-26 事故：Pl@ntNet 上游挂起，一跳吃满共享的 30s ctx —— iOS 侧 30s（含上传）
+// 先到期断线，GPT on-demand 兜底拿到的是已取消的 ctx，必死 → 502。单跳 12s 切断后，
+// 兜底接手时客户端仍在线、且 22s 总预算还有 10s 余量（≥ minIdentifyRescueBudget）。
+// 正常 Pl@ntNet 延迟中位 ~1s，12s 只砍 outage 尾部，不误伤慢请求。
+var identifyPlantNetTimeout = 12 * time.Second
+
+// identifyWallClockBudget bounds the GPT on-demand rescue by wall clock from
+// reqStart（= identifyUpstreamTimeout：真正的紧约束是客户端 30s 计时器，不是 35s
+// WriteTimeout —— 见 identifyUpstreamTimeout 的预算推导；镜像 diagnose 的
+// wall-clock budget pattern）。兜底 ctx 与主级联解耦后不再有 deadline，必须用
+// wall clock 封顶：否则 PlantNet 12s + Plant.id 吃满共享预算的配置组合
+// （GPT_ARBITER_ON_DEMAND=true 且 PLANTID_IDENTIFY_FALLBACK=true）下，GPT 可跑到
+// 客户端断线之后 —— 白烧钱且响应写不回去（Codex review P2 + P1）。
+const identifyWallClockBudget = identifyUpstreamTimeout
+
+// minIdentifyRescueBudget — 剩余 wall clock 低于此值就不发起注定超时的 GPT 调用
+// （直接保留 err → 502）。镜像 minDiagnoseFallbackBudget（6s）。
+const minIdentifyRescueBudget = 6 * time.Second
 
 // aiCatalogRecoveryMinConfidence is the floor the AI vision guess must clear
 // to be ACCEPTED as a curated-catalog recovery (SPEC §2.1 catalog-preference
@@ -371,7 +397,10 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), identifyUpstreamTimeout)
+		// Anchored at reqStart（handler 入口，multipart 读取之前）而非"现在"：
+		// 慢上传必须计入 22s 预算，否则 5s 队列 + 4s 上传 + 22s 级联 ≈ 31s，又造出
+		// 客户端看不到的 200（Codex review P1 二连；镜像 diagnose 的 WithDeadline 锚定）。
+		ctx, cancel := context.WithDeadline(r.Context(), reqStart.Add(identifyUpstreamTimeout))
 		defer cancel()
 
 		// --- Parallel GPT-4o open-world arbiter (identify-gpt-arbiter). Fire the
@@ -436,7 +465,11 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 
 		if plantNet != nil {
 			engine = "plantnet"
-			result, err = plantNet.Identify(ctx, bytes.NewReader(imgBytes), mime, organ)
+			// 单跳预算：不许 Pl@ntNet 一跳吃满共享 ctx（见 identifyPlantNetTimeout）。
+			// 超时被 plantnet.go 包成 ErrPlantNetUnavailable → plantNetFellBack 正常成立。
+			pnCtx, pnCancel := context.WithTimeout(ctx, identifyPlantNetTimeout)
+			result, err = plantNet.Identify(pnCtx, bytes.NewReader(imgBytes), mime, organ)
+			pnCancel()
 		}
 
 		// Decide whether to fall back to Plant.id. Fall back iff Pl@ntNet was
@@ -545,23 +578,51 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			// image-rejection（坏图 / 不支持格式）不是引擎 outage —— 保持原 400
 			// bad_image 让用户重拍，绝不送 GPT（否则坏图被 GPT 转成 200 结果）。Codex #111-1。
 			engErr := err
-			s, e := vision.IdentifyPlant(ctx, imgBytes, mime)
-			switch {
-			case e == nil && s != nil:
-				result = &IdentifyResult{IsPlant: true, IsPlantConfidence: 1.0}
-				gptSug = s
-				engine = "ai-fallback"
-				err = nil
-			case errors.Is(e, ErrVisionNotAPlant):
-				// GPT 有效判定"不是植物" → 清引擎 outage + 保留 sentinel error，让下方
-				// cascade 的 ErrVisionNotAPlant 分支返回 Unknown sentinel（而非原 502）。Codex #111-2。
-				result = &IdentifyResult{IsPlant: true, IsPlantConfidence: 1.0}
-				gptErr = ErrVisionNotAPlant
-				engine = "ai-fallback"
-				err = nil
+			rescueBudget := identifyWallClockBudget - time.Since(reqStart)
+			if ce := r.Context().Err(); ce != nil {
+				// 客户端已断开（iOS 侧 30s 超时先到 / 用户退出）——没人在听，跳过 GPT
+				// 省一次调用；err 保留走原 502（响应写不回去，无人看到）。2026-08-26
+				// 事故中三次 "context canceled" 均属此类。
+				log.Printf("identify gpt on-demand fallback skipped (client gone): deviceID=%s ctxErr=%v enginesDownErr=%v",
+					deviceID, ce, engErr)
+			} else if rescueBudget < minIdentifyRescueBudget {
+				// 主级联（PlantNet 12s + 可能的 Plant.id）+ 慢上传已把 wall clock 吃到
+				// 离 WriteTimeout 太近：GPT 注定在响应可写窗口内完不成，不发起
+				// （省钱 + 不留孤儿调用），保留 err → 502。Codex review P2。
+				log.Printf("identify gpt on-demand fallback skipped (budget exhausted): deviceID=%s remaining=%v enginesDownErr=%v",
+					deviceID, rescueBudget, engErr)
+			} else {
+				// 兜底预算与主级联解耦：父 ctx 用 r.Context()（本路由无 chi Timeout，
+				// 无 deadline、只随客户端断开取消 —— 断开中止不烧钱）而非上面的共享
+				// 30s ctx：主级联把总预算烧光时兜底必死（2026-08-26 事故根因）。再用
+				// reqStart 起算的 wall clock 封顶，保证 GPT 调用不越过 WriteTimeout
+				// （IdentifyPlant 内部的 15s deadline 与此取更紧者，tier-3 决策 (g)）。
+				// 镜像 diagnose 兜底的 "don't reuse the timed-out ctx" + wall-clock
+				// budget 决策（SPEC §2.2）。
+				rctx, rcancel := context.WithTimeout(r.Context(), rescueBudget)
+				s, e := vision.IdentifyPlant(rctx, imgBytes, mime)
+				rcancel()
+				switch {
+				case e == nil && s != nil:
+					result = &IdentifyResult{IsPlant: true, IsPlantConfidence: 1.0}
+					gptSug = s
+					engine = "ai-fallback"
+					err = nil
+				case errors.Is(e, ErrVisionNotAPlant):
+					// GPT 有效判定"不是植物" → 清引擎 outage + 保留 sentinel error，让下方
+					// cascade 的 ErrVisionNotAPlant 分支返回 Unknown sentinel（而非原 502）。Codex #111-2。
+					result = &IdentifyResult{IsPlant: true, IsPlantConfidence: 1.0}
+					gptErr = ErrVisionNotAPlant
+					engine = "ai-fallback"
+					err = nil
+				default:
+					// GPT 兜底也失败：错因必须落盘。此前 e 被静默丢弃、日志只有
+					// rescued=false，2026-08-26 事故只能靠读代码倒推原因。
+					log.Printf("identify gpt on-demand fallback err: deviceID=%s visionErr=%v", deviceID, e)
+				}
+				log.Printf("identify gpt on-demand fallback: deviceID=%s enginesDownErr=%v rescued=%v notPlant=%v",
+					deviceID, engErr, err == nil, errors.Is(gptErr, ErrVisionNotAPlant))
 			}
-			log.Printf("identify gpt on-demand fallback: deviceID=%s enginesDownErr=%v rescued=%v notPlant=%v",
-				deviceID, engErr, err == nil, errors.Is(gptErr, ErrVisionNotAPlant))
 		}
 		if err == nil {
 			// Await the parallel GPT arbiter fired at cascade start (gptSug is nil
