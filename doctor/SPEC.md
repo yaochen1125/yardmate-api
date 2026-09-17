@@ -132,6 +132,29 @@ never translated. `followUp` stays in the schema — the reminder feature is
 deferred client-side, and removing/re-adding schema fields is a contract
 change; the client simply doesn't render it yet.
 
+**Household remedies rule** (2026-09, backs the App Store product page
+claim "often with things already in your kitchen"). When a common household or
+kitchen item is a genuinely effective and safe option for the problem in the
+photo, it becomes one of the `actionsNow` steps with recipe (amount/dilution in
+the user's units), how/how often to apply, and a short safety note (test on one
+leaf, evening/out of sun, pets). Allowed set, each with horticultural support:
+true (castile) soap spray for soft-bodied pests, plain dish liquid only as a flagged second choice at the low dilution; 70 percent rubbing-alcohol swab (stronger bottles diluted 3:1) for
+mealybugs/scale; weak baking soda spray as a powdery-mildew *preventive*;
+top-dry + yellow sticky traps for fungus gnats (vinegar-and-soap dish only as a
+weaker backup lure); cinnamon on cuts as a minor add-on only (kept for root cuts
+too — product decision 2026-09-16 after staging review). Amounts are given in
+the user's unit system only (metric ml/g, US teaspoons). Forbidden: bleach, vinegar on the plant or soil, salt on soil, strong soap/detergent
+mixes, straight cooking oil, anything harmful to plant/people/pets. Never
+forced: root rot, sunburn, watering/nutrient problems, pruning/repotting, or
+pests that need a proper product get the real fix and no kitchen remedy. The
+rule lives in both the system prompt (`HOUSEHOLD REMEDIES` section + the
+`actionsNow` field rule) and the schema's `actionsNow` description; it never
+overrides the branch rules (`actionsNow` stays null under `photoProblem` /
+`clarification`), the 2–4 item cap, or the field order.
+`prompt_test.go` asserts the rule's presence, that rendering introduces no
+`fmt` verb errors (the prompt is a format string — a bare percent sign breaks
+it), and that the schema property order is unchanged.
+
 `reasoning_effort: minimal` is sent ONLY for gpt-5-family models (other
 models 400 on the parameter).
 
