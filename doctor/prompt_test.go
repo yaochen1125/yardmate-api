@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -37,5 +38,88 @@ func TestReplySchemaRequiredMatchesProperties(t *testing.T) {
 func TestResponseFormatIsValidJSON(t *testing.T) {
 	if !json.Valid([]byte(responseFormat)) {
 		t.Fatal("responseFormat is not valid JSON")
+	}
+}
+
+// 字段顺序是流式进度的承重墙（SPEC §5）：observations 必须最先完成、
+// spokenSummary 在结构之后。改 prompt/描述时顺带重排字段 = 静默失效。
+func TestReplySchemaFieldOrderUnchanged(t *testing.T) {
+	want := []string{"photoProblem", "observations", "clarification", "healthLevel", "diagnosis", "possibleCauses", "actionsNow", "expectedRecovery", "followUp", "spokenSummary", "caseTitle"}
+	dec := json.NewDecoder(strings.NewReader(replySchema))
+	var got []string
+	depth := 0
+	inProps := false
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		switch v := tok.(type) {
+		case json.Delim:
+			if v == '{' || v == '[' {
+				depth++
+			} else {
+				depth--
+				if inProps && depth == 1 {
+					inProps = false
+				}
+			}
+		case string:
+			if depth == 1 && v == "properties" {
+				inProps = true
+				continue
+			}
+			// 顶层 properties 对象内（depth 2）的 key 就是字段名；值都是对象，
+			// 所以 depth==2 的字符串 token 只会是 key。
+			if inProps && depth == 2 {
+				got = append(got, v)
+			}
+		}
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("schema property order changed:\n got %v\nwant %v", got, want)
+	}
+}
+
+// 家用疗法规则：必须在 system prompt 与 actionsNow 描述里都在场，
+// 且新增文字不能引入裸 % 把 fmt 渲染弄坏。
+func TestSystemPromptHouseholdRemedies(t *testing.T) {
+	for _, units := range []string{"metric", "imperial"} {
+		p := SystemPrompt("en", units)
+		if strings.Contains(p, "%!") {
+			t.Fatalf("%s: fmt verb error in rendered prompt", units)
+		}
+		for _, must := range []string{
+			"HOUSEHOLD REMEDIES",
+			"castile soap",
+			"baking soda",
+			"sticky traps",
+			"cinnamon",
+			"never both",
+			"70 percent rubbing (isopropyl) alcohol",
+			"NEVER suggest bleach, vinegar sprayed or poured on the plant or soil, salt on the soil",
+			"Do not force it",
+			"never appears when actionsNow must be null",
+			"still within the 2 to 4 limit",
+		} {
+			if !strings.Contains(p, must) {
+				t.Errorf("%s: prompt missing %q", units, must)
+			}
+		}
+	}
+
+	var schema struct {
+		Properties map[string]struct {
+			Description string `json:"description"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(replySchema), &schema); err != nil {
+		t.Fatal(err)
+	}
+	d := schema.Properties["actionsNow"].Description
+	for _, must := range []string{"2 to 4", "Null when clarification or photoProblem is set", "household or kitchen item", "Never bleach", "Do not force"} {
+		if !strings.Contains(d, must) {
+			t.Errorf("actionsNow description missing %q", must)
+		}
 	}
 }
