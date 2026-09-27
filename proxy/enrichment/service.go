@@ -78,7 +78,7 @@ type Service struct {
 	db         ServiceDB
 	llm        ServiceLLM
 	cache      *Cache
-	inat       *proxy.INatClient   // optional iNat client; nil → skip name override (PR #24 follow-up, library-internal stays curated)
+	names      *NameResolver       // optional; nil → no authoritative-name override (SPEC §7 common_name C; catalog rows stay curated)
 	backfill   *Backfiller         // optional; nil → no async translation backfill (tests / DB-less mode)
 	diseaseIDs map[string]struct{} // for common_diseases_list whitelist
 
@@ -105,17 +105,29 @@ func (s *Service) Backfiller() *Backfiller {
 	return s.backfill
 }
 
+// SetNameResolver replaces the authoritative-name resolver (main wires one with
+// both iNat and Wikidata; NewService's default uses iNat only). nil disables
+// the override.
+func (s *Service) SetNameResolver(r *NameResolver) {
+	if s != nil {
+		s.names = r
+	}
+}
+
 // NewService builds a Service with the given dependencies. content may not
 // be nil in production (path-1 catalog hit relies on it); db + llm + cache +
-// inat may legitimately be nil during partial-degradation tests. inat is the
-// iNaturalist taxa client used to override out-of-catalog common names with
-// iNat preferred_common_name (PR #24 follow-up; library-internal catalog
-// results stay curated, matching identify-side priority library > iNat >
-// upstream).
+// inat may legitimately be nil during partial-degradation tests. inat backs the
+// default authoritative-name resolver that overrides out-of-catalog common
+// names (SPEC §7 common_name C; library-internal catalog results stay curated,
+// matching identify-side priority library > iNat > upstream).
 //
 // Computes the catalog disease ID set once for fast whitelisting of
 // LLM-generated common_diseases_list (SPEC §1.1 + §7 whitelist decision).
 func NewService(content *proxy.ContentIndex, db ServiceDB, llm ServiceLLM, cache *Cache, inat *proxy.INatClient) *Service {
+	var names *NameResolver
+	if inat != nil {
+		names = NewNameResolver(inat, nil)
+	}
 	diseaseIDs := make(map[string]struct{})
 	if content != nil {
 		for _, ref := range content.AllDiseaseNames() {
@@ -127,7 +139,7 @@ func NewService(content *proxy.ContentIndex, db ServiceDB, llm ServiceLLM, cache
 		db:         db,
 		llm:        llm,
 		cache:      cache,
-		inat:       inat,
+		names:      names,
 		diseaseIDs: diseaseIDs,
 	}
 }
@@ -170,25 +182,50 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	preciseName := proxy.NormalizeScientificNamePrecise(name)
 	cacheKey := preciseName + "|" + lang
 
-	// iNat preferred_common_name override applies to ENGLISH rows only (SPEC §7
-	// common_name B): the iNat name is English, so injecting it into a localized
-	// row would force English back in. The lookup itself is deferred until AFTER
-	// the cache (Step 0) and catalog (Step 1) short-circuits so a hot-path hit
-	// pays no 8s iNat round-trip; iNatName stays "" (a no-op override) until then.
-	iNatName := ""
-	overrideINat := func(d *proxy.PlantDetail, source string) *proxy.PlantDetail {
-		if iNatName == "" || source == SourceCatalog || d == nil {
+	// Authoritative display name (SPEC §7 common_name C): every NON-catalog
+	// response gets its common_name from iNat / Wikidata in the request language
+	// (→ English → scientific name), never the LLM's. Resolution is started once
+	// (startName) and awaited lazily (awaitName) so it overlaps the DB lookups /
+	// LLM call; the resolver's own 24h cache makes repeat lookups free and its
+	// 1.5s cap bounds the first one. Catalog hits never start it. All closures
+	// run on this goroutine (singleflight runs fn on the leader's goroutine).
+	var nameCh chan resolveOutcome
+	var nameResult *resolveOutcome
+	startName := func() {
+		if nameCh != nil {
+			return
+		}
+		nameCh = make(chan resolveOutcome, 1)
+		go func() {
+			n, ok := s.names.Resolve(ctx, name, lang)
+			nameCh <- resolveOutcome{n, ok}
+		}()
+	}
+	awaitName := func() resolveOutcome {
+		startName()
+		if nameResult == nil {
+			o := <-nameCh
+			nameResult = &o
+		}
+		return *nameResult
+	}
+	applyName := func(d *proxy.PlantDetail, source string) *proxy.PlantDetail {
+		if source == SourceCatalog || d == nil {
 			return d
 		}
-		out := *d // copy: do NOT mutate cached / catalog-shared pointer
-		out.CommonName = iNatName
-		out.CommonNameSource = "inaturalist"
+		o := awaitName()
+		if !o.ok {
+			return d // unresolved (source outage) → keep the row's own name
+		}
+		out := *d // copy: do NOT mutate cached / DB-shared pointer
+		out.CommonName = o.name.Name
+		out.CommonNameSource = o.name.Source
 		return &out
 	}
 
 	// Step 0: in-process LRU cache.
 	if cached, ok := s.cache.Get(cacheKey); ok {
-		return overrideINat(cached, SourceCache), SourceCache, nil
+		return applyName(cached, SourceCache), SourceCache, nil
 	}
 
 	// Step 1: embedded 1522 catalog. Lang-agnostic today — the curated catalog is
@@ -214,16 +251,9 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		return nil, "", ErrEnrichmentUnavailable
 	}
 
-	// Deferred iNat lookup (#1): only reached on a cache + catalog miss, i.e. a
-	// request that will actually serve/generate a Supabase row. English-only —
-	// the iNat preferred_common_name is English, so it must not touch localized
-	// rows. Populated here so overrideINat refreshes Supabase/generated rows below
-	// (cache + catalog hits already returned above and never pay this round-trip).
-	if lang == "en" && s.inat != nil {
-		if n, ok := s.inat.PreferredCommonName(ctx, name); ok {
-			iNatName = n
-		}
-	}
+	// Kick off name resolution now so it runs concurrently with the DB lookups
+	// and any LLM call below.
+	startName()
 
 	row, err := s.db.Lookup(ctx, normalized, lang)
 	if err != nil {
@@ -231,7 +261,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	}
 	if row != nil {
 		s.cache.Set(cacheKey, row)
-		return overrideINat(row, SourceSupabaseHit), SourceSupabaseHit, nil
+		return applyName(row, SourceSupabaseHit), SourceSupabaseHit, nil
 	}
 
 	// Step 3: display fallback — exact lang missing, serve the English row if it
@@ -242,7 +272,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		// (or English fallback) may already hold the master, so serve it without a
 		// second DB round-trip. Same source tag + no override as the DB path below.
 		if enCached, ok := s.cache.Get(preciseName + "|en"); ok {
-			return enCached, SourceSupabaseFallbackEn, nil
+			return applyName(enCached, SourceSupabaseFallbackEn), SourceSupabaseFallbackEn, nil
 		}
 		enRow, err := s.db.Lookup(ctx, normalized, "en")
 		if err != nil {
@@ -250,7 +280,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		}
 		if enRow != nil {
 			s.cache.Set(preciseName+"|en", enRow)
-			return enRow, SourceSupabaseFallbackEn, nil
+			return applyName(enRow, SourceSupabaseFallbackEn), SourceSupabaseFallbackEn, nil
 		}
 		// English also missing → fall through and generate the master in `lang`.
 	}
@@ -265,8 +295,8 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	// cache+DB misses pay ONE OpenAI round-trip; late followers reuse the leader's
 	// result. Key = cacheKey (preciseName|lang), matching the LRU key. On error
 	// every follower receives the leader's error. The result carries the raw
-	// detail + source; overrideINat is applied per-caller AFTER Do so each caller
-	// gets its own (copied) iNat-refreshed English name.
+	// detail + source; applyName is applied per-caller AFTER Do so each caller
+	// gets its own (copied) authoritative name.
 	v, err, _ := s.sf.Do(cacheKey, func() (any, error) {
 		// Detach the SHARED generation from any single caller's context. This
 		// flight is coalesced across all concurrent first-callers, so if the
@@ -286,9 +316,6 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		}
 
 		hint := req.CommonName
-		if iNatName != "" { // only non-empty for English (gated above)
-			hint = iNatName
-		}
 
 		// Step 4: before generating a fresh master, check whether a master already
 		// exists for this plant in ANOTHER language — i.e. we are racing this
@@ -330,7 +357,13 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		}
 
 		// Step 5: true first-caller (or translation-failure fallback) — generate
-		// the master in `lang`.
+		// the master in `lang`. A localized authoritative name becomes the hint so
+		// the description prose uses the same name as the title (awaited only
+		// here: resolution has been running since before the DB lookups).
+		authName := awaitName()
+		if authName.ok && authName.name.Localized() {
+			hint = authName.name.Name
+		}
 		generated, requestID, genErr := s.llm.Generate(ctx, name, hint, lang)
 		if genErr != nil {
 			return nil, genErr
@@ -339,11 +372,12 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		// Whitelist common_diseases_list against the catalog (SPEC §1.1 + §7).
 		generated.CommonDiseasesList = s.filterCatalogDiseaseIDs(generated.CommonDiseasesList)
 
-		// Patch the English master with the iNat name (the LLM may ignore the
-		// hint). Non-English masters keep their localized common_name (iNatName == "").
-		if iNatName != "" {
-			generated.CommonName = iNatName
-			generated.CommonNameSource = "inaturalist"
+		// Bake a localized authoritative name into the stored master (the LLM may
+		// ignore the hint). English / scientific-name fallbacks are NOT baked — they
+		// are applied at response time so a better source can win later.
+		if authName.ok && authName.name.Localized() {
+			generated.CommonName = authName.name.Name
+			generated.CommonNameSource = authName.name.Source
 		}
 
 		// Step 6: INSERT ON CONFLICT (normalized, lang) DO NOTHING. On conflict,
@@ -353,7 +387,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 			Normalized:      normalized,
 			Lang:            lang,
 			ScientificName:  name,
-			CommonName:      hint, // iNat-resolved hint when iNat hit (en), else upstream
+			CommonName:      hint, // localized authoritative name when resolved, else upstream
 			Data:            generated,
 			Source:          SourceTag,
 			SourceVersion:   PromptVersion,
@@ -396,7 +430,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		return nil, "", err
 	}
 	res := v.(genResult)
-	return overrideINat(res.detail, res.source), res.source, nil
+	return applyName(res.detail, res.source), res.source, nil
 }
 
 // genResult bundles the (detail, source) pair returned through singleflight.Do,
