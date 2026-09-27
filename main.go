@@ -584,6 +584,8 @@ func buildEnrichmentService(vault *secrets.Vault, content *proxy.ContentIndex, i
 	llm := enrichment.NewLLMClient(openaiKey)
 	cache := enrichment.NewCache(0, 0) // defaults: 10k entries, 30 min TTL
 	svc := enrichment.NewService(content, db, llm, cache, inat)
+	// Authoritative out-of-catalog names: iNat + Wikidata (SPEC §7 common_name C).
+	svc.SetNameResolver(enrichment.NewNameResolver(inat, enrichment.NewWikidataClient()))
 	svc.SetBackfiller(enrichment.NewBackfiller(db, llm)) // async multi-language translation backfill (SPEC §7)
 	log.Printf("enrichment service ready: shared db pool + LRU cache + LLM %s + %d-language backfill",
 		enrichment.SourceTag, len(enrichment.SupportedLangs))

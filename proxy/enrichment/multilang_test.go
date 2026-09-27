@@ -2,8 +2,11 @@ package enrichment
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -338,26 +341,51 @@ func TestGetOrGenerate_CacheKeyIncludesLang(t *testing.T) {
 	}
 }
 
-// TestGetOrGenerate_NonEnglishSkipsINatOverride: the iNat English-name override
-// is gated to English rows (SPEC §7 common_name B). A non-en row keeps its
-// localized name even when iNat would have a match.
-func TestGetOrGenerate_NonEnglishSkipsINatOverride(t *testing.T) {
-	inat, done := inatStub(t, inatBodyPrettyface)
-	defer done()
+// TestGetOrGenerate_NonEnglishUsesLocalizedAuthoritativeName: a non-en row gets
+// iNat's name IN THAT LANGUAGE (zh-Hans → iNat locale zh-CN), replacing the
+// LLM's localized name.
+func TestGetOrGenerate_NonEnglishUsesLocalizedAuthoritativeName(t *testing.T) {
+	var gotLocale atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLocale.Store(r.URL.Query().Get("locale"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"name":"Trifolium hirtum","preferred_common_name":"玫瑰车轴草","english_common_name":"Rose Clover"}]}`))
+	}))
+	defer srv.Close()
+	inat := &proxy.INatClient{HTTP: srv.Client(), BaseURL: srv.URL}
 
 	cache := NewCache(10, time.Hour)
-	cache.Set("triteleia ixioides|ja", &proxy.PlantDetail{CommonName: "プリティフェイス", CommonNameSource: "llm"})
+	cache.Set("trifolium hirtum|zh-Hans", &proxy.PlantDetail{CommonName: "粗毛三叶草", CommonNameSource: "llm"})
 	svc := NewService(nil, nil, nil, cache, inat)
 
-	got, src, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Triteleia ixioides", Lang: "ja"})
+	got, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Trifolium hirtum", Lang: "zh-Hans"})
 	if err != nil {
 		t.Fatalf("GetOrGenerate: %v", err)
 	}
-	if src != SourceCache {
-		t.Errorf("source = %q, want %q", src, SourceCache)
+	if got.CommonName != "玫瑰车轴草" || got.CommonNameSource != NameSourceINat {
+		t.Errorf("name=%q source=%q, want 玫瑰车轴草/%s", got.CommonName, got.CommonNameSource, NameSourceINat)
 	}
-	if got.CommonName != "プリティフェイス" || got.CommonNameSource != "llm" {
-		t.Errorf("non-en row must not be iNat-overridden, got name=%q source=%q", got.CommonName, got.CommonNameSource)
+	if l, _ := gotLocale.Load().(string); l != "zh-CN" {
+		t.Errorf("iNat locale = %q, want zh-CN", l)
+	}
+}
+
+// TestGetOrGenerate_NonEnglishFallsBackToEnglishName: iNat knows the plant but
+// has no name in the request language → the English common name (user decision
+// B), not the LLM's localized guess.
+func TestGetOrGenerate_NonEnglishFallsBackToEnglishName(t *testing.T) {
+	inat, done := inatStub(t, `{"results":[{"name":"Trifolium hirtum","preferred_common_name":null,"english_common_name":"Rose Clover"}]}`)
+	defer done()
+	cache := NewCache(10, time.Hour)
+	cache.Set("trifolium hirtum|de", &proxy.PlantDetail{CommonName: "Rauhaariger Klee", CommonNameSource: "llm"})
+	svc := NewService(nil, nil, nil, cache, inat)
+
+	got, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Trifolium hirtum", Lang: "de"})
+	if err != nil {
+		t.Fatalf("GetOrGenerate: %v", err)
+	}
+	if got.CommonName != "Rose Clover" || got.CommonNameSource != NameSourceINatEnglish {
+		t.Errorf("name=%q source=%q, want Rose Clover/%s", got.CommonName, got.CommonNameSource, NameSourceINatEnglish)
 	}
 }
 

@@ -30,13 +30,11 @@ const inatBodyPrettyface = `{"results":[
 	{"name":"Triteleia ixioides","rank":"species","preferred_common_name":"Prettyface"}
 ]}`
 
-// TestGetOrGenerate_CacheHitSkipsINat pins finding #1: a cache hit must NOT pay
-// an iNat round-trip. Before the fix, iNat ran on EVERY request (including cache
-// hits), so a slow/hung iNat added up to 8s to a hot-path hit. Now the cached
-// row is served verbatim and iNat is never contacted. This is correct because
-// production cache/DB rows already carry the iNat-resolved common name baked in
-// at generation time (service.go Step 5), so no per-hit re-patch is needed.
-func TestGetOrGenerate_CacheHitSkipsINat(t *testing.T) {
+// TestGetOrGenerate_CacheHitGetsAuthoritativeNameOnce: a cache hit is served
+// with the authoritative name (SPEC §7 common_name C — cached rows carry the
+// LLM name), and the name lookup is itself cached, so a second hit does NOT
+// contact iNat again (hot path stays free after the first resolution).
+func TestGetOrGenerate_CacheHitGetsAuthoritativeNameOnce(t *testing.T) {
 	var inatCalls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&inatCalls, 1)
@@ -51,22 +49,23 @@ func TestGetOrGenerate_CacheHitSkipsINat(t *testing.T) {
 	cache.Set("triteleia ixioides|en", pre)
 
 	svc := NewService(nil, nil, nil, cache, inat)
-	got, src, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Triteleia ixioides"})
-	if err != nil {
-		t.Fatalf("GetOrGenerate: %v", err)
+	for i := 0; i < 2; i++ {
+		got, src, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Triteleia ixioides"})
+		if err != nil {
+			t.Fatalf("GetOrGenerate: %v", err)
+		}
+		if src != SourceCache {
+			t.Errorf("source = %q, want %q (cache hit path)", src, SourceCache)
+		}
+		if got.CommonName != "Prettyface" || got.CommonNameSource != NameSourceINat {
+			t.Errorf("call %d: name=%q source=%q, want Prettyface/%s", i, got.CommonName, got.CommonNameSource, NameSourceINat)
+		}
 	}
-	if src != SourceCache {
-		t.Errorf("source = %q, want %q (cache hit path)", src, SourceCache)
+	if pre.CommonName != "Ixia" {
+		t.Errorf("cached pointer mutated: %q", pre.CommonName)
 	}
-	// Cache is served as-is on the hot path — no iNat override applied.
-	if got.CommonName != "Ixia" {
-		t.Errorf("commonName = %q, want Ixia (cache served verbatim)", got.CommonName)
-	}
-	if got.CommonNameSource != "plantnet" {
-		t.Errorf("commonNameSource = %q, want plantnet (cache served verbatim)", got.CommonNameSource)
-	}
-	if n := atomic.LoadInt32(&inatCalls); n != 0 {
-		t.Errorf("iNat was contacted %d times on a cache hit — must be 0 (finding #1: no 8s round-trip on hot path)", n)
+	if n := atomic.LoadInt32(&inatCalls); n != 1 {
+		t.Errorf("iNat contacted %d times across two cache hits, want 1 (name cache)", n)
 	}
 }
 
@@ -102,35 +101,54 @@ func TestGetOrGenerate_INatDoesNotOverrideCatalogHit(t *testing.T) {
 	}
 }
 
-// TestGetOrGenerate_INatMissKeepsCachedName covers the best-effort guarantee:
-// when iNat returns a mismatched / empty / non-200 result (or no client is
-// wired), the original common name passes through untouched. This is the
-// "iNat never blocks identify/enrichment" safety net.
-func TestGetOrGenerate_INatMissKeepsCachedName(t *testing.T) {
-	// iNat returns a DIFFERENT taxon (fuzzy q matched another plant) — the
-	// name-match guard in PreferredCommonName rejects it.
+// TestGetOrGenerate_INatNoMatchFallsBackToScientificName: iNat ANSWERED with
+// no matching taxon (fuzzy q hit another plant) and no other source knows the
+// plant → the scientific name is shown, never the LLM's invented name.
+func TestGetOrGenerate_INatNoMatchFallsBackToScientificName(t *testing.T) {
 	inat, done := inatStub(t, `{"results":[
 		{"name":"Ixia polystachya","rank":"species","preferred_common_name":"Wand Flower"}
 	]}`)
 	defer done()
 
 	cache := NewCache(10, time.Hour)
-	pre := &proxy.PlantDetail{CommonName: "Original", CommonNameSource: "plantnet"}
-	cache.Set("triteleia ixioides|en", pre)
+	cache.Set("triteleia ixioides|en", &proxy.PlantDetail{CommonName: "Original", CommonNameSource: "plantnet"})
 
 	svc := NewService(nil, nil, nil, cache, inat)
-	got, src, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Triteleia ixioides"})
+	got, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Triteleia ixioides"})
 	if err != nil {
 		t.Fatalf("GetOrGenerate: %v", err)
 	}
-	if src != SourceCache {
-		t.Errorf("source = %q, want %q", src, SourceCache)
+	if got.CommonName != "Triteleia ixioides" || got.CommonNameSource != NameSourceScientificName {
+		t.Errorf("name=%q source=%q, want scientific-name fallback", got.CommonName, got.CommonNameSource)
 	}
-	if got.CommonName != "Original" {
-		t.Errorf("iNat miss should keep original: commonName = %q, want Original", got.CommonName)
+}
+
+// TestGetOrGenerate_INatOutageKeepsRowName: iNat could NOT be asked (5xx) →
+// the row's own name passes through untouched and nothing is cached, so the
+// next request retries (a transient outage must not flip names to Latin).
+func TestGetOrGenerate_INatOutageKeepsRowName(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	inat := &proxy.INatClient{HTTP: srv.Client(), BaseURL: srv.URL}
+
+	cache := NewCache(10, time.Hour)
+	cache.Set("triteleia ixioides|en", &proxy.PlantDetail{CommonName: "Original", CommonNameSource: "plantnet"})
+	svc := NewService(nil, nil, nil, cache, inat)
+	for i := 0; i < 2; i++ {
+		got, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Triteleia ixioides"})
+		if err != nil {
+			t.Fatalf("GetOrGenerate: %v", err)
+		}
+		if got.CommonName != "Original" || got.CommonNameSource != "plantnet" {
+			t.Errorf("outage must keep row name, got %q/%q", got.CommonName, got.CommonNameSource)
+		}
 	}
-	if got.CommonNameSource != "plantnet" {
-		t.Errorf("iNat miss should keep original source: commonNameSource = %q, want plantnet", got.CommonNameSource)
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Errorf("iNat calls = %d, want 2 (unresolved results must not be cached)", n)
 	}
 }
 
