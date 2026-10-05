@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"time"
 	"unicode"
 
 	"golang.org/x/sync/singleflight"
@@ -176,6 +177,10 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	// the cache (Step 0) and catalog (Step 1) short-circuits so a hot-path hit
 	// pays no 8s iNat round-trip; iNatName stays "" (a no-op override) until then.
 	iNatName := ""
+	// iNatKingdom is the authoritative kingdom from that SAME deferred iNat taxon
+	// lookup (no extra round-trip). nil until/unless iNat resolves the name.
+	var iNatKingdom *string
+	iNatAsked := false // the taxon lookup already ran for this request
 	overrideINat := func(d *proxy.PlantDetail, source string) *proxy.PlantDetail {
 		if iNatName == "" || source == SourceCatalog || d == nil {
 			return d
@@ -219,9 +224,15 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	// the iNat preferred_common_name is English, so it must not touch localized
 	// rows. Populated here so overrideINat refreshes Supabase/generated rows below
 	// (cache + catalog hits already returned above and never pay this round-trip).
+	//
+	// The request is LookupTaxon (Plantae + Fungi scope), not the plants-only
+	// PreferredCommonName: one round-trip yields the common name AND the kingdom
+	// that drives the mushroom-safety notice (SPEC §7 kingdom).
 	if lang == "en" && s.inat != nil {
-		if n, ok := s.inat.PreferredCommonName(ctx, name); ok {
-			iNatName = n
+		iNatAsked = true
+		if t, ok := s.inat.LookupTaxon(ctx, name); ok {
+			iNatName = t.CommonName
+			iNatKingdom = proxy.NormalizeKingdom(t.Kingdom)
 		}
 	}
 
@@ -230,6 +241,10 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		return nil, "", err
 	}
 	if row != nil {
+		// Rows written before v6 carry no kingdom; an iNat verdict fills it in on
+		// the fly, and a fungal row is hard-filtered on read (legacy v1 rows can
+		// hold culinary uses) — see applyKingdom.
+		row = s.applyKingdom(row, name, iNatKingdom)
 		s.cache.Set(cacheKey, row)
 		return overrideINat(row, SourceSupabaseHit), SourceSupabaseHit, nil
 	}
@@ -249,6 +264,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 			return nil, "", err
 		}
 		if enRow != nil {
+			enRow = s.applyKingdom(enRow, name, nil) // stored kingdom only (no iNat on non-en)
 			s.cache.Set(preciseName+"|en", enRow)
 			return enRow, SourceSupabaseFallbackEn, nil
 		}
@@ -301,6 +317,9 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 			return nil, lookErr
 		} else if existing != nil {
 			if translated, reqID, tErr := s.llm.Translate(ctx, existing, lang); tErr == nil && translated != nil {
+				// The copy inherits the master's kingdom; fold in iNat (en only)
+				// and hard-filter before it is persisted.
+				translated = s.applyKingdom(translated, name, iNatKingdom)
 				inserted, insErr := s.db.Insert(ctx, InsertParams{
 					Normalized:      normalized,
 					Lang:            lang,
@@ -317,6 +336,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 				if !inserted {
 					// Another caller wrote this lang first — return their row.
 					if row, _ := s.db.Lookup(ctx, normalized, lang); row != nil {
+						row = s.applyKingdom(row, name, iNatKingdom)
 						s.cache.Set(cacheKey, row)
 						return genResult{row, SourceSupabaseHit}, nil
 					}
@@ -331,10 +351,37 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 
 		// Step 5: true first-caller (or translation-failure fallback) — generate
 		// the master in `lang`.
+		//
+		// Non-English requests skipped the iNat lookup above (its common name is
+		// English-only), but the KINGDOM is language-independent and must be baked
+		// into the master. Fetch it CONCURRENTLY with the multi-second LLM call so
+		// it adds no latency; bounded by its own short timeout and best-effort — a
+		// slow / failed iNat just leaves the model's self-report as the only source.
+		var kingdomCh chan *string
+		if !iNatAsked && s.inat != nil {
+			kingdomCh = make(chan *string, 1) // buffered: never blocks if we bail out
+			go func() {
+				kctx, kcancel := context.WithTimeout(ctx, inatKingdomTimeout)
+				defer kcancel()
+				var k *string
+				if t, ok := s.inat.LookupTaxon(kctx, name); ok {
+					k = proxy.NormalizeKingdom(t.Kingdom)
+				}
+				kingdomCh <- k
+			}()
+		}
+
 		generated, requestID, genErr := s.llm.Generate(ctx, name, hint, lang)
 		if genErr != nil {
 			return nil, genErr
 		}
+		if kingdomCh != nil {
+			iNatKingdom = <-kingdomCh // returns within inatKingdomTimeout at worst
+		}
+
+		// kingdom = iNat (authoritative) ⊕ the model's self-report, Fungi-wins; a
+		// fungal master is hard-filtered BEFORE persistence (SPEC §7 kingdom).
+		generated = s.applyKingdom(generated, name, iNatKingdom)
 
 		// Whitelist common_diseases_list against the catalog (SPEC §1.1 + §7).
 		generated.CommonDiseasesList = s.filterCatalogDiseaseIDs(generated.CommonDiseasesList)
@@ -367,6 +414,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 			// Concurrent race resolved by ON CONFLICT. The conflicting writer's
 			// master is now available — return that to keep all callers consistent.
 			if row, lookupErr := s.db.Lookup(ctx, normalized, lang); lookupErr == nil && row != nil {
+				row = s.applyKingdom(row, name, iNatKingdom)
 				s.cache.Set(cacheKey, row)
 				return genResult{row, SourceSupabaseMissGenerateRaceWinner}, nil
 			}
@@ -397,6 +445,48 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	}
 	res := v.(genResult)
 	return overrideINat(res.detail, res.source), res.source, nil
+}
+
+// inatKingdomTimeout caps the kingdom-only iNat lookup that runs alongside a
+// non-English master generation (the client's own timeout is 8 s). It is waited
+// on only after the LLM call returns, so in practice it never extends the
+// request; the cap bounds the worst case when the LLM answers unusually fast.
+const inatKingdomTimeout = 4 * time.Second
+
+// applyKingdom stamps d's biological kingdom and enforces the mushroom-safety
+// hard filter (SPEC §7 kingdom). The kingdom is the Fungi-wins merge of d's own
+// value (a stored row's / the LLM's self-report) and `authoritative` (iNat; nil
+// when it was not asked or did not resolve). When the result is Fungi, every
+// edible/culinary use and the "edible" attribute are stripped
+// (proxy.SanitizeFungiDetail) — on freshly generated masters before they are
+// persisted, AND on rows read back from Supabase, so a legacy row is safe to
+// serve without waiting for the backfill. A resolved kingdom is also noted on
+// the ContentIndex so /v1/identify + /v1/diagnose can reuse it with no I/O.
+//
+// Returns d itself when nothing changes, otherwise a modified COPY (d may be a
+// pointer shared with the cache or a test stub — never mutated).
+func (s *Service) applyKingdom(d *proxy.PlantDetail, scientificName string, authoritative *string) *proxy.PlantDetail {
+	if d == nil {
+		return nil
+	}
+	out := *d
+	out.Kingdom = proxy.MergeKingdom(d.Kingdom, authoritative)
+	sanitized := proxy.SanitizeFungiDetail(&out)
+	if out.Kingdom != nil {
+		s.content.NoteKingdom(scientificName, out.Kingdom)
+	}
+	if !sanitized && sameKingdom(d.Kingdom, out.Kingdom) {
+		return d
+	}
+	return &out
+}
+
+// sameKingdom reports whether two kingdom pointers hold the same value.
+func sameKingdom(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // genResult bundles the (detail, source) pair returned through singleflight.Do,
