@@ -21,9 +21,11 @@ import (
 // ONCE (authoritative, free — no LLM call), then patches every such language row:
 // `kingdom`, plus — for fungi — the hard-filtered `uses_list` / `attributes`
 // (proxy.SanitizeFungiDetail), so legacy v1 rows stop carrying culinary uses in
-// storage too. Plants iNat cannot resolve are left untouched (still null) and
-// reported; a re-run retries them. Idempotent: the list query selects on the
-// missing field itself and the patch re-checks it.
+// storage too. Plants iNat has no exact match for are left untouched (still null)
+// and reported as UNDETERMINED; plants whose lookup FAILED (429 / 5xx / timeout,
+// after backoff retries) are reported separately as failed — a re-run retries
+// both. Idempotent: the list query selects on the missing field itself and the
+// patch re-checks it.
 //
 // Run via cmd/backfill-kingdom (dry-run by default). It is a standalone one-shot,
 // NOT part of the resident service.
@@ -33,6 +35,12 @@ import (
 const (
 	kingdomBackfillLookupTimeout = 10 * time.Second
 	kingdomBackfillWriteTimeout  = 15 * time.Second
+	// kingdomBackfillLookupAttempts is how many times one iNat query is tried
+	// when the lookup itself fails (429 / 5xx / transport). Attempt n waits
+	// n × kingdomBackfillBackoffFactor × interval first, i.e. 5 s then 10 s at the
+	// default 1 s interval.
+	kingdomBackfillLookupAttempts = 3
+	kingdomBackfillBackoffFactor  = 5
 )
 
 // KingdomBackfillRow is one served plants_pending row whose data has no kingdom.
@@ -51,9 +59,11 @@ type KingdomBackfillDB interface {
 }
 
 // KingdomResolver is the authoritative kingdom source. *proxy.INatClient
-// satisfies it; tests substitute a stub.
+// satisfies it; tests substitute a stub. ok=false with a nil error is a
+// definitive "no exact match"; a non-nil error means the lookup did not complete
+// and is worth retrying.
 type KingdomResolver interface {
-	LookupTaxon(ctx context.Context, sciName string) (proxy.INatTaxon, bool)
+	LookupTaxonErr(ctx context.Context, sciName string) (proxy.INatTaxon, bool, error)
 }
 
 // KingdomBackfillReport summarizes a run for the operator / caller.
@@ -62,7 +72,8 @@ type KingdomBackfillReport struct {
 	Rows         int // rows lacking kingdom
 	Fungi        int // plants resolved to Fungi
 	Plantae      int // plants resolved to Plantae
-	Undetermined int // plants iNat could not resolve (rows left null; retried next run)
+	Undetermined int // plants iNat answered for but has no exact match (rows left null)
+	LookupFailed int // plants whose iNat lookup failed after retries (429/5xx/timeout; rows left null, re-run)
 	Updated      int // rows patched (apply) / that would be patched (dry-run)
 	Sanitized    int // of Updated: fungal rows that also lost edible/culinary content
 	Vanished     int // patch matched 0 rows — changed between list and write (benign)
@@ -71,8 +82,10 @@ type KingdomBackfillReport struct {
 
 // RunKingdomBackfill stamps `kingdom` on every served row that lacks it. apply=false
 // is a dry-run: iNat is still consulted (read-only) so the report shows exactly
-// what WOULD change, but nothing is written. interval is the pause between iNat
-// lookups (be a polite API citizen; <= 0 disables it, used by tests). logf
+// what WOULD change, but nothing is written. interval is the minimum gap between
+// ANY two iNat requests — including the second query for the same plant and
+// retries — and the base of the failure backoff (be a polite API citizen; <= 0
+// disables both, used by tests). logf
 // receives progress lines (pass log.Printf; nil is a no-op). The returned error is
 // non-nil only on the initial list query or context cancellation; per-plant and
 // per-row failures are counted and the run continues.
@@ -107,20 +120,22 @@ func RunKingdomBackfill(ctx context.Context, db KingdomBackfillDB, resolver King
 	if apply {
 		verb = "UPDATE"
 	}
-	for i, normalized := range order {
+	pace := &requestPacer{interval: interval}
+	for _, normalized := range order {
 		if err := ctx.Err(); err != nil {
 			return rep, err // shutting down — stop cleanly, resume next run
 		}
-		if i > 0 && interval > 0 {
-			select {
-			case <-ctx.Done():
-				return rep, ctx.Err()
-			case <-time.After(interval):
-			}
-		}
 		group := byPlant[normalized]
 
-		kingdom := resolveKingdomForBackfill(ctx, resolver, group[0].ScientificName, normalized)
+		kingdom, err := resolveKingdomForBackfill(ctx, resolver, pace, interval, group[0].ScientificName, normalized)
+		if err != nil {
+			if ctx.Err() != nil {
+				return rep, ctx.Err()
+			}
+			rep.LookupFailed++
+			logf("LOOKUP FAILED %s (%q): %v — left null, re-run to retry", normalized, group[0].ScientificName, err)
+			continue
+		}
 		if kingdom == nil {
 			rep.Undetermined++
 			logf("UNDETERMINED %s (%q): iNat has no exact match — left null", normalized, group[0].ScientificName)
@@ -160,31 +175,73 @@ func RunKingdomBackfill(ctx context.Context, db KingdomBackfillDB, resolver King
 			}
 		}
 	}
-	logf("kingdom backfill: done plants=%d rows=%d fungi=%d plantae=%d undetermined=%d updated=%d sanitized=%d vanished=%d failed=%d apply=%v",
-		rep.Plants, rep.Rows, rep.Fungi, rep.Plantae, rep.Undetermined, rep.Updated, rep.Sanitized, rep.Vanished, rep.Failed, apply)
+	logf("kingdom backfill: done plants=%d rows=%d fungi=%d plantae=%d undetermined=%d lookup_failed=%d updated=%d sanitized=%d vanished=%d failed=%d apply=%v",
+		rep.Plants, rep.Rows, rep.Fungi, rep.Plantae, rep.Undetermined, rep.LookupFailed, rep.Updated, rep.Sanitized, rep.Vanished, rep.Failed, apply)
 	return rep, nil
 }
 
+// requestPacer spaces out iNat requests: wait blocks until at least `interval`
+// has passed since the previous request it released (no wait before the first).
+type requestPacer struct {
+	interval time.Duration
+	last     time.Time
+}
+
+func (p *requestPacer) wait(ctx context.Context, extra time.Duration) error {
+	if d := p.interval + extra; d > 0 && !p.last.IsZero() {
+		if rest := d - time.Since(p.last); rest > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(rest):
+			}
+		}
+	}
+	p.last = time.Now()
+	return ctx.Err()
+}
+
 // resolveKingdomForBackfill asks the resolver for the stored scientific name and,
-// on a miss, once more for the normalized species form (the stored name can carry
-// an infraspecific rank or stray formatting that defeats iNat's exact-name match).
-// nil when neither resolves to Fungi / Plantae.
-func resolveKingdomForBackfill(ctx context.Context, resolver KingdomResolver, scientificName, normalized string) *string {
+// on a definitive miss, once more for the normalized species form (the stored name
+// can carry an infraspecific rank or stray formatting that defeats iNat's
+// exact-name match). Every request — the second query and retries included — is
+// paced. Returns (nil, nil) when iNat answered and neither form resolves to
+// Fungi / Plantae, and a non-nil error when a lookup still fails after
+// kingdomBackfillLookupAttempts tries (429 / 5xx / timeout) — the caller must NOT
+// count that as undetermined.
+func resolveKingdomForBackfill(ctx context.Context, resolver KingdomResolver, pace *requestPacer, interval time.Duration, scientificName, normalized string) (*string, error) {
 	for _, q := range []string{scientificName, normalized} {
 		if q == "" {
 			continue
 		}
-		lctx, cancel := context.WithTimeout(ctx, kingdomBackfillLookupTimeout)
-		t, ok := resolver.LookupTaxon(lctx, q)
-		cancel()
+		var (
+			t   proxy.INatTaxon
+			ok  bool
+			err error
+		)
+		for attempt := 0; attempt < kingdomBackfillLookupAttempts; attempt++ {
+			backoff := time.Duration(attempt*kingdomBackfillBackoffFactor) * interval
+			if werr := pace.wait(ctx, backoff); werr != nil {
+				return nil, werr
+			}
+			lctx, cancel := context.WithTimeout(ctx, kingdomBackfillLookupTimeout)
+			t, ok, err = resolver.LookupTaxonErr(lctx, q)
+			cancel()
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("inat lookup %q: %w", q, err)
+		}
 		if !ok {
 			continue
 		}
 		if k := proxy.NormalizeKingdom(t.Kingdom); k != nil {
-			return k
+			return k, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // kingdomPatch builds the top-level JSONB merge patch for one row: always

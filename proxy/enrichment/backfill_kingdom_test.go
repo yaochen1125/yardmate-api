@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yaochen1125/yardmate-api/proxy"
 )
@@ -35,16 +36,27 @@ func (s *stubKingdomDB) PatchKingdom(_ context.Context, normalized, lang string,
 	return s.patchN, nil
 }
 
-// stubResolver answers LookupTaxon from a lowercase-name → kingdom map.
+// stubResolver answers LookupTaxonErr from a lowercase-name → kingdom map. A name
+// in failures errors that many times first (-1 = always) — a rate-limited iNat.
 type stubResolver struct {
 	kingdoms map[string]string
+	failures map[string]int
 	queries  []string
+	at       []time.Time
 }
 
-func (s *stubResolver) LookupTaxon(_ context.Context, sciName string) (proxy.INatTaxon, bool) {
+func (s *stubResolver) LookupTaxonErr(_ context.Context, sciName string) (proxy.INatTaxon, bool, error) {
 	s.queries = append(s.queries, sciName)
-	k, ok := s.kingdoms[strings.ToLower(sciName)]
-	return proxy.INatTaxon{Kingdom: k}, ok
+	s.at = append(s.at, time.Now())
+	key := strings.ToLower(sciName)
+	if n := s.failures[key]; n != 0 {
+		if n > 0 {
+			s.failures[key] = n - 1
+		}
+		return proxy.INatTaxon{}, false, &proxy.INatStatusError{Status: 429}
+	}
+	k, ok := s.kingdoms[key]
+	return proxy.INatTaxon{Kingdom: k}, ok, nil
 }
 
 func kingdomBackfillFixture() *stubKingdomDB {
@@ -168,5 +180,72 @@ func TestRunKingdomBackfill_FatalAndGuards(t *testing.T) {
 	}
 	if len(db2.calls) != 0 {
 		t.Errorf("cancelled run wrote %d rows", len(db2.calls))
+	}
+}
+
+// A rate-limited / failing iNat is NOT "undetermined": transient failures are
+// retried, and a plant whose lookup keeps failing is counted as LookupFailed so
+// the run is reported incomplete instead of looking like iNat has no such taxon.
+func TestRunKingdomBackfill_LookupFailureIsNotUndetermined(t *testing.T) {
+	db := kingdomBackfillFixture()
+	res := kingdomBackfillResolver()
+	res.failures = map[string]int{
+		"amanita muscaria":   2,  // 429, 429, then answers → recovered by retry
+		"monstera deliciosa": -1, // down for the whole run
+	}
+	rep, err := RunKingdomBackfill(context.Background(), db, res, true, 0, nil)
+	if err != nil {
+		t.Fatalf("RunKingdomBackfill: %v", err)
+	}
+	if rep.Fungi != 1 || rep.LookupFailed != 1 || rep.Undetermined != 1 || rep.Plantae != 0 {
+		t.Errorf("report = %+v, want fungi1 lookupFailed1 undetermined1 (only the genuine no-match)", rep)
+	}
+	if rep.Updated != 2 {
+		t.Errorf("updated = %d, want 2 (both Amanita rows after the retry succeeded)", rep.Updated)
+	}
+	for _, c := range db.calls {
+		if c.normalized == "monstera deliciosa" {
+			t.Errorf("a plant whose lookup failed was written: %+v", c)
+		}
+	}
+	// 3 tries for Amanita (2 failures + success); Monstera exhausts its attempts
+	// on the FIRST name form and must not fall through to the normalized form.
+	monstera := 0
+	for _, q := range res.queries {
+		if strings.EqualFold(q, "monstera deliciosa") {
+			monstera++
+		}
+	}
+	if monstera != kingdomBackfillLookupAttempts {
+		t.Errorf("monstera lookups = %d, want %d", monstera, kingdomBackfillLookupAttempts)
+	}
+}
+
+// Every iNat request is paced — including the second (normalized-name) query for
+// the SAME plant, and retries back off further.
+func TestRunKingdomBackfill_PacesEveryRequest(t *testing.T) {
+	const interval = 30 * time.Millisecond
+	db := &stubKingdomDB{patchN: 1, rows: []KingdomBackfillRow{
+		{Normalized: "obscurus unknownus", Lang: "en", ScientificName: "Obscurus unknownus", Data: &proxy.PlantDetail{}},
+		{Normalized: "amanita muscaria", Lang: "en", ScientificName: "Amanita muscaria", Data: &proxy.PlantDetail{}},
+	}}
+	res := kingdomBackfillResolver()
+	res.failures = map[string]int{"amanita muscaria": 1}
+
+	if _, err := RunKingdomBackfill(context.Background(), db, res, false, interval, nil); err != nil {
+		t.Fatalf("RunKingdomBackfill: %v", err)
+	}
+	// Obscurus (stored form), obscurus (normalized form), Amanita (429), Amanita (retry).
+	if len(res.at) != 4 {
+		t.Fatalf("lookups = %d (%v), want 4", len(res.at), res.queries)
+	}
+	for i := 1; i < len(res.at); i++ {
+		if gap := res.at[i].Sub(res.at[i-1]); gap < interval {
+			t.Errorf("gap before request %d (%s) = %v, want >= %v", i, res.queries[i], gap, interval)
+		}
+	}
+	// The retry waits interval + 1×factor×interval.
+	if gap, want := res.at[3].Sub(res.at[2]), time.Duration(1+kingdomBackfillBackoffFactor)*interval; gap < want {
+		t.Errorf("retry backoff gap = %v, want >= %v", gap, want)
 	}
 }
