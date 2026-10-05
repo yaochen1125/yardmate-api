@@ -56,6 +56,13 @@ type PlantDetail struct {
 	FlowerMeaning      string           `json:"flower_meaning"`
 	CommonDiseasesList []string         `json:"common_diseases_list"`
 	Genus              string           `json:"genus"`
+	// Kingdom is the biological kingdom: "Fungi" / "Plantae", or null when it
+	// could not be determined (kingdom.go). The iOS mushroom-safety feature keys
+	// off it — "Fungi" shows the safety notice and hides food content. Catalog
+	// (path 1) rows carry whatever plants_detail.json ships (absent → null);
+	// enrichment (path 2/3) rows get it from iNat + the LLM self-report, merged
+	// Fungi-wins (enrichment/SPEC §7). Canonical (never localized).
+	Kingdom *string `json:"kingdom"`
 }
 
 // Fragrance describes scent characteristics (level + plant parts emitting it).
