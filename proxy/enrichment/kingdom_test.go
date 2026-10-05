@@ -136,7 +136,20 @@ func TestGetOrGenerate_PlantKeepsEdibleContent(t *testing.T) {
 		{"name":"Ocimum basilicum","rank":"species","preferred_common_name":"Sweet Basil","iconic_taxon_name":"Plantae"}
 	]}`)
 	defer done()
-	d := foodyDetail(kPtr("Plantae"))
+	for _, lang := range []string{"en", "de"} { // iNat-confirmed Plantae is stored in every language
+		d := foodyDetail(kPtr("Plantae"))
+		d.ScientificName = "Ocimum fakeum"
+		db := &stubDB{}
+		svc := NewService(nil, db, &stubLLM{ret: d}, NewCache(10, time.Hour), inat)
+		got, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Ocimum basilicum", Lang: lang})
+		if err != nil {
+			t.Fatalf("lang=%s: GetOrGenerate: %v", lang, err)
+		}
+		if kStr(got.Kingdom) != "Plantae" || kStr(db.insertCalls[0].Data.Kingdom) != "Plantae" {
+			t.Errorf("lang=%s: kingdom = %s / persisted %s, want Plantae (iNat-confirmed)", lang, kStr(got.Kingdom), kStr(db.insertCalls[0].Data.Kingdom))
+		}
+	}
+	d := foodyDetail(nil) // the model stays silent; iNat alone confirms Plantae
 	d.ScientificName = "Ocimum fakeum"
 	db := &stubDB{}
 	svc := NewService(nil, db, &stubLLM{ret: d}, NewCache(10, time.Hour), inat)
@@ -153,8 +166,10 @@ func TestGetOrGenerate_PlantKeepsEdibleContent(t *testing.T) {
 	}
 }
 
-// iNat failing (5xx / timeout) must never fail or stall the request: the model's
-// self-report stands, and with no source at all kingdom is simply nil.
+// iNat failing (5xx / timeout) must never fail or stall the request. Without an
+// iNat confirmation only a Fungi self-report survives: an unconfirmed "Plantae"
+// is stored as nil, so a mislabelled mushroom stays repairable (the backfill only
+// selects rows with NO kingdom).
 func TestGetOrGenerate_INatFailureDoesNotAffectMainFlow(t *testing.T) {
 	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -177,10 +192,13 @@ func TestGetOrGenerate_INatFailureDoesNotAffectMainFlow(t *testing.T) {
 		llm  *string
 		want string
 	}{
-		{"en 5xx, llm plantae", &proxy.INatClient{HTTP: fail.Client(), BaseURL: fail.URL}, "en", kPtr("Plantae"), "Plantae"},
+		{"en 5xx, llm plantae", &proxy.INatClient{HTTP: fail.Client(), BaseURL: fail.URL}, "en", kPtr("Plantae"), "<nil>"},
 		{"en 5xx, llm silent", &proxy.INatClient{HTTP: fail.Client(), BaseURL: fail.URL}, "en", nil, "<nil>"},
 		{"en 5xx, llm fungi", &proxy.INatClient{HTTP: fail.Client(), BaseURL: fail.URL}, "en", kPtr("Fungi"), "Fungi"},
-		{"en timeout, llm plantae", &proxy.INatClient{HTTP: &http.Client{Timeout: 50 * time.Millisecond}, BaseURL: hang.URL}, "en", kPtr("Plantae"), "Plantae"},
+		{"en timeout, llm plantae", &proxy.INatClient{HTTP: &http.Client{Timeout: 50 * time.Millisecond}, BaseURL: hang.URL}, "en", kPtr("Plantae"), "<nil>"},
+		{"de timeout, llm plantae", &proxy.INatClient{HTTP: &http.Client{Timeout: 50 * time.Millisecond}, BaseURL: hang.URL}, "de", kPtr("Plantae"), "<nil>"},
+		{"de 5xx, llm plantae", &proxy.INatClient{HTTP: fail.Client(), BaseURL: fail.URL}, "de", kPtr("Plantae"), "<nil>"},
+		{"no inat client, llm plantae", nil, "de", kPtr("Plantae"), "<nil>"},
 		{"de timeout, llm fungi", &proxy.INatClient{HTTP: &http.Client{Timeout: 50 * time.Millisecond}, BaseURL: hang.URL}, "de", kPtr("Fungi"), "Fungi"},
 		{"de 5xx, llm silent", &proxy.INatClient{HTTP: fail.Client(), BaseURL: fail.URL}, "de", nil, "<nil>"},
 	}
@@ -200,6 +218,9 @@ func TestGetOrGenerate_INatFailureDoesNotAffectMainFlow(t *testing.T) {
 		}
 		if kStr(got.Kingdom) != c.want {
 			t.Errorf("%s: kingdom = %s, want %s", c.name, kStr(got.Kingdom), c.want)
+		}
+		if len(db.insertCalls) == 1 && kStr(db.insertCalls[0].Data.Kingdom) != c.want {
+			t.Errorf("%s: PERSISTED kingdom = %s, want %s", c.name, kStr(db.insertCalls[0].Data.Kingdom), c.want)
 		}
 		if el := time.Since(start); el > 2*time.Second {
 			t.Errorf("%s: took %v — a failing iNat must not stall the request", c.name, el)
@@ -387,5 +408,91 @@ func TestTranslate_PreservesKingdom(t *testing.T) {
 	}
 	if kStr(out.Kingdom) != "Fungi" || out.CommonName != "Fliegenpilz" {
 		t.Errorf("translated = kingdom %s / name %q, want Fungi / Fliegenpilz", kStr(out.Kingdom), out.CommonName)
+	}
+}
+
+// --- every persistence path goes through finalizeKingdom ---
+
+// The in-process hint (an earlier request resolved this species via iNat) is
+// merged in, so a legacy non-English row — which never consults iNat — is still
+// flagged + filtered.
+func TestApplyKingdom_MergesInProcessHint(t *testing.T) {
+	content := loadTestContent(t)
+	content.NoteKingdom("Amanita muscaria", kPtr("Fungi"))
+	db := &stubDB{lookupQ: []dbLookupResult{{pd: foodyDetail(nil)}}}
+	svc := NewService(content, db, &stubLLM{}, NewCache(10, time.Hour), nil)
+
+	got, src, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Amanita muscaria", Lang: "ja"})
+	if err != nil || src != SourceSupabaseHit {
+		t.Fatalf("GetOrGenerate = (%q, %v), want a Supabase hit", src, err)
+	}
+	assertFungiSanitized(t, "response", got)
+}
+
+// Backfiller.run (also the Sweeper's only write path) must stamp + hard-filter a
+// translation BEFORE inserting it: a Sweeper master is a raw DB row.
+func TestBackfillerRun_FinalizesKingdomBeforeInsert(t *testing.T) {
+	content := loadTestContent(t)
+	content.NoteKingdom("Legacyus hintedus", kPtr("Fungi"))
+	cases := []struct {
+		name    string
+		sci     string
+		master  *proxy.PlantDetail
+		content *proxy.ContentIndex
+	}{
+		{"stored Fungi master with legacy culinary uses", "Amanita muscaria", foodyDetail(kPtr("Fungi")), nil},
+		{"legacy master without kingdom, hint says Fungi", "Legacyus hintedus", foodyDetail(nil), content},
+	}
+	for _, c := range cases {
+		db := &stubDB{}
+		b := &Backfiller{db: db, llm: &stubLLM{}, content: c.content}
+		b.run(BackfillJob{Normalized: "x", ScientificName: c.sci, SourceLang: "en", Master: c.master, OnlyLangs: []string{"de", "ja"}})
+		if len(db.insertCalls) != 2 {
+			t.Fatalf("%s: inserts = %d, want 2", c.name, len(db.insertCalls))
+		}
+		for _, ins := range db.insertCalls {
+			assertFungiSanitized(t, c.name+" / persisted "+ins.Lang, ins.Data)
+		}
+		if len(c.master.UsesList) != 3 {
+			t.Errorf("%s: the job's master was mutated", c.name)
+		}
+	}
+	// A plant master is translated untouched.
+	db := &stubDB{}
+	(&Backfiller{db: db, llm: &stubLLM{}}).run(BackfillJob{ScientificName: "Ocimum basilicum", SourceLang: "en", Master: foodyDetail(kPtr("Plantae")), OnlyLangs: []string{"de"}})
+	if d := db.insertCalls[0].Data; kStr(d.Kingdom) != "Plantae" || len(d.UsesList) != 3 || len(d.Attributes) != 2 {
+		t.Errorf("plant translation altered: %+v", d)
+	}
+}
+
+func TestSetBackfiller_SharesContentIndex(t *testing.T) {
+	content := loadTestContent(t)
+	svc := NewService(content, &stubDB{}, &stubLLM{}, NewCache(10, time.Hour), nil)
+	b := &Backfiller{}
+	svc.SetBackfiller(b)
+	if b.content != content {
+		t.Error("SetBackfiller did not hand the ContentIndex to the backfiller")
+	}
+	svc.SetBackfiller(nil) // must not panic
+}
+
+// End to end through the request path: the master a first-caller generates is
+// what the async backfill translates, so every language row is born clean.
+func TestGetOrGenerate_EnqueuedBackfillMasterIsFinalized(t *testing.T) {
+	inat, _, done := inatCountingStub(t, inatBodyFlyAgaric)
+	defer done()
+	db := &stubDB{}
+	svc := NewService(nil, db, &stubLLM{ret: foodyDetail(kPtr("Plantae"))}, NewCache(10, time.Hour), inat)
+	b := &Backfiller{jobs: make(chan BackfillJob, 1)} // no workers: capture the job
+	svc.SetBackfiller(b)
+
+	if _, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Amanita muscaria"}); err != nil {
+		t.Fatalf("GetOrGenerate: %v", err)
+	}
+	select {
+	case job := <-b.jobs:
+		assertFungiSanitized(t, "enqueued master", job.Master)
+	default:
+		t.Fatal("no backfill job enqueued")
 	}
 }

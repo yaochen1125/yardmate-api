@@ -19,9 +19,9 @@ import (
 // NOTHING, so it never updates an existing row. This runner is surgical: it
 // translates ONLY the native_region array (TranslateRegions) and patches it in
 // place via jsonb_set, leaving the row's already-correct localized prose
-// untouched. Idempotent: it stamps each patched row source_version='v5', and the
-// list query excludes rows already at v5, so a re-run resumes where a crash left
-// off and a fully-backfilled DB is a no-op.
+// untouched. Idempotent: it stamps each patched row with the current
+// PromptVersion (>= v5), and the list query selects only source_version < 'v5',
+// so a re-run resumes where a crash left off and a fully-backfilled DB is a no-op.
 
 // nativeRegionBackfillTimeout bounds one translate+update round-trip per row.
 const nativeRegionBackfillTimeout = 60 * time.Second

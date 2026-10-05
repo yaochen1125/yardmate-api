@@ -43,6 +43,9 @@ type Backfiller struct {
 	db   ServiceDB
 	llm  ServiceLLM
 	jobs chan BackfillJob
+	// content feeds finalizeKingdom (in-process kingdom hints). Optional: set by
+	// Service.SetBackfiller; nil just means "no hints" (stored kingdom only).
+	content *proxy.ContentIndex
 }
 
 // NewBackfiller starts the worker pool. Workers live for the process lifetime
@@ -117,6 +120,13 @@ func (b *Backfiller) run(job BackfillJob) {
 				job.ScientificName, lang, err)
 			continue
 		}
+		// Same kingdom merge + fungi hard filter as the request path BEFORE the row
+		// is persisted (SPEC §7 kingdom / §9 #24). The translation is a copy of the
+		// master, and a master handed over by the Sweeper is a raw DB row that may
+		// predate `kingdom` and still carry culinary uses — without this a legacy
+		// mushroom would be re-persisted, unflagged and unfiltered, in every newly
+		// translated language.
+		translated = finalizeKingdom(b.content, translated, job.ScientificName, nil)
 		_, err = b.db.Insert(ctx, InsertParams{
 			Normalized:      job.Normalized,
 			Lang:            lang,

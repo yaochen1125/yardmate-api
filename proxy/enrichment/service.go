@@ -93,6 +93,12 @@ type Service struct {
 // main after the Service + DB + LLM exist; nil-safe so tests can skip it.
 func (s *Service) SetBackfiller(b *Backfiller) {
 	if s != nil {
+		// Share the ContentIndex so translations get the same kingdom merge + fungi
+		// hard filter as the request path (finalizeKingdom). Set before the
+		// backfiller can receive its first job.
+		if b != nil {
+			b.content = s.content
+		}
 		s.backfill = b
 	}
 }
@@ -379,8 +385,17 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 			iNatKingdom = <-kingdomCh // returns within inatKingdomTimeout at worst
 		}
 
-		// kingdom = iNat (authoritative) ⊕ the model's self-report, Fungi-wins; a
-		// fungal master is hard-filtered BEFORE persistence (SPEC §7 kingdom).
+		// The model's self-report is trusted ONLY when it says Fungi. A bare
+		// "Plantae" from the LLM is not evidence: if iNat timed out / failed, a
+		// mushroom the model mislabelled would be persisted as Plantae forever (the
+		// kingdom backfill only selects rows with NO kingdom). Dropping it stores
+		// null instead, which the backfill — or the next English read — can still
+		// fix. Invariant: a STORED Plantae is always iNat-confirmed.
+		if !proxy.IsFungi(generated.Kingdom) {
+			generated.Kingdom = nil
+		}
+		// kingdom = iNat (authoritative) ⊕ the model's Fungi self-report, Fungi-wins;
+		// a fungal master is hard-filtered BEFORE persistence (SPEC §7 kingdom).
 		generated = s.applyKingdom(generated, name, iNatKingdom)
 
 		// Whitelist common_diseases_list against the catalog (SPEC §1.1 + §7).
@@ -453,27 +468,39 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 // request; the cap bounds the worst case when the LLM answers unusually fast.
 const inatKingdomTimeout = 4 * time.Second
 
-// applyKingdom stamps d's biological kingdom and enforces the mushroom-safety
-// hard filter (SPEC §7 kingdom). The kingdom is the Fungi-wins merge of d's own
-// value (a stored row's / the LLM's self-report) and `authoritative` (iNat; nil
-// when it was not asked or did not resolve). When the result is Fungi, every
-// edible/culinary use and the "edible" attribute are stripped
-// (proxy.SanitizeFungiDetail) — on freshly generated masters before they are
-// persisted, AND on rows read back from Supabase, so a legacy row is safe to
-// serve without waiting for the backfill. A resolved kingdom is also noted on
+// applyKingdom is finalizeKingdom bound to this Service's ContentIndex.
+func (s *Service) applyKingdom(d *proxy.PlantDetail, scientificName string, authoritative *string) *proxy.PlantDetail {
+	return finalizeKingdom(s.content, d, scientificName, authoritative)
+}
+
+// finalizeKingdom stamps d's biological kingdom and enforces the mushroom-safety
+// hard filter (SPEC §7 kingdom). EVERY path that returns, caches or persists a
+// path-2/3 row goes through it: the request path (Service.applyKingdom) and the
+// async translation Backfiller (which also serves the Sweeper).
+//
+// The kingdom is the Fungi-wins merge of d's own value (a stored row's, or a
+// fresh master's Fungi self-report), `authoritative` (iNat; nil when it was not
+// asked or did not resolve) and what this process already learned about the
+// species (content.KingdomFor — e.g. an earlier English request resolved it via
+// iNat, so a legacy row translated later still gets it). When the result is
+// Fungi, every edible/culinary use and the "edible" attribute are stripped
+// (proxy.SanitizeFungiDetail) — on fresh masters and translations before they
+// are persisted, AND on rows read back from Supabase, so a legacy row is safe to
+// serve without waiting for the backfill. A resolved kingdom is noted back on
 // the ContentIndex so /v1/identify + /v1/diagnose can reuse it with no I/O.
 //
-// Returns d itself when nothing changes, otherwise a modified COPY (d may be a
-// pointer shared with the cache or a test stub — never mutated).
-func (s *Service) applyKingdom(d *proxy.PlantDetail, scientificName string, authoritative *string) *proxy.PlantDetail {
+// content may be nil. Returns d itself when nothing changes, otherwise a
+// modified COPY (d may be a pointer shared with the cache or a test stub — never
+// mutated).
+func finalizeKingdom(content *proxy.ContentIndex, d *proxy.PlantDetail, scientificName string, authoritative *string) *proxy.PlantDetail {
 	if d == nil {
 		return nil
 	}
 	out := *d
-	out.Kingdom = proxy.MergeKingdom(d.Kingdom, authoritative)
+	out.Kingdom = proxy.MergeKingdom(d.Kingdom, authoritative, content.KingdomFor(scientificName))
 	sanitized := proxy.SanitizeFungiDetail(&out)
 	if out.Kingdom != nil {
-		s.content.NoteKingdom(scientificName, out.Kingdom)
+		content.NoteKingdom(scientificName, out.Kingdom)
 	}
 	if !sanitized && sameKingdom(d.Kingdom, out.Kingdom) {
 		return d
@@ -499,10 +526,11 @@ type genResult struct {
 // nativeRegionStaleVersion is stamped (instead of PromptVersion) on a translated
 // row whose native_region could NOT be localized: the translator returned a
 // mismatched element count so Translate (prompt.go) kept the master's
-// source-language regions verbatim. It sorts before PromptVersion ("v5"), keeping
-// the row selectable by ListNativeRegionBackfillRows (source_version < 'v5') so
-// the one-shot native_region backfill retries it — otherwise un-localized regions
-// would escape re-selection forever under a v5 stamp.
+// source-language regions verbatim. It sorts before 'v5' — the version that
+// introduced localized native_region — keeping the row selectable by
+// ListNativeRegionBackfillRows (source_version < 'v5') so the one-shot
+// native_region backfill retries it; otherwise un-localized regions would escape
+// re-selection forever under the current PromptVersion stamp (v5 or later).
 const nativeRegionStaleVersion = "v4"
 
 // translatedRowVersion returns the source_version to stamp on a freshly translated

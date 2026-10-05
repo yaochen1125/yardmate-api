@@ -73,14 +73,15 @@ const (
 	// is content-compatible for English; it is content-incompatible ONLY for
 	// non-English rows written under <= v4, whose native_region is still English.
 	// The one-time native_region backfill (backfill_native_region.go) targets
-	// `lang <> 'en' AND source_version <> 'v5'` and patches just that field.
+	// `lang <> 'en' AND source_version < 'v5'` and patches just that field.
 	//
 	// v6 = mushroom safety (SPEC §7). The schema gains a self-reported `kingdom`
 	// enum (Plantae / Fungi / Other) and the system prompt forbids any food-use
-	// claim for fungi. Content-compatible with v5 for plants; rows written under
-	// <= v5 simply lack `kingdom` (null on the wire) until the one-shot kingdom
-	// backfill (backfill_kingdom.go, which selects on the missing field itself,
-	// not on source_version) stamps it from iNat.
+	// claim for fungi. Only a Fungi self-report is acted on; a stored "Plantae"
+	// always comes from iNat. Content-compatible with v5 for plants; rows written
+	// under <= v5 simply lack `kingdom` (null on the wire) until the one-shot
+	// kingdom backfill (backfill_kingdom.go, which selects on the missing field
+	// itself, not on source_version) stamps it from iNat.
 	PromptVersion = "v6"
 
 	// SourceTag is recorded in plants_pending.source for the master copy.
@@ -171,8 +172,9 @@ func (c *LLMClient) Generate(ctx context.Context, scientificName, commonName, la
 	// the per-month chart (see bloom.go). The LLM's own period_short is discarded.
 	reconcilePeriods(&pd, lang)
 	// Canonicalize the self-reported kingdom ("Other" / anything unexpected → nil).
-	// The service merges it with iNat and applies the fungi hard filter before
-	// persistence (service.go applyKingdom) — this is only the model's own claim.
+	// This is only the model's own claim: the service keeps it solely when it says
+	// Fungi, merges it with iNat and applies the fungi hard filter before
+	// persistence (service.go Step 5 + finalizeKingdom).
 	if pd.Kingdom != nil {
 		pd.Kingdom = proxy.NormalizeKingdom(*pd.Kingdom)
 	}
