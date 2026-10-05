@@ -3,6 +3,8 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -50,7 +52,8 @@ func NewINatClient() *INatClient {
 // a name mismatch against the query, or an empty common name — the caller then
 // keeps the upstream common_names.
 func (c *INatClient) PreferredCommonName(ctx context.Context, sciName string) (string, bool) {
-	for _, r := range c.searchTaxa(ctx, sciName, inatPlantaeTaxonID) {
+	matches, _ := c.searchTaxa(ctx, sciName, inatPlantaeTaxonID)
+	for _, r := range matches {
 		if r.PreferredCommonName != "" {
 			return r.PreferredCommonName, true
 		}
@@ -70,9 +73,23 @@ func (c *INatClient) PreferredCommonName(ctx context.Context, sciName string) (s
 // bias, see MergeKingdom) and CommonName comes from the most-observed match that
 // has one.
 func (c *INatClient) LookupTaxon(ctx context.Context, sciName string) (INatTaxon, bool) {
-	matches := c.searchTaxa(ctx, sciName, inatPlantaeTaxonID+","+inatFungiTaxonID)
+	t, ok, _ := c.LookupTaxonErr(ctx, sciName)
+	return t, ok
+}
+
+// LookupTaxonErr is LookupTaxon for callers that must tell "iNat answered and has
+// no exact match" (ok=false, err=nil — a definitive miss) from "the lookup itself
+// failed" (err != nil: transport error, timeout, 429 / 5xx, undecodable body —
+// retryable). The serving path does not care (both mean "carry on without it");
+// the kingdom backfill does, so a rate-limited run is not misreported as a pile
+// of undeterminable plants. A non-2xx status is an *INatStatusError.
+func (c *INatClient) LookupTaxonErr(ctx context.Context, sciName string) (INatTaxon, bool, error) {
+	matches, err := c.searchTaxa(ctx, sciName, inatPlantaeTaxonID+","+inatFungiTaxonID)
+	if err != nil {
+		return INatTaxon{}, false, err
+	}
 	if len(matches) == 0 {
-		return INatTaxon{}, false
+		return INatTaxon{}, false, nil
 	}
 	var out INatTaxon
 	for _, r := range matches {
@@ -83,8 +100,13 @@ func (c *INatClient) LookupTaxon(ctx context.Context, sciName string) (INatTaxon
 			out.Kingdom = r.IconicTaxonName
 		}
 	}
-	return out, true
+	return out, true, nil
 }
+
+// INatStatusError is a non-2xx iNat response (429 = rate limited, 5xx = iNat down).
+type INatStatusError struct{ Status int }
+
+func (e *INatStatusError) Error() string { return fmt.Sprintf("inat: status %d", e.Status) }
 
 // inatTaxonResult is one iNat /v1/taxa result row (the fields we consume).
 type inatTaxonResult struct {
@@ -95,10 +117,15 @@ type inatTaxonResult struct {
 
 // searchTaxa runs the iNat taxa search for sciName inside taxonScope (one taxon
 // id, or a comma-separated list) and returns ONLY the results whose name equals
-// the query exactly, in iNat's observations-count order. nil on any error.
-func (c *INatClient) searchTaxa(ctx context.Context, sciName, taxonScope string) []inatTaxonResult {
-	if c == nil || c.HTTP == nil || strings.TrimSpace(sciName) == "" {
-		return nil
+// the query exactly, in iNat's observations-count order. A non-nil error means
+// the lookup did not complete (nil client, transport, non-2xx, decode); (nil, nil)
+// means iNat answered and nothing matched exactly.
+func (c *INatClient) searchTaxa(ctx context.Context, sciName, taxonScope string) ([]inatTaxonResult, error) {
+	if c == nil || c.HTTP == nil {
+		return nil, errors.New("inat: nil client")
+	}
+	if strings.TrimSpace(sciName) == "" {
+		return nil, nil
 	}
 	base := c.BaseURL
 	if base == "" {
@@ -116,25 +143,25 @@ func (c *INatClient) searchTaxa(ctx context.Context, sciName, taxonScope string)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"?"+q.Encode(), nil)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "YardMate/1.0 (server; emanon.me@gmail.com)")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer drainAndClose(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil
+		return nil, &INatStatusError{Status: resp.StatusCode}
 	}
 
 	var body struct {
 		Results []inatTaxonResult `json:"results"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil
+		return nil, err
 	}
 
 	want := strings.ToLower(strings.TrimSpace(sciName))
@@ -146,5 +173,5 @@ func (c *INatClient) searchTaxa(ctx context.Context, sciName, taxonScope string)
 			out = append(out, r)
 		}
 	}
-	return out
+	return out, nil
 }

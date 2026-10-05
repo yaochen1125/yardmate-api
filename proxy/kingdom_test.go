@@ -3,11 +3,13 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -498,5 +500,239 @@ func TestHandleDiagnose_PlantIDTopKingdomNull(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"kingdom":null`) {
 		t.Errorf("body lacks an explicit kingdom null: %s", rec.Body)
+	}
+}
+
+// --- fungi are identifiable subjects (product decision 2026-10) ---
+
+// The prompt must not define is_plant as "plant only" while asking for
+// kingdom=Fungi: a model following it literally would answer is_plant=false for
+// every mushroom and the handler would drop it before reading the kingdom.
+func TestIdentifyPlant_PromptTreatsFungiAsIdentifiable(t *testing.T) {
+	var sys, user string
+	vision, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		for _, m := range body.Messages {
+			if m.Role == "system" {
+				_ = json.Unmarshal(m.Content, &sys)
+			} else {
+				user = string(m.Content)
+			}
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Amanita muscaria\",\"common_names\":[],\"confidence\":0.8,\"kingdom\":\"Fungi\"}"}}]}`)
+	})
+	defer srv.Close()
+	if _, err := vision.IdentifyPlant(context.Background(), jpegMagic, "image/jpeg"); err != nil {
+		t.Fatalf("IdentifyPlant: %v", err)
+	}
+	for _, want := range []string{
+		"plant OR fungus species",
+		"is_plant = true if the image shows a real plant or a real fungus",
+		"MUST be reported with is_plant = true",
+		"to species level for fungi",
+	} {
+		if !strings.Contains(sys, want) {
+			t.Errorf("system prompt missing %q\n%s", want, sys)
+		}
+	}
+	if strings.Contains(sys, "false for anything else (an object") && !strings.Contains(sys, "false only for anything else") {
+		t.Errorf("system prompt still gates is_plant on plants only:\n%s", sys)
+	}
+	if !strings.Contains(user, "plant or fungus") {
+		t.Errorf("user message = %s, want it to mention fungus", user)
+	}
+	isPlantDesc := visionIdentifySchema["json_schema"].(map[string]any)["schema"].(map[string]any)["properties"].(map[string]any)["is_plant"].(map[string]any)["description"].(string)
+	if !strings.Contains(isPlantDesc, "OR a fungus") {
+		t.Errorf("is_plant schema description still plant-only: %q", isPlantDesc)
+	}
+}
+
+// Code backstop: is_plant=false but a named Fungi species IS an identification.
+func TestIdentifyPlant_FungiBackstopOverridesIsPlantFalse(t *testing.T) {
+	reply := func(inner string) string {
+		return `{"choices":[{"message":{"content":"` + inner + `"}}]}`
+	}
+	cases := []struct {
+		name       string
+		inner      string
+		wantErr    error
+		wantSci    string
+		wantFungus bool
+	}{
+		{"false + Fungi + species → identified",
+			`{\"is_plant\":false,\"scientific_name\":\"Amanita phalloides\",\"common_names\":[\"Death cap\"],\"confidence\":0.7,\"kingdom\":\"Fungi\"}`,
+			nil, "Amanita phalloides", true},
+		{"false + fungi lowercase → identified",
+			`{\"is_plant\":false,\"scientific_name\":\"Amanita phalloides\",\"common_names\":[],\"confidence\":0.7,\"kingdom\":\"fungi\"}`,
+			nil, "Amanita phalloides", true},
+		{"false + Fungi + blank name → still not a plant",
+			`{\"is_plant\":false,\"scientific_name\":\"  \",\"common_names\":[],\"confidence\":0.1,\"kingdom\":\"Fungi\"}`,
+			ErrVisionNotAPlant, "", false},
+		{"false + Plantae → not a plant (unchanged)",
+			`{\"is_plant\":false,\"scientific_name\":\"Rosa chinensis\",\"common_names\":[],\"confidence\":0.1,\"kingdom\":\"Plantae\"}`,
+			ErrVisionNotAPlant, "", false},
+		{"false + Other → not a plant (unchanged)",
+			`{\"is_plant\":false,\"scientific_name\":\"Felis catus\",\"common_names\":[],\"confidence\":0.9,\"kingdom\":\"Other\"}`,
+			ErrVisionNotAPlant, "", false},
+	}
+	for _, c := range cases {
+		vision, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, reply(c.inner))
+		})
+		sug, err := vision.IdentifyPlant(context.Background(), jpegMagic, "image/jpeg")
+		srv.Close()
+		if c.wantErr != nil {
+			if !errors.Is(err, c.wantErr) {
+				t.Errorf("%s: err = %v, want %v", c.name, err, c.wantErr)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected err %v", c.name, err)
+			continue
+		}
+		if sug.ScientificName != c.wantSci || IsFungi(sug.Kingdom) != c.wantFungus {
+			t.Errorf("%s: got %q kingdom=%s", c.name, sug.ScientificName, kingdomStr(sug.Kingdom))
+		}
+	}
+}
+
+func TestDiagnosePlant_PromptCoversFungi(t *testing.T) {
+	var sys string
+	vision, srv := newTestVisionClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		for _, m := range body.Messages {
+			if m.Role == "system" {
+				_ = json.Unmarshal(m.Content, &sys)
+			}
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"scientific_name\":\"Amanita muscaria\",\"common_names\":[],\"confidence\":0.8,\"kingdom\":\"Fungi\",\"is_healthy\":true,\"health_probability\":0.9,\"issues\":[]}"}}]}`)
+	})
+	defer srv.Close()
+	vr, err := vision.DiagnosePlant(context.Background(), jpegMagic, "image/jpeg", "en")
+	if err != nil {
+		t.Fatalf("DiagnosePlant: %v", err)
+	}
+	if vr.Kingdom != "Fungi" {
+		t.Errorf("kingdom = %q, want Fungi", vr.Kingdom)
+	}
+	if !strings.Contains(sys, "If the subject is a fungus") || !strings.Contains(sys, "still identify it to species") {
+		t.Errorf("diagnose system prompt does not cover fungi:\n%s", sys)
+	}
+}
+
+const gptFlyAgaric = `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Amanita muscaria\",\"common_names\":[\"Fly agaric\"],\"confidence\":0.7,\"kingdom\":\"Fungi\"}"}}]}`
+
+func plantIDEngineBody(sci string, prob string) string {
+	return `{"result":{"is_plant":{"probability":0.98,"binary":true},"classification":{"suggestions":[{"name":"` + sci + `","probability":` + prob + `,"details":{"common_names":[],"scientific_name":"` + sci + `"}}]}}}`
+}
+
+// The engines are plant-only, so on a mushroom photo they return plants. A GPT
+// Fungi verdict must win over a WEAK engine candidate — in-catalog or not —
+// exactly where the not-a-plant verdict used to win (it produced the Unknown
+// sentinel; now the mushroom is identified instead of shown as a garden plant).
+func TestHandleIdentify_GPTFungusBeatsWeakEngineCandidates(t *testing.T) {
+	cases := map[string]string{
+		"weak in-catalog hit":       plantIDEngineBody("Abelia chinensis", "0.40"),
+		"weak out-of-catalog guess": plantIDEngineBody("Zzzz nonexistent plantii", "0.30"),
+	}
+	for name, engine := range cases {
+		result := runArbiterIdentify(t, engine, gptFlyAgaric)
+		if len(result.Suggestions) != 1 {
+			t.Fatalf("%s: suggestions = %+v, want only the fungus", name, result.Suggestions)
+		}
+		s0 := result.Suggestions[0]
+		if s0.ScientificName != "Amanita muscaria" || !IsFungi(s0.Kingdom) || s0.PlantID != nil {
+			t.Errorf("%s: top = %+v kingdom=%s, want Amanita muscaria / Fungi / no plant_id", name, s0, kingdomStr(s0.Kingdom))
+		}
+		if !result.IsPlant {
+			t.Errorf("%s: is_plant = false, want true (a mushroom is a successful identification)", name)
+		}
+	}
+}
+
+// A CONFIDENT engine answer keeps its existing trust (>= 0.80), mirroring how the
+// not-a-plant verdict is ignored there — guards against a GPT false Fungi call.
+func TestHandleIdentify_GPTFungusDoesNotOverrideConfidentEngine(t *testing.T) {
+	inCat := runArbiterIdentify(t, plantIDEngineBody("Abelia chinensis", "0.90"), gptFlyAgaric)
+	if inCat.Suggestions[0].PlantID == nil || *inCat.Suggestions[0].PlantID != "AAA0001" {
+		t.Errorf("confident in-catalog engine displaced: %+v", inCat.Suggestions[0])
+	}
+	oob := runConfidentOOBIdentify(t, gptFlyAgaric)
+	if oob.Suggestions[0].Name != "Zzzz nonexistent plantii" || IsFungi(oob.Suggestions[0].Kingdom) {
+		t.Errorf("confident out-of-catalog engine displaced: %+v", oob.Suggestions[0])
+	}
+}
+
+// is_plant=false + Fungi must reach the client as the mushroom, not the Unknown
+// sentinel, even through the full handler.
+func TestHandleIdentify_FungiBackstopNotUnknownSentinel(t *testing.T) {
+	result := runArbiterIdentify(t, plantIDEngineBody("Abelia chinensis", "0.40"),
+		`{"choices":[{"message":{"content":"{\"is_plant\":false,\"scientific_name\":\"Amanita muscaria\",\"common_names\":[],\"confidence\":0.6,\"kingdom\":\"Fungi\"}"}}]}`)
+	s0 := result.Suggestions[0]
+	if s0.ScientificName != "Amanita muscaria" || !IsFungi(s0.Kingdom) {
+		t.Errorf("top = %+v, want the fungus (not AAA0000 / the weak plant)", s0)
+	}
+}
+
+// Fungi stickiness must hold under concurrent writers (run with -race).
+func TestContentIndex_KingdomHintsConcurrentFungiSticky(t *testing.T) {
+	content, err := LoadContent()
+	if err != nil {
+		t.Fatalf("LoadContent: %v", err)
+	}
+	for round := 0; round < 50; round++ {
+		name := "Concurrentus fungus" + strings.Repeat("a", round%7)
+		content.NoteKingdom(name, strPtr("Fungi"))
+		var wg sync.WaitGroup
+		for i := 0; i < 16; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				if i%2 == 0 {
+					content.NoteKingdom(name, strPtr("Plantae"))
+				} else {
+					content.NoteKingdom(name, strPtr("Fungi"))
+				}
+			}(i)
+		}
+		wg.Wait()
+		if k := content.KingdomFor(name); !IsFungi(k) {
+			t.Fatalf("round %d: kingdom = %s, want Fungi (sticky)", round, kingdomStr(k))
+		}
+	}
+}
+
+func TestINatLookupTaxonErr_DistinguishesFailureFromMiss(t *testing.T) {
+	status := http.StatusOK
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, `{"results":[]}`)
+	}))
+	defer srv.Close()
+	c := &INatClient{HTTP: srv.Client(), BaseURL: srv.URL}
+
+	if _, ok, err := c.LookupTaxonErr(context.Background(), "Nomatchus here"); ok || err != nil {
+		t.Errorf("empty result = (ok=%v, err=%v), want a definitive miss (false, nil)", ok, err)
+	}
+	for _, code := range []int{http.StatusTooManyRequests, http.StatusBadGateway} {
+		status = code
+		_, ok, err := c.LookupTaxonErr(context.Background(), "Amanita muscaria")
+		var se *INatStatusError
+		if ok || !errors.As(err, &se) || se.Status != code {
+			t.Errorf("status %d = (ok=%v, err=%v), want INatStatusError{%d}", code, ok, err, code)
+		}
 	}
 }

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"strings"
+	"sync"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 )
@@ -127,7 +128,22 @@ const kingdomHintCap = 10_000
 // round-trip on the latency-budgeted identify path (2026-08-26 timeout
 // incident): a pure memory read, nil on a miss.
 type kingdomHints struct {
+	// mu makes note's read-then-write atomic. The LRU is itself thread-safe per
+	// call, but "Fungi is sticky" is a check-then-act across two calls: without
+	// the lock a concurrent Plantae note could land between another writer's
+	// check and its Add and downgrade a Fungi verdict.
+	mu  sync.Mutex
 	lru *lru.Cache[string, string]
+}
+
+// note records kingdom k for key unless a Fungi verdict is already held.
+func (h *kingdomHints) note(key, k string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if prev, ok := h.lru.Peek(key); ok && prev == KingdomFungi {
+		return
+	}
+	h.lru.Add(key, k)
 }
 
 func newKingdomHints() *kingdomHints {
@@ -152,10 +168,7 @@ func (c *ContentIndex) NoteKingdom(scientificName string, kingdom *string) {
 	if k == nil || key == "" {
 		return
 	}
-	if prev, ok := c.kingdoms.lru.Peek(key); ok && prev == KingdomFungi {
-		return
-	}
-	c.kingdoms.lru.Add(key, *k)
+	c.kingdoms.note(key, *k)
 }
 
 // KingdomFor returns the kingdom known for scientificName WITHOUT any I/O, or
