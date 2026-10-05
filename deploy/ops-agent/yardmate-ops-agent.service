@@ -1,0 +1,20 @@
+[Unit]
+Description=YardMate ops action agent (email-button endpoint)
+After=network.target
+
+[Service]
+Type=simple
+# root：需要 systemctl 重启 nginx / yardmate-api，以及替换 binary 做回滚。
+# 攻击面靠「只监听 127.0.0.1 + nginx 白名单 + HMAC 签名 + 一次性 token +
+# 写死的动作表」收窄，而不是靠降权 —— 降权就做不了它唯一要做的事。
+User=root
+ExecStart=/usr/bin/python3 /usr/local/bin/yardmate-ops-agent.py
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
