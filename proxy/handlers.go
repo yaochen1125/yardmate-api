@@ -828,6 +828,19 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					result = unknownSentinelResult()
 					unknownSentinel = true
 					engine = "unknown-sentinel"
+				case gptErr == nil && gptSug != nil && IsFungi(gptSug.Kingdom) && bestConf < plantnetConfidentSkipAIConfidence:
+					// GPT says this is a FUNGUS. The engines are plant-only (Pl@ntNet /
+					// Plant.id can never name a mushroom), so their weak catalog hit
+					// is a false positive — exactly the slot the not-a-plant verdict
+					// above used to fill before fungi became identifiable. Adopt GPT's
+					// fungus (kingdom=Fungi → iOS safety notice) instead of showing a
+					// mushroom as a garden plant. Same >=0.80 engine-trust guard.
+					result = &IdentifyResult{
+						IsPlant:           true,
+						IsPlantConfidence: gptSug.Confidence,
+						Suggestions:       []Suggestion{*gptSug},
+					}
+					engine = "ai-fungi"
 				case gptErr == nil && gptSug != nil:
 					// GPT resolves to a DIFFERENT catalog plant AND is at least as
 					// confident as the engine's in-catalog candidate → adopt GPT's
@@ -915,6 +928,18 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					result = unknownSentinelResult()
 					unknownSentinel = true
 					engine = "unknown-sentinel"
+				case verr == nil && aiSug != nil && IsFungi(aiSug.Kingdom):
+					// AI vision says FUNGUS and the plant-only engine was not
+					// confident → the engine's plant candidates (if any) are false
+					// positives; use the AI's fungus. Takes the precedence the
+					// not-a-plant verdict above had for mushrooms before fungi
+					// became identifiable (was: Unknown sentinel).
+					result = &IdentifyResult{
+						IsPlant:           true,
+						IsPlantConfidence: aiSug.Confidence,
+						Suggestions:       []Suggestion{*aiSug},
+					}
+					engine = "ai-fungi"
 				case verr == nil && aiSug != nil && aiHasPID &&
 					aiSug.Confidence >= aiCatalogRecoveryMinConfidence:
 					// AI recovered a catalog match with enough confidence →
