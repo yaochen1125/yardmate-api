@@ -1181,6 +1181,12 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					result.Suggestions[i].PlantID = &pid
 					plantIDsResolved++
 				}
+				// kingdom (mushroom-safety signal, SPEC §2.1): merge the candidate's
+				// own GPT-vision self-report (nil for engine candidates) with what
+				// the catalog record / an earlier enrichment already knows. Pure
+				// in-memory — NO network or DB call may be added here (identify
+				// timeout budget); undetermined stays nil → JSON null.
+				result.Suggestions[i].Kingdom = MergeKingdom(result.Suggestions[i].Kingdom, content.KingdomFor(sci))
 				result.Suggestions[i].ScientificName = speciesBinomial(sci) // display species-level (SPEC §2.1)
 			}
 
@@ -1742,6 +1748,11 @@ func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, cont
 			res.PlantID = &pid
 		}
 	}
+	if res.Top != nil {
+		// kingdom (SPEC §2.2): Plant.id reports none — catalog record / earlier
+		// enrichment only, in-memory, nil when unknown.
+		res.Top.Kingdom = content.KingdomFor(res.Top.ScientificName)
+	}
 
 	res.HealthProbability = api.Result.IsHealthy.Probability
 	res.IsHealthy = api.Result.IsHealthy.Binary
@@ -1854,6 +1865,9 @@ func diagnoseResultFromVision(ctx context.Context, vr *visionDiagnoseResult, con
 		ScientificName: name,
 		CommonNames:    cn,
 		Confidence:     clamp01(vr.Confidence),
+		// GPT self-report merged with catalog / earlier-enrichment knowledge
+		// (in-memory only, SPEC §2.2). "Other" / unknown → nil.
+		Kingdom: MergeKingdom(NormalizeKingdom(vr.Kingdom), content.KingdomFor(name)),
 	}
 	if name != "" {
 		if id, ok := content.LookupPlantID(name); ok {
