@@ -80,6 +80,9 @@ type StreamRequest struct {
 	History         []HistoryTurn
 	UserText        string
 	Images          [][]byte // sniffed jpeg/png/webp, ≤3 (validated by the handler)
+	// Plant is the garden record of the plant this case is about; nil when
+	// the chat was not started from a plant in the user's garden.
+	Plant *PlantContext
 }
 
 // Client streams chat/completions. The zero value is not usable; NewClient
@@ -297,6 +300,14 @@ func buildBody(req StreamRequest) ([]byte, error) {
 			inst += "\n" + followUpTextOnly
 		}
 		parts = append(parts, oaPart{Type: "text", Text: inst})
+	} else if len(req.Images) == 0 {
+		// 首轮就没有照片（从花园植物发起、只打了字）：系统提示词默认「你在看他们刚拍的
+		// 照片」，不纠正的话模型要么编造画面，要么误走 photoProblem。
+		parts = append(parts, oaPart{Type: "text", Text: firstTurnTextOnly})
+	}
+	// 每一轮都带：历史里不重放这一段，续问时模型同样需要知道是哪一株、养护情况如何。
+	if block := plantContextBlock(req.Plant); block != "" {
+		parts = append(parts, oaPart{Type: "text", Text: block})
 	}
 	if req.UserText != "" {
 		parts = append(parts, oaPart{Type: "text", Text: req.UserText})

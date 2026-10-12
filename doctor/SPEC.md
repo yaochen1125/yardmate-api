@@ -40,6 +40,7 @@ Form fields (all optional unless said otherwise):
 | `history`  | JSON array of prior turns (see below), ≤ 8 turns               |
 | `language` | app UI locale code (`en`, `zh-Hans`, …); unknown → English     |
 | `units`    | `metric` \| `imperial`; anything else → `metric`               |
+| `plant`    | JSON object, ≤ 1 KB: the garden record of the plant this case is about (see below). Sent when the chat was started from a plant in the user's garden. Unusable value (bad JSON, oversized, no species) → ignored, **never an error** |
 | `model`    | override; honored ONLY when `DOCTOR_ALLOW_MODEL_OVERRIDE=true` **and** the value is in the model whitelist. Silently ignored otherwise (never an error — a stale debug client must not break prod). |
 
 At least one of `text` / `image` must be present → else `empty_request`.
@@ -49,6 +50,36 @@ where `reply` is the assistant's structured JSON from the prior turn, passed
 back verbatim. The first turn's images are NOT re-sent (several hundred image
 tokens per turn saved); `had_images` lets the prompt say "[sent a photo]".
 Caps: `user` ≤ 2 KB, `reply` ≤ 8 KB each, else `bad_history`.
+
+`plant` object — every key except the names is optional, and **an absent key
+means "the app does not know", not zero** (the client omits
+`days_since_watered` when the user never logged a watering):
+
+| key                     | type   | meaning                                              |
+|-------------------------|--------|------------------------------------------------------|
+| `scientific_name`       | string | species (at least one of the two names is required)  |
+| `common_name`           | string | species common name                                  |
+| `nickname`              | string | the user's own name for this plant (user-typed)      |
+| `location`              | string | where they keep it (`Indoor`, `Balcony`, …)          |
+| `days_in_garden`        | int    | days since it was added to the app                   |
+| `days_since_watered`    | int    | days since the last logged watering                  |
+| `days_since_fertilized` | int    | days since the last logged feeding                   |
+| `water_every_days`      | int    | the app's watering reminder interval                 |
+| `fertilize_every_days`  | int    | the app's feeding reminder interval                  |
+
+Strings are flattened to one line, stripped of control characters and double
+quotes, and capped at 80 characters (`nickname` is user-typed and lands in the
+prompt). Implausible numbers (negative days, intervals outside 1–730) are
+dropped key by key. The record is rendered as a `PLANT ON FILE` block in the
+final user message of **every** turn — history does not replay it — labelled as
+app data, not something the user said.
+
+**First turn without a photo.** The system prompt assumes the model is looking
+at a photo. When the first turn carries text only (the garden entry point does
+not require a photo), the final user message gets `firstTurnTextOnly`: no
+visual claims, observations restate the user's report, and `photoProblem` is
+off the table — that branch is for a photo that was sent and cannot be read.
+Follow-up turns keep using `followUpTextOnly`.
 
 ## 3. Response — SSE event contract
 

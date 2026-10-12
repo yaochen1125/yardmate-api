@@ -187,3 +187,94 @@ func TestBuildBodyShape(t *testing.T) {
 func pngBytes() []byte {
 	return []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0}
 }
+
+// finalUserText joins the text parts of the last message in a built body.
+func finalUserText(t *testing.T, body []byte) string {
+	t.Helper()
+	var decoded struct {
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(decoded.Messages[len(decoded.Messages)-1].Content, &parts); err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		if p.Type == "text" {
+			b.WriteString(p.Text)
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+func TestBuildBodyFirstTurnWithoutPhoto(t *testing.T) {
+	body, err := buildBody(StreamRequest{Model: "gpt-5-mini", UserText: "the lower leaves are yellow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := finalUserText(t, body)
+	if !strings.Contains(got, "contains NO photo") || !strings.Contains(got, "Do NOT use the photoProblem branch") {
+		t.Fatalf("first text-only turn must carry the no-photo instruction, got:\n%s", got)
+	}
+
+	// With a photo the instruction must be absent: it would forbid describing
+	// the very photo the model is looking at.
+	withPhoto, _ := buildBody(StreamRequest{Model: "gpt-5-mini", UserText: "x", Images: [][]byte{pngBytes()}})
+	if strings.Contains(finalUserText(t, withPhoto), "contains NO photo") {
+		t.Fatal("first turn WITH a photo must not carry the no-photo instruction")
+	}
+
+	// Follow-ups keep their own text-only rule and do not get the first-turn one.
+	followUp, _ := buildBody(StreamRequest{
+		Model: "gpt-5-mini", UserText: "x",
+		History: []HistoryTurn{{User: "hi", Reply: json.RawMessage(`{}`)}},
+	})
+	fu := finalUserText(t, followUp)
+	if strings.Contains(fu, "This first message") || !strings.Contains(fu, "contains NO new photo") {
+		t.Fatalf("follow-up must use followUpTextOnly only, got:\n%s", fu)
+	}
+}
+
+func TestBuildBodyCarriesPlantOnEveryTurn(t *testing.T) {
+	four, seven := 4, 7
+	plant := &PlantContext{
+		ScientificName: "Monstera deliciosa", CommonName: "Swiss Cheese Plant",
+		Nickname: "Monty", Location: "Indoor",
+		DaysSinceWatered: &four, WaterEveryDays: &seven,
+	}
+	first, _ := buildBody(StreamRequest{Model: "gpt-5-mini", UserText: "x", Plant: plant})
+	got := finalUserText(t, first)
+	for _, want := range []string{
+		"PLANT ON FILE", "Monstera deliciosa (Swiss Cheese Plant)", `"Monty"`, "Indoor",
+		"last logged 4 days ago; the app reminds every 7 days",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("plant block missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Fertilizing") {
+		t.Fatal("care the app knows nothing about must not produce a line")
+	}
+
+	followUp, _ := buildBody(StreamRequest{
+		Model: "gpt-5-mini", UserText: "x", Plant: plant,
+		History: []HistoryTurn{{User: "hi", Reply: json.RawMessage(`{}`)}},
+	})
+	if !strings.Contains(finalUserText(t, followUp), "PLANT ON FILE") {
+		t.Fatal("follow-ups must carry the plant block too (history does not replay it)")
+	}
+
+	none, _ := buildBody(StreamRequest{Model: "gpt-5-mini", UserText: "x"})
+	if strings.Contains(finalUserText(t, none), "PLANT ON FILE") {
+		t.Fatal("no plant → no block")
+	}
+}

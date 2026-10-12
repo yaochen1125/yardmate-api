@@ -183,6 +183,7 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 			lang    string
 			units   string
 			model   string
+			plant   *PlantContext
 		)
 		for {
 			part, perr := mr.NextPart()
@@ -240,6 +241,11 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 				units = readField(part, 16)
 			case "model":
 				model = readField(part, 64)
+			case "plant":
+				// Read one byte past the cap: an oversized field then fails to
+				// parse (truncated JSON) and is dropped as a whole, instead of
+				// being silently cut to a prefix that happens to be valid.
+				plant = parsePlant(readField(part, maxPlantBytes+1))
 			default:
 				_, _ = io.Copy(io.Discard, part) // unknown fields ignored, part drained
 			}
@@ -295,6 +301,7 @@ func Handle(svc *Service, gate SpendGate) http.HandlerFunc {
 			History:         history,
 			UserText:        text,
 			Images:          images,
+			Plant:           plant,
 		}
 		obsCount := 0
 		reply, usage, err := svc.clientFor(resolved).Stream(ctx, req, func(index int, s string) {
