@@ -138,7 +138,7 @@ func plantContextBlock(p *PlantContext) string {
 	b.WriteString("Use this to reason about care history and species-specific needs. Logged care can be incomplete - the user may water or feed without logging it, so a missing log is not proof of neglect; ask if it matters. Do not recite this record back.\n")
 	// 照片里的不是档案上这一株：先说出来再诊断照片里的东西。用户从某一株发起对话，却拍了
 	// 旁边另一盆，不提醒的话结论会被记进错的那一株的日志。只在明显不同时说，拿不准不提。
-	b.WriteString("If a photo in this conversation clearly shows a different plant than the species on file (an obviously different kind of plant, not merely an unusual or stressed specimen of the same one), say so plainly in the first sentence of spokenSummary: name what the photo appears to show and that it does not look like the plant this case was opened for. Then diagnose what is actually in the photo. Do not raise a mismatch when you are unsure, and never for a message without a photo.")
+	b.WriteString("If a photo in this conversation clearly shows a different plant than the species on file (an obviously different kind of plant, not merely an unusual or stressed specimen of the same one), say so plainly in the first sentence of spokenSummary: name what the photo appears to show and that it does not look like the plant this case was opened for. Then diagnose what is actually in the photo. Be very conservative: raise this only when you are highly confident the two cannot be the same plant - for example a spiky agave where basil is on file. Plants that merely look somewhat different, close relatives, cultivars, seedlings, cuttings, or damaged, leggy or out-of-season specimens are NOT a mismatch; in any doubt, say nothing and diagnose normally. Never raise it for a message without a photo.")
 	return b.String()
 }
 
