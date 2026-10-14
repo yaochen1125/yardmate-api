@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -425,5 +426,68 @@ func TestFallbackForPolicy(t *testing.T) {
 	svc.FallbackModel = "grok-4.6"
 	if got := svc.fallbackFor("gpt-5"); got != "" {
 		t.Fatalf("grok fallback without XAIClient returned %q", got)
+	}
+}
+
+// capturingUpstream answers like fakeUpstream but records the request body it
+// was sent, so a test can assert what actually reached the model.
+func capturingUpstream(t *testing.T, got *string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		*got = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		chunk, _ := json.Marshal(map[string]any{
+			"choices": []map[string]any{{"delta": map[string]any{"content": wireReply}}},
+		})
+		fmt.Fprintf(w, "data: %s\n\n", chunk)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+}
+
+// A chat started from a plant in the user's garden: no photo, text only, with
+// the plant record. The record and the no-photo rule must reach the model.
+func TestHandlePlantContextReachesTheModel(t *testing.T) {
+	var sent string
+	up := capturingUpstream(t, &sent)
+	defer up.Close()
+
+	body, ct := buildMultipart(t, map[string]string{
+		"text":  "the lower leaves are turning yellow",
+		"plant": `{"scientific_name":"Monstera deliciosa","common_name":"Swiss Cheese Plant","nickname":"Monty","days_since_watered":4,"water_every_days":7}`,
+	}, nil)
+	rec := httptest.NewRecorder()
+	Handle(testService(t, up.URL), allowGate)(rec, doctorRequest(t, body, ct))
+
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "event: reply") {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{"PLANT ON FILE", "Monstera deliciosa", "Monty", "contains NO photo"} {
+		if !strings.Contains(sent, want) {
+			t.Fatalf("upstream request missing %q", want)
+		}
+	}
+}
+
+// The plant record is a bonus: a malformed one must not cost the user their answer.
+func TestHandleBadPlantIsIgnored(t *testing.T) {
+	var sent string
+	up := capturingUpstream(t, &sent)
+	defer up.Close()
+
+	for name, plant := range map[string]string{
+		"not json":  "Monstera",
+		"oversized": `{"scientific_name":"` + strings.Repeat("a", maxPlantBytes) + `"}`,
+	} {
+		sent = ""
+		body, ct := buildMultipart(t, map[string]string{"text": "help", "plant": plant}, nil)
+		rec := httptest.NewRecorder()
+		Handle(testService(t, up.URL), allowGate)(rec, doctorRequest(t, body, ct))
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "event: reply") {
+			t.Fatalf("%s: code=%d body=%s", name, rec.Code, rec.Body.String())
+		}
+		if strings.Contains(sent, "PLANT ON FILE") {
+			t.Fatalf("%s: unusable plant must not produce a block", name)
+		}
 	}
 }
