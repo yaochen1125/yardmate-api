@@ -245,6 +245,15 @@ func newServer(
 			r.Post("/plants/signal", enrichment.HandleSignal(enrichDB))
 		}
 
+		// /v1/shop/click — Shop tab product-card click log (one row per click),
+		// feeding the 7788 admin「商店数据」page. Same posture as /v1/plants/signal:
+		// outside the per-device expensive-call group, bounded by this /v1 scope's
+		// per-IP limit plus a per-device daily cap enforced in SQL
+		// (RecordShopClick). The handler requires + validates X-Device-Install-Id.
+		if enrichDB != nil {
+			r.Post("/shop/click", enrichment.HandleShopClick(enrichDB))
+		}
+
 		// /v1/feedback — anonymous in-app "Send feedback" messages (More →
 		// SUPPORT). Same posture as /v1/plants/signal: outside the per-device
 		// expensive-call group, bounded by this /v1 scope's per-IP limit plus a
