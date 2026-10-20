@@ -92,6 +92,24 @@ deletion + Sign in with Apple revoke). All SERVER-ONLY (never vended/logged):
   lines (the server un-escapes them); for a real multi-line PEM use
   `APPLE_PRIVATE_KEY_PATH` and deploy the .p8 to the host manually (see §0).
 
+Referral endpoints (`/v1/referral/{me,claim,redeemed}` — invite a friend,
+`referral/SPEC.md`). SERVER-ONLY; when any is missing the three routes answer
+`503 not_configured` (never 404) and the settlement loop does not start:
+
+- `SUPABASE_URL` + `SUPABASE_DB_URL` — same two as above (JWT verification +
+  the tables from `proxy/enrichment/migrations/013_referral.sql`, applied
+  staging → prod BEFORE the binary that uses them).
+- `REVENUECAT_SECRET_KEY` — RevenueCat **v1 secret** key (`sk_…`): reads
+  customers, grants promotional entitlements.
+- `REVENUECAT_ENTITLEMENT_ID` — the entitlement **identifier** string exactly
+  as the RevenueCat dashboard shows it. For this project that is the display
+  name itself, `YardMate: AI Plant ID & Care Pro` (spaces + colon, no quotes;
+  verified against a prod customer record 2026-10-19).
+- `REFERRAL_SETTLE_INTERVAL` — optional, Go duration, default `10m`.
+
+Restocking the offer-code pool: `deploy/supabase/import-codes.sh` (CSV from
+App Store Connect → `code_pool`, idempotent). Smoke: `deploy/referral-smoke.sh`.
+
 Adding a new key:
 
 1. Add it to your local `secrets.env.prod`.
