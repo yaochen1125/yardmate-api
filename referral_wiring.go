@@ -53,8 +53,18 @@ func buildReferralService(vault *secrets.Vault, db *enrichment.DB) *referral.Ser
 	if c := referral.NewClient(vault.Get("REVENUECAT_SECRET_KEY")); c != nil {
 		rc = c
 	}
+	// The code-pool low-stock / expiry alert goes to the operator mailbox the
+	// feedback forwarder uses (mail_wiring.go). A typed nil must not reach the
+	// interface, or the watch would call Alert on a nil mailer.
+	var alerter referral.Alerter
+	if m := operatorMailer(vault); m != nil {
+		alerter = m
+	} else {
+		log.Printf("referral pool alert mail disabled (FEEDBACK_SMTP_FROM/PASS/EMAIL_TO not all set); WARN log only")
+	}
 	svc := referral.New(store, rc, vault.Get("REVENUECAT_ENTITLEMENT_ID"), newSupabaseAuthenticator(vault), referral.Options{
 		Interval: vaultDurationOr(vault, "REFERRAL_SETTLE_INTERVAL", 0),
+		Alerter:  alerter,
 	})
 	if !svc.Configured() {
 		log.Printf("WARN: referral not configured (missing %v); /v1/referral/* answers 503 not_configured", svc.Missing())

@@ -255,10 +255,7 @@ func newServer(
 		// is also emailed to the operator (FEEDBACK_SMTP_* / FEEDBACK_EMAIL_TO
 		// in the Vault; all-absent = mail disabled, rows still stored).
 		if enrichDB != nil {
-			feedbackMailer := enrichment.NewFeedbackMailer(
-				vault.Get("FEEDBACK_SMTP_HOST"), vault.Get("FEEDBACK_SMTP_PORT"),
-				vault.Get("FEEDBACK_SMTP_FROM"), vault.Get("FEEDBACK_SMTP_PASS"),
-				vault.Get("FEEDBACK_EMAIL_TO"))
+			feedbackMailer := operatorMailer(vault)
 			if feedbackMailer == nil {
 				log.Printf("feedback mail disabled (FEEDBACK_SMTP_FROM/PASS/EMAIL_TO not all set)")
 			}

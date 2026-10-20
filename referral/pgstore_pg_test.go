@@ -208,3 +208,40 @@ func TestPGClaimPoolEmptyWhenOnlyShortCodesAreLeft(t *testing.T) {
 	}
 }
 
+func TestPGPoolStatusGroupsByBatch(t *testing.T) {
+	st, pool, ctx := pgTest(t)
+	codeA := pgInviteCode(t, st, ctx, userA)
+	pgSeed(t, pool, ctx, "Referral Friend Month", 10*day, "S1", "S2")
+	pgSeed(t, pool, ctx, "Referral Friend Month", 120*day, "L1", "L2", "L3")
+	if _, err := st.Claim(ctx, userB, codeA); err != nil { // takes L1
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `update code_pool set state = 'expired' where code = 'S2'`); err != nil {
+		t.Fatal(err)
+	}
+
+	ps, err := st.PoolStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ps.Settings != (PoolSettings{IssueMarginDays: 14, LowStockThreshold: 100, ExpiryWarnDays: 30}) {
+		t.Errorf("settings = %+v, want the 014 defaults", ps.Settings)
+	}
+	if len(ps.Batches) != 2 {
+		t.Fatalf("batches = %+v, want 2 (same name, two dates)", ps.Batches)
+	}
+	short, long := ps.Batches[0], ps.Batches[1]
+	if !short.ExpiresAt.Before(long.ExpiresAt) {
+		t.Errorf("batches not in expiry order: %+v", ps.Batches)
+	}
+	if short.Free != 1 || short.Expired != 1 || short.Issued != 0 {
+		t.Errorf("short batch = %+v", short)
+	}
+	if long.Free != 2 || long.Issued != 1 {
+		t.Errorf("long batch = %+v", long)
+	}
+	stock := TakeStock(ps, time.Now())
+	if stock.Usable != 2 || stock.Short != 1 || !stock.LowStock {
+		t.Errorf("stock = %+v", stock)
+	}
+}

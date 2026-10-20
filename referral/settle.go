@@ -40,6 +40,8 @@ type Report struct {
 	Granted   int // referrals rewarded straight away (③)
 	Saved     int // referrals parked (③)
 	Flushed   int // saved referrals paid out (④)
+	Usable    int // free pool codes beyond the issue margin (pool.go)
+	Alerted   int // pool alert emails sent this pass (0 or 1)
 	Errors    int
 }
 
@@ -117,6 +119,9 @@ func (s *Service) Settle(ctx context.Context) Report {
 	} else {
 		rep.Expired = n
 	}
+	// Stock check right after retiring the dead codes, so the numbers are
+	// about what /claim can actually hand out.
+	s.watchPool(ctx, now, &rep)
 	hold, err := s.store.HoldDays(ctx)
 	if err != nil || hold < 0 {
 		log.Printf("referral settle: hold_days unavailable (%v); using 7", err)

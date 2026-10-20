@@ -35,6 +35,8 @@ type memStore struct {
 	expired     int64
 	recordErr   error
 	recordCalls int
+	pool        PoolStatus
+	poolErr     error
 }
 
 type memRef struct {
@@ -98,6 +100,29 @@ func (m *memStore) DeleteUser(_ context.Context, userID string) error {
 }
 
 func (m *memStore) ExpireCodes(context.Context) (int64, error) { return m.expired, nil }
+
+func (m *memStore) PoolStatus(context.Context) (PoolStatus, error) { return m.pool, m.poolErr }
+
+// fakeAlerter records every alert; err makes each send fail.
+type fakeAlerter struct {
+	mu    sync.Mutex
+	sent  []alertCall
+	err   error
+	calls int
+}
+
+type alertCall struct{ subject, body string }
+
+func (f *fakeAlerter) Alert(subject, body string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.err != nil {
+		return f.err
+	}
+	f.sent = append(f.sent, alertCall{subject, body})
+	return nil
+}
 
 func (m *memStore) HoldDays(context.Context) (int, error) { return m.holdDays, m.holdErr }
 
