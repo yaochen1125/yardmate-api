@@ -295,6 +295,12 @@ func newServer(
 				r.With(referralSvc.ReadLimiter()).Get("/me", referralSvc.HandleMe())
 				r.Post("/claim", referralSvc.HandleClaim())
 				r.With(referralSvc.ReadLimiter()).Post("/redeemed", referralSvc.HandleRedeemed())
+				// Gift-card request (rewards/SPEC.md): same JWT as /claim and
+				// /claim's per-device bucket, consumed inside the handler after
+				// the email shape check.
+				if rewardsSvc != nil {
+					r.Post("/payout", rewardsSvc.HandlePayout())
+				}
 			})
 		}
 
