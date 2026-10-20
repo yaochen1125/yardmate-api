@@ -310,6 +310,12 @@ func main() {
 	referralSvc := buildReferralService(vault, enrichDB)
 	referralSvc.StartSettler(context.Background())
 
+	// Referral rewards (rewards/SPEC.md): RevenueCat webhook → 30% gift-card
+	// ledger, /me "rewards" block, POST /v1/referral/payout, and the loop that
+	// clears credits after Apple's 90-day refund window.
+	rewardsSvc := buildRewardsService(vault, enrichDB, referralSvc)
+	rewardsSvc.Start(context.Background())
+
 	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim, doctorSvc, doctorInflight, doctorBudget, rarityPub, scanCounter, referralSvc)
 
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify

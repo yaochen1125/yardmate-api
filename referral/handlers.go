@@ -77,6 +77,9 @@ type Service struct {
 	rc          Subscribers
 	entitlement string
 	auth        Authenticator
+	// rewards fills /me's "rewards" block (rewards/ package, SetRewards);
+	// nil leaves the field out.
+	rewards RewardsReader
 
 	claimBucket *ratelimit.Bucket
 	readBucket  *ratelimit.Bucket
@@ -189,6 +192,7 @@ func (s *Service) HandleMe() http.HandlerFunc {
 				standing.CanClaim = false
 			}
 		}
+		s.attachRewards(ctx, userID, &standing)
 		writeJSON(w, http.StatusOK, standing)
 	}
 }

@@ -26,6 +26,9 @@ type Standing struct {
 	// CanClaim is whether this account may still put in a friend's code: never
 	// claimed before, and no subscription history on RevenueCat.
 	CanClaim bool `json:"can_claim"`
+	// Rewards is the gift-card block (rewards.md ## 数据契约), filled by the
+	// injected RewardsReader; absent when none is injected or it failed.
+	Rewards any `json:"rewards,omitempty"`
 }
 
 // Referral is one A→B record as the settlement loop sees it.
