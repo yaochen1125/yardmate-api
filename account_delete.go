@@ -43,6 +43,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/yaochen1125/yardmate-api/proxy/enrichment"
+	"github.com/yaochen1125/yardmate-api/referral"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
 
@@ -130,7 +131,10 @@ func loadAccountDeleteSecrets(vault *secrets.Vault) (accountDeleteSecrets, bool)
 // the shared Supabase pgx pool (same pool the enrichment service uses); it may
 // be nil if the DB was never configured — in that case account deletion can't
 // run its row deletes, so we 500 (server_error) rather than silently skipping.
-func handleAccountDelete(vault *secrets.Vault, enrichDB *enrichment.DB) http.HandlerFunc {
+// referralSvc (nil-safe) removes the user's invite code, referral records on
+// either side, and reward ledger (referral/SPEC.md); RevenueCat promotional
+// grants already made are deliberately NOT revoked.
+func handleAccountDelete(vault *secrets.Vault, enrichDB *enrichment.DB, referralSvc *referral.Service) http.HandlerFunc {
 	// Build the JWKS verifier once (long-lived cache) from SUPABASE_URL. Access
 	// tokens are ES256, verified against the project's public JWKS.
 	jwks := newJWKSCache(strings.TrimRight(vault.Get("SUPABASE_URL"), "/"))
@@ -217,6 +221,16 @@ func handleAccountDelete(vault *secrets.Vault, enrichDB *enrichment.DB) http.Han
 
 		if err := enrichDB.DeleteUserRows(deleteCtx, userID); err != nil {
 			log.Printf("account/delete: delete user rows failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "server_error")
+			return
+		}
+
+		// Referral rows (invite code, referrals as referrer/referee, reward
+		// ledger) — load-bearing like the row deletes above. A missing table
+		// (migration 013 not yet applied) is treated as nothing-to-delete by the
+		// store, so rollout order can never break account deletion.
+		if err := referralSvc.DeleteUser(deleteCtx, userID); err != nil {
+			log.Printf("account/delete: delete referral rows failed: %v", err)
 			writeError(w, http.StatusInternalServerError, "server_error")
 			return
 		}

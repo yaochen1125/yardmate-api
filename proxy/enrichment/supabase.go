@@ -46,6 +46,16 @@ func NewDB(ctx context.Context, dsn string) (*DB, error) {
 	return &DB{pool: pool}, nil
 }
 
+// Pool exposes the underlying pgx pool for sibling domains that share it
+// (referral/pgstore.go). nil on a nil DB. Callers run only short, indexed
+// statements on it — never per-request goroutines (SPEC §9 #18).
+func (d *DB) Pool() *pgxpool.Pool {
+	if d == nil {
+		return nil
+	}
+	return d.pool
+}
+
 // Close releases the pool. Safe to call on nil.
 func (d *DB) Close() {
 	if d == nil || d.pool == nil {
