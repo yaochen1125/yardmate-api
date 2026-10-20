@@ -52,4 +52,4 @@ left=$(curl -fsSI "$base/rest/v1/code_pool?select=code&state=eq.free&expires_at=
   -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
   -H "Prefer: count=exact" -H "Range: 0-0" \
   | awk -F/ '/[Cc]ontent-[Rr]ange/ { gsub(/\r/, "", $2); print $2 }')
-echo "库存（未过期、未发出）：${left:-?} 条"
+echo "库存（未过期、未发出；没扣 issue_margin_days 余量，精确数看 deploy/referral-pool.sh）：${left:-?} 条"
