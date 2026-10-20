@@ -97,7 +97,8 @@ Referral endpoints (`/v1/referral/{me,claim,redeemed}` — invite a friend,
 `503 not_configured` (never 404) and the settlement loop does not start:
 
 - `SUPABASE_URL` + `SUPABASE_DB_URL` — same two as above (JWT verification +
-  the tables from `proxy/enrichment/migrations/013_referral.sql`, applied
+  the tables from `proxy/enrichment/migrations/013_referral.sql` and the pool
+  settings / issue margin from `014_referral_pool_margin.sql`, applied
   staging → prod BEFORE the binary that uses them).
 - `REVENUECAT_SECRET_KEY` — RevenueCat **v1 secret** key (`sk_…`): reads
   customers, grants promotional entitlements.
@@ -109,6 +110,14 @@ Referral endpoints (`/v1/referral/{me,claim,redeemed}` — invite a friend,
 
 Restocking the offer-code pool: `deploy/supabase/import-codes.sh` (CSV from
 App Store Connect → `code_pool`, idempotent). Smoke: `deploy/referral-smoke.sh`.
+Stock check (read-only): `SUPABASE_DB_URL=… deploy/referral-pool.sh` (per-batch
+counts, usable stock, earliest expiry, alert verdict). The settlement loop
+watches the same numbers every pass and emails the `FEEDBACK_EMAIL_TO` inbox
+(same `FEEDBACK_SMTP_*` account as `/v1/feedback`) at most once a day when
+usable stock drops below `referral_settings.low_stock_threshold` (100) or the
+earliest usable batch expires within `expiry_warn_days` (30); without the mail
+settings it only logs `WARN referral pool`. Apple batches live six months
+(150 000 codes / quarter / app): import a new batch about every five months.
 
 Adding a new key:
 
