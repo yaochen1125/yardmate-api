@@ -77,13 +77,20 @@ const (
 // (migration 014). Changing the row takes effect on the next claim / pass —
 // no deploy.
 type PoolSettings struct {
-	// IssueMarginDays: /claim only hands out codes that expire LATER than
+	// IssueMarginDays: /claim only hands out NEW codes that expire later than
 	// now + this many days, so the friend has time to redeem (default 14).
 	IssueMarginDays int
-	// LowStockThreshold: fewer usable free codes than this → alert (default 100).
+	// SwapGraceDays: on a re-claim the code already in hand is swapped only
+	// when it has fewer than this many days left (default 3). Deliberately
+	// smaller than the issue margin, or every code nearing the margin would
+	// be replaced on a re-claim and burn a second good one.
+	SwapGraceDays int
+	// LowStockThreshold: fewer usable free codes than this → alert (default
+	// 100). 0 turns both alerts off (expiring is a projected low stock).
 	LowStockThreshold int
 	// ExpiryWarnDays: the earliest usable batch expiring within this many
-	// days → alert (default 30).
+	// days, with fewer than LowStockThreshold usable codes left once it is
+	// gone → alert (default 30).
 	ExpiryWarnDays int
 }
 

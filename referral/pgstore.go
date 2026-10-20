@@ -121,9 +121,9 @@ func (p *PGStore) ExpireCodes(ctx context.Context) (int64, error) {
 func (p *PGStore) PoolStatus(ctx context.Context) (PoolStatus, error) {
 	var st PoolStatus
 	if err := p.pool.QueryRow(ctx,
-		`select issue_margin_days, low_stock_threshold, expiry_warn_days
+		`select issue_margin_days, swap_grace_days, low_stock_threshold, expiry_warn_days
 		   from referral_settings where id = 1`).
-		Scan(&st.Settings.IssueMarginDays, &st.Settings.LowStockThreshold, &st.Settings.ExpiryWarnDays); err != nil {
+		Scan(&st.Settings.IssueMarginDays, &st.Settings.SwapGraceDays, &st.Settings.LowStockThreshold, &st.Settings.ExpiryWarnDays); err != nil {
 		return st, fmt.Errorf("pool settings: %w", err)
 	}
 	rows, err := p.pool.Query(ctx,

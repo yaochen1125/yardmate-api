@@ -1,28 +1,34 @@
 -- 014_referral_pool_margin.sql
--- 推荐好友码池：发码留余量 + 临期 / 低库存告警的三个阈值。
+-- 推荐好友码池：发码留余量、再 claim 换码的宽限、临期 / 低库存告警的阈值。
 --
 -- 问题：013 的 referral_claim 只要 expires_at > now() 就发，B 可能拿到一张明天就过期
 -- 的码，去 App Store 兑换时已经失效。改成：
---   * 只发 expires_at > now() + issue_margin_days 的码（默认 14 天），仍按 expires_at
+--   * 新发只发 expires_at > now() + issue_margin_days 的码（默认 14 天），仍按 expires_at
 --     升序先发快过期的；
---   * 同一人再 claim 时，手上那张 issued 码若已进入余量期（不只是已过期）也划 expired
---     换新；已 redeemed 的原样回；
---   * pool_empty 的口径同步改成「没有留够余量的 free 码」——余量期内的 free 码不发、
---     也不改状态，等结算循环的 ExpireCodes 到期划 expired。
--- 三个阈值放 referral_settings，改库即生效、不用发版（referral/settle.go 每轮读）。
+--   * 同一人再 claim：已 redeemed 原样回；手上那张 issued 码只要还有 swap_grace_days
+--     （默认 3 天）以上就原样回——换码阈值故意不等于发码余量，否则每张快到余量线的码
+--     都会被再 claim 系统性换掉、白烧第二张好码；
+--   * 要换码时**先选替换码再划老码**：池子里没有留够余量的替换码、老码在苹果那边还能用
+--     （expires_at > now()）→ 原样回老码；老码也不能用了才 pool_empty；
+--   * 换码时刷新 referrals.claimed_at，不然很晚才兑的会掉出结算 ListClaimed 的 200 天窗口；
+--   * pool_empty 的口径改成「没有留够余量的 free 码（且老码也不能用）」——余量期内的 free 码
+--     不发、也不改状态，等结算循环的 ExpireCodes 到期划 expired。
+-- 四个阈值放 referral_settings，改库即生效、不用发版（referral/settle.go 每轮读）。
 --
 -- 用法：psql "$SUPABASE_DB_URL" -f 014_referral_pool_margin.sql，或 Supabase SQL Editor
--- 整份跑。可重复执行。先 staging 后 prod，且先于二进制（新二进制每轮读这三列）。
+-- 整份跑。可重复执行。先 staging 后 prod，且先于二进制（新二进制每轮读这几列）。
 
 -- ---------------------------------------------------------------- 设置
 
 alter table referral_settings
     add column if not exists issue_margin_days   int not null default 14
-        check (issue_margin_days >= 0),      -- 发码时码至少还得活这么多天
+        check (issue_margin_days >= 0),      -- 新发的码至少还得活这么多天
+    add column if not exists swap_grace_days     int not null default 3
+        check (swap_grace_days >= 0),        -- 再 claim 时手上那张不足这么多天才换新
     add column if not exists low_stock_threshold int not null default 100
         check (low_stock_threshold >= 0),    -- 可发（free 且余量够）少于这个数 → 告警
     add column if not exists expiry_warn_days    int not null default 30
-        check (expiry_warn_days >= 0);       -- 最早一批可发码在这么多天内到期 → 告警
+        check (expiry_warn_days >= 0);       -- 最早一批可发码在这么多天内到期、且到期后可发数会低于阈值 → 告警
 
 -- ---------------------------------------------------------------- POST /v1/referral/claim
 
@@ -32,13 +38,15 @@ alter table referral_settings
 create or replace function referral_claim(p_user text, p_code text) returns json
 language plpgsql as $$
 declare
-    v_referrer text;
-    v_ref      referrals%rowtype;
-    v_offer    text;
-    v_state    text;
-    v_expires  timestamptz;
-    v_margin   int;
-    v_cutoff   timestamptz;
+    v_referrer    text;
+    v_ref         referrals%rowtype;
+    v_offer       text;
+    v_state       text;
+    v_expires     timestamptz;
+    v_margin      int;
+    v_grace       int;
+    v_cutoff      timestamptz;   -- 新发的码到期日必须晚于这个
+    v_swap_before timestamptz;   -- 手上那张到期日早于这个才换
 begin
     select user_id into v_referrer from referral_users where code = p_code;
     if v_referrer is null then
@@ -48,9 +56,11 @@ begin
         raise exception 'own_code';
     end if;
 
-    -- 发码余量：只发 B 来得及去兑换的码。设置行缺失（不该发生）按 14 天。
-    select issue_margin_days into v_margin from referral_settings where id = 1;
-    v_cutoff := now() + make_interval(days => coalesce(v_margin, 14));
+    -- 两个阈值。设置行缺失（不该发生）按默认值。
+    select issue_margin_days, swap_grace_days into v_margin, v_grace
+      from referral_settings where id = 1;
+    v_cutoff      := now() + make_interval(days => coalesce(v_margin, 14));
+    v_swap_before := now() + make_interval(days => coalesce(v_grace, 3));
 
     -- B 也要有自己的一行（FK），顺手给他造码。
     insert into referral_users (user_id, code) values (p_user, referral_new_code())
@@ -62,18 +72,18 @@ begin
         if v_ref.referrer <> v_referrer then
             raise exception 'already_claimed';
         end if;
-        -- 同一个人、同一个码再来：把上次那张兑换码再给他（上次可能拿到码之后 App 崩了）。
-        -- 已兑换的原样回；还在余量之外的 issued 码原样回；
-        -- 过期了、或者已进入余量期（B 可能来不及兑）的 → 划 expired、换一张新的。
+        -- 同一个人、同一个码再来（上次可能拿到码之后 App 崩了）。锁住手上那张，
+        -- 免得和结算的 MarkRedeemed / ExpireCodes 交叉。
         select state, expires_at into v_state, v_expires
-          from code_pool where code = v_ref.offer_code;
+          from code_pool where code = v_ref.offer_code
+           for update;
+        -- 已兑换的永远原样回；issued 且还有宽限天数以上的也原样回。
         if v_ref.offer_code is not null
-           and (v_state = 'redeemed' or (v_state = 'issued' and v_expires > v_cutoff)) then
+           and (v_state = 'redeemed' or (v_state = 'issued' and v_expires > v_swap_before)) then
             return json_build_object('offer_code', v_ref.offer_code);
         end if;
-        if v_ref.offer_code is not null and v_state = 'issued' then
-            update code_pool set state = 'expired' where code = v_ref.offer_code;
-        end if;
+        -- 走到这里 = 想换：老码过期了 / 快过期了 / 状态不对 / 行没了。先去选替换码，
+        -- 选到了才动老码（下面）。
     else
         begin
             insert into referrals (referrer, referee) values (v_referrer, p_user)
@@ -84,24 +94,32 @@ begin
         end;
     end if;
 
-    -- 真过期的先划掉（余量期内的留着，状态如实，等 ExpireCodes 到期再划）。
-    update code_pool set state = 'expired'
-     where state = 'free' and expires_at <= now();
-
     -- 余量之外的里面先到期的先发；skip locked：另一台手机正在拿的那张直接跳过。
+    -- （过期的码不用先划：> v_cutoff 已经把它们排除了，划 expired 交给结算的 ExpireCodes。）
     select code into v_offer from code_pool
      where state = 'free' and expires_at > v_cutoff
      order by expires_at
        for update skip locked
      limit 1;
     if v_offer is null then
+        -- 没有留够余量的替换码。老码在苹果那边还能用就先给老码，总比 503 强；
+        -- 老码也不能用了（过期 / 状态不对）才算没货。首次 claim 的 raise 会回滚上面插的 referral。
+        if v_ref.offer_code is not null and v_state = 'issued' and v_expires > now() then
+            return json_build_object('offer_code', v_ref.offer_code);
+        end if;
         raise exception 'pool_empty';
+    end if;
+
+    -- 换码：老码划 expired（苹果那边它可能还活几天，但我们不再认它），
+    -- claimed_at 刷到现在——结算的 ListClaimed 只看 200 天内的、订阅起始也要晚于它。
+    if v_ref.offer_code is not null and v_state = 'issued' then
+        update code_pool set state = 'expired' where code = v_ref.offer_code;
     end if;
 
     update code_pool
        set state = 'issued', issued_to = p_user, issued_at = now(), referral_id = v_ref.id
      where code = v_offer;
-    update referrals set offer_code = v_offer where id = v_ref.id;
+    update referrals set offer_code = v_offer, claimed_at = now() where id = v_ref.id;
 
     return json_build_object('offer_code', v_offer);
 end;

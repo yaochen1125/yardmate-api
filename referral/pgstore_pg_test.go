@@ -13,9 +13,10 @@ import (
 )
 
 // The plpgsql side (migrations 013 + 014) against a real Postgres: the issue
-// margin, the expires_at order, re-claim keeping / replacing the issued code,
-// pool_empty rolling the referral back, and PoolStatus grouping. Needs a
-// scratch database:
+// margin, the expires_at order, re-claim keeping / replacing the issued code
+// (swap grace, old code kept when the pool has no replacement, claimed_at
+// refreshed on a swap), pool_empty rolling the referral back, and PoolStatus
+// grouping. Needs a scratch database:
 //
 //	REFERRAL_PG_TEST_URL=postgres://postgres:postgres@localhost:5432/scratch go test ./referral/ -run PG -v
 //
@@ -78,15 +79,24 @@ func pgTest(t *testing.T) (*PGStore, *pgxpool.Pool, context.Context) {
 	return NewPGStore(pool), pool, ctx
 }
 
-// pgCode seeds one pool code expiring in `in` from now.
+// pgSeed seeds one batch: every code gets the SAME expiry (one timestamp
+// computed here, like import-codes.sh gives a CSV one date), so they group as
+// one batch in PoolStatus.
 func pgSeed(t *testing.T, pool *pgxpool.Pool, ctx context.Context, batch string, in time.Duration, codes ...string) {
 	t.Helper()
-	for _, c := range codes {
-		if _, err := pool.Exec(ctx,
-			`insert into code_pool (code, offer_ref_name, expires_at) values ($1, $2, now() + make_interval(secs => $3))`,
-			c, batch, in.Seconds()); err != nil {
-			t.Fatalf("seed %s: %v", c, err)
-		}
+	exp := time.Now().UTC().Add(in).Truncate(time.Second)
+	if _, err := pool.Exec(ctx,
+		`insert into code_pool (code, offer_ref_name, expires_at)
+		 select unnest($1::text[]), $2, $3`, codes, batch, exp); err != nil {
+		t.Fatalf("seed %s: %v", batch, err)
+	}
+}
+
+func pgExpiresIn(t *testing.T, pool *pgxpool.Pool, ctx context.Context, code string, in time.Duration) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `update code_pool set expires_at = now() + make_interval(secs => $2) where code = $1`,
+		code, in.Seconds()); err != nil {
+		t.Fatalf("move %s: %v", code, err)
 	}
 }
 
@@ -99,6 +109,15 @@ func pgState(t *testing.T, pool *pgxpool.Pool, ctx context.Context, code string)
 	return s
 }
 
+func pgReferral(t *testing.T, pool *pgxpool.Pool, ctx context.Context, referee string) (offer string, claimedAt time.Time) {
+	t.Helper()
+	if err := pool.QueryRow(ctx, `select coalesce(offer_code, ''), claimed_at from referrals where referee = $1`, referee).
+		Scan(&offer, &claimedAt); err != nil {
+		t.Fatalf("referral of %s: %v", referee, err)
+	}
+	return offer, claimedAt
+}
+
 func pgInviteCode(t *testing.T, st *PGStore, ctx context.Context, user string) string {
 	t.Helper()
 	me, err := st.Me(ctx, user)
@@ -107,6 +126,8 @@ func pgInviteCode(t *testing.T, st *PGStore, ctx context.Context, user string) s
 	}
 	return me.Code
 }
+
+const userC = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 
 func TestPGClaimSkipsCodesInsideTheIssueMargin(t *testing.T) {
 	st, pool, ctx := pgTest(t)
@@ -126,7 +147,6 @@ func TestPGClaimSkipsCodesInsideTheIssueMargin(t *testing.T) {
 	if _, err := pool.Exec(ctx, `update referral_settings set issue_margin_days = 0 where id = 1`); err != nil {
 		t.Fatal(err)
 	}
-	userC := "cccccccc-cccc-cccc-cccc-cccccccccccc"
 	if offer, err := st.Claim(ctx, userC, codeA); err != nil || offer != "SHORT10" {
 		t.Errorf("margin 0: claim = %q, %v; want SHORT10", offer, err)
 	}
@@ -139,17 +159,24 @@ func TestPGClaimHandsOutTheSoonestUsableCodeFirst(t *testing.T) {
 	pgSeed(t, pool, ctx, "b30", 30*day, "D30")
 	pgSeed(t, pool, ctx, "b45", 45*day, "D45")
 	pgSeed(t, pool, ctx, "b07", 7*day, "D07") // inside the margin: never
+	pgSeed(t, pool, ctx, "dead", -time.Hour, "DEAD")
 
 	if offer, err := st.Claim(ctx, userB, codeA); err != nil || offer != "D30" {
 		t.Fatalf("first claim = %q, %v; want D30", offer, err)
 	}
-	userC := "cccccccc-cccc-cccc-cccc-cccccccccccc"
 	if offer, err := st.Claim(ctx, userC, codeA); err != nil || offer != "D45" {
 		t.Fatalf("second claim = %q, %v; want D45", offer, err)
 	}
+	// Claiming no longer retires dead stock; that is ExpireCodes' job.
+	if s := pgState(t, pool, ctx, "DEAD"); s != "free" {
+		t.Errorf("DEAD state after claims = %s, want free (ExpireCodes retires it)", s)
+	}
+	if n, err := st.ExpireCodes(ctx); err != nil || n != 1 {
+		t.Errorf("ExpireCodes = %d, %v; want 1", n, err)
+	}
 }
 
-func TestPGReclaimKeepsTheIssuedCodeUntilItIsInsideTheMargin(t *testing.T) {
+func TestPGReclaimSwapsOnlyInsideTheSwapGrace(t *testing.T) {
 	st, pool, ctx := pgTest(t)
 	codeA := pgInviteCode(t, st, ctx, userA)
 	pgSeed(t, pool, ctx, "b20", 20*day, "D20")
@@ -158,30 +185,80 @@ func TestPGReclaimKeepsTheIssuedCodeUntilItIsInsideTheMargin(t *testing.T) {
 	if offer, err := st.Claim(ctx, userB, codeA); err != nil || offer != "D20" {
 		t.Fatalf("claim = %q, %v; want D20", offer, err)
 	}
+	_, claimed0 := pgReferral(t, pool, ctx, userB)
 	// Same person, same code, the app crashed: the same card again.
 	if offer, err := st.Claim(ctx, userB, codeA); err != nil || offer != "D20" {
 		t.Fatalf("re-claim = %q, %v; want D20 again", offer, err)
 	}
-	// Time passes: D20 now has 10 days left — inside the margin, not expired.
-	if _, err := pool.Exec(ctx, `update code_pool set expires_at = now() + interval '10 days' where code = 'D20'`); err != nil {
-		t.Fatal(err)
+	// 10 days left: inside the 14-day ISSUE margin but outside the 3-day SWAP
+	// grace — still the same card (no burning a second good code).
+	pgExpiresIn(t, pool, ctx, "D20", 10*day)
+	if offer, err := st.Claim(ctx, userB, codeA); err != nil || offer != "D20" {
+		t.Fatalf("re-claim at 10 days = %q, %v; want D20 kept", offer, err)
 	}
+	if s := pgState(t, pool, ctx, "D90"); s != "free" {
+		t.Errorf("D90 state = %s, want free (not burnt)", s)
+	}
+	// 2 days left: inside the swap grace → fresh code, old one retired,
+	// referral re-pointed and claimed_at refreshed.
+	pgExpiresIn(t, pool, ctx, "D20", 2*day)
 	if offer, err := st.Claim(ctx, userB, codeA); err != nil || offer != "D90" {
-		t.Fatalf("re-claim near expiry = %q, %v; want a fresh D90", offer, err)
+		t.Fatalf("re-claim at 2 days = %q, %v; want a fresh D90", offer, err)
 	}
 	if s := pgState(t, pool, ctx, "D20"); s != "expired" {
 		t.Errorf("D20 state = %s, want expired", s)
 	}
-	var current string
-	if err := pool.QueryRow(ctx, `select offer_code from referrals where referee = $1`, userB).Scan(&current); err != nil || current != "D90" {
-		t.Errorf("referrals.offer_code = %q, %v; want D90", current, err)
+	if offer, claimed1 := pgReferral(t, pool, ctx, userB); offer != "D90" || !claimed1.After(claimed0) {
+		t.Errorf("referral = %s claimed_at %v (was %v); want D90 and a later claimed_at", offer, claimed1, claimed0)
 	}
 	// A redeemed code is always the answer, however close its date.
-	if _, err := pool.Exec(ctx, `update code_pool set state = 'redeemed', expires_at = now() + interval '1 day' where code = 'D90'`); err != nil {
+	if _, err := pool.Exec(ctx, `update code_pool set state = 'redeemed' where code = 'D90'`); err != nil {
 		t.Fatal(err)
 	}
+	pgExpiresIn(t, pool, ctx, "D90", time.Hour)
 	if offer, err := st.Claim(ctx, userB, codeA); err != nil || offer != "D90" {
 		t.Errorf("re-claim after redeem = %q, %v; want D90", offer, err)
+	}
+}
+
+func TestPGReclaimKeepsTheOldCodeWhenThereIsNoReplacement(t *testing.T) {
+	st, pool, ctx := pgTest(t)
+	codeA := pgInviteCode(t, st, ctx, userA)
+	pgSeed(t, pool, ctx, "only", 20*day, "ONLY")
+
+	if offer, err := st.Claim(ctx, userB, codeA); err != nil || offer != "ONLY" {
+		t.Fatalf("claim = %q, %v", offer, err)
+	}
+	_, claimed0 := pgReferral(t, pool, ctx, userB)
+	// 2 days left, nothing to swap to: the old code still works at Apple, so
+	// it is handed back rather than a 503 — and nothing is touched.
+	pgExpiresIn(t, pool, ctx, "ONLY", 2*day)
+	if offer, err := st.Claim(ctx, userB, codeA); err != nil || offer != "ONLY" {
+		t.Fatalf("re-claim with empty pool = %q, %v; want ONLY kept", offer, err)
+	}
+	if s := pgState(t, pool, ctx, "ONLY"); s != "issued" {
+		t.Errorf("ONLY state = %s, want issued (not retired without a replacement)", s)
+	}
+	if _, claimed1 := pgReferral(t, pool, ctx, userB); !claimed1.Equal(claimed0) {
+		t.Errorf("claimed_at moved (%v → %v) without a swap", claimed0, claimed1)
+	}
+	// Old code dead and still nothing to swap to: now it is pool_empty, and
+	// the existing referral stays (only the first claim's insert rolls back).
+	pgExpiresIn(t, pool, ctx, "ONLY", -time.Hour)
+	_, err := st.Claim(ctx, userB, codeA)
+	if f, ok := named(err); !ok || f.Code != ErrPoolEmpty {
+		t.Fatalf("re-claim with dead code and empty pool: %v, want pool_empty", err)
+	}
+	if offer, _ := pgReferral(t, pool, ctx, userB); offer != "ONLY" {
+		t.Errorf("referral offer_code = %s, want ONLY untouched", offer)
+	}
+	// A restock fixes it: swap happens now.
+	pgSeed(t, pool, ctx, "fresh", 120*day, "FRESH")
+	if offer, err := st.Claim(ctx, userB, codeA); err != nil || offer != "FRESH" {
+		t.Errorf("after restock = %q, %v; want FRESH", offer, err)
+	}
+	if s := pgState(t, pool, ctx, "ONLY"); s != "expired" {
+		t.Errorf("ONLY state = %s, want expired after the swap", s)
 	}
 }
 
@@ -224,7 +301,7 @@ func TestPGPoolStatusGroupsByBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ps.Settings != (PoolSettings{IssueMarginDays: 14, LowStockThreshold: 100, ExpiryWarnDays: 30}) {
+	if ps.Settings != (PoolSettings{IssueMarginDays: 14, SwapGraceDays: 3, LowStockThreshold: 100, ExpiryWarnDays: 30}) {
 		t.Errorf("settings = %+v, want the 014 defaults", ps.Settings)
 	}
 	if len(ps.Batches) != 2 {
