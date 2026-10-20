@@ -19,7 +19,10 @@ import (
 // conditions raise an alert, each read from referral_settings:
 //
 //	low stock   usable < low_stock_threshold
-//	expiring    the earliest usable batch expires within expiry_warn_days
+//	expiring    the earliest usable batch expires within expiry_warn_days AND
+//	            what is left once it is gone would be below the threshold —
+//	            a projected low stock, so a fresh batch waiting behind the
+//	            old one keeps the watch quiet.
 //
 // An alert is a WARN log line every pass plus at most ONE email per day for
 // the same set of conditions (in memory; a restart may repeat one, which is
@@ -48,8 +51,11 @@ type Stock struct {
 	Short int
 	// Earliest is the expiry of the earliest usable batch; zero when none.
 	Earliest time.Time
-	LowStock bool
-	Expiring bool
+	// AfterEarliest is what Usable drops to once the earliest batch (every
+	// batch sharing that date) has expired.
+	AfterEarliest int
+	LowStock      bool
+	Expiring      bool
 }
 
 // Alerting reports whether either condition holds.
@@ -73,6 +79,7 @@ func (st Stock) conditions() string {
 func TakeStock(ps PoolStatus, now time.Time) Stock {
 	var st Stock
 	cutoff := now.Add(time.Duration(ps.Settings.IssueMarginDays) * poolDay)
+	earliestFree := 0
 	for _, b := range ps.Batches {
 		if !b.ExpiresAt.After(cutoff) {
 			st.Short += b.Free
@@ -82,15 +89,35 @@ func TakeStock(ps PoolStatus, now time.Time) Stock {
 			continue
 		}
 		st.Usable += b.Free
-		if st.Earliest.IsZero() || b.ExpiresAt.Before(st.Earliest) {
-			st.Earliest = b.ExpiresAt
+		switch {
+		case st.Earliest.IsZero() || b.ExpiresAt.Before(st.Earliest):
+			st.Earliest, earliestFree = b.ExpiresAt, b.Free
+		case b.ExpiresAt.Equal(st.Earliest):
+			earliestFree += b.Free
 		}
 	}
+	st.AfterEarliest = st.Usable - earliestFree
 	st.LowStock = st.Usable < ps.Settings.LowStockThreshold
 	if !st.Earliest.IsZero() && ps.Settings.ExpiryWarnDays > 0 {
-		st.Expiring = !st.Earliest.After(now.Add(time.Duration(ps.Settings.ExpiryWarnDays) * poolDay))
+		soon := !st.Earliest.After(now.Add(time.Duration(ps.Settings.ExpiryWarnDays) * poolDay))
+		st.Expiring = soon && st.AfterEarliest < ps.Settings.LowStockThreshold
 	}
 	return st
+}
+
+// SettingsProblem names a referral_settings combination that cannot do what
+// it looks like it does; "" when the row is fine. Logged once per
+// misconfiguration by the watch, never fatal.
+func SettingsProblem(s PoolSettings) string {
+	switch {
+	case s.ExpiryWarnDays > 0 && s.ExpiryWarnDays <= s.IssueMarginDays:
+		return fmt.Sprintf("expiry_warn_days=%d <= issue_margin_days=%d: a usable batch always has more than the margin left, so the expiring alert can never fire",
+			s.ExpiryWarnDays, s.IssueMarginDays)
+	case s.SwapGraceDays > s.IssueMarginDays:
+		return fmt.Sprintf("swap_grace_days=%d > issue_margin_days=%d: a code can be swapped the moment it is issued, burning a second one on every re-claim",
+			s.SwapGraceDays, s.IssueMarginDays)
+	}
+	return ""
 }
 
 // watchPool is the per-pass step: read, assess, log, and email at most once
@@ -102,6 +129,14 @@ func (s *Service) watchPool(ctx context.Context, now time.Time, rep *Report) {
 		rep.Errors++
 		return
 	}
+	if p := SettingsProblem(ps.Settings); p != "" {
+		if !s.poolConfigWarned {
+			log.Printf("WARN referral pool settings: %s", p)
+			s.poolConfigWarned = true
+		}
+	} else {
+		s.poolConfigWarned = false
+	}
 	st := TakeStock(ps, now)
 	rep.Usable = st.Usable
 	if !st.Alerting() {
@@ -111,12 +146,20 @@ func (s *Service) watchPool(ctx context.Context, now time.Time, rep *Report) {
 	if !st.Earliest.IsZero() {
 		earliest = st.Earliest.UTC().Format("2006-01-02")
 	}
-	log.Printf("WARN referral pool: %s usable=%d short=%d earliest=%s threshold=%d warn_days=%d margin_days=%d",
-		st.conditions(), st.Usable, st.Short, earliest,
+	log.Printf("WARN referral pool: %s usable=%d short=%d earliest=%s after_earliest=%d threshold=%d warn_days=%d margin_days=%d",
+		st.conditions(), st.Usable, st.Short, earliest, st.AfterEarliest,
 		ps.Settings.LowStockThreshold, ps.Settings.ExpiryWarnDays, ps.Settings.IssueMarginDays)
 
-	key := now.UTC().Format("2006-01-02") + " " + st.conditions()
-	if s.alerter == nil || key == s.lastAlert {
+	if s.alerter == nil {
+		return
+	}
+	// One mail per condition set per UTC day, flapping included: the set of
+	// keys sent today is remembered, and forgotten when the date changes.
+	if today := now.UTC().Format("2006-01-02"); today != s.alertDay {
+		s.alertDay, s.alertsSent = today, map[string]bool{}
+	}
+	key := st.conditions()
+	if s.alertsSent[key] {
 		return
 	}
 	subject, body := alertMail(ps, st, now)
@@ -125,14 +168,14 @@ func (s *Service) watchPool(ctx context.Context, now time.Time, rep *Report) {
 		rep.Errors++
 		return
 	}
-	s.lastAlert = key
+	s.alertsSent[key] = true
 	rep.Alerted++
 }
 
 // alertMail renders the operator email: what is left per batch, when the
 // first batch dies, and the exact restock command. Subject stays ASCII (a
 // non-ASCII header would need RFC 2047 encoding); the body is UTF-8 Chinese
-// like every other ops note in this repo.
+// like every other ops note in this repo. Dates are UTC, like the dedup key.
 func alertMail(ps PoolStatus, st Stock, now time.Time) (subject, body string) {
 	var why []string
 	if st.LowStock {
@@ -156,7 +199,9 @@ func alertMail(ps PoolStatus, st Stock, now time.Time) (subject, body string) {
 		left := int(st.Earliest.Sub(now).Hours() / 24)
 		fmt.Fprintf(&b, "最早到期：%s（还有 %d 天", st.Earliest.UTC().Format("2006-01-02"), left)
 		if st.Expiring {
-			fmt.Fprintf(&b, "，预警线 %d 天", ps.Settings.ExpiryWarnDays)
+			fmt.Fprintf(&b, "，预警线 %d 天；到期后可发只剩 %d 张，低于阈值 %d", ps.Settings.ExpiryWarnDays, st.AfterEarliest, ps.Settings.LowStockThreshold)
+		} else {
+			fmt.Fprintf(&b, "；到期后可发还剩 %d 张", st.AfterEarliest)
 		}
 		b.WriteString("）\n")
 	}
@@ -180,6 +225,6 @@ func alertMail(ps PoolStatus, st Stock, now time.Time) (subject, body string) {
 	b.WriteString("（每批最长 6 个月；每季度每 App 上限 15 万个），导出 CSV 后在 secrets 环境里跑：\n")
 	b.WriteString("  SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… " + restockCommand + "\n")
 	b.WriteString("先 staging 后 prod。看现状：deploy/referral-pool.sh\n\n")
-	b.WriteString("阈值在 referral_settings（issue_margin_days / low_stock_threshold / expiry_warn_days），改库即生效。\n")
+	b.WriteString("阈值在 referral_settings（issue_margin_days / swap_grace_days / low_stock_threshold / expiry_warn_days），改库即生效。\n")
 	return subject, b.String()
 }

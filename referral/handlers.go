@@ -89,11 +89,16 @@ type Service struct {
 	nudge        chan struct{}
 	now          func() time.Time
 
-	// pool watch (pool.go): where the alert goes and the "day + conditions"
-	// key of the last email that got through. Only the settlement goroutine
-	// touches lastAlert.
-	alerter   Alerter
-	lastAlert string
+	// pool watch (pool.go): where the alert goes, and which condition sets
+	// have already been mailed today (alertDay, UTC) so a day sends at most
+	// one email per set even when the conditions flap. Only the settlement
+	// goroutine touches these.
+	alerter    Alerter
+	alertDay   string
+	alertsSent map[string]bool
+	// poolConfigWarned: the settings-problem line (pool.go) has been logged
+	// for the current misconfiguration; cleared once it is fixed.
+	poolConfigWarned bool
 }
 
 // New wires a Service. Pass nil for whatever is not configured.

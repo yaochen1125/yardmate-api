@@ -113,11 +113,15 @@ App Store Connect → `code_pool`, idempotent). Smoke: `deploy/referral-smoke.sh
 Stock check (read-only): `SUPABASE_DB_URL=… deploy/referral-pool.sh` (per-batch
 counts, usable stock, earliest expiry, alert verdict). The settlement loop
 watches the same numbers every pass and emails the `FEEDBACK_EMAIL_TO` inbox
-(same `FEEDBACK_SMTP_*` account as `/v1/feedback`) at most once a day when
-usable stock drops below `referral_settings.low_stock_threshold` (100) or the
-earliest usable batch expires within `expiry_warn_days` (30); without the mail
-settings it only logs `WARN referral pool`. Apple batches live six months
-(150 000 codes / quarter / app): import a new batch about every five months.
+(same `FEEDBACK_SMTP_*` account as `/v1/feedback`, built once in main) at most
+once a day per condition set when usable stock drops below
+`referral_settings.low_stock_threshold` (100) or the earliest usable batch
+expires within `expiry_warn_days` (30) AND too little would be left behind it;
+without the mail settings it only logs `WARN referral pool`. The same row also
+holds `issue_margin_days` (14, new codes must outlive it) and `swap_grace_days`
+(3, a re-claim swaps the code in hand only below it). Apple batches live six
+months (150 000 codes / quarter / app): import a new batch about every five
+months.
 
 Adding a new key:
 

@@ -37,7 +37,7 @@
 | `claim` body | `{"code": "ym 7kq2", "subscribed_before": false}` |
 | `redeemed` body | `{"offer_code": "XK7P2M9Q"}` |
 | vault | `REVENUECAT_SECRET_KEY`（v1 secret）、`REVENUECAT_ENTITLEMENT_ID`、`REFERRAL_SETTLE_INTERVAL`（可选，默认 10m）|
-| 库 | migration `013_referral.sql` 的五张表 + 两个函数，`014_referral_pool_margin.sql` 的三列设置 + 改过的 `referral_claim`（经共享 pgx 池 `enrichment.DB.Pool()`）|
+| 库 | migration `013_referral.sql` 的五张表 + 两个函数，`014_referral_pool_margin.sql` 的四列设置 + 改过的 `referral_claim`（经共享 pgx 池 `enrichment.DB.Pool()`）|
 | 告警邮件 | `FEEDBACK_SMTP_FROM/PASS` + `FEEDBACK_EMAIL_TO`（与意见反馈同一个账号、同一个收件箱）；缺任一 → 只打 WARN 日志 |
 | RevenueCat | `GET /v1/subscribers/{id}`（**不存在会创建**，只对验过签的 user id 调）、`POST .../entitlements/{ent}/promotional {"end_time_ms"}` |
 
@@ -89,11 +89,15 @@ RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidStr
 ### 2.2 幂等 / 并发
 
 - 造码、领码是 plpgsql 函数（`raise exception` 整体回滚；`for update skip locked` 取库存）。
-- 同一人同一码再 claim → 拿回同一张；那张已 redeemed 永远原样回；那张 issued 但**已进入发码余量期**
-  （`expires_at <= now + issue_margin_days`，不只是已过期）→ 划 expired、换新（B 可能来不及兑）。
+- 同一人同一码再 claim → 拿回同一张；已 redeemed 永远原样回；issued 且 `expires_at > now + swap_grace_days`
+  （默认 3 天）也原样回。换码阈值故意**小于**发码余量：等于的话每张快到余量线的码都会被再 claim 换掉、白烧第二张。
+- 要换（老码过期 / 不足宽限 / 状态不对 / 行没了）时**先选替换码再动老码**（老码行 `for update` 锁住）：
+  选到 → 老码划 expired、`referrals.offer_code` 换新、`claimed_at = now()`（不然很晚才兑的会掉出 `ListClaimed`
+  的 200 天窗口）；选不到且老码在苹果那边还能用（issued 且 `expires_at > now()`）→ 原样回老码；老码也不能用了才
+  `pool_empty`（首次 claim 的 raise 会回滚刚插的 referral，再 claim 的不动已有行）。
 - 发码余量：`referral_claim` 只在 `state = 'free' and expires_at > now + issue_margin_days` 里按 `expires_at`
-  升序取（先用快过期的，但保证 B 有 ≥ 余量天数去兑）。余量期内的 free 码不发也不改状态，等 `ExpireCodes`
-  到期划 expired；巡检把它们单独计作「余量不足」。
+  升序取（先用快过期的，但保证 B 有 ≥ 余量天数去兑）。余量期内 / 已过期的 free 码不发也不改状态
+  （claim 不再全表划 expired，那是并发争用点），等结算的 `ExpireCodes` 到期划；巡检把余量期内的单独计作「余量不足」。
 - `/redeemed` 重复调无副作用；`ListClaimed` 只看 200 天内的（码最长 6 个月）。
 - 赠送先 RC 后账本；账本写失败会大声记日志，下一轮**再赠一次**（宁多发不少发）。
 - `end_time_ms` 与现有赠送到期相差 < 2h 会被 RC 当重复忽略；我们每次至少 +30d。
@@ -120,17 +124,24 @@ RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidStr
   | 列 | 默认 | 用处 |
   |---|---|---|
   | `hold_days` | 7 | B 兑换后满几天 A 才拿得到 |
-  | `issue_margin_days` | 14 | 发码余量：只发到期日在 `now + 这么多天` 之后的码；再 claim 时手上那张进了余量期就换新 |
-  | `low_stock_threshold` | 100 | 可发码少于这个数 → 告警；0 = 关 |
-  | `expiry_warn_days` | 30 | 最早一批可发码在这么多天内到期 → 告警；0 = 关 |
+  | `issue_margin_days` | 14 | 发码余量：**新发**只发到期日在 `now + 这么多天` 之后的码 |
+  | `swap_grace_days` | 3 | 再 claim 时手上那张 issued 码不足这么多天才换新；必须 < `issue_margin_days` |
+  | `low_stock_threshold` | 100 | 可发码少于这个数 → 告警；0 = 两种告警都关（临期是投影的低库存） |
+  | `expiry_warn_days` | 30 | 最早一批可发码在这么多天内到期、**且它死后可发数会低于阈值** → 告警；0 = 关；必须 > `issue_margin_days` 才可达 |
 
-  `014_referral_pool_margin.sql` 加的三列 + 替换 `referral_claim`；**先于二进制**（新二进制每轮读这三列，
+  `014_referral_pool_margin.sql` 加的四列 + 替换 `referral_claim`；**先于二进制**（新二进制每轮读这四列，
   列不存在只是每轮记一条 `pool status` 错误 + `rep.Errors`，结算其它步照跑；旧 `referral_claim` 也能用，只是没余量）。
-- 码池告警（`pool.go`）：结算每轮算一次可发数 / 最早到期 / 各批剩余；`low_stock` 或 `expiring` 成立 →
-  每轮一条 `WARN referral pool: …` 日志 + **每天每种条件组合最多一封邮件**（内存去重，键 = UTC 日期 + 条件；
-  重启后可能重复一封；发信失败不算发过、下轮重试）。邮件走 `FEEDBACK_SMTP_*` 同一账号到 `FEEDBACK_EMAIL_TO`，
-  主题 ASCII（`[YardMate] Referral code pool: low stock (42 usable), expiring 2026-11-10`），正文中文：
-  各批剩余、最早到期日、补货命令。
+  组合不可达（`expiry_warn_days <= issue_margin_days` / `swap_grace_days > issue_margin_days`）→ 巡检打一条
+  `WARN referral pool settings: …`，改好之前不重复、改好后再错再打。
+- 码池告警（`pool.go`）：结算每轮算一次可发数 / 最早到期 / 它死后还剩多少 / 各批剩余；`low_stock`（可发 < 阈值）
+  或 `expiring`（最早可发批 `expiry_warn_days` 内到期 **且** 死后可发 < 阈值——投影口径，后面有新批顶着就不吵）
+  成立 → 每轮一条 `WARN referral pool: …` 日志 + **每天每种条件组合最多一封邮件**（内存记当天已发的条件组合，
+  条件来回翻也只各一封；日期按 UTC，重启后可能重复一封；发信失败不算发过、下轮重试）。
+  邮件走 `FEEDBACK_SMTP_*` 同一账号到 `FEEDBACK_EMAIL_TO`（`FeedbackMailer` 由 main 建一次、`/v1/feedback` 和
+  本包共用），主题 ASCII（`[YardMate] Referral code pool: low stock (42 usable), expiring 2026-11-10`），
+  正文中文：各批剩余、最早到期日及其死后余量、补货命令。时区：去重键、日志、邮件里的日期全是 UTC，
+  到期日是 import 时填的 `YYYY-MM-DDT00:00:00Z`，看起来会比本地日历早一天，正常。
+  结算通过日志（`referral settle: … usable=N alerted=N …`）在有告警那轮也会打。
 - 补货节奏：Apple 一次性码**每批最长 6 个月**、**每季度每 App 上限 15 万个**。建议**每 5 个月补一批**
   （新批到货时旧批还剩 ≥ 1 个月 > 余量 14 天 + 预警 30 天的窗口，两批重叠期间先发旧批）。
   补货：`SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… deploy/supabase/import-codes.sh codes.csv "Referral Friend Month" 2027-04-19`。
@@ -148,12 +159,15 @@ RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidStr
 RevenueCat 对象解码与五个判断（订阅史 / 填码后开始 / 退款 / 生效中 / 赠送到期）；Client 的路径、鉴权头、`end_time_ms`；
 结算：直接发 / 攒着 → 付费结束补发 / 多个 saved 一次发 / 第 11 个照样 +30d / 退款不算 /
 取消不退款照算 / 填码前的订阅不算 / hold_days 读设置 / 账本写失败重发 / RC 挂了跳过；
-码池巡检（`pool_test.go`）：余量口径（恰在 cutoff 上不算）/ 最早到期取可发批次里最早的 / 阈值与 0 = 关 /
-低库存每天一封 / 临期一封 / 同日条件变了再发一封 / 健康静默 / 发信失败计错下轮重试 / 库读失败不挡结算 /
-没配邮件只打日志 / 邮件正文含各批、到期日、补货命令。
+码池巡检（`pool_test.go`）：余量口径（恰在 cutoff 上不算）/ 最早到期取可发批次里最早的（同日期的批一起算死后余量）/
+投影口径（后面有 ≥ 阈值顶着不报、不够才报、恰好等于阈值不报）/ 阈值与 0 = 关 / 不可达组合的 `SettingsProblem` /
+低库存每天一封 / 临期一封 / 补货后旧批滑进窗口 25 天静默 / 同日条件变了再发一封、翻回去不再发 / 健康静默 /
+发信失败计错下轮重试 / 库读失败不挡结算 / 没配邮件只打日志 / 设置问题只打一次、修好后清 / 邮件正文含各批、到期日、补货命令。
 SQL 函数（013 + 014）：`pgstore_pg_test.go` 要一个空库（`REFERRAL_PG_TEST_URL=postgres://… go test ./referral/ -run PG`，
-在临时 schema 里跑完就删，没设就 skip）：余量过滤 / 升序 / 重领同一张 → 进余量期换新 → 已兑换永远原样回 /
-只剩余量不足的码 = pool_empty 且 referral 回滚 / PoolStatus 按批分组。
+在临时 schema 里跑完就删，没设就 skip；每批码同一个时间戳插入，和 import-codes.sh 口径一致）：
+余量过滤 / 升序 + claim 不划过期码 / 重领：3 天宽限外原样回 → 宽限内换新 + 老码 expired + `claimed_at` 刷新 → 已兑换永远原样回 /
+没替换码时老码还能用就回老码（不动任何行）→ 老码也死了才 pool_empty 且已有 referral 不动 → 补货后换 /
+首次 claim 只剩余量不足的码 = pool_empty 且 referral 回滚 / PoolStatus 按批分组 + 四列默认值。
 013 的函数此前在 staging 用临时 id 实跑过（own_code / unknown_code / 领码 / 重领同一张 / pool_empty / already_claimed）；
 **014 还没在 staging 跑过**，上线前先 staging 跑迁移 + `deploy/referral-smoke.sh`。
 
@@ -163,7 +177,7 @@ SQL 函数（013 + 014）：`pgstore_pg_test.go` 要一个空库（`REFERRAL_PG_
 - `ListClaimed` 200 天截止之后那条 referral 永远停在 claimed；要不要定期 void。
 - RevenueCat 对一个 customer 多次 `end_time_ms` 赠送是「替换到期日」还是「叠加」—— 文档只说 2h 内算重复；
   我们按「替换为更晚的到期日」理解，并把 RC 现有到期日也算进基准。prod 第一笔赠送后看一眼 customer 页核实。
-- 临期告警按字面「最早一批可发码 30 天内到期」判：补货之后旧批进入 30 天窗口仍会每天一封「expiring」
-  （直到它进余量期、不再算可发，约 16 天）。要是嫌吵，可改成「旧批死后可发数会低于阈值才报」（投影口径）。
-- 再 claim 时手上那张 issued 码进了余量期就换新：如果 B 其实已经在苹果那边用旧码兑了但 App 没来得及报
-  `/redeemed`，旧码在库里被划 expired、新码白发一张；结算只看 RC 的订阅起始时间，奖励不受影响。
+- 再 claim 换码（老码不足 3 天宽限）时：如果 B 其实已经在苹果那边用旧码兑了、结算还没跑到（≤ 10 分钟）、
+  App 也没报 `/redeemed`，旧码在库里被划 expired、新码白发一张，而且 `claimed_at` 刷新后订阅起始早于它，
+  结算 ① 永远对不上 → 这条 referral 停在 claimed、A 拿不到奖励。窗口极窄（老码只剩 ≤ 3 天 × 10 分钟内），
+  先记着；真出现就手工把 `claimed_at` 改回去。
