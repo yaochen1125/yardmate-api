@@ -16,6 +16,7 @@ import (
 	"github.com/yaochen1125/yardmate-api/proxy/imageingest"
 	"github.com/yaochen1125/yardmate-api/proxy/rarity"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
+	"github.com/yaochen1125/yardmate-api/referral"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
 
@@ -65,6 +66,7 @@ func newServer(
 	doctorBudget *ratelimit.Bucket,
 	rarityPub *rarity.Publisher,
 	scanCounter *proxy.IdentifyScanCounter,
+	referralSvc *referral.Service,
 ) *Server {
 	// Rose cultivar rerank is ON by default; ROSE_RERANK_ENABLED=false kill-switches it.
 	roseEnabled := vault.GetBool("ROSE_RERANK_ENABLED", true)
@@ -209,7 +211,7 @@ func newServer(
 				// token revoke (account_delete.go). Registered only when the
 				// shared Supabase pool is present (row deletes need it).
 				if enrichDB != nil {
-					r.Post("/account/delete", handleAccountDelete(vault, enrichDB))
+					r.Post("/account/delete", handleAccountDelete(vault, enrichDB, referralSvc))
 				}
 
 				// /v1/doctor — conversational diagnosis over SSE (doctor/SPEC.md).
@@ -274,6 +276,24 @@ func newServer(
 		// X-Device-Install-Id itself.
 		if enrichDB != nil {
 			r.Post("/attribution", enrichment.HandleAttribution(enrichDB, enrichment.NewAppleAdServicesClient()))
+		}
+
+		// /v1/referral/{me,claim,redeemed} — invite a friend (referral/SPEC.md).
+		// Identity is the verified Supabase JWT (same JWKS path as
+		// /v1/account/delete), so these sit OUTSIDE the per-device expensive-call
+		// group and carry their OWN per-device buckets (docs ## 数据契约: claim
+		// 5 / 24 h, me + redeemed 30 / h) on top of this /v1 scope's per-IP
+		// limit. /claim consumes its bucket inside the handler, after the cheap
+		// shape checks, so a typo does not spend one of the day's five tries.
+		// Always registered when the service exists: a half-configured server
+		// answers 503 not_configured, never 404 (the iOS app treats 503 as
+		// offline and 404 as a bug).
+		if referralSvc != nil {
+			r.Route("/referral", func(r chi.Router) {
+				r.With(referralSvc.ReadLimiter()).Get("/me", referralSvc.HandleMe())
+				r.Post("/claim", referralSvc.HandleClaim())
+				r.With(referralSvc.ReadLimiter()).Post("/redeemed", referralSvc.HandleRedeemed())
+			})
 		}
 	})
 

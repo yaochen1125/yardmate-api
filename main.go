@@ -303,7 +303,14 @@ func main() {
 		inflightWait,
 	)
 
-	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim, doctorSvc, doctorInflight, doctorBudget, rarityPub, scanCounter)
+	// /v1/referral/* — invite a friend (referral/SPEC.md). Always built (the
+	// routes answer 503 not_configured until SUPABASE_URL / SUPABASE_DB_URL /
+	// REVENUECAT_SECRET_KEY / REVENUECAT_ENTITLEMENT_ID are all present); the
+	// 10-minute settlement loop starts only when fully configured.
+	referralSvc := buildReferralService(vault, enrichDB)
+	referralSvc.StartSettler(context.Background())
+
+	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim, doctorSvc, doctorInflight, doctorBudget, rarityPub, scanCounter, referralSvc)
 
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream) with 5 s headroom = 35 s base.
