@@ -26,7 +26,10 @@ func buildRewardsService(vault *secrets.Vault, db *enrichment.DB, referralSvc *r
 		}
 	}
 	svc := rewards.New(store, nil, rewards.Options{
-		Interval: vaultDurationOr(vault, "REFERRAL_SETTLE_INTERVAL", 0),
+		// What RevenueCat puts in the Authorization header (dashboard →
+		// Integrations → Webhooks), with or without "Bearer ". Unset → 503.
+		WebhookSecret: vault.Get("REVENUECAT_WEBHOOK_SECRET"),
+		Interval:      vaultDurationOr(vault, "REFERRAL_SETTLE_INTERVAL", 0),
 	})
 	if svc.CanRead() && referralSvc != nil {
 		referralSvc.SetRewards(svc)

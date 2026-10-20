@@ -316,7 +316,7 @@ func main() {
 	rewardsSvc := buildRewardsService(vault, enrichDB, referralSvc)
 	rewardsSvc.Start(context.Background())
 
-	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim, doctorSvc, doctorInflight, doctorBudget, rarityPub, scanCounter, referralSvc)
+	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim, doctorSvc, doctorInflight, doctorBudget, rarityPub, scanCounter, referralSvc, rewardsSvc)
 
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream) with 5 s headroom = 35 s base.

@@ -17,6 +17,7 @@ import (
 	"github.com/yaochen1125/yardmate-api/proxy/rarity"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
 	"github.com/yaochen1125/yardmate-api/referral"
+	"github.com/yaochen1125/yardmate-api/rewards"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
 
@@ -67,6 +68,7 @@ func newServer(
 	rarityPub *rarity.Publisher,
 	scanCounter *proxy.IdentifyScanCounter,
 	referralSvc *referral.Service,
+	rewardsSvc *rewards.Service, // referral gift-card rewards (rewards/SPEC.md); nil = routes unregistered (tests)
 ) *Server {
 	// Rose cultivar rerank is ON by default; ROSE_RERANK_ENABLED=false kill-switches it.
 	roseEnabled := vault.GetBool("ROSE_RERANK_ENABLED", true)
@@ -294,6 +296,17 @@ func newServer(
 				r.Post("/claim", referralSvc.HandleClaim())
 				r.With(referralSvc.ReadLimiter()).Post("/redeemed", referralSvc.HandleRedeemed())
 			})
+		}
+
+		// /v1/revenuecat/webhook — RevenueCat server-to-server events feeding
+		// the referral gift-card ledger (rewards/SPEC.md). Authenticated by the
+		// shared REVENUECAT_WEBHOOK_SECRET in the Authorization header (503 until
+		// it is set), so no device / JWT checks; only this /v1 scope's per-IP
+		// limit applies (RevenueCat posts from a handful of IPs — volume is one
+		// event per store transaction, far under 600/h at our size; a 429 is
+		// retried by RevenueCat). Always registered when the service exists.
+		if rewardsSvc != nil {
+			r.Post("/revenuecat/webhook", rewardsSvc.HandleWebhook())
 		}
 	})
 
