@@ -343,7 +343,7 @@ func (s *Service) HandleClaim() http.HandlerFunc {
 			return
 		}
 		if kind == ClaimAgain {
-			s.finishClaim(w, r, userID, code, installID, nil)
+			s.finishClaim(w, r.Context(), userID, code, installID, nil)
 			return
 		}
 
@@ -368,12 +368,21 @@ func (s *Service) HandleClaim() http.HandlerFunc {
 		// 6 + 7: what needs no Apple (no client, no token) is decided here;
 		// asking Apple, taking the code and setting bit0 happen inside the
 		// claim's transaction under the device lock (ClaimGate).
-		gate, refuse, status := s.deviceGate(r.Context(), env, token)
+		//
+		// From here on Apple may be told to set bit0, which nothing undoes.
+		// The client hanging up must not cancel the read-back or the commit
+		// that go with it: the claim would roll back with the device already
+		// marked used, and every retry would read device_used. So the gated
+		// claim runs detached from the request, bounded by finishClaim's own
+		// timeout; a claim the client never hears about is re-handed on the
+		// next try (ClaimAgain).
+		claimCtx := context.WithoutCancel(r.Context())
+		gate, refuse, status := s.deviceGate(claimCtx, env, token)
 		if refuse != "" {
 			writeError(w, status, refuse)
 			return
 		}
-		s.finishClaim(w, r, userID, code, installID, gate)
+		s.finishClaim(w, claimCtx, userID, code, installID, gate)
 	}
 }
 
@@ -382,12 +391,12 @@ func (s *Service) HandleClaim() http.HandlerFunc {
 // re-read after a failed set) on top of the database's own budget, so the
 // transaction never runs out under an Apple call that has already been
 // sent.
-func (s *Service) finishClaim(w http.ResponseWriter, r *http.Request, userID, code, installID string, gate *ClaimGate) {
+func (s *Service) finishClaim(w http.ResponseWriter, parent context.Context, userID, code, installID string, gate *ClaimGate) {
 	budget := storeTimeout
 	if gate != nil {
 		budget += deviceLockWait + 3*s.dcTimeout
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), budget)
+	ctx, cancel := context.WithTimeout(parent, budget)
 	defer cancel()
 	offer, err := s.store.Claim(ctx, userID, code, installID, gate)
 	if err != nil {

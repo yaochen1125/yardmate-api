@@ -188,7 +188,7 @@ func (m *memStore) judgeLocked(userID, code, installID string) (ClaimKind, error
 	return ClaimNew, nil
 }
 
-func (m *memStore) Claim(_ context.Context, userID, code, installID string, gate *ClaimGate) (string, error) {
+func (m *memStore) Claim(ctx context.Context, userID, code, installID string, gate *ClaimGate) (string, error) {
 	if gate != nil {
 		m.deviceMu.Lock()
 		defer m.deviceMu.Unlock()
@@ -254,6 +254,10 @@ func (m *memStore) Claim(_ context.Context, userID, code, installID string, gate
 	offer := m.shelf[0]
 	if err := set(true); err != nil {
 		return "", err // rolled back: the code stays on the shelf, no claim
+	}
+	// The commit (PG: tx.Commit(ctx)) fails on a cancelled context.
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	m.shelf = m.shelf[1:]
 	m.claims[userID] = &memClaim{referrer: m.codes[code], offer: offer, install: strings.ToLower(installID)}
@@ -397,7 +401,7 @@ func (m *memStore) MarkVoid(_ context.Context, id int64, reason string) error {
 // each call wait for its context (a hung Apple); delay makes each call take
 // that long (widens race windows). setApplies: a failing set still sets the
 // bit (Apple did it, the answer got lost). queryFails, when set, may fail
-// query number n (1-based).
+// query number n (1-based). afterSet runs once a set has succeeded.
 type fakeDC struct {
 	mu         sync.Mutex
 	bits       map[string]bool // env + "|" + token → bit0
@@ -406,6 +410,7 @@ type fakeDC struct {
 	setErr     error
 	setApplies bool
 	queryFails func(n int) error
+	afterSet   func()
 	block      bool
 	delay      time.Duration
 	queries    int
@@ -466,6 +471,9 @@ func (f *fakeDC) SetBit0(ctx context.Context, env, token string) error {
 		return f.setErr
 	}
 	f.bits[env+"|"+token] = true
+	if f.afterSet != nil {
+		f.afterSet()
+	}
 	return nil
 }
 

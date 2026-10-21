@@ -185,23 +185,56 @@ func (p *PGStore) ReportRedeemed(ctx context.Context, userID, offerCode string) 
 // Before that, the subscription keys of this user's live referrals (either
 // side) go into referral_used_subscriptions — the key and a time, no user id —
 // so deleting the account and starting over cannot make the same Apple ID
-// count again (gate 3). Missing 016 objects are skipped, like a missing table.
+// count again (gate 3). Copy and delete are one transaction with the user's
+// referrals locked first, so settlement cannot stamp a subscription_key
+// (referral_mark_redeemed) between the copy and the cascade and have it
+// vanish with neither a live referral nor a tombstone left to stop it.
+// Missing 016 objects are skipped, like a missing table.
 func (p *PGStore) DeleteUser(ctx context.Context, userID string) error {
 	if userID == "" {
 		return errors.New("referral: delete user: empty user id")
 	}
-	if _, err := p.pool.Exec(ctx,
-		`insert into referral_used_subscriptions (subscription_key)
-		 select distinct subscription_key from referrals
-		  where (referrer = $1 or referee = $1) and state <> 'void' and subscription_key is not null
-		 on conflict (subscription_key) do nothing`, userID); err != nil && !undefinedObject(err) {
-		return fmt.Errorf("keep used subscription keys: %w", err)
+	err := p.deleteUserKeepingKeys(ctx, userID)
+	if !undefinedObject(err) {
+		return err
 	}
-	_, err := p.pool.Exec(ctx, `delete from referral_users where user_id = $1`, userID)
+	// 013 without 016 (no subscription_key yet: nothing to keep), or no
+	// referral tables at all (then this is undefined too → nothing to delete).
+	_, err = p.pool.Exec(ctx, `delete from referral_users where user_id = $1`, userID)
 	if undefinedObject(err) {
 		return nil
 	}
 	return err
+}
+
+func (p *PGStore) deleteUserKeepingKeys(ctx context.Context, userID string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// The same order the cascade takes them: the user row, then the referrals.
+	if _, err := tx.Exec(ctx, `select 1 from referral_users where user_id = $1 for update`, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`select 1 from referrals where referrer = $1 or referee = $1 for update`, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`insert into referral_used_subscriptions (subscription_key)
+		 select distinct subscription_key from referrals
+		  where (referrer = $1 or referee = $1) and state <> 'void' and subscription_key is not null
+		 on conflict (subscription_key) do nothing`, userID); err != nil {
+		if undefinedObject(err) {
+			return err
+		}
+		return fmt.Errorf("keep used subscription keys: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `delete from referral_users where user_id = $1`, userID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // undefinedObject: a table or column a not-yet-applied migration adds.

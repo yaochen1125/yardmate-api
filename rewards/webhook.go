@@ -245,6 +245,9 @@ func (s *Service) credit(ctx context.Context, ev rcEvent) (string, error) {
 	case CreditVoided:
 		log.Printf("revenuecat webhook: %s arrived after its refund; not credited", ev.Type)
 		return outVoided, nil
+	case CreditReferralVoid:
+		log.Printf("revenuecat webhook: %s for a referral voided meanwhile; not credited", ev.Type)
+		return outNotRedeemed, nil
 	}
 	log.Printf("revenuecat webhook: recorded %s %s credit_cents=%d", ev.Type, ev.PeriodType, creditCents)
 	return outRecorded, nil

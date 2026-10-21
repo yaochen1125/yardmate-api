@@ -93,9 +93,10 @@ type Credit struct {
 type CreditResult int
 
 const (
-	CreditInserted  CreditResult = iota // a new pending row
-	CreditDuplicate                     // its event id or transaction id is already in the ledger (a redelivery)
-	CreditVoided                        // its transaction was refunded before this charge arrived; nothing written
+	CreditInserted     CreditResult = iota // a new pending row
+	CreditDuplicate                        // its event id or transaction id is already in the ledger (a redelivery)
+	CreditVoided                           // its transaction was refunded before this charge arrived; nothing written
+	CreditReferralVoid                     // its referral was voided (or deleted) after the webhook read it; nothing written
 )
 
 // Payout is one reward_payouts row.
@@ -144,7 +145,10 @@ type Store interface {
 	// RecordCredit writes one pending credit. Not written, and not an error:
 	// CreditDuplicate when its event id or its transaction id is already in
 	// the ledger (a RevenueCat redelivery), CreditVoided when a refund of the
-	// transaction got here first (reward_voided_txns, see VoidPending).
+	// transaction got here first (reward_voided_txns, see VoidPending),
+	// CreditReferralVoid when the referral is void or gone by the time the
+	// credit is written (re-read under a row lock: referral_void cannot slip
+	// in between and leave a fresh pending credit on a void referral).
 	RecordCredit(ctx context.Context, c Credit) (CreditResult, error)
 	// VoidPending voids the PENDING credits of one store transaction (refund).
 	// Already-available credits are left alone. When it voids nothing, it

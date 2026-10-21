@@ -1,6 +1,7 @@
 package referral
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -110,6 +111,35 @@ func TestClaimSetAnswerLostButBitSetKeepsTheClaim(t *testing.T) {
 	}
 	if dc.queries != 2 {
 		t.Errorf("queries = %d, want the check plus one read-back", dc.queries)
+	}
+}
+
+// A client hanging up right after Apple set bit0 must not roll the claim
+// back (final review P1): the device would read device_used on every retry
+// with no code ever handed out. The claim stands; the retry is re-handed it.
+func TestClaimClientHangingUpAfterTheSetKeepsTheClaim(t *testing.T) {
+	svc, store, _, dc := gated(DeviceCheckEnforce)
+	ctx, hangUp := context.WithCancel(context.Background())
+	defer hangUp()
+	dc.afterSet = hangUp
+	r := httptest.NewRequest("POST", "/v1/referral/claim", strings.NewReader(claimWith(codeA, "tok", false))).WithContext(ctx)
+	r.Header.Set("X-Device-Install-Id", device)
+	r.Header.Set("X-App-Version", "2.2.0 (50)")
+	r.Header.Set("Authorization", "Bearer x")
+	svc.HandleClaim()(httptest.NewRecorder(), r)
+	if ctx.Err() == nil {
+		t.Fatal("the request was never cancelled; the test proves nothing")
+	}
+	if store.claims[userB] == nil || len(store.shelf) != 1 || !dc.bit(DeviceEnvProduction, "tok") {
+		t.Fatalf("claim %+v shelf %v — the claim must survive the hang-up with the bit", store.claims[userB], store.shelf)
+	}
+	dc.afterSet = nil
+	status, code, offer := claimAs(t, svc, claimWith(codeA, "tok", false), nil)
+	if status != http.StatusOK || offer != "P1" {
+		t.Errorf("retry: %d %q %q, want 200 P1 re-handed", status, code, offer)
+	}
+	if dc.sets != 1 {
+		t.Errorf("sets = %d, want 1: the retry is a re-claim, Apple is not told again", dc.sets)
 	}
 }
 
