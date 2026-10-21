@@ -162,6 +162,14 @@ type outageRig struct {
 // 带每日上限。plantIDUp 为 nil 时用 cannedPlantIDOK。
 func newOutageRig(t *testing.T, mode PlantIDFallbackMode, plantNetUp, plantIDUp http.HandlerFunc, budget *PlantIDBudget) *outageRig {
 	t.Helper()
+	return newOutageRigVision(t, mode, plantNetUp, plantIDUp, budget, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, cannedVisionRescueGenus)
+	})
+}
+
+// newOutageRigVision — 同 newOutageRig，GPT（vision）上游可自定义。
+func newOutageRigVision(t *testing.T, mode PlantIDFallbackMode, plantNetUp, plantIDUp http.HandlerFunc, budget *PlantIDBudget, visionUp http.HandlerFunc) *outageRig {
+	t.Helper()
 	rig := &outageRig{plantIDHit: &atomic.Int32{}, visionHit: &atomic.Int32{}, budget: budget}
 	var pn *PlantNetClient
 	pnClose := func() {}
@@ -179,7 +187,7 @@ func newOutageRig(t *testing.T, mode PlantIDFallbackMode, plantNetUp, plantIDUp 
 	}))
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rig.visionHit.Add(1)
-		_, _ = io.WriteString(w, cannedVisionRescueGenus)
+		visionUp(w, r)
 	}))
 	pi := &PlantIDClient{APIKey: "test-key", Endpoint: piSrv.URL, HTTP: piSrv.Client(), Budget: budget}
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}

@@ -9,8 +9,8 @@
 #   - identify 200 但耗时 > SLOW_SECS ≥ 1    （危险区：接近客户端 30s 计时器）
 #   - GPT 兜底失败/预算耗尽跳过 ≥ 1          （兜底链路自身出问题）
 #   - Pl@ntNet 失败 ≥ 2                      （上游 outage 进行中，即使兜底救回）
-#     = 快速失败（plantid-skip 交 GPT / plantnet fallback 交 Plant.id / plantid-budget 上限挡下）
-#       + 6s 没回被叫后备（plantnet hedge；引擎赛跑，Pl@ntNet 不掐断）
+#     = `identify plantnet down:` 行数：引擎赛跑每个请求最多打一行（reason=error 快速失败 /
+#       slow 6s 没回 / deadline 赛跑截止），不会因同一请求的 hedge + skip/budget 多行重复计数
 # 30 分钟冷却：持续 outage 期间最多每半小时一封，不淹邮箱（healthz watchdog
 # 的 2026-07-28 教训是只发一封会被淹没；这里反向教训是别变成邮件炸弹）。
 set -uo pipefail
@@ -31,12 +31,11 @@ slow200=$(grep -E 'v1/identify HTTP/1\.[01]" from [0-9.]+ - 200 ' <<<"$LOG" \
     | awk -v t="$SLOW_SECS" '{d=$NF; sub(/s$/,"",d); if (d+0 > t) n++} END {print n+0}')
 rescue_err=$(count "gpt on-demand fallback err:")
 rescue_nobudget=$(count "fallback skipped (budget exhausted)")
-pn_fallback=$(count "identify plantnet fallback:")
 pid_capped=$(count "plantid-budget:")
-pn_slow=$(count "identify plantnet hedge:")
-pid_takeover=$(( pn_fallback + $(count "并行叫 Plant.id") ))
-pnfail=$(( $(count "identify plantid-skip:") + pn_fallback + $(count "identify plantid-budget:") + pn_slow ))
-race_lost=$(count "identify engine race:")
+pn_slow=$(grep -F "identify plantnet down:" <<<"$LOG" | grep -cF "reason=slow" || true)
+pid_takeover=$(( $(count "identify plantnet fallback:") + $(count "并行叫 Plant.id") ))
+pnfail=$(count "identify plantnet down:")
+race_lost=$(grep -F "identify engine race:" <<<"$LOG" | grep -cF "winner=" || true)
 rescued_ok=$(count "rescued=true")
 genus_kept=$(count "identify genus-keep:")
 
@@ -81,7 +80,7 @@ BODY="最近 11 分钟 /v1/identify 异常汇总：
 PLANTID_DAILY_CAP 全站 / PLANTID_PER_IP_DAILY_CAP 单 IP 每日上限约束）。
 
 最近相关日志（最多 20 条）：
-$(grep -E "identify (plantid-skip|plantnet fallback|plantnet hedge|engine race|plantid-budget|genus-keep|gpt on-demand fallback|upstream err)|plantnet trace|v1/identify.*- (502|200) " <<<"$LOG" | tail -20)
+$(grep -E "identify (plantnet down|plantid-skip|plantnet fallback|plantnet hedge|engine race|plantid-budget|genus-keep|gpt on-demand fallback|upstream err)|plantnet trace|v1/identify.*- (502|200) " <<<"$LOG" | tail -20)
 
 排查: journalctl -u yardmate-api --since '30 min ago' | grep identify
 30 分钟冷却已启动，持续异常将再次提醒。"

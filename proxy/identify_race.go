@@ -68,10 +68,16 @@ type raceOutcome struct {
 	gpt    *visionArbiterResult
 }
 
-// gptUsable — 并行 GPT 的结果能否直接当后备答案（有猜测，或明确判定不是植物）。
+// gptUsable — 兜底阶段（引擎已全部失败）能否直接用并行 GPT 的结果：有猜测，或明确
+// 判定不是植物（→ Unknown sentinel，与旧串行兜底一致）。
 func gptUsable(a visionArbiterResult) bool {
 	return (a.err == nil && a.sug != nil) || errors.Is(a.err, ErrVisionNotAPlant)
 }
+
+// gptHasGuess — 赛跑中能否让 GPT 抢先：只有它给出了植物名才行。「不是植物」不能顶掉
+// 还在跑的引擎（原有规则：AI 判非植物不得压过引擎结果；独立评审复现过慢 Pl@ntNet 的
+// 库内结果被 101ms 的 not-a-plant 抢成「没认出来」）。
+func gptHasGuess(a visionArbiterResult) bool { return a.err == nil && a.sug != nil }
 
 func hasCandidates(r *IdentifyResult) bool { return r != nil && len(r.Suggestions) > 0 }
 
@@ -96,23 +102,39 @@ func (e *engineRace) run() raceOutcome {
 		lastErr  error
 		gptRes   *visionArbiterResult
 		hedged   bool
+		// pidStarted — 一个请求最多叫一次 Plant.id（pidCh 在它返回后会置 nil，不能拿它防重入；
+		// 独立评审复现过 hedge 叫一次、Pl@ntNet 随后报错又叫一次 → 扣 2 次额度）。
+		pidStarted bool
+		pnDown     bool // 本请求的 `identify plantnet down:` 已打（报警按请求计数，只打一行）
 	)
+	out.engine = "plantid"
+	if e.plantNet != nil {
+		out.engine = "plantnet" // 失败时日志 / 错误映射也知道是哪个引擎
+	}
+	markPlantNetDown := func(reason string, pnErr error) {
+		if pnDown || e.plantNet == nil {
+			return
+		}
+		pnDown = true
+		log.Printf("identify plantnet down: deviceID=%s reason=%s after=%v err=%v", e.deviceID, reason, time.Since(e.reqStart).Round(time.Millisecond), pnErr)
+	}
 	gptCh := e.gptCh
 	if !e.gptCanRescue {
 		gptCh = nil // always 模式：GPT 只当复核、不当后备（引擎全挂保持 502）
 	}
 
-	startPlantID := func(trigger string, pnErr error) {
-		if e.plantID == nil || pidCh != nil {
-			return
+	// startPlantID 返回是否真的叫起了 Plant.id（被断连 / 时间 / 额度挡下返回 false）。
+	startPlantID := func(trigger string, pnErr error) bool {
+		if e.plantID == nil || pidStarted {
+			return false
 		}
 		if e.clientCtx.Err() != nil {
 			log.Printf("identify plantid-skip: deviceID=%s reason=client_gone plantnetErr=%v", e.deviceID, pnErr)
-			return
+			return false
 		}
-		if left := time.Until(deadline); e.gptCanRescue && left < minPlantIDHopBudget {
-			log.Printf("identify plantid-skip: deviceID=%s reason=hop_budget left=%v plantnetErr=%v → 后备交 GPT", e.deviceID, left, pnErr)
-			return
+		if left := time.Until(deadline); left < minPlantIDHopBudget {
+			log.Printf("identify plantid-skip: deviceID=%s reason=hop_budget left=%v plantnetErr=%v", e.deviceID, left, pnErr)
+			return false
 		}
 		if ok, limit := e.plantID.Budget.TryAcquire(e.clientIP, plantIDIdentifyCredits); !ok {
 			used, capN := e.plantID.Budget.Snapshot()
@@ -120,16 +142,18 @@ func (e *engineRace) run() raceOutcome {
 			if e.plantNet == nil {
 				lastErr = fmt.Errorf("%w: daily budget (%s)", ErrPlantIDRateLimit, limit)
 			}
-			return
+			return false
 		}
 		if trigger == "plantnet-error" {
 			log.Printf("identify plantnet fallback: deviceID=%s err=%v", e.deviceID, pnErr)
 		}
+		pidStarted = true
 		pidCh = make(chan engineOut, 1)
 		go func() {
 			r, err := e.plantID.Identify(pidCtx, bytes.NewReader(e.img), e.mime, e.lat, e.lon)
 			pidCh <- engineOut{r, err}
 		}()
+		return true
 	}
 
 	// plantIDAllowed — 档位是否允许为这次 Pl@ntNet 失败 / 慢请求花 Plant.id。#112 守卫：
@@ -214,8 +238,9 @@ func (e *engineRace) run() raceOutcome {
 				if lastErr == nil {
 					lastErr = o.err
 				}
-				if pidPending {
-					break // 后备已在跑（hedge 已叫起）
+				markPlantNetDown("error", o.err)
+				if pidPending || pidStarted {
+					break // 后备已叫过（一个请求只叫一次 Plant.id）
 				}
 				if plantIDAllowed(o.err) {
 					startPlantID("plantnet-error", o.err)
@@ -237,24 +262,28 @@ func (e *engineRace) run() raceOutcome {
 				pidEmpty = o.res
 			default:
 				lastErr = o.err
+				out.engine = plantIDEngine // 最后失败的是 Plant.id（错误映射 / 日志用）
 			}
 		case <-hedge:
 			hedge = nil
 			hedged = true
-			if !pnPending || pidPending {
+			if !pnPending || pidPending || pidStarted {
 				break
 			}
-			if plantIDAllowed(nil) && e.plantID != nil {
+			markPlantNetDown("slow", nil)
+			switch {
+			case plantIDAllowed(nil) && e.plantID != nil && startPlantID("hedge", nil):
 				log.Printf("identify plantnet hedge: deviceID=%s after=%v → 并行叫 Plant.id（Pl@ntNet 继续跑）", e.deviceID, identifyPlantNetHedgeDelay)
-				startPlantID("hedge", nil)
-			} else {
-				log.Printf("identify plantnet hedge: deviceID=%s after=%v mode=%s → 后备交 GPT（Pl@ntNet 继续跑）", e.deviceID, identifyPlantNetHedgeDelay, e.mode)
+			case gptCh != nil:
+				log.Printf("identify plantnet hedge: deviceID=%s after=%v mode=%s → 后备是并行 GPT（Pl@ntNet 继续跑）", e.deviceID, identifyPlantNetHedgeDelay, e.mode)
+			default:
+				log.Printf("identify plantnet hedge: deviceID=%s after=%v mode=%s → 无并行后备，继续等 Pl@ntNet 到截止", e.deviceID, identifyPlantNetHedgeDelay, e.mode)
 			}
 		case a := <-gptWait:
 			gptRes = &a
 			out.gpt = gptRes
 			gptCh = nil
-			if gptUsable(a) {
+			if gptHasGuess(a) {
 				// Pl@ntNet 慢、Plant.id 不在跑，GPT 先答完 → 交给 GPT（不再等 Pl@ntNet）。
 				log.Printf("identify engine race: deviceID=%s winner=gpt after=%v (Pl@ntNet slow, no Plant.id)", e.deviceID, time.Since(e.reqStart).Round(time.Millisecond))
 				if lastErr == nil {
@@ -263,8 +292,11 @@ func (e *engineRace) run() raceOutcome {
 				out.err = lastErr
 				return out
 			}
-			// GPT 也失败：继续等 Pl@ntNet 到截止（兜底处还会再试一次 GPT）。
+			// GPT 失败或判「不是植物」：不抢先，继续等引擎到截止（兜底处再按旧规则处理）。
 		case <-raceCtx.Done():
+			if pnPending {
+				markPlantNetDown("deadline", raceCtx.Err())
+			}
 			switch {
 			case pidEmpty != nil:
 				return finishEngine(pidEmpty, plantIDEngine)

@@ -126,12 +126,12 @@ func TestEngineRace_GPTRunsInParallelWithPlantNet(t *testing.T) {
 	var visionHit atomic.Int32
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		visionHit.Add(1)
-		after(300*time.Millisecond, func(w http.ResponseWriter, r *http.Request) {
+		after(400*time.Millisecond, func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.WriteString(w, cannedVisionRescueGenus)
 		})(w, r)
 	}))
 	defer vsrv.Close()
-	pnSrv := httptest.NewServer(after(300*time.Millisecond, plantNetOK))
+	pnSrv := httptest.NewServer(after(400*time.Millisecond, plantNetOK))
 	defer pnSrv.Close()
 	pn := &PlantNetClient{APIKey: "test-key", Endpoint: pnSrv.URL, Lang: "en", NbResults: 10, HTTP: pnSrv.Client()}
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
@@ -148,8 +148,8 @@ func TestEngineRace_GPTRunsInParallelWithPlantNet(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}
-	if el > 550*time.Millisecond {
-		t.Fatalf("elapsed = %v, want ≈300ms (parallel), not ≈600ms (serial)", el)
+	if el > 700*time.Millisecond {
+		t.Fatalf("elapsed = %v, want ≈400ms (parallel), not ≈800ms (serial)", el)
 	}
 	if visionHit.Load() != 1 {
 		t.Fatalf("GPT calls = %d, want exactly 1", visionHit.Load())
@@ -170,5 +170,46 @@ func TestPlantNetTrace_ShowsWherePlantNetHung(t *testing.T) {
 	got := tr.String()
 	if !strings.Contains(got, "firstByte=-") || strings.Contains(got, "wrote=-") {
 		t.Fatalf("trace = %q, want upload done (wrote=<dur>) and no first byte (firstByte=-)", got)
+	}
+}
+
+// 一个请求最多叫一次 Plant.id：hedge 叫过、Plant.id 失败、Pl@ntNet 随后也报错 → 不再叫第二次
+// （独立评审复现过扣 2 次额度）。
+func TestEngineRace_PlantIDCalledAtMostOnce(t *testing.T) {
+	shortRace(t, 100*time.Millisecond, 2*time.Second)
+	b := NewPlantIDBudget(30, 3)
+	rig := newOutageRigVision(t, PlantIDFallbackOutage,
+		after(400*time.Millisecond, plantNetStatus(http.StatusInternalServerError)),
+		plantNetStatus(http.StatusInternalServerError), // Plant.id 立即 5xx
+		b,
+		plantNetStatus(http.StatusInternalServerError)) // GPT 也挂
+	defer rig.close()
+	rec := doCascadeReq(t, rig.h)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (everything down)", rec.Code)
+	}
+	if n := rig.plantIDHit.Load(); n != 1 {
+		t.Fatalf("Plant.id calls = %d, want exactly 1", n)
+	}
+	if used, _ := b.Snapshot(); used != 1 {
+		t.Fatalf("budget used = %d, want 1", used)
+	}
+}
+
+// GPT 判「不是植物」不能抢掉还在跑的 Pl@ntNet：要等 Pl@ntNet 回来再按原有规则合判。
+func TestEngineRace_GPTNotAPlantDoesNotPreemptSlowPlantNet(t *testing.T) {
+	shortRace(t, 100*time.Millisecond, 2*time.Second)
+	notPlant := func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":false,\"scientific_name\":\"\",\"common_names\":[],\"confidence\":0.9}"}}]}`)
+	}
+	rig := newOutageRigVision(t, PlantIDFallbackNever, after(300*time.Millisecond, plantNetOK), plantIDOK, NewPlantIDBudget(30, 3), notPlant)
+	defer rig.close()
+	start := time.Now()
+	rec := doCascadeReq(t, rig.h)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if el := time.Since(start); el < 250*time.Millisecond {
+		t.Fatalf("elapsed = %v: returned at the hedge point on GPT's not-a-plant instead of waiting for Pl@ntNet (300ms)", el)
 	}
 }
