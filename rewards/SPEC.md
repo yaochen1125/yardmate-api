@@ -37,8 +37,9 @@
 
 ### 1.4 输出
 
-`/me` 的 `rewards` → `{available_cents, pending_cents, lifetime_cents, payout}`，`payout` = 最近一条（任何状态）或 `null`，
+`/me` 的 `rewards` → `{available_cents, pending_cents, lifetime_cents, payout, counts, referrals}`，`payout` = 最近一条（任何状态）或 `null`，
 时间字段 RFC 3339、UTC、整秒（`"2026-10-20T12:00:00Z"`），`sent_at` 没发时 `null`。
+`counts` / `referrals`（2026-10-21 加，§2.6）只加不改：读进度出错时两个都不出（只记日志），前四个照常；`referrals` 为空时也不出。
 `/payout` 201 → `{"payout": {...}}`（同上 object，`state == "requested"`）。webhook 200 → `{"status": "<outcome>"}`
 （`recorded` / `duplicate` / `voided` / `nothing_to_void` / `not_counted` / `not_referee` / `not_redeemed` / `ignored_type` / `ignored_environment`，
 RevenueCat 后台的投递记录里看得到；`voided` 既指退款作废了 pending，也指扣费晚于自己的退款到达、没入账）。错误体 `{"error":"<code>"}`：
@@ -153,6 +154,30 @@ pending_cents   = sum(pending 账本)
   串行化：扣费和退款同一瞬间处理时，不会出现「退款没看到 pending、扣费也没看到退款记录」两边都漏。
 - 我们出错一律 500（RevenueCat 指数退避重试）；永远不会接受的请求是 4xx；看过但不记的一律 200（否则 RevenueCat 会一直重发）。
 
+### 2.6 每条推荐的进度（`Progress`，progress.go）
+
+奖励卡的三格人数和「ON THE WAY」清单（产品文档 `### 每条推荐的进度`）。`Store.Progress` 在一个只读 repeatable read 事务里读两条
+（同一快照：两条之间朋友删号 / 推荐作废不会让同一个人出现两次）——推荐人没作废的 `referrals`（`id, state, claimed_at, redeemed_at,
+coalesce(reissued_at, claimed_at)`，走 `referrals_referrer_idx`）和他的账本（全部 `pending` + 每条推荐**最近一笔** `available`，
+`available` 只增不减、只用来判「付过钱」和套餐，所以 `distinct on` 只取一行；走 `reward_ledger_referrer_state_idx`）——
+其余在 Go 里算（纯函数，单测全覆盖）。**不加迁移、不改 `referral_me`。** `Balance` 是另一条语句，清单合计偶尔与 `pending_cents` 差一笔刚到的钱，下次 `/me` 对齐。
+
+```
+有一笔 pending / available 账本            → paying     计 Paying；还有 pending 才进清单
+否则 state = claimed                       → unredeemed 领码 / 换码 200 天内进清单（同结算 ① 的窗口），之后只计 Joined
+否则 now < FreeMonthEnd(redeemed_at)       → free_month 计 Free month；进清单
+否则（免费月过了、没记账）                    → 只计 Joined
+账本 referral_id 为空（朋友删号）            → 合成一行 joined_at = null、paying，不计人数
+账本 referral_id 不在没作废的推荐里（void）   → 跳过
+```
+
+- `joined = len(没作废的推荐)`，与 `referral_me` 的 `invited` 同口径；`joined_at = claimed_at`。
+- `FreeMonthEnd` = UTC 下 +1 个日历月，下个月没有这一天取月底（1-31 → 2-28 / 29；`time.AddDate` 会滚到 3 月，不能直接用）。
+- `plan` 取最近一笔（`purchased_at` 最大）的 `product_id`：`premium.yearly.3d` / `premium.yearly` / `premium.monthly`（老产品，实为年付）→ `yearly`，`premium.month` → `monthly`，其余不给。
+- `next_*` = 最早 `available_at` 的那笔 pending。
+- 排序 paying（next 升序）→ free_month（结束升序）→ unredeemed（加入降序），同值按 referral id；最多 50 行。
+- 用 `Service.now`（应用时钟）判免费月，不用库的 `now()`。
+
 ## 3. 配置与运维
 
 - 迁移：`proxy/enrichment/migrations/015_referral_rewards.sql`（依赖 013，可重复跑），**先 staging 后 prod，且先于二进制**。
@@ -179,6 +204,12 @@ payout 三个错误码 + 201、头 / 鉴权 / 未配置、邮箱黑白名单、�
 邮件正文与 W-9 阈值（$400 无、$500 有、去年的不算）、主题纯 ASCII。
 防刷（016）：webhook `held` 状态照记（首购 / 续费）；申请邮件审核行逐项（朋友数 / 带来钱的 / 设备去重含重复与没记设备 / 退款笔数只数退款 / 各作废原因含 0 和其他 / held）、
 全不同的写法、读审核数据失败邮件照发且 201；PG：退款写 `void_reason = refunded`、`ReviewStats` 各口径（016 跑两遍）。
+
+进度（§2.6，`progress_test.go`）：对比稿那张卡（年付 5 天、月付两笔取最早、免费月、未兑换、免费月过期只算 Joined）、线上 JSON 逐字、
+全部到账移出清单 / 续费回来、免费月结束前一秒与正点、claimed 却已付费算 paying、删号朋友合一行不计人数、void 与 voided 跳过、
+产品映射（含老 `premium.monthly`）与升级后取最近一笔、排序与 50 行上限、`/me` 带进度 / 读进度失败只去掉两个字段、
+`FreeMonthEnd` 月底表（含闰年 / 跨年 / 带时区）、未兑换 200 天窗口（含换过码）；
+PG `TestPGProgress`：两条查询的口径（void 不出、删号后 referral_id 为空仍在、voided 不出）。
 
 `go test .`：两条路由已注册、未配置答 503 / 401；webhook 不占 `/v1` 的 IP 桶、自己 600 / min 后 429。`go test ./referral/`：`/me` 有 / 无 / 失败三种、共享桶。
 

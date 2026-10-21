@@ -294,3 +294,78 @@ func (p *PGStore) ReviewStats(ctx context.Context, userID string) (Review, error
 	}
 	return rv, rows.Err()
 }
+
+func (p *PGStore) Progress(ctx context.Context, userID string) ([]TrackReferral, []TrackCredit, error) {
+	// One read-only snapshot for both reads: a friend deleting their account
+	// (or a referral_void) between them would otherwise show the same friend
+	// twice, or a voided referral once.
+	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	refs, err := progressReferrals(ctx, tx, userID)
+	if err != nil {
+		return nil, nil, err
+	}
+	credits, err := progressCredits(ctx, tx, userID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return refs, credits, nil
+}
+
+func progressReferrals(ctx context.Context, tx pgx.Tx, userID string) ([]TrackReferral, error) {
+	// referrals_referrer_idx (013) covers this.
+	rows, err := tx.Query(ctx,
+		`select id, state, claimed_at, redeemed_at, coalesce(reissued_at, claimed_at) from referrals
+		  where referrer = $1 and state <> 'void'`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []TrackReferral
+	for rows.Next() {
+		var r TrackReferral
+		var redeemed *time.Time
+		if err := rows.Scan(&r.ID, &r.State, &r.ClaimedAt, &redeemed, &r.IssuedAt); err != nil {
+			return nil, err
+		}
+		if redeemed != nil {
+			r.RedeemedAt = *redeemed
+		}
+		refs = append(refs, r)
+	}
+	return refs, rows.Err()
+}
+
+func progressCredits(ctx context.Context, tx pgx.Tx, userID string) ([]TrackCredit, error) {
+	// reward_ledger_referrer_state_idx (015) covers both halves. Every pending
+	// row (bounded: 90 days of charges), but only the latest available row per
+	// referral — available rows only grow, and Progress needs no more of them
+	// than "has paid" and the latest product. referral_id is null once the
+	// friend deleted their account: the money is still the referrer's.
+	rows, err := tx.Query(ctx,
+		`(select coalesce(referral_id, 0), state, credit_cents, product_id, purchased_at, available_at
+		    from reward_ledger
+		   where referrer = $1 and state = 'pending')
+		 union all
+		 (select distinct on (coalesce(referral_id, 0))
+		         coalesce(referral_id, 0), state, credit_cents, product_id, purchased_at, available_at
+		    from reward_ledger
+		   where referrer = $1 and state = 'available'
+		   order by coalesce(referral_id, 0), purchased_at desc, id desc)`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var credits []TrackCredit
+	for rows.Next() {
+		var c TrackCredit
+		if err := rows.Scan(&c.ReferralID, &c.State, &c.CreditCents, &c.ProductID, &c.PurchasedAt, &c.AvailableAt); err != nil {
+			return nil, err
+		}
+		credits = append(credits, c)
+	}
+	return credits, rows.Err()
+}

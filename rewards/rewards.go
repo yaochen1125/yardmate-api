@@ -156,6 +156,12 @@ type Summary struct {
 	PendingCents   int64       `json:"pending_cents"`
 	LifetimeCents  int64       `json:"lifetime_cents"`
 	Payout         *PayoutView `json:"payout"` // null when the user has never asked
+	// Counts and Referrals are the card's progress (progress.go, added
+	// 2026-10-21). Left out when reading them failed — the balance above is
+	// still served — so old apps and a broken progress query see the block
+	// exactly as before.
+	Counts    *Counts        `json:"counts,omitempty"`
+	Referrals []ReferralView `json:"referrals,omitempty"`
 }
 
 // PayoutView is a payout on the wire. Times are RFC 3339, UTC, whole seconds.
@@ -204,13 +210,23 @@ func Summarize(b Balance) Summary {
 }
 
 // Rewards is the /me hook (referral.RewardsReader): the caller's block, or an
-// error the referral handler logs before leaving the field out.
+// error the referral handler logs before leaving the field out. A failure
+// reading the progress only drops counts / referrals (logged, no user id).
 func (s *Service) Rewards(ctx context.Context, userID string) (any, error) {
 	b, err := s.store.Balance(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
-	return Summarize(b), nil
+	sum := Summarize(b)
+	refs, credits, err := s.store.Progress(ctx, userID)
+	if err != nil {
+		log.Printf("referral rewards progress: %v", err)
+		return sum, nil
+	}
+	counts, list := Progress(refs, credits, s.now())
+	sum.Counts = &counts
+	sum.Referrals = list
+	return sum, nil
 }
 
 // CanRead reports whether the /me hook can be injected (a store exists).

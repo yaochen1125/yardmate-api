@@ -55,11 +55,8 @@ func TestMatureStoreErrorIsCountedAsZero(t *testing.T) {
 func TestSummaryZeroForNewUser(t *testing.T) {
 	svc, _, _ := newTestSvc(t0)
 	s := summaryOf(t, svc, referrer)
-	if s != (Summary{}) {
-		t.Fatalf("summary = %+v, want zeros", s)
-	}
 	raw, _ := json.Marshal(s)
-	if string(raw) != `{"available_cents":0,"pending_cents":0,"lifetime_cents":0,"payout":null}` {
+	if string(raw) != `{"available_cents":0,"pending_cents":0,"lifetime_cents":0,"payout":null,"counts":{"joined":0,"free_month":0,"paying":0}}` {
 		t.Fatalf("wire = %s", raw)
 	}
 }
