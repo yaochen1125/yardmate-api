@@ -264,3 +264,25 @@ func TestEngineRace_LowConfidenceGPT_UsedAtDeadline(t *testing.T) {
 		t.Fatalf("elapsed = %v, want ≈ race deadline (400ms): low-confidence GPT must wait", el)
 	}
 }
+
+// Pl@ntNet 当日额度用完（429，秒回）+ Plant.id 当日额度用满 → 只剩 GPT：不等任何截止，
+// GPT（0s 起并行）一出结果就返回；GPT 把握低也照样直接用（已没有别的结果可等）。
+func TestEngineRace_AllQuotasExhausted_ReturnsAsSoonAsGPT(t *testing.T) {
+	shortRace(t, 2*time.Second, 5*time.Second) // hedge/截止都远大于 GPT 的 300ms
+	b := NewPlantIDBudget(30, 3)
+	b.SeedUsedToday(30)
+	rig := newOutageRigVision(t, PlantIDFallbackOutage,
+		plantNetStatus(http.StatusTooManyRequests), plantIDOK, b,
+		after(300*time.Millisecond, gptAnswer("Rescuea fakeium", 0.42)))
+	defer rig.close()
+	start := time.Now()
+	if sci := firstSci(t, doCascadeReq(t, rig.h)); sci != "Rescuea fakeium" {
+		t.Fatalf("top = %q, want GPT's answer", sci)
+	}
+	if el := time.Since(start); el > 700*time.Millisecond {
+		t.Fatalf("elapsed = %v, want ≈ GPT's 300ms — must not wait for the hedge (2s) or race deadline (5s)", el)
+	}
+	if rig.plantIDHit.Load() != 0 {
+		t.Fatalf("Plant.id calls = %d, want 0 (429 → GPT; budget exhausted anyway)", rig.plantIDHit.Load())
+	}
+}
