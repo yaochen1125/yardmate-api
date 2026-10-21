@@ -828,6 +828,19 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					result = unknownSentinelResult()
 					unknownSentinel = true
 					engine = "unknown-sentinel"
+				case gptErr == nil && gptSug != nil && IsFungi(gptSug.Kingdom) && bestConf < plantnetConfidentSkipAIConfidence:
+					// GPT says this is a FUNGUS. The engines are plant-only (Pl@ntNet /
+					// Plant.id can never name a mushroom), so their weak catalog hit
+					// is a false positive — exactly the slot the not-a-plant verdict
+					// above used to fill before fungi became identifiable. Adopt GPT's
+					// fungus (kingdom=Fungi → iOS safety notice) instead of showing a
+					// mushroom as a garden plant. Same >=0.80 engine-trust guard.
+					result = &IdentifyResult{
+						IsPlant:           true,
+						IsPlantConfidence: gptSug.Confidence,
+						Suggestions:       []Suggestion{*gptSug},
+					}
+					engine = "ai-fungi"
 				case gptErr == nil && gptSug != nil:
 					// GPT resolves to a DIFFERENT catalog plant AND is at least as
 					// confident as the engine's in-catalog candidate → adopt GPT's
@@ -915,6 +928,18 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					result = unknownSentinelResult()
 					unknownSentinel = true
 					engine = "unknown-sentinel"
+				case verr == nil && aiSug != nil && IsFungi(aiSug.Kingdom):
+					// AI vision says FUNGUS and the plant-only engine was not
+					// confident → the engine's plant candidates (if any) are false
+					// positives; use the AI's fungus. Takes the precedence the
+					// not-a-plant verdict above had for mushrooms before fungi
+					// became identifiable (was: Unknown sentinel).
+					result = &IdentifyResult{
+						IsPlant:           true,
+						IsPlantConfidence: aiSug.Confidence,
+						Suggestions:       []Suggestion{*aiSug},
+					}
+					engine = "ai-fungi"
 				case verr == nil && aiSug != nil && aiHasPID &&
 					aiSug.Confidence >= aiCatalogRecoveryMinConfidence:
 					// AI recovered a catalog match with enough confidence →
@@ -1181,6 +1206,12 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					result.Suggestions[i].PlantID = &pid
 					plantIDsResolved++
 				}
+				// kingdom (mushroom-safety signal, SPEC §2.1): merge the candidate's
+				// own GPT-vision self-report (nil for engine candidates) with what
+				// the catalog record / an earlier enrichment already knows. Pure
+				// in-memory — NO network or DB call may be added here (identify
+				// timeout budget); undetermined stays nil → JSON null.
+				result.Suggestions[i].Kingdom = MergeKingdom(result.Suggestions[i].Kingdom, content.KingdomFor(sci))
 				result.Suggestions[i].ScientificName = speciesBinomial(sci) // display species-level (SPEC §2.1)
 			}
 
@@ -1742,6 +1773,11 @@ func buildDiagnoseResult(ctx context.Context, api *plantIDDiagnoseResponse, cont
 			res.PlantID = &pid
 		}
 	}
+	if res.Top != nil {
+		// kingdom (SPEC §2.2): Plant.id reports none — catalog record / earlier
+		// enrichment only, in-memory, nil when unknown.
+		res.Top.Kingdom = content.KingdomFor(res.Top.ScientificName)
+	}
 
 	res.HealthProbability = api.Result.IsHealthy.Probability
 	res.IsHealthy = api.Result.IsHealthy.Binary
@@ -1854,6 +1890,9 @@ func diagnoseResultFromVision(ctx context.Context, vr *visionDiagnoseResult, con
 		ScientificName: name,
 		CommonNames:    cn,
 		Confidence:     clamp01(vr.Confidence),
+		// GPT self-report merged with catalog / earlier-enrichment knowledge
+		// (in-memory only, SPEC §2.2). "Other" / unknown → nil.
+		Kingdom: MergeKingdom(NormalizeKingdom(vr.Kingdom), content.KingdomFor(name)),
 	}
 	if name != "" {
 		if id, ok := content.LookupPlantID(name); ok {

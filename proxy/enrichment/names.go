@@ -32,6 +32,11 @@ import (
 // asked at all (timeout / network error) and no localized name was found, in
 // which case the row's own name is left untouched and nothing is cached, so the
 // next request retries (a transient outage must not flip names to Latin).
+//
+// The iNat query is scoped to Plantae + Fungi and also returns the taxon's
+// kingdom, which Resolve hands back with the name (Resolution.Kingdom), so the
+// request path gets the mushroom-safety kingdom without a second iNat call
+// (SPEC §7 kingdom).
 
 // Name sources, written into PlantDetail.CommonNameSource (forensic only — iOS
 // does not branch on it).
@@ -69,11 +74,36 @@ func (r ResolvedName) Localized() bool {
 	return r.Source == NameSourceINat || r.Source == NameSourceWikidata
 }
 
-// commonNameLookup is one authoritative source. local is the name in the
-// requested language ("" if the source has none); english is its English name.
-// err == nil / errNameNoMatch mean the source ANSWERED; any other error means it
-// could not be asked.
-type commonNameLookup func(ctx context.Context, sciName, lang string) (local, english string, err error)
+// Resolution is one Resolve outcome: the display name, plus the iNat kingdom
+// that the SAME iNat taxa query returned (enrichment asks iNat once per request
+// for both — SPEC §7 kingdom).
+type Resolution struct {
+	// Name is the authoritative display name; meaningful only when OK.
+	Name ResolvedName
+	// OK reports whether Name could be determined. false (no sources wired, or a
+	// source failed without a localized hit) → the caller keeps the row's own name.
+	OK bool
+	// Kingdom is iNat's normalized kingdom ("Plantae" / "Fungi") for the matched
+	// taxon; nil when iNat has no exact match or did not answer. Independent of OK.
+	Kingdom *string
+	// INatAnswered reports that iNat responded (a match or a definitive miss).
+	// false when iNat is not wired or the request failed / timed out — the only
+	// case where a caller that needs the kingdom should ask iNat again.
+	INatAnswered bool
+}
+
+// sourceAnswer is one source's reply. local is the name in the requested
+// language ("" if the source has none); english is its English name; kingdom is
+// iNat's iconic taxon ("" for Wikidata). err == nil / errNameNoMatch mean the
+// source ANSWERED; any other error means it could not be asked.
+type sourceAnswer struct {
+	local, english string
+	kingdom        string
+	err            error
+}
+
+// commonNameLookup is one authoritative source.
+type commonNameLookup func(ctx context.Context, sciName, lang string) sourceAnswer
 
 var errNameNoMatch = errors.New("names: no matching taxon")
 
@@ -82,7 +112,7 @@ var errNameNoMatch = errors.New("names: no matching taxon")
 type NameResolver struct {
 	inat     commonNameLookup // may be nil
 	wikidata commonNameLookup // may be nil
-	cache    *expirable.LRU[string, ResolvedName]
+	cache    *expirable.LRU[string, Resolution]
 	sf       singleflight.Group
 	timeout  time.Duration
 }
@@ -91,65 +121,62 @@ type NameResolver struct {
 // then skipped); both nil → a resolver that never resolves.
 func NewNameResolver(inat *proxy.INatClient, wd *WikidataClient) *NameResolver {
 	r := &NameResolver{
-		cache:   expirable.NewLRU[string, ResolvedName](defaultNameCacheSize, nil, defaultNameCacheTTL),
+		cache:   expirable.NewLRU[string, Resolution](defaultNameCacheSize, nil, defaultNameCacheTTL),
 		timeout: nameResolveTimeout,
 	}
 	if inat != nil {
-		r.inat = func(ctx context.Context, sciName, lang string) (string, string, error) {
-			local, en, err := inat.LocalizedCommonNames(ctx, sciName, inatLocale(lang))
+		r.inat = func(ctx context.Context, sciName, lang string) sourceAnswer {
+			t, err := inat.LocalizedCommonNames(ctx, sciName, inatLocale(lang))
 			if errors.Is(err, proxy.ErrINatNoMatch) {
 				err = errNameNoMatch
 			}
-			return local, en, err
+			return sourceAnswer{local: t.CommonName, english: t.EnglishCommonName, kingdom: t.Kingdom, err: err}
 		}
 	}
 	if wd != nil {
-		r.wikidata = wd.CommonNames
+		r.wikidata = func(ctx context.Context, sciName, lang string) sourceAnswer {
+			local, en, err := wd.CommonNames(ctx, sciName, lang)
+			return sourceAnswer{local: local, english: en, err: err}
+		}
 	}
 	return r
 }
 
-// Resolve returns the authoritative name, or ok=false when it could not be
-// determined (no sources wired, or a source failed without a localized hit) —
-// the caller then keeps the row's own name.
-func (r *NameResolver) Resolve(ctx context.Context, sciName, lang string) (ResolvedName, bool) {
+// Resolve returns the authoritative name (Resolution.OK=false when it could not
+// be determined — the caller then keeps the row's own name) together with the
+// iNat kingdom from the same query.
+//
+// A result is cached only when it is complete: the name resolved AND iNat
+// answered (or is not wired). When iNat failed but Wikidata supplied a localized
+// name, that name is still returned but not cached — iNat outranks Wikidata for
+// the name and is the only kingdom source, so the next request asks again.
+func (r *NameResolver) Resolve(ctx context.Context, sciName, lang string) Resolution {
 	if r == nil || (r.inat == nil && r.wikidata == nil) {
-		return ResolvedName{}, false
+		return Resolution{}
 	}
 	sciName = strings.TrimSpace(sciName)
 	if sciName == "" {
-		return ResolvedName{}, false
+		return Resolution{}
 	}
 	key := proxy.NormalizeScientificNamePrecise(sciName) + "|" + lang
 	if v, ok := r.cache.Get(key); ok {
-		return v, true
+		return v
 	}
 	v, _, _ := r.sf.Do(key, func() (any, error) {
 		// Detached from the caller: coalesced followers must not inherit the
 		// leader's cancellation. Bounded by r.timeout.
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.timeout)
 		defer cancel()
-		res, ok := r.lookup(cctx, sciName, lang)
-		if ok {
+		res := r.lookup(cctx, sciName, lang)
+		if res.OK && (r.inat == nil || res.INatAnswered) {
 			r.cache.Add(key, res)
 		}
-		return resolveOutcome{res, ok}, nil
+		return res, nil
 	})
-	out := v.(resolveOutcome)
-	return out.name, out.ok
+	return v.(Resolution)
 }
 
-type resolveOutcome struct {
-	name ResolvedName
-	ok   bool
-}
-
-type sourceAnswer struct {
-	local, english string
-	err            error
-}
-
-func (r *NameResolver) lookup(ctx context.Context, sciName, lang string) (ResolvedName, bool) {
+func (r *NameResolver) lookup(ctx context.Context, sciName, lang string) Resolution {
 	ask := func(f commonNameLookup) <-chan sourceAnswer {
 		ch := make(chan sourceAnswer, 1)
 		if f == nil {
@@ -157,8 +184,9 @@ func (r *NameResolver) lookup(ctx context.Context, sciName, lang string) (Resolv
 			return ch
 		}
 		go func() {
-			l, e, err := f(ctx, sciName, lang)
-			ch <- sourceAnswer{strings.TrimSpace(l), strings.TrimSpace(e), err}
+			a := f(ctx, sciName, lang)
+			a.local, a.english = strings.TrimSpace(a.local), strings.TrimSpace(a.english)
+			ch <- a
 		}()
 		return ch
 	}
@@ -168,22 +196,26 @@ func (r *NameResolver) lookup(ctx context.Context, sciName, lang string) (Resolv
 	answered := func(a sourceAnswer) bool { return a.err == nil || errors.Is(a.err, errNameNoMatch) }
 	valid := func(n string) bool { return n != "" && !strings.EqualFold(n, sciName) }
 
+	out := Resolution{INatAnswered: r.inat != nil && answered(in)}
+	if out.INatAnswered {
+		out.Kingdom = proxy.NormalizeKingdom(in.kingdom)
+	}
 	switch {
 	case valid(in.local):
-		return ResolvedName{in.local, NameSourceINat}, true
+		out.Name, out.OK = ResolvedName{in.local, NameSourceINat}, true
 	case valid(wd.local):
-		return ResolvedName{wd.local, NameSourceWikidata}, true
+		out.Name, out.OK = ResolvedName{wd.local, NameSourceWikidata}, true
 	case !answered(in) || !answered(wd):
 		// A source may have had the localized name — don't settle for a
 		// fallback on a transient failure.
-		return ResolvedName{}, false
 	case valid(in.english):
-		return ResolvedName{in.english, NameSourceINatEnglish}, true
+		out.Name, out.OK = ResolvedName{in.english, NameSourceINatEnglish}, true
 	case valid(wd.english):
-		return ResolvedName{wd.english, NameSourceWikidataEn}, true
+		out.Name, out.OK = ResolvedName{wd.english, NameSourceWikidataEn}, true
 	default:
-		return ResolvedName{sciName, NameSourceScientificName}, true
+		out.Name, out.OK = ResolvedName{sciName, NameSourceScientificName}, true
 	}
+	return out
 }
 
 // inatLocale maps a supported request lang to iNat's locale parameter.

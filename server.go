@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log"
 	"net/http"
 	"time"
 
@@ -16,6 +15,8 @@ import (
 	"github.com/yaochen1125/yardmate-api/proxy/imageingest"
 	"github.com/yaochen1125/yardmate-api/proxy/rarity"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
+	"github.com/yaochen1125/yardmate-api/referral"
+	"github.com/yaochen1125/yardmate-api/rewards"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
 
@@ -65,6 +66,9 @@ func newServer(
 	doctorBudget *ratelimit.Bucket,
 	rarityPub *rarity.Publisher,
 	scanCounter *proxy.IdentifyScanCounter,
+	referralSvc *referral.Service,
+	mailer *enrichment.FeedbackMailer, // operator mailbox (mail_wiring.go); nil = feedback stored, not forwarded
+	rewardsSvc *rewards.Service, // referral gift-card rewards (rewards/SPEC.md); nil = routes unregistered (tests)
 ) *Server {
 	// Rose cultivar rerank is ON by default; ROSE_RERANK_ENABLED=false kill-switches it.
 	roseEnabled := vault.GetBool("ROSE_RERANK_ENABLED", true)
@@ -209,7 +213,7 @@ func newServer(
 				// token revoke (account_delete.go). Registered only when the
 				// shared Supabase pool is present (row deletes need it).
 				if enrichDB != nil {
-					r.Post("/account/delete", handleAccountDelete(vault, enrichDB))
+					r.Post("/account/delete", handleAccountDelete(vault, enrichDB, referralSvc))
 				}
 
 				// /v1/doctor — conversational diagnosis over SSE (doctor/SPEC.md).
@@ -250,17 +254,10 @@ func newServer(
 		// expensive-call group, bounded by this /v1 scope's per-IP limit plus a
 		// per-device daily cap enforced in SQL (RecordFeedback). The handler
 		// requires + validates X-Device-Install-Id itself. Each stored message
-		// is also emailed to the operator (FEEDBACK_SMTP_* / FEEDBACK_EMAIL_TO
-		// in the Vault; all-absent = mail disabled, rows still stored).
+		// is also emailed to the operator mailbox main built once
+		// (mail_wiring.go; nil = mail disabled, rows still stored).
 		if enrichDB != nil {
-			feedbackMailer := enrichment.NewFeedbackMailer(
-				vault.Get("FEEDBACK_SMTP_HOST"), vault.Get("FEEDBACK_SMTP_PORT"),
-				vault.Get("FEEDBACK_SMTP_FROM"), vault.Get("FEEDBACK_SMTP_PASS"),
-				vault.Get("FEEDBACK_EMAIL_TO"))
-			if feedbackMailer == nil {
-				log.Printf("feedback mail disabled (FEEDBACK_SMTP_FROM/PASS/EMAIL_TO not all set)")
-			}
-			r.Post("/feedback", enrichment.HandleFeedback(enrichDB, feedbackMailer))
+			r.Post("/feedback", enrichment.HandleFeedback(enrichDB, mailer))
 		}
 
 		// /v1/attribution — Apple Search Ads (AdServices) install attribution.
@@ -275,7 +272,47 @@ func newServer(
 		if enrichDB != nil {
 			r.Post("/attribution", enrichment.HandleAttribution(enrichDB, enrichment.NewAppleAdServicesClient()))
 		}
+
+		// /v1/referral/{me,claim,redeemed} — invite a friend (referral/SPEC.md).
+		// Identity is the verified Supabase JWT (same JWKS path as
+		// /v1/account/delete), so these sit OUTSIDE the per-device expensive-call
+		// group and carry their OWN per-device buckets (docs ## 数据契约: claim
+		// 5 / 24 h, me + redeemed 30 / h) on top of this /v1 scope's per-IP
+		// limit. /claim consumes its bucket inside the handler, after the cheap
+		// shape checks, so a typo does not spend one of the day's five tries.
+		// Always registered when the service exists: a half-configured server
+		// answers 503 not_configured, never 404 (the iOS app treats 503 as
+		// offline and 404 as a bug).
+		if referralSvc != nil {
+			r.Route("/referral", func(r chi.Router) {
+				r.With(referralSvc.ReadLimiter()).Get("/me", referralSvc.HandleMe())
+				r.Post("/claim", referralSvc.HandleClaim())
+				r.With(referralSvc.ReadLimiter()).Post("/redeemed", referralSvc.HandleRedeemed())
+				// Gift-card request (rewards/SPEC.md): same JWT as /claim and
+				// /claim's per-device bucket, consumed inside the handler after
+				// the email shape check.
+				if rewardsSvc != nil {
+					r.Post("/payout", rewardsSvc.HandlePayout())
+				}
+			})
+		}
 	})
+
+	// /v1/revenuecat/webhook — RevenueCat server-to-server events feeding the
+	// referral gift-card ledger (rewards/SPEC.md). Registered at the top level,
+	// deliberately OUTSIDE the /v1 group above, so it does not share the
+	// public 600 / h per-IP bucket: RevenueCat posts every app user's events
+	// from a handful of IPs, and a renewal burst or a redelivered backlog that
+	// trips the app-facing limit would be 429'd into retry backoff (credits
+	// late, or dropped once RevenueCat gives up). It authenticates with the
+	// shared REVENUECAT_WEBHOOK_SECRET (503 until set), so no device / JWT
+	// checks. Still a public URL (nginx location /v1/), so — like every public
+	// route here — it keeps a per-IP limit, its own and far higher: 600 / min
+	// (rewards.Service.WebhookLimiter). Static path, so chi matches it before
+	// the /v1 mount. Always registered when the service exists.
+	if rewardsSvc != nil {
+		r.With(rewardsSvc.WebhookLimiter()).Post("/v1/revenuecat/webhook", rewardsSvc.HandleWebhook())
+	}
 
 	return &Server{
 		verifier: verifier, vault: vault, limiter: lim,

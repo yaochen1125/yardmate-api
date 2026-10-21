@@ -73,8 +73,16 @@ const (
 	// is content-compatible for English; it is content-incompatible ONLY for
 	// non-English rows written under <= v4, whose native_region is still English.
 	// The one-time native_region backfill (backfill_native_region.go) targets
-	// `lang <> 'en' AND source_version <> 'v5'` and patches just that field.
-	PromptVersion = "v5"
+	// `lang <> 'en' AND source_version < 'v5'` and patches just that field.
+	//
+	// v6 = mushroom safety (SPEC §7). The schema gains a self-reported `kingdom`
+	// enum (Plantae / Fungi / Other) and the system prompt forbids any food-use
+	// claim for fungi. Only a Fungi self-report is acted on; a stored "Plantae"
+	// always comes from iNat. Content-compatible with v5 for plants; rows written
+	// under <= v5 simply lack `kingdom` (null on the wire) until the one-shot
+	// kingdom backfill (backfill_kingdom.go, which selects on the missing field
+	// itself, not on source_version) stamps it from iNat.
+	PromptVersion = "v6"
 
 	// SourceTag is recorded in plants_pending.source for the master copy.
 	SourceTag = "openai-" + defaultLLMModel
@@ -163,6 +171,13 @@ func (c *LLMClient) Generate(ctx context.Context, scientificName, commonName, la
 	// Derive *_period_short from *_months_north so the header always agrees with
 	// the per-month chart (see bloom.go). The LLM's own period_short is discarded.
 	reconcilePeriods(&pd, lang)
+	// Canonicalize the self-reported kingdom ("Other" / anything unexpected → nil).
+	// This is only the model's own claim: the service keeps it solely when it says
+	// Fungi, merges it with iNat and applies the fungi hard filter before
+	// persistence (service.go Step 5 + finalizeKingdom).
+	if pd.Kingdom != nil {
+		pd.Kingdom = proxy.NormalizeKingdom(*pd.Kingdom)
+	}
 	return &pd, requestID, nil
 }
 
@@ -230,6 +245,8 @@ Hard rules — non-negotiable:
 - "id" MUST be null. YardMate ids are reserved for the curated catalog.
 - "fertilize_formula" MUST be null. Its reference formula template is internal to the curated catalog and not available to you.
 - "common_name_source" MUST be the literal string "llm".
+- "kingdom" is the organism's biological kingdom: "Fungi" for any fungus (mushrooms, toadstools, bracket fungi, puffballs, truffles, moulds, yeasts, lichens), "Plantae" for plants, "Other" for anything else or when you are unsure.
+- FUNGI SAFETY — when "kingdom" is "Fungi": poisonous species are routinely mistaken for edible ones, so NEVER present the organism as food. Do NOT include "edible" in "attributes". In every free-text field do NOT state or imply that it is edible, choice, or safe to eat, and do NOT mention taste, flavour, cooking, recipes, preparation, preservation, or foraging / harvesting for the table. Describe only appearance, habitat, ecology and naming.
 - For "common_diseases_list", emit up to 10 catalog disease IDs in the form L01 / P05 / R12 / ST09 / FL06 (1-3 capital letters followed by 2 digits). The server whitelists your output against the actual catalog; unknown IDs are dropped silently, so prefer common ones. Empty array is acceptable.
 - All strings must be plain text. No markdown, no HTML, no URLs, no emojis.
 - Numbers: difficulty / sunlight / watering_note / weed_level are integers 0..5. hardiness_zones use USDA integer zones 1..13. Watering / fertilizing values are integer days between events (use 0 for "skip this season").
@@ -335,7 +352,7 @@ func buildResponseSchema(lang string) map[string]any {
 			"native_region", "locations", "weed_level",
 			"description", "name_origin",
 			"attributes", "height", "spread", "soil",
-			"common_diseases_list", "genus",
+			"common_diseases_list", "genus", "kingdom",
 		},
 		"properties": map[string]any{
 			"id": map[string]any{
@@ -405,14 +422,15 @@ func buildResponseSchema(lang string) map[string]any {
 			"native_region":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Geographic regions of origin, e.g. [\"East Asia\"] or [\"Mediterranean\", \"North Africa\"]. 1-3 entries. These are geographic proper nouns (continents / regions / countries)." + proseLang},
 			"locations":            map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"Yard", "Patio", "Indoor", "Bedroom", "Bathroom", "Kitchen", "Office", "Greenhouse", "Balcony"}}, "description": "Where the plant is typically grown. 1-3 entries."},
 			"weed_level":           map[string]any{"type": "integer", "description": "Invasiveness risk integer 0..5: 0=none, 1=mild self-seeder, 3=naturalized, 5=aggressive invasive."},
-			"description":          map[string]any{"type": "string", "description": "Concise overview: growth habit, key features, native habitat and ornamental value. 15-40 words. Plain text only." + proseLang},
+			"description":          map[string]any{"type": "string", "description": "Concise overview: growth habit, key features, native habitat and ornamental value. 15-40 words. Plain text only. For a fungus: appearance, habitat and ecology ONLY — nothing about edibility, taste or cooking." + proseLang},
 			"name_origin":          map[string]any{"type": "string", "description": "Etymology of the binomial name, 15-40 words." + proseLang},
-			"attributes":           map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"fragrant", "cold-hardy", "drought-tolerant", "evergreen", "deciduous", "long-blooming", "fast-growing", "slow-growing", "compact", "climbing", "spreading", "pollinator-friendly", "edible", "showy-fruit", "shade-tolerant", "container-friendly"}}, "description": "Up to 6 keyword tags from the enum."},
+			"attributes":           map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"fragrant", "cold-hardy", "drought-tolerant", "evergreen", "deciduous", "long-blooming", "fast-growing", "slow-growing", "compact", "climbing", "spreading", "pollinator-friendly", "edible", "showy-fruit", "shade-tolerant", "container-friendly"}}, "description": "Up to 6 keyword tags from the enum. NEVER include \"edible\" when kingdom is \"Fungi\"."},
 			"height":               dimensionSchema,
 			"spread":               dimensionSchema,
 			"soil":                 map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"loamy", "sandy", "clay", "silty", "rocky", "well-drained", "moist", "acidic", "alkaline", "neutral"}}, "description": "Soil preferences. 1-4 entries."},
 			"common_diseases_list": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Up to 10 catalog disease IDs (1-3 letters + 2 digits, e.g. L01, P05, R12, ST09, FL06). Unknown IDs are dropped server-side."},
 			"genus":                map[string]any{"type": "string", "description": "Genus portion of the binomial (first word)."},
+			"kingdom":              map[string]any{"type": "string", "enum": []string{proxy.KingdomPlantae, proxy.KingdomFungi, "Other"}, "description": "Biological kingdom: \"Fungi\" for any fungus (mushroom, toadstool, bracket fungus, puffball, truffle, mould, yeast, lichen), \"Plantae\" for a plant, \"Other\" for anything else or when unsure. Always one of these exact English tokens — never localize."},
 		},
 	}
 }

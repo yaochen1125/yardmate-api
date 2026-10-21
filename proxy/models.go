@@ -35,6 +35,13 @@ type Suggestion struct {
 	// related image. iOS uses it for the detail hero / gallery of
 	// out-of-catalog plants (PlantID == null), which otherwise have no image.
 	ImageURL *string `json:"image_url"`
+	// Kingdom is the candidate's biological kingdom: "Fungi" / "Plantae", or
+	// null when undetermined (kingdom.go). Resolved WITHOUT any extra network
+	// call on the identify path — catalog record, GPT-vision self-report, or the
+	// in-memory hint left by an earlier enrichment — so null is common and is
+	// NOT a "not a mushroom" verdict; the detail record's `kingdom` is the
+	// backstop. iOS treats only "Fungi" (case-insensitive) as a mushroom.
+	Kingdom *string `json:"kingdom"`
 }
 
 // --- diagnose (POST /v1/diagnose, SPEC §2.2) ---
@@ -65,6 +72,9 @@ type PlantSuggestion struct {
 	ScientificName string   `json:"scientific_name"`
 	CommonNames    []string `json:"common_names"`
 	Confidence     float64  `json:"confidence"`
+	// Kingdom mirrors Suggestion.Kingdom: "Fungi" / "Plantae" / null, resolved
+	// with no extra network call (SPEC §2.2).
+	Kingdom *string `json:"kingdom"`
 }
 
 // HealthIssue is one disease suggestion attached to a diagnose result.

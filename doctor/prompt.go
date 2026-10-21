@@ -90,6 +90,10 @@ const followUpWithPhoto = `One case tracks ONE plant over time. If the newest ph
 // followUpTextOnly 在续问**不带图**时附加：封死凭空看图的口子。
 const followUpTextOnly = `This message contains NO new photo. Do not describe, confirm, or invent anything visual about the plant's current state - you cannot see it right now. Respond to what they wrote; observations may only restate what the user reported or reference earlier photos, clearly attributed as such.`
 
+// firstTurnTextOnly 在**首轮不带图**时附加（客户端从花园植物发起、用户只用文字描述）。
+// 与 followUpTextOnly 同一个目的，外加一条：没发照片不等于照片不可读，别走 photoProblem。
+const firstTurnTextOnly = `This first message contains NO photo - the user is describing the problem in words. You cannot see the plant. Do not describe, confirm, or invent anything visual. Do NOT use the photoProblem branch: it is only for a photo that was sent and cannot be read, and no photo was sent. observations must restate what the user reported (and relevant facts from the plant on file, if given), clearly as their report, not as something you saw. If their description cannot separate causes that need opposite treatment, use the clarification branch. When a photo would settle it, say in spokenSummary which close-up would help - as an invitation, not a condition for answering.`
+
 const metricRule = `Use metric everywhere: centimetres and metres for length, °C for temperature, millilitres and litres for volume, grams for small dry amounts.`
 const imperialRule = `Use US customary units everywhere: inches and feet for length, °F for temperature, teaspoons and tablespoons for small amounts, gallons and quarts for volume.`
 

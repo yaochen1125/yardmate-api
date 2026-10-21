@@ -92,6 +92,37 @@ deletion + Sign in with Apple revoke). All SERVER-ONLY (never vended/logged):
   lines (the server un-escapes them); for a real multi-line PEM use
   `APPLE_PRIVATE_KEY_PATH` and deploy the .p8 to the host manually (see §0).
 
+Referral endpoints (`/v1/referral/{me,claim,redeemed}` — invite a friend,
+`referral/SPEC.md`). SERVER-ONLY; when any is missing the three routes answer
+`503 not_configured` (never 404) and the settlement loop does not start:
+
+- `SUPABASE_URL` + `SUPABASE_DB_URL` — same two as above (JWT verification +
+  the tables from `proxy/enrichment/migrations/013_referral.sql` and the pool
+  settings / issue margin from `014_referral_pool_margin.sql`, applied
+  staging → prod BEFORE the binary that uses them).
+- `REVENUECAT_SECRET_KEY` — RevenueCat **v1 secret** key (`sk_…`): reads
+  customers, grants promotional entitlements.
+- `REVENUECAT_ENTITLEMENT_ID` — the entitlement **identifier** string exactly
+  as the RevenueCat dashboard shows it. For this project that is the display
+  name itself, `YardMate: AI Plant ID & Care Pro` (spaces + colon, no quotes;
+  verified against a prod customer record 2026-10-19).
+- `REFERRAL_SETTLE_INTERVAL` — optional, Go duration, default `10m`.
+
+Restocking the offer-code pool: `deploy/supabase/import-codes.sh` (CSV from
+App Store Connect → `code_pool`, idempotent). Smoke: `deploy/referral-smoke.sh`.
+Stock check (read-only): `SUPABASE_DB_URL=… deploy/referral-pool.sh` (per-batch
+counts, usable stock, earliest expiry, alert verdict). The settlement loop
+watches the same numbers every pass and emails the `FEEDBACK_EMAIL_TO` inbox
+(same `FEEDBACK_SMTP_*` account as `/v1/feedback`, built once in main) at most
+once a day per condition set when usable stock drops below
+`referral_settings.low_stock_threshold` (100) or the earliest usable batch
+expires within `expiry_warn_days` (30) AND too little would be left behind it;
+without the mail settings it only logs `WARN referral pool`. The same row also
+holds `issue_margin_days` (14, new codes must outlive it) and `swap_grace_days`
+(3, a re-claim swaps the code in hand only below it). Apple batches live six
+months (150 000 codes / quarter / app): import a new batch about every five
+months.
+
 Adding a new key:
 
 1. Add it to your local `secrets.env.prod`.
@@ -231,7 +262,135 @@ supplementary gallery 400s until the copy is re-synced and the binary rebuilt.
 There is exactly **one** in-repo copy (the fix deliberately reuses this embed
 rather than adding a second) — keep it in lockstep with the swiftui source.
 
-## 8. References
+## 8. Referral rewards — RevenueCat webhook + gift-card payouts
+
+`rewards/SPEC.md`. A friend's real charge (RevenueCat `INITIAL_PURCHASE` /
+`RENEWAL`, `NORMAL` / `INTRO`, price > 0, `PRODUCTION`) credits the referrer
+30% of Apple's payout; it clears after 90 days; $100 of cleared balance buys
+one Amazon.com gift card, **sent by hand**. Everything below is staging first,
+then prod.
+
+**Turning it on**
+
+1. Apply `proxy/enrichment/migrations/015_referral_rewards.sql` (after 013 and 014)
+   **before** the binary that uses it. Re-runnable.
+2. Generate a secret (`openssl rand -hex 32`), add
+   `REVENUECAT_WEBHOOK_SECRET=<it>` to the secrets file, deploy. Unset → the
+   webhook answers `503` and nothing is credited (the rest of the app is
+   unaffected).
+3. RevenueCat dashboard → Project → Integrations → Webhooks → add one:
+   URL `https://<api host>/v1/revenuecat/webhook`, *Authorization header
+   value* = the same secret (with or without `Bearer ` — either side may carry
+   it), all events. Sandbox events are accepted and ignored (`200
+   ignored_environment`), so one webhook for both environments is fine.
+4. "Send test event" in that screen → `200 {"status":"ignored_environment"}`
+   (or `ignored_type`). `401` = secret mismatch; `503` = secret or database not
+   configured (see `journalctl -u yardmate-api | grep "revenuecat webhook"`).
+   A `500` is ours (database) and RevenueCat retries it with backoff.
+5. nginx: `location /v1/` already forwards it; nothing to change.
+
+**A gift-card request arrives** (mail `[YardMate] Referral gift card request
+#17` to `FEEDBACK_EMAIL_TO`, same account as `/v1/feedback`):
+
+1. If the mail says `W-9 FIRST`, the user is at $500+ in cards this calendar
+   year: collect a W-9 before sending (1099-NEC from $600).
+2. Within 3 business days buy a $100 Amazon.com eGift card and deliver it to
+   the address in the mail.
+3. `SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… deploy/referral-payout.sh mark-sent 17`
+   — the app shows `Sent {date}` on its next `/me`.
+4. Not sending after all (bad address, no W-9): `… deploy/referral-payout.sh cancel 17`
+   — the $100 is back in their balance by definition (balance = cleared
+   credits − requested − sent), no ledger edit.
+5. Missed a mail / mail not configured: `… deploy/referral-payout.sh list`
+   shows every open request (`list sent` / `list cancelled` for history).
+
+## 9. Referral anti-abuse (防刷) — DeviceCheck, devices, one Apple ID once, velocity
+
+`referral/SPEC.md` §2.3–§2.4; product rules in yardmate-swiftui
+`invite-friends.md ### 防刷`. Gate 1 is Apple DeviceCheck (one device is a
+referred friend once in its life); gate 2 refuses a friend claiming on a device
+the referrer has used (`own_code`); gate 3 voids a second referral whose friend
+subscription is the same Apple ID chain (`duplicate_apple_id`); gate 4 parks
+the 6th+ success of one referrer within 24 h as `held` and mails the operator
+(counted on theoretical success time — redeemed + `hold_days`, migration 017 —
+so a backlog judged in one pass after a settlement outage is not held
+wholesale). An approved held referral has the friend's refund checked again
+before it pays.
+
+**Rollout order** (nothing here touches prod until step 6):
+
+1. **Migrations 016 then 017 on staging**: `psql "$STAGING_SUPABASE_DB_URL" -f
+   proxy/enrichment/migrations/016_referral_antiabuse.sql`, then the same with
+   `017_referral_review_fixes.sql` (after 013 → 014 → 015; both re-runnable —
+   but re-running 016 after 017 puts 016's `referral_claim` / `referral_qualify`
+   back, so always follow a 016 re-run with 017). Both must land **before** the
+   binary: the new binary calls 016's functions (`referral_claim(text,text,text)`,
+   `referral_me(text,text)`, `referral_mark_redeemed`, `referral_qualify`, …)
+   and reads / writes 017's `referrals.last_checked_at` (without 017,
+   settlement ① / ④ fail every pass; `/me` and `/claim` still work). Older
+   binaries keep working on a 017 database (017 only replaces two functions
+   with the same signatures; the two-argument ones are untouched), so a binary
+   rollback needs no database rollback.
+2. **Staging secrets** (`secrets-staging.env`): add `DEVICECHECK_KEY_ID`
+   (`W3YN83SB24`), `DEVICECHECK_PRIVATE_KEY` (the .p8 on one line with literal
+   `\n`, exactly like `APPLE_PRIVATE_KEY`; or `DEVICECHECK_PRIVATE_KEY_PATH`),
+   **`DEVICECHECK_MODE=log`** and **`DEVICECHECK_ALLOW_DEVELOPMENT=true`**
+   (staging only: lets enforce take a DEBUG build's `development` token when
+   you switch to enforce in step 4). `APPLE_TEAM_ID` is already there. Unset
+   mode means `enforce`; unset allow-development means `false`.
+3. **Deploy staging** (`deploy/deploy-staging.sh`). The log must show
+   `referral devicecheck ready: mode=log`; a `WARN: referral devicecheck not
+   configured (missing [...])` line names what is missing (never the key).
+4. **Watch staging in log mode**: claims are never refused, but every verdict
+   is logged — `journalctl -u yardmate-api-staging | grep devicecheck`
+   (`would be device_used`, `would be device_unverified`, `apple query failed`,
+   `set bit0 failed`). `deploy/referral-smoke.sh` passes only in log mode (it
+   has no real-device token). To test gate 1 itself: set
+   `DEVICECHECK_MODE=enforce` on staging, redeploy, run the real-device
+   acceptance list (invite-friends.md ## 验收 · 防刷). With
+   `DEVICECHECK_ALLOW_DEVELOPMENT=true` a DEBUG build from Xcode works
+   (`device_check_env = development` → Apple's development host, whose bits
+   are separate from production's) as well as a TestFlight build; without it
+   enforce only accepts `production`. The simulator or a request without the
+   field gets `400 device_unverified`. The startup log has a `WARN:
+   DEVICECHECK_ALLOW_DEVELOPMENT=true …` line while it is on. Then back to
+   `log` (which asks whichever environment the request names).
+   Gates 2–4 work the same in both modes; tune the velocity gate in the
+   database (`update referral_settings set velocity_limit = …,
+   velocity_window_hours = … where id = 1` — `0` turns it off).
+5. **Migrations 016 then 017 on prod**, same commands against the prod
+   database.
+6. **Prod secrets** (`secrets.env`): the same two DeviceCheck values (already in
+   the local `~/.config/yardmate-api/secrets.env.prod`) and
+   **`DEVICECHECK_MODE=enforce`** — and **no** `DEVICECHECK_ALLOW_DEVELOPMENT`
+   (on prod it would give every device a second life) — then
+   `deploy/deploy.sh`. Check for `referral devicecheck ready: mode=enforce` and
+   that there is no `DEVICECHECK_ALLOW_DEVELOPMENT` WARN line. In enforce, a missing or broken
+   key makes every **new** claim `503 device_check_unavailable` (re-claims,
+   `/me`, `/redeemed` keep working), so look at that line before turning the
+   `referralEnabled` flag on. Only Release builds (TestFlight / App Store,
+   `device_check_env = production`) can claim in enforce.
+
+**A held mail arrives** (`[YardMate] Referral review: N held for one
+referrer`, at most one per referrer per 24 h):
+
+1. Read it: how many friends, how many distinct claim devices (`有重复` =
+   several friends on one phone), claim times bunched together.
+2. `SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… deploy/referral-review.sh list`
+   shows every held referral.
+3. Fine: `… deploy/referral-review.sh approve <referral_id>` — the next
+   settlement pass (≤ 10 min) first re-checks the friend's subscription (a
+   refund while it was held voids it as `refunded`), then grants or saves the
+   month as usual, and the app's arrival notification fires on its next `/me`.
+4. Abuse: `… deploy/referral-review.sh reject <referral_id>` — void
+   (`rejected`), no month, and its gift-card money (pending + available) is
+   voided with it. Also the tool for a suspicious gift-card request (§8):
+   cancel the request, then reject the referrals behind it.
+
+The referrer never sees "under review": a held referral counts in
+`months_pending` ("on the way").
+
+## 10. References
 
 - `attest/SPEC.md` — App Attest protocol implementation
 - `secrets/SPEC.md` — env file format + load semantics
@@ -239,3 +398,5 @@ rather than adding a second) — keep it in lockstep with the swiftui source.
 - `deploy/yardmate-api.service` — the unit file shipped to the host
 - `deploy/secrets.env.example` — template for the local secrets file
 - `deploy/deploy.sh` — the script
+- `rewards/SPEC.md` + `deploy/referral-payout.sh` — referral gift-card rewards (§8)
+- `referral/SPEC.md` + `deploy/referral-review.sh` — referral anti-abuse, held review (§9)

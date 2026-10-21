@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -98,7 +99,9 @@ func TestWikidataCommonNames(t *testing.T) {
 
 // fakeLookup builds a commonNameLookup returning fixed values.
 func fakeLookup(local, en string, err error) commonNameLookup {
-	return func(context.Context, string, string) (string, string, error) { return local, en, err }
+	return func(context.Context, string, string) sourceAnswer {
+		return sourceAnswer{local: local, english: en, err: err}
+	}
 }
 
 func newTestResolver(inat, wd commonNameLookup) *NameResolver {
@@ -134,7 +137,8 @@ func TestNameResolverPrecedence(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := newTestResolver(tc.inat, tc.wd).Resolve(context.Background(), "Trifolium hirtum", "zh-Hans")
+			res := newTestResolver(tc.inat, tc.wd).Resolve(context.Background(), "Trifolium hirtum", "zh-Hans")
+			got, ok := res.Name, res.OK
 			if ok != tc.wantOK || got != tc.want {
 				t.Errorf("got (%+v, %v), want (%+v, %v)", got, ok, tc.want, tc.wantOK)
 			}
@@ -145,19 +149,92 @@ func TestNameResolverPrecedence(t *testing.T) {
 // A hung source is abandoned at the resolver timeout instead of blocking the
 // user; with a localized answer from the other source the result still resolves.
 func TestNameResolverTimeout(t *testing.T) {
-	hang := func(ctx context.Context, _, _ string) (string, string, error) {
+	hang := func(ctx context.Context, _, _ string) sourceAnswer {
 		<-ctx.Done()
-		return "", "", ctx.Err()
+		return sourceAnswer{err: ctx.Err()}
 	}
 	r := newTestResolver(hang, fakeLookup("Sumpfporst", "", nil))
 	r.timeout = 50 * time.Millisecond
 	start := time.Now()
-	got, ok := r.Resolve(context.Background(), "Rhododendron tomentosum", "de")
+	res := r.Resolve(context.Background(), "Rhododendron tomentosum", "de")
+	got, ok := res.Name, res.OK
 	if el := time.Since(start); el > time.Second {
 		t.Fatalf("Resolve took %v, want ≈ timeout", el)
 	}
 	if !ok || got.Name != "Sumpfporst" || got.Source != NameSourceWikidata {
 		t.Errorf("got (%+v, %v), want Sumpfporst from wikidata", got, ok)
+	}
+}
+
+// The iNat answer's kingdom rides on the name resolution; an iNat that could
+// not be asked reports INatAnswered=false and no kingdom, a definitive miss
+// reports INatAnswered=true.
+func TestNameResolverKingdom(t *testing.T) {
+	fungi := func(context.Context, string, string) sourceAnswer {
+		return sourceAnswer{local: "Fliegenpilz", kingdom: "fungi", err: nil}
+	}
+	res := newTestResolver(fungi, nil).Resolve(context.Background(), "Amanita muscaria", "de")
+	if !res.OK || !res.INatAnswered || kStr(res.Kingdom) != "Fungi" {
+		t.Errorf("iNat answered: got %+v (kingdom %s), want OK + answered + Fungi", res, kStr(res.Kingdom))
+	}
+	res = newTestResolver(fakeLookup("", "", errors.New("timeout")), fakeLookup("Fliegenpilz", "", nil)).
+		Resolve(context.Background(), "Amanita muscaria", "de")
+	if !res.OK || res.INatAnswered || res.Kingdom != nil {
+		t.Errorf("iNat down: got %+v, want OK (Wikidata name) + not answered + nil kingdom", res)
+	}
+	res = newTestResolver(fakeLookup("", "", errNameNoMatch), nil).Resolve(context.Background(), "Fakeus plantus", "de")
+	if !res.INatAnswered || res.Kingdom != nil {
+		t.Errorf("iNat no match: got %+v, want answered + nil kingdom", res)
+	}
+}
+
+// Only a complete result is cached: when iNat failed, a Wikidata name is still
+// served but the next request asks iNat again (it outranks Wikidata for the name
+// and is the only kingdom source).
+func TestNameResolverDoesNotCacheWithoutINat(t *testing.T) {
+	var inatCalls int
+	inatOK := false
+	inat := func(context.Context, string, string) sourceAnswer {
+		inatCalls++
+		if !inatOK {
+			return sourceAnswer{err: errors.New("timeout")}
+		}
+		return sourceAnswer{local: "Sumpf-Porst", kingdom: "Plantae"}
+	}
+	r := newTestResolver(inat, fakeLookup("Sumpfporst", "", nil))
+	if res := r.Resolve(context.Background(), "Rhododendron tomentosum", "de"); res.Name.Name != "Sumpfporst" {
+		t.Fatalf("iNat down: name = %q, want the Wikidata one", res.Name.Name)
+	}
+	inatOK = true
+	res := r.Resolve(context.Background(), "Rhododendron tomentosum", "de")
+	if inatCalls != 2 || res.Name.Name != "Sumpf-Porst" || kStr(res.Kingdom) != "Plantae" {
+		t.Fatalf("after iNat recovers: calls=%d res=%+v, want a fresh iNat answer", inatCalls, res)
+	}
+	r.Resolve(context.Background(), "Rhododendron tomentosum", "de")
+	if inatCalls != 2 {
+		t.Errorf("complete result not cached: iNat calls = %d, want 2", inatCalls)
+	}
+}
+
+// When the name lookup's iNat query got no answer, the kingdom is retried once
+// alongside generation, so the persisted master still gets iNat's verdict.
+func TestGetOrGenerate_KingdomRetriedWhenNameLookupMissedINat(t *testing.T) {
+	inat, calls, done := inatCountingStub(t, inatBodyFlyAgaric)
+	defer done()
+	db := &stubDB{}
+	svc := NewService(nil, db, &stubLLM{ret: foodyDetail(kPtr("Plantae"))}, NewCache(10, time.Hour), inat)
+	svc.SetNameResolver(newTestResolver(fakeLookup("", "", errors.New("timeout")), fakeLookup("Fliegenpilz", "", nil)))
+
+	got, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Amanita muscaria", Lang: "de"})
+	if err != nil {
+		t.Fatalf("GetOrGenerate: %v", err)
+	}
+	assertFungiSanitized(t, "persisted row", db.insertCalls[0].Data)
+	if got.CommonName != "Fliegenpilz" {
+		t.Errorf("name = %q, want the Wikidata one", got.CommonName)
+	}
+	if n := atomic.LoadInt32(calls); n != 1 {
+		t.Errorf("kingdom retry iNat calls = %d, want 1", n)
 	}
 }
 

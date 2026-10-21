@@ -115,25 +115,32 @@ func (c appleRevokeConfig) clientSecret(now time.Time) (string, error) {
 }
 
 // privateKeyBytes returns the .p8 PEM contents from APPLE_PRIVATE_KEY, or from
-// the file at APPLE_PRIVATE_KEY_PATH when the inline value is empty. Some env
-// stores strip real newlines; we accept the common "\n"-escaped single-line
-// form by unescaping it back to real newlines so PEM parsing succeeds.
+// the file at APPLE_PRIVATE_KEY_PATH when the inline value is empty.
 func (c appleRevokeConfig) privateKeyBytes() ([]byte, error) {
-	if c.privateKeyPEM != "" {
-		pem := c.privateKeyPEM
+	return appleP8Bytes(c.privateKeyPEM, c.privateKeyPath, "APPLE_PRIVATE_KEY")
+}
+
+// appleP8Bytes is how every Apple .p8 in the vault is read (Sign in with
+// Apple here, DeviceCheck in referral_wiring.go): the inline PEM from <name>,
+// else the file at <name>_PATH. Some env stores strip real newlines; we accept
+// the common "\n"-escaped single-line form by unescaping it back to real
+// newlines so PEM parsing succeeds. Errors name the variables, never the key.
+func appleP8Bytes(inlinePEM, path, name string) ([]byte, error) {
+	if inlinePEM != "" {
+		pem := inlinePEM
 		if strings.Contains(pem, `\n`) {
 			pem = strings.ReplaceAll(pem, `\n`, "\n")
 		}
 		return []byte(pem), nil
 	}
-	if c.privateKeyPath != "" {
-		b, err := os.ReadFile(c.privateKeyPath)
+	if path != "" {
+		b, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("read APPLE_PRIVATE_KEY_PATH: %w", err)
+			return nil, fmt.Errorf("read %s_PATH: %w", name, err)
 		}
 		return b, nil
 	}
-	return nil, errors.New("no Apple private key (APPLE_PRIVATE_KEY / APPLE_PRIVATE_KEY_PATH)")
+	return nil, fmt.Errorf("no Apple private key (%s / %s_PATH)", name, name)
 }
 
 // appleTokenResponse is the subset of the /auth/token response we read.

@@ -135,6 +135,12 @@ type ContentIndex struct {
 	// so genus-level cultivar clusters (the Rosa domain, handled by rose rerank)
 	// never form a group.
 	speciesGroups map[string][]rosererank.RoseCandidate
+
+	// kingdoms is the bounded in-memory memory of biological kingdoms resolved
+	// at runtime by the enrichment service (kingdom.go NoteKingdom / KingdomFor).
+	// The one MUTABLE member besides `names`; internally synchronized. nil on a
+	// hand-built index (tests) → notes are dropped and lookups miss.
+	kingdoms *kingdomHints
 }
 
 // DiseaseCatalog is the subset of diseases.json[*] fields the server consumes
@@ -353,6 +359,7 @@ func LoadContent() (*ContentIndex, error) {
 		stepByID:              diseaseFile.Shared.Steps,
 		remedyByID:            diseaseFile.Shared.Remedies,
 		speciesGroups:         groups,
+		kingdoms:              newKingdomHints(),
 	}
 	ci.names.Store(names) // seed the hot-swappable name table with the embed baseline
 	return ci, nil
