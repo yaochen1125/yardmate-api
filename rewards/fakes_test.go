@@ -27,12 +27,23 @@ type memStore struct {
 	nextID  int64
 
 	// error knobs
-	findErr, recordErr, voidErr, matureErr, balanceErr, payoutErr error
+	findErr, recordErr, voidErr, matureErr, balanceErr, payoutErr, reviewErr error
+
+	// review knobs: referral rows beyond refs (by id) for ReviewStats —
+	// state, void reason, claim device.
+	reviewRefs []reviewRef
+}
+
+type reviewRef struct {
+	id                    int64
+	referrer              string
+	state, reason, device string
 }
 
 type ledgerRow struct {
 	Credit
-	State string
+	State      string
+	VoidReason string
 }
 
 func newMemStore(now time.Time) *memStore {
@@ -124,7 +135,7 @@ func (m *memStore) VoidPending(_ context.Context, txn string) (int64, error) {
 	var n int64
 	for _, r := range m.ledger {
 		if r.TransactionID == txn && r.State == LedgerPending {
-			r.State = LedgerVoided
+			r.State, r.VoidReason = LedgerVoided, VoidRefunded
 			n++
 		}
 	}
@@ -231,6 +242,59 @@ func (m *memStore) RequestPayout(_ context.Context, userID, email string, amount
 		}
 	}
 	return *p, y, nil
+}
+
+// ReviewStats replays the PG query over reviewRefs (and the ledger).
+func (m *memStore) ReviewStats(_ context.Context, userID string) (Review, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rv := Review{VoidByReason: map[string]int{}}
+	if m.reviewErr != nil {
+		return rv, m.reviewErr
+	}
+	devices := map[string]bool{}
+	live := map[int64]bool{}
+	for _, r := range m.reviewRefs {
+		if r.referrer != userID {
+			continue
+		}
+		switch {
+		case r.state == "void":
+			reason := r.reason
+			if reason == "" {
+				reason = "unknown"
+			}
+			rv.VoidByReason[reason]++
+			continue
+		case r.state == "held":
+			rv.Held++
+		}
+		rv.Friends++
+		live[r.id] = true
+		if r.device == "" {
+			rv.NoDevice++
+		} else {
+			devices[r.device] = true
+		}
+	}
+	rv.ClaimDevices = len(devices)
+	paid := map[int64]bool{}
+	for _, l := range m.ledger {
+		if l.Referrer != userID {
+			continue
+		}
+		if l.State == LedgerVoided {
+			if l.VoidReason == "" || l.VoidReason == VoidRefunded {
+				rv.Refunds++
+			}
+			continue
+		}
+		if live[l.ReferralID] {
+			paid[l.ReferralID] = true
+		}
+	}
+	rv.FriendsPaid = len(paid)
+	return rv, nil
 }
 
 // fakeMailer records Alert calls.

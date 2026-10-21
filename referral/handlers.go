@@ -38,6 +38,11 @@ import (
 const (
 	// bodyCap: a code and nothing else. The rest is somebody trying something.
 	bodyCap = 4 << 10
+	// claimBodyCap: /claim also carries the DeviceCheck token (a few KB of
+	// base64).
+	claimBodyCap = 16 << 10
+	// maxDeviceToken is past any DCDevice token; longer is not one.
+	maxDeviceToken = 12 << 10
 	// maxOfferCode is past any App Store Connect code; they run to 12.
 	maxOfferCode = 64
 
@@ -67,9 +72,16 @@ type Options struct {
 	ReadWindow   time.Duration
 	Interval     time.Duration // settlement cadence (default 10 min)
 	StartupDelay time.Duration // before the first settlement pass (default 1 min)
-	// Alerter receives the code-pool low-stock / expiry email (pool.go);
-	// nil = WARN log only.
+	// Alerter receives the code-pool low-stock / expiry email (pool.go) and
+	// the gate-4 review email (review.go); nil = WARN log only.
 	Alerter Alerter
+	// DeviceCheck is Apple's DeviceCheck (gate 1); nil = not configured,
+	// which in enforce mode makes every new claim device_check_unavailable.
+	DeviceCheck DeviceChecker
+	// DeviceCheckMode is DEVICECHECK_MODE; "" = enforce.
+	DeviceCheckMode DeviceCheckMode
+	// DeviceCheckTimeout bounds each Apple call (default 3 s).
+	DeviceCheckTimeout time.Duration
 }
 
 // Service owns the three handlers, their per-device buckets, and the
@@ -86,6 +98,12 @@ type Service struct {
 
 	claimBucket *ratelimit.Bucket
 	readBucket  *ratelimit.Bucket
+
+	// gate 1 (devicecheck.go): Apple's client (nil = not configured), the
+	// mode, and the per-call bound.
+	dc        DeviceChecker
+	dcMode    DeviceCheckMode
+	dcTimeout time.Duration
 
 	interval     time.Duration
 	startupDelay time.Duration
@@ -124,6 +142,12 @@ func New(store Store, rc Subscribers, entitlement string, auth Authenticator, op
 	if opt.StartupDelay <= 0 {
 		opt.StartupDelay = defaultSettleStartupDelay
 	}
+	if opt.DeviceCheckMode == "" {
+		opt.DeviceCheckMode = DeviceCheckEnforce
+	}
+	if opt.DeviceCheckTimeout <= 0 {
+		opt.DeviceCheckTimeout = DefaultDeviceCheckTimeout
+	}
 	return &Service{
 		store:        store,
 		rc:           rc,
@@ -136,7 +160,16 @@ func New(store Store, rc Subscribers, entitlement string, auth Authenticator, op
 		nudge:        make(chan struct{}, 1),
 		now:          time.Now,
 		alerter:      opt.Alerter,
+		dc:           opt.DeviceCheck,
+		dcMode:       opt.DeviceCheckMode,
+		dcTimeout:    opt.DeviceCheckTimeout,
 	}
+}
+
+// DeviceCheck reports gate 1's mode and whether Apple's client is wired, for
+// the startup log.
+func (s *Service) DeviceCheck() (mode DeviceCheckMode, configured bool) {
+	return s.dcMode, s.dc != nil
 }
 
 // Configured reports whether every dependency is present.
@@ -188,7 +221,9 @@ func (s *Service) HandleMe() http.HandlerFunc {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), storeTimeout)
 		defer cancel()
-		standing, err := s.store.Me(ctx, userID)
+		// The install id goes in with every /me: gate 2 needs the devices a
+		// referrer has used, so a friend claiming on one of them is refused.
+		standing, err := s.store.Me(ctx, userID, r.Header.Get("X-Device-Install-Id"))
 		if err != nil {
 			fail(w, err, "me")
 			return
@@ -219,14 +254,35 @@ type claimRequest struct {
 	// re-checks RevenueCat, and the App Store offer (new subscribers only) is
 	// the real gate. What this saves is a code off the shelf for nothing.
 	SubscribedBefore bool `json:"subscribed_before"`
+	// DeviceToken is DCDevice.generateToken() base64 (gate 1). Absent on the
+	// simulator or when the app could not get one.
+	DeviceToken string `json:"device_token"`
+	// DeviceCheckEnv is "development" (DEBUG build) or "production"
+	// (TestFlight / App Store): which Apple host, whose bits are kept apart.
+	// enforce only accepts "production" (see isProductionEnv).
+	DeviceCheckEnv string `json:"device_check_env"`
 }
 
 // HandleClaim is POST /v1/referral/claim: a friend's code goes in, an App
 // Store one-time code comes back.
 //
-// Order: cheap shape checks → the day's per-device try → RevenueCat history
-// → the one atomic database statement (code exists, not their own, not
-// claimed before, stock left).
+// Judgement order (invite-friends.md /claim 判定顺序, first hit answers):
+//
+//  1. token 401, request shape 400, the day's per-device try 429
+//  2. unknown_code
+//  3. this account claimed before: same code → the code it has (no
+//     RevenueCat, no DeviceCheck); another code → already_claimed
+//  4. own_code: their own code, or this device is one the owner has used
+//  5. not_new_user: the app says so, or RevenueCat has a store subscription
+//  6. DeviceCheck: no / rejected token, or (enforce) device_check_env not
+//     "production" → device_unverified (enforce only); bit0 set →
+//     device_used; Apple unusable → device_check_unavailable
+//  7. a pool code: none → pool_empty (bit0 untouched); taken → bit0 set in
+//     the same transaction, a failed set rolls the claim back →
+//     device_check_unavailable
+//
+// 2–4 are a read-only pre-check (ClaimCheck) and are checked again,
+// atomically, by the claim itself.
 func (s *Service) HandleClaim() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, ok := s.caller(w, r)
@@ -234,7 +290,7 @@ func (s *Service) HandleClaim() http.HandlerFunc {
 			return
 		}
 		var req claimRequest
-		if !decode(w, r, &req) {
+		if !decodeCapped(w, r, &req, claimBodyCap) {
 			return
 		}
 		code, okCode := Normalise(req.Code)
@@ -242,15 +298,41 @@ func (s *Service) HandleClaim() http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "bad_code")
 			return
 		}
-		if req.SubscribedBefore {
-			writeError(w, http.StatusBadRequest, ErrNotNewUser)
-			return
+		token := strings.TrimSpace(req.DeviceToken)
+		if len(token) > maxDeviceToken || !printable(token) {
+			token = "" // not a DeviceCheck token; treated as none
 		}
-		if allowed, retry := s.claimBucket.Allow(r.Header.Get("X-Device-Install-Id"), s.now()); !allowed {
+		env := deviceEnv(req.DeviceCheckEnv)
+		if s.dcMode != DeviceCheckLog && !isProductionEnv(req.DeviceCheckEnv) {
+			// enforce: only a production token counts. Anything else is "no
+			// token" → device_unverified, and Apple's development host (whose
+			// bits are separate) is never asked.
+			token = ""
+		}
+		installID := r.Header.Get("X-Device-Install-Id")
+		if allowed, retry := s.claimBucket.Allow(installID, s.now()); !allowed {
 			ratelimit.Write429(w, retry, "rate_limit_device")
 			return
 		}
 
+		// 2–4
+		ctx, cancel := context.WithTimeout(r.Context(), storeTimeout)
+		kind, err := s.store.ClaimCheck(ctx, userID, code, installID)
+		cancel()
+		if err != nil {
+			fail(w, err, "claim check")
+			return
+		}
+		if kind == ClaimAgain {
+			s.finishClaim(w, r, userID, code, installID, nil)
+			return
+		}
+
+		// 5
+		if req.SubscribedBefore {
+			writeError(w, http.StatusBadRequest, ErrNotNewUser)
+			return
+		}
 		rcCtx, rcCancel := context.WithTimeout(r.Context(), claimRCTimeout)
 		sub, err := s.rc.Subscriber(rcCtx, AppUserID(userID))
 		rcCancel()
@@ -264,14 +346,117 @@ func (s *Service) HandleClaim() http.HandlerFunc {
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), storeTimeout)
-		defer cancel()
-		offer, err := s.store.Claim(ctx, userID, code)
-		if err != nil {
-			fail(w, err, "claim")
+		// 6
+		gate := s.checkDevice(r.Context(), env, token)
+		if gate.refuse != "" {
+			writeError(w, gate.status, gate.refuse)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"offer_code": offer})
+
+		// 7
+		s.finishClaim(w, r, userID, code, installID, s.bitHook(r.Context(), env, token, gate.setBit))
+	}
+}
+
+// finishClaim takes (or re-hands) the pool code and answers.
+func (s *Service) finishClaim(w http.ResponseWriter, r *http.Request, userID, code, installID string, hook ClaimHook) {
+	ctx, cancel := context.WithTimeout(r.Context(), storeTimeout)
+	defer cancel()
+	offer, err := s.store.Claim(ctx, userID, code, installID, hook)
+	if errors.Is(err, errDeviceSetFailed) {
+		writeError(w, http.StatusServiceUnavailable, ErrDeviceUnavailable)
+		return
+	}
+	if err != nil {
+		fail(w, err, "claim")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"offer_code": offer})
+}
+
+// deviceGate is step 6's verdict: a refusal to send, or a pass and whether
+// bit0 is to be set once a code is taken.
+type deviceGate struct {
+	refuse string
+	status int
+	setBit bool
+}
+
+// checkDevice is step 6. In log mode nothing is refused, but Apple is asked
+// (and later told) exactly as in enforce, so staging shows what prod would
+// do. Log lines carry the verdict only — never the token.
+func (s *Service) checkDevice(parent context.Context, env, token string) deviceGate {
+	enforce := s.dcMode != DeviceCheckLog
+	pass := func(setBit bool, why string) deviceGate {
+		if why != "" {
+			log.Printf("referral claim: devicecheck log mode, not refusing: %s (env=%s)", why, env)
+		}
+		return deviceGate{setBit: setBit}
+	}
+	if s.dc == nil {
+		if enforce {
+			log.Printf("referral claim: devicecheck not configured (DEVICECHECK_KEY_ID / DEVICECHECK_PRIVATE_KEY / APPLE_TEAM_ID); refusing in enforce mode")
+			return deviceGate{refuse: ErrDeviceUnavailable, status: http.StatusServiceUnavailable}
+		}
+		return pass(false, "devicecheck not configured")
+	}
+	if token == "" {
+		if enforce {
+			return deviceGate{refuse: ErrDeviceUnverified, status: http.StatusBadRequest}
+		}
+		return pass(false, "no device_token (would be device_unverified)")
+	}
+	ctx, cancel := context.WithTimeout(parent, s.dcTimeout)
+	used, err := s.dc.QueryBit0(ctx, env, token)
+	cancel()
+	switch {
+	case errors.Is(err, ErrDeviceTokenInvalid):
+		if enforce {
+			return deviceGate{refuse: ErrDeviceUnverified, status: http.StatusBadRequest}
+		}
+		return pass(false, "apple rejected the device token (would be device_unverified)")
+	case err != nil:
+		log.Printf("referral claim: devicecheck query failed: %v", err)
+		if enforce {
+			return deviceGate{refuse: ErrDeviceUnavailable, status: http.StatusServiceUnavailable}
+		}
+		return pass(true, "apple query failed (would be device_check_unavailable)")
+	case used:
+		if enforce {
+			return deviceGate{refuse: ErrDeviceUsed, status: http.StatusBadRequest}
+		}
+		return pass(true, "bit0 already set (would be device_used)")
+	}
+	return deviceGate{setBit: true}
+}
+
+// errDeviceSetFailed is the hook's way of rolling the claim back when bit0
+// could not be set (enforce). Never leaves this package.
+var errDeviceSetFailed = errors.New("devicecheck: set bit0 failed")
+
+// bitHook sets bit0 inside the claim transaction for a FRESH claim — "与从码池
+// 取码同进退": in enforce a failed set rolls the claim back; in log mode it is
+// only logged and the claim stands.
+func (s *Service) bitHook(parent context.Context, env, token string, setBit bool) ClaimHook {
+	if !setBit {
+		return nil
+	}
+	return func(fresh bool) error {
+		if !fresh {
+			return nil // lost a race to our own other device: that claim set it
+		}
+		ctx, cancel := context.WithTimeout(parent, s.dcTimeout)
+		err := s.dc.SetBit0(ctx, env, token)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if s.dcMode == DeviceCheckLog {
+			log.Printf("referral claim: devicecheck log mode, set bit0 failed (claim kept): %v", err)
+			return nil
+		}
+		log.Printf("referral claim: devicecheck set bit0 failed, claim rolled back: %v", err)
+		return errDeviceSetFailed
 	}
 }
 
@@ -338,7 +523,11 @@ func (s *Service) caller(w http.ResponseWriter, r *http.Request) (string, bool) 
 // decode reads a small JSON body. Unknown fields are tolerated so a newer app
 // can send more than this build reads.
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, bodyCap)
+	return decodeCapped(w, r, dst, bodyCap)
+}
+
+func decodeCapped(w http.ResponseWriter, r *http.Request, dst any, limit int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_json")
 		return false
@@ -353,8 +542,9 @@ func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 func fail(w http.ResponseWriter, err error, where string) {
 	if f, ok := named(err); ok {
 		switch f.Code {
-		case ErrPoolEmpty:
-			// Not the user's fault and not permanent: the pool wants restocking.
+		case ErrPoolEmpty, ErrDeviceUnavailable:
+			// Not the user's fault and not permanent: the pool wants
+			// restocking / Apple wants a moment.
 			writeError(w, http.StatusServiceUnavailable, f.Code)
 		default:
 			writeError(w, http.StatusBadRequest, f.Code)

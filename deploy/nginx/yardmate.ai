@@ -5,6 +5,17 @@ server {
     access_log /var/log/nginx/yardmate.ai.access.log;
     error_log  /var/log/nginx/yardmate.ai.error.log warn;
     location / { try_files $uri $uri/ =404; }
+    # 邀请链接落地页（yardmate-swiftui docs: invite-friends/invite-links/invite-links.md）：
+    # https://yardmate.ai/i/{code} —— /i/ 下任何路径都回同一个静态页 /i/index.html，页面自己从
+    # location.pathname 取码（/i/hello、/i/ 由页面显示「链接不对」）。^~ 让它压过下面的正则 location。
+    location ^~ /i/ { try_files /i/index.html =404; }
+    # Universal Link 的 AASA（只认 /i/*）：无扩展名，必须 Content-Type: application/json、200、
+    # 不能有任何重定向（苹果 CDN 取它，跟随重定向会判失败）。精确匹配 + 只试 $uri，
+    # 不走上面的 $uri/（目录补斜杠会 301）。
+    location = /.well-known/apple-app-site-association {
+        default_type application/json;
+        try_files $uri =404;
+    }
     # 反代 CDN 内容（含法律正文 privacy_policy.json/terms_of_use.json），让官网 JS
     # 同源 fetch /content/*，避免跨域 CORS。CDN 仍是唯一数据源。
     #

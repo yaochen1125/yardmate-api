@@ -304,7 +304,75 @@ then prod.
 5. Missed a mail / mail not configured: `… deploy/referral-payout.sh list`
    shows every open request (`list sent` / `list cancelled` for history).
 
-## 9. References
+## 9. Referral anti-abuse (防刷) — DeviceCheck, devices, one Apple ID once, velocity
+
+`referral/SPEC.md` §2.3–§2.4; product rules in yardmate-swiftui
+`invite-friends.md ### 防刷`. Gate 1 is Apple DeviceCheck (one device is a
+referred friend once in its life); gate 2 refuses a friend claiming on a device
+the referrer has used (`own_code`); gate 3 voids a second referral whose friend
+subscription is the same Apple ID chain (`duplicate_apple_id`); gate 4 parks
+the 6th+ success of one referrer within 24 h as `held` and mails the operator.
+
+**Rollout order** (nothing here touches prod until step 6):
+
+1. **Migration 016 on staging**: `psql "$STAGING_SUPABASE_DB_URL" -f
+   proxy/enrichment/migrations/016_referral_antiabuse.sql` (after 013 → 014 →
+   015; re-runnable). It must land **before** the binary: the new binary calls
+   016's functions (`referral_claim(text,text,text)`, `referral_me(text,text)`,
+   `referral_mark_redeemed`, `referral_qualify`, …). The old binary keeps
+   working on a 016 database (its two-argument functions are untouched), so a
+   binary rollback needs no database rollback.
+2. **Staging secrets** (`secrets-staging.env`): add `DEVICECHECK_KEY_ID`
+   (`W3YN83SB24`), `DEVICECHECK_PRIVATE_KEY` (the .p8 on one line with literal
+   `\n`, exactly like `APPLE_PRIVATE_KEY`; or `DEVICECHECK_PRIVATE_KEY_PATH`)
+   and **`DEVICECHECK_MODE=log`**. `APPLE_TEAM_ID` is already there. Unset mode
+   means `enforce`.
+3. **Deploy staging** (`deploy/deploy-staging.sh`). The log must show
+   `referral devicecheck ready: mode=log`; a `WARN: referral devicecheck not
+   configured (missing [...])` line names what is missing (never the key).
+4. **Watch staging in log mode**: claims are never refused, but every verdict
+   is logged — `journalctl -u yardmate-api-staging | grep devicecheck`
+   (`would be device_used`, `would be device_unverified`, `apple query failed`,
+   `set bit0 failed`). `deploy/referral-smoke.sh` passes only in log mode (it
+   has no real-device token). To test gate 1 itself: set
+   `DEVICECHECK_MODE=enforce` on staging, redeploy, run the real-device
+   acceptance list (invite-friends.md ## 验收 · 防刷) **with a TestFlight
+   build** — enforce only accepts `device_check_env = production`; a DEBUG
+   build (`development`), the simulator or a request without the field gets
+   `400 device_unverified` and Apple's development host is never asked.
+   Then back to `log` (which asks whichever environment the request names).
+   Gates 2–4 work the same in both modes; tune the velocity gate in the
+   database (`update referral_settings set velocity_limit = …,
+   velocity_window_hours = … where id = 1` — `0` turns it off).
+5. **Migration 016 on prod**, same command against the prod database.
+6. **Prod secrets** (`secrets.env`): the same two DeviceCheck values (already in
+   the local `~/.config/yardmate-api/secrets.env.prod`) and
+   **`DEVICECHECK_MODE=enforce`**, then `deploy/deploy.sh`. Check for
+   `referral devicecheck ready: mode=enforce`. In enforce, a missing or broken
+   key makes every **new** claim `503 device_check_unavailable` (re-claims,
+   `/me`, `/redeemed` keep working), so look at that line before turning the
+   `referralEnabled` flag on. Only Release builds (TestFlight / App Store,
+   `device_check_env = production`) can claim in enforce.
+
+**A held mail arrives** (`[YardMate] Referral review: N held for one
+referrer`, at most one per referrer per 24 h):
+
+1. Read it: how many friends, how many distinct claim devices (`有重复` =
+   several friends on one phone), claim times bunched together.
+2. `SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… deploy/referral-review.sh list`
+   shows every held referral.
+3. Fine: `… deploy/referral-review.sh approve <referral_id>` — the next
+   settlement pass (≤ 10 min) grants or saves the month as usual, and the app's
+   arrival notification fires on its next `/me`.
+4. Abuse: `… deploy/referral-review.sh reject <referral_id>` — void
+   (`rejected`), no month, and its gift-card money (pending + available) is
+   voided with it. Also the tool for a suspicious gift-card request (§8):
+   cancel the request, then reject the referrals behind it.
+
+The referrer never sees "under review": a held referral counts in
+`months_pending` ("on the way").
+
+## 10. References
 
 - `attest/SPEC.md` — App Attest protocol implementation
 - `secrets/SPEC.md` — env file format + load semantics
@@ -313,3 +381,4 @@ then prod.
 - `deploy/secrets.env.example` — template for the local secrets file
 - `deploy/deploy.sh` — the script
 - `rewards/SPEC.md` + `deploy/referral-payout.sh` — referral gift-card rewards (§8)
+- `referral/SPEC.md` + `deploy/referral-review.sh` — referral anti-abuse, held review (§9)

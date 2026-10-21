@@ -26,10 +26,22 @@ func newSvc(store Store, rc Subscribers, ent string, auth Authenticator) *Servic
 }
 
 func configured() (*Service, *memStore, *fakeRC) {
-	store, rc := newMemStore(), newFakeRC()
+	svc, store, rc, _ := configuredDC()
+	return svc, store, rc
+}
+
+// configuredDC is configured() plus the fake DeviceCheck it runs with
+// (enforce mode, the prod setting).
+func configuredDC() (*Service, *memStore, *fakeRC, *fakeDC) {
+	store, rc, dc := newMemStore(), newFakeRC(), newFakeDC()
 	store.meStanding = Standing{Code: "YM-7KQ2", Invited: 3, MonthsEarned: 2, MonthsPending: 1, MonthsSaved: 1, CanClaim: true}
 	store.claimOffer = "XK7P2M9Q"
-	return newSvc(store, rc, entID, okAuth), store, rc
+	return New(store, rc, entID, okAuth, Options{DeviceCheck: dc}), store, rc, dc
+}
+
+// claimBody is a /claim body from a real device (token "tok") in production.
+func claimBody(code string) string {
+	return `{"code":"` + code + `","subscribed_before":false,"device_token":"tok","device_check_env":"production"}`
 }
 
 func call(t *testing.T, h http.HandlerFunc, method, body string, headers map[string]string) *httptest.ResponseRecorder {
@@ -75,7 +87,7 @@ type endpoint struct {
 func endpoints() []endpoint {
 	return []endpoint{
 		{"me", "GET", "", (*Service).HandleMe},
-		{"claim", "POST", `{"code":"YM-7KQ2","subscribed_before":false}`, (*Service).HandleClaim},
+		{"claim", "POST", claimBody("YM-7KQ2"), (*Service).HandleClaim},
 		{"redeemed", "POST", `{"offer_code":"XK7P2M9Q"}`, (*Service).HandleRedeemed},
 	}
 }
@@ -158,6 +170,10 @@ func TestMeReturnsTheStandingAndAsksRevenueCatAboutCanClaim(t *testing.T) {
 	if store.gotUser != userA {
 		t.Errorf("store asked about %q, want the verified user", store.gotUser)
 	}
+	// Gate 2: every /me hands the store the device it came from.
+	if len(store.meInstalls) != 1 || store.meInstalls[0] != device {
+		t.Errorf("/me install ids = %v, want [%s]", store.meInstalls, device)
+	}
 	for _, k := range []string{"code", "invited", "months_earned", "months_pending", "months_saved", "can_claim"} {
 		if _, ok := body(t, w)[k]; !ok {
 			t.Errorf("response missing %q", k)
@@ -199,8 +215,8 @@ func TestMeStoreDownIsStoreFailed(t *testing.T) {
 // MARK: claim
 
 func TestClaimHappyPath(t *testing.T) {
-	svc, store, rc := configured()
-	w := call(t, svc.HandleClaim(), "POST", `{"code":"ym 7kq2","subscribed_before":false}`, nil)
+	svc, store, rc, dc := configuredDC()
+	w := call(t, svc.HandleClaim(), "POST", `{"code":"ym 7kq2","subscribed_before":false,"device_token":"tok","device_check_env":"production"}`, nil)
 	if w.Code != 200 {
 		t.Fatalf("status %d %s", w.Code, w.Body)
 	}
@@ -212,6 +228,12 @@ func TestClaimHappyPath(t *testing.T) {
 	}
 	if rc.gets != 1 {
 		t.Errorf("RevenueCat consulted %d times, want 1", rc.gets)
+	}
+	if store.gotInstall != device {
+		t.Errorf("claim recorded install %q, want the request's", store.gotInstall)
+	}
+	if dc.queries != 1 || dc.sets != 1 || !dc.bit(DeviceEnvProduction, "tok") {
+		t.Errorf("devicecheck queries=%d sets=%d bit0=%v, want 1 1 true", dc.queries, dc.sets, dc.bit(DeviceEnvProduction, "tok"))
 	}
 }
 
@@ -225,7 +247,6 @@ func TestClaimRefusalsBeforeAnythingIsSpent(t *testing.T) {
 		{"bad json", `{`, 400, "bad_json"},
 		{"bad code", `{"code":"YM-7KQ0"}`, 400, "bad_code"},
 		{"empty code", `{"code":""}`, 400, "bad_code"},
-		{"subscribed before", `{"code":"YM-7KQ2","subscribed_before":true}`, 400, "not_new_user"},
 	}
 	for _, c := range cases {
 		w := call(t, svc.HandleClaim(), "POST", c.body, nil)
@@ -239,14 +260,14 @@ func TestClaimRefusalsBeforeAnythingIsSpent(t *testing.T) {
 }
 
 func TestClaimRevenueCatDecides(t *testing.T) {
-	svc, store, rc := configured()
+	svc, store, rc, dc := configuredDC()
 	rc.set(userA, withSubs(map[string]Subscription{"premium.yearly": storeSub(time.Now().Add(-400*24*time.Hour), time.Now().Add(-35*24*time.Hour))}))
-	w := call(t, svc.HandleClaim(), "POST", `{"code":"YM-7KQ2"}`, nil)
+	w := call(t, svc.HandleClaim(), "POST", claimBody("YM-7KQ2"), nil)
 	if w.Code != 400 || errCode(t, w) != "not_new_user" {
 		t.Errorf("paid history: %d %q, want 400 not_new_user", w.Code, errCode(t, w))
 	}
-	if store.gotCode != "" {
-		t.Error("a code must not be taken from the pool for someone Apple will refuse")
+	if store.claimCalls != 0 || dc.queries != 0 {
+		t.Error("a code must not be taken from the pool, nor Apple asked, for someone Apple will refuse")
 	}
 
 	// Promotional-only and family-shared histories are not "subscribed before".
@@ -254,13 +275,13 @@ func TestClaimRevenueCatDecides(t *testing.T) {
 		"rc_promo_pro_monthly": promoSub(time.Now().Add(10 * 24 * time.Hour)),
 		"premium.month":        {Store: "app_store", OwnershipType: "FAMILY_SHARED", PurchaseDate: tp(time.Now()), ExpiresDate: tp(time.Now().Add(time.Hour))},
 	}))
-	w = call(t, svc.HandleClaim(), "POST", `{"code":"YM-7KQ2"}`, nil)
+	w = call(t, svc.HandleClaim(), "POST", claimBody("YM-7KQ2"), nil)
 	if w.Code != 200 {
 		t.Errorf("promo/family only: %d %s, want 200", w.Code, w.Body)
 	}
 
 	rc.err = errors.New("timeout")
-	w = call(t, svc.HandleClaim(), "POST", `{"code":"YM-7KQ2"}`, nil)
+	w = call(t, svc.HandleClaim(), "POST", `{"code":"YM-7KQ2","device_token":"tok2"}`, nil)
 	if w.Code != 502 || errCode(t, w) != "store_failed" {
 		t.Errorf("rc down: %d %q, want 502 store_failed", w.Code, errCode(t, w))
 	}
@@ -281,11 +302,19 @@ func TestClaimStoreRefusalsKeepTheirCode(t *testing.T) {
 		{context.DeadlineExceeded, 502, "store_failed"},
 	}
 	for _, c := range cases {
+		// From the claim itself (the atomic re-check) …
 		svc, store, _ := configured()
 		store.claimErr = c.err
-		w := call(t, svc.HandleClaim(), "POST", `{"code":"YM-7KQ2"}`, nil)
+		w := call(t, svc.HandleClaim(), "POST", claimBody("YM-7KQ2"), nil)
 		if w.Code != c.status || errCode(t, w) != c.code {
-			t.Errorf("%v: %d %q, want %d %s", c.err, w.Code, errCode(t, w), c.status, c.code)
+			t.Errorf("claim %v: %d %q, want %d %s", c.err, w.Code, errCode(t, w), c.status, c.code)
+		}
+		// … and from the read-only pre-check.
+		svc, store, _ = configured()
+		store.checkErr = c.err
+		w = call(t, svc.HandleClaim(), "POST", claimBody("YM-7KQ2"), nil)
+		if w.Code != c.status || errCode(t, w) != c.code {
+			t.Errorf("check %v: %d %q, want %d %s", c.err, w.Code, errCode(t, w), c.status, c.code)
 		}
 	}
 }
@@ -293,7 +322,9 @@ func TestClaimStoreRefusalsKeepTheirCode(t *testing.T) {
 func TestClaimIsFivePerDevicePerDay(t *testing.T) {
 	store, rc := newMemStore(), newFakeRC()
 	store.claimOffer = "X"
-	svc := New(store, rc, entID, okAuth, Options{ClaimLimit: 2, ClaimWindow: 24 * time.Hour})
+	// Log mode: this test is about the bucket, not about bit0.
+	svc := New(store, rc, entID, okAuth, Options{ClaimLimit: 2, ClaimWindow: 24 * time.Hour,
+		DeviceCheck: newFakeDC(), DeviceCheckMode: DeviceCheckLog})
 
 	// A malformed code does not spend a try.
 	for i := 0; i < 5; i++ {

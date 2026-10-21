@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -31,8 +32,9 @@ func NewPGStore(pool *pgxpool.Pool) *PGStore {
 }
 
 const (
-	pgRaiseException = "P0001" // plpgsql `raise exception` — our named refusals
-	pgUndefinedTable = "42P01" // migration not applied yet
+	pgRaiseException  = "P0001" // plpgsql `raise exception` — our named refusals
+	pgUndefinedTable  = "42P01" // migration not applied yet
+	pgUndefinedColumn = "42703" // migration not applied yet (a column of it)
 )
 
 // asFailure pulls a named refusal out of a Postgres error; anything else
@@ -48,9 +50,11 @@ func asFailure(err error) error {
 	return err
 }
 
-func (p *PGStore) Me(ctx context.Context, userID string) (Standing, error) {
+// Me calls the two-argument referral_me (016): the standing, plus installID
+// upserted into referral_devices (gate 2).
+func (p *PGStore) Me(ctx context.Context, userID, installID string) (Standing, error) {
 	var raw []byte
-	if err := p.pool.QueryRow(ctx, `select referral_me($1)::text`, userID).Scan(&raw); err != nil {
+	if err := p.pool.QueryRow(ctx, `select referral_me($1::text, $2::text)::text`, userID, installID).Scan(&raw); err != nil {
 		return Standing{}, fmt.Errorf("referral_me: %w", asFailure(err))
 	}
 	var out Standing
@@ -63,19 +67,58 @@ func (p *PGStore) Me(ctx context.Context, userID string) (Standing, error) {
 	return out, nil
 }
 
-func (p *PGStore) Claim(ctx context.Context, userID, code string) (string, error) {
+// ClaimCheck is referral_claim_check (016): judgement steps 2–4, read-only.
+func (p *PGStore) ClaimCheck(ctx context.Context, userID, code, installID string) (ClaimKind, error) {
+	var kind string
+	if err := p.pool.QueryRow(ctx, `select referral_claim_check($1::text, $2::text, $3::text)`, userID, code, installID).Scan(&kind); err != nil {
+		return ClaimNew, asFailure(err)
+	}
+	switch kind {
+	case "again":
+		return ClaimAgain, nil
+	case "new":
+		return ClaimNew, nil
+	}
+	return ClaimNew, fmt.Errorf("referral_claim_check: unexpected %q", kind)
+}
+
+// Claim runs the three-argument referral_claim (016) in a transaction and,
+// when a hook is given, calls it before commit: the DeviceCheck bit0 set
+// happens while the pool code is still only ours, and a failed set rolls the
+// claim back with the code untouched (docs: 置位失败 → 回滚).
+func (p *PGStore) Claim(ctx context.Context, userID, code, installID string, hook ClaimHook) (string, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
 	var raw []byte
-	if err := p.pool.QueryRow(ctx, `select referral_claim($1, $2)::text`, userID, code).Scan(&raw); err != nil {
+	if err := tx.QueryRow(ctx, `select referral_claim($1::text, $2::text, $3::text)::text`, userID, code, installID).Scan(&raw); err != nil {
 		return "", asFailure(err)
 	}
 	var out struct {
 		OfferCode string `json:"offer_code"`
+		Fresh     *bool  `json:"fresh"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return "", fmt.Errorf("referral_claim decode: %w", err)
 	}
 	if out.OfferCode == "" {
 		return "", Failure{Code: ErrPoolEmpty}
+	}
+	// The three-argument function always says; if it ever does not, treat it
+	// as new (setting bit0 on a re-claim only re-marks a friend's device).
+	fresh := out.Fresh == nil || *out.Fresh
+	if hook != nil {
+		if err := hook(fresh); err != nil {
+			return "", err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		if hook != nil && fresh {
+			log.Printf("referral claim: commit failed AFTER the DeviceCheck hook ran (bit0 may be set without a claim): %v", err)
+		}
+		return "", err
 	}
 	return out.OfferCode, nil
 }
@@ -92,16 +135,33 @@ func (p *PGStore) ReportRedeemed(ctx context.Context, userID, offerCode string) 
 // reward ledger cascade, pool codes keep their state with issued_to nulled.
 // A missing table (migration not yet applied) is nothing to delete, not an
 // error — account deletion must never 500 over this feature's rollout order.
+//
+// Before that, the subscription keys of this user's live referrals (either
+// side) go into referral_used_subscriptions — the key and a time, no user id —
+// so deleting the account and starting over cannot make the same Apple ID
+// count again (gate 3). Missing 016 objects are skipped, like a missing table.
 func (p *PGStore) DeleteUser(ctx context.Context, userID string) error {
 	if userID == "" {
 		return errors.New("referral: delete user: empty user id")
 	}
+	if _, err := p.pool.Exec(ctx,
+		`insert into referral_used_subscriptions (subscription_key)
+		 select distinct subscription_key from referrals
+		  where (referrer = $1 or referee = $1) and state <> 'void' and subscription_key is not null
+		 on conflict (subscription_key) do nothing`, userID); err != nil && !undefinedObject(err) {
+		return fmt.Errorf("keep used subscription keys: %w", err)
+	}
 	_, err := p.pool.Exec(ctx, `delete from referral_users where user_id = $1`, userID)
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgUndefinedTable {
+	if undefinedObject(err) {
 		return nil
 	}
 	return err
+}
+
+// undefinedObject: a table or column a not-yet-applied migration adds.
+func undefinedObject(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == pgUndefinedTable || pgErr.Code == pgUndefinedColumn)
 }
 
 func (p *PGStore) ExpireCodes(ctx context.Context) (int64, error) {
@@ -194,23 +254,15 @@ func (p *PGStore) ListClaimed(ctx context.Context, limit int) ([]Referral, error
 	return scanReferrals(rows)
 }
 
-func (p *PGStore) MarkRedeemed(ctx context.Context, id int64, at time.Time) error {
-	tx, err := p.pool.Begin(ctx)
-	if err != nil {
-		return err
+// MarkRedeemed is referral_mark_redeemed (016): claimed → redeemed with the
+// subscription key, or void (duplicate_apple_id) when the key is taken.
+func (p *PGStore) MarkRedeemed(ctx context.Context, id int64, at time.Time, subscriptionKey string) (bool, error) {
+	var outcome string
+	if err := p.pool.QueryRow(ctx, `select referral_mark_redeemed($1::bigint, $2::timestamptz, $3::text)`,
+		id, at, subscriptionKey).Scan(&outcome); err != nil {
+		return false, err
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	if _, err := tx.Exec(ctx,
-		`update referrals set state = 'redeemed', redeemed_at = $2
-		  where id = $1 and state = 'claimed'`, id, at); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx,
-		`update code_pool set state = 'redeemed', redeemed_at = $2
-		  where referral_id = $1 and state = 'issued'`, id, at); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return outcome == "void", nil
 }
 
 func (p *PGStore) ListDue(ctx context.Context, hold time.Duration, limit int) ([]Referral, error) {
@@ -225,17 +277,95 @@ func (p *PGStore) ListDue(ctx context.Context, hold time.Duration, limit int) ([
 	return scanReferrals(rows)
 }
 
+// MarkVoid is referral_void (016); for refunded / no_subscription it touches
+// only the referral (the refund's own webhook voids that charge).
 func (p *PGStore) MarkVoid(ctx context.Context, id int64, reason string) error {
-	_, err := p.pool.Exec(ctx,
-		`update referrals set state = 'void', void_reason = $2
-		  where id = $1 and state in ('claimed','redeemed','qualified')`, id, reason)
+	_, err := p.pool.Exec(ctx, `select referral_void($1::bigint, $2::text)`, id, reason)
 	return err
 }
 
-func (p *PGStore) MarkQualified(ctx context.Context, id int64) error {
+// MarkQualified is referral_qualify (016): redeemed → qualified, or held by
+// the velocity gate.
+func (p *PGStore) MarkQualified(ctx context.Context, id int64) (bool, error) {
+	var outcome string
+	if err := p.pool.QueryRow(ctx, `select referral_qualify($1::bigint)`, id).Scan(&outcome); err != nil {
+		return false, err
+	}
+	return outcome == "held", nil
+}
+
+// HeldDigests: referrers with held referrals not yet mailed, none of whose
+// referrals was mailed in the last 24 hours; per referrer every held referral
+// plus the successes inside the velocity window.
+func (p *PGStore) HeldDigests(ctx context.Context, limit int) ([]HeldDigest, error) {
+	rows, err := p.pool.Query(ctx,
+		`select r.referrer from referrals r
+		  where r.state = 'held' and r.held_notified_at is null
+		    and not exists (select 1 from referrals x
+		                     where x.referrer = r.referrer and x.held_notified_at > now() - interval '24 hours')
+		  group by r.referrer
+		  order by min(r.qualified_at)
+		  limit $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	var referrers []string
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		referrers = append(referrers, u)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(referrers) == 0 {
+		return nil, nil
+	}
+	var lim, window int
+	if err := p.pool.QueryRow(ctx,
+		`select velocity_limit, velocity_window_hours from referral_settings where id = 1`).Scan(&lim, &window); err != nil {
+		return nil, fmt.Errorf("velocity settings: %w", err)
+	}
+	out := make([]HeldDigest, 0, len(referrers))
+	for _, u := range referrers {
+		d := HeldDigest{Referrer: u, Limit: lim, WindowHours: window}
+		rows, err := p.pool.Query(ctx,
+			`select id, referee, state, claimed_at, coalesce(qualified_at, claimed_at),
+			        coalesce(claim_install_id, ''), held_notified_at is not null
+			   from referrals
+			  where referrer = $1
+			    and (state = 'held'
+			         or (state in ('qualified','saved','rewarded')
+			             and qualified_at > now() - make_interval(hours => $2::int)))
+			  order by qualified_at, id`, u, window)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var h HeldReferral
+			if err := rows.Scan(&h.ID, &h.Referee, &h.State, &h.ClaimedAt, &h.QualifiedAt, &h.InstallID, &h.Notified); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			d.Referrals = append(d.Referrals, h)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+func (p *PGStore) MarkHeldNotified(ctx context.Context, ids []int64) error {
 	_, err := p.pool.Exec(ctx,
-		`update referrals set state = 'qualified', qualified_at = now()
-		  where id = $1 and state = 'redeemed'`, id)
+		`update referrals set held_notified_at = now()
+		  where id = any($1::bigint[]) and state = 'held' and held_notified_at is null`, ids)
 	return err
 }
 

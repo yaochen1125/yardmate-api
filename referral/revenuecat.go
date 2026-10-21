@@ -132,6 +132,42 @@ func (s *Subscriber) StartedAfter(t time.Time) (key string, start time.Time, ok 
 	return key, start, ok
 }
 
+// SubscriptionKey is anti-abuse gate 3's identity for the subscription under
+// key (a product id from StartedAfter): "<store>:<original purchase time>",
+// "" when there is no such entry or no start time.
+//
+// The product docs ask for Apple's original_transaction_id, but RevenueCat's
+// REST API does not return it (v1 subscriptions carry store_transaction_id,
+// which is the LATEST transaction and changes on every renewal; v2 has no
+// original id either — only webhooks do, and a subscription transferred to a
+// second account never sends that account an INITIAL_PURCHASE). What the REST
+// record does carry is original_purchase_date: the purchase time of the
+// original transaction, the same on every renewal, product change within the
+// group, re-login or RevenueCat transfer — so one Apple ID's subscription
+// chain shows the same key on every account it lands on. The product id is
+// deliberately left out (an upgrade keeps the chain but changes the key it
+// sits under). Two DIFFERENT people starting a subscription in the same
+// second would collide; at YardMate's volume that is rare, and the cost is one
+// referral voided as duplicate_apple_id that an operator can see.
+func (s *Subscriber) SubscriptionKey(key string) string {
+	if s == nil {
+		return ""
+	}
+	sub, found := s.Subscriptions[key]
+	if !found {
+		return ""
+	}
+	st, ok := sub.start()
+	if !ok {
+		return ""
+	}
+	store := sub.Store
+	if store == "" {
+		store = "unknown"
+	}
+	return store + ":" + st.UTC().Format(time.RFC3339Nano)
+}
+
 // Refunded reports whether the subscription under key was refunded.
 func (s *Subscriber) Refunded(key string) bool {
 	if s == nil {

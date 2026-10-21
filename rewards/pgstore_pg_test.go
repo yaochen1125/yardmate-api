@@ -66,8 +66,9 @@ func pgTest(t *testing.T) (*PGStore, *pgxpool.Pool, context.Context) {
 			c.Close(ctx)
 		}
 	})
-	// In the order production runs them; 015 twice: it must be re-runnable.
-	for _, f := range []string{"013_referral.sql", "014_referral_pool_margin.sql", "015_referral_rewards.sql", "015_referral_rewards.sql"} {
+	// In the order production runs them; 015 and 016 twice: they must be re-runnable.
+	for _, f := range []string{"013_referral.sql", "014_referral_pool_margin.sql", "015_referral_rewards.sql", "015_referral_rewards.sql",
+		"016_referral_antiabuse.sql", "016_referral_antiabuse.sql"} {
 		sql, err := os.ReadFile(filepath.Join("..", "proxy", "enrichment", "migrations", f))
 		if err != nil {
 			t.Fatalf("%s: %v", f, err)
@@ -232,6 +233,11 @@ func TestPGRefundBeforeCharge(t *testing.T) {
 	if n, err := store.VoidPending(ctx, "t-normal"); err != nil || n != 1 {
 		t.Fatalf("void: %d %v", n, err)
 	}
+	// 016: a refund says why (the payout review counts refunds by it).
+	var reason string
+	if err := pool.QueryRow(ctx, `select void_reason from reward_ledger where transaction_id = 't-normal'`).Scan(&reason); err != nil || reason != VoidRefunded {
+		t.Fatalf("void_reason = %q %v, want refunded", reason, err)
+	}
 	// Its redelivery afterwards is a duplicate (the row is there, voided), not a new credit.
 	if res, err := store.RecordCredit(ctx, c2); err != nil || res != CreditDuplicate {
 		t.Fatalf("redelivered charge after void: %v %v", res, err)
@@ -254,5 +260,55 @@ func TestPGOneRequestedPerUserIndex(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `insert into reward_payouts (user_id, email) values ($1, 'a@example.com')`, referrer); err == nil {
 		t.Fatal("second requested payout accepted by the partial unique index")
+	}
+}
+
+func TestPGReviewStats(t *testing.T) {
+	store, pool, ctx := pgTest(t)
+	now := time.Now()
+	friends := []struct {
+		user, state, reason, device string
+	}{
+		{"f1111111-0000-4000-8000-000000000000", "rewarded", "", "dev-1"},
+		{"f2222222-0000-4000-8000-000000000000", "held", "", "dev-1"},
+		{"f3333333-0000-4000-8000-000000000000", "qualified", "", ""},
+		{"f4444444-0000-4000-8000-000000000000", "void", "duplicate_apple_id", "dev-4"},
+		{"f5555555-0000-4000-8000-000000000000", "void", "rejected", "dev-5"},
+	}
+	ids := map[string]int64{}
+	for _, f := range friends {
+		id := seedReferral(t, ctx, pool, referrer, f.user, f.state)
+		ids[f.user] = id
+		if _, err := pool.Exec(ctx, `update referrals set void_reason = nullif($2, ''), claim_install_id = nullif($3, '') where id = $1`,
+			id, f.reason, f.device); err != nil {
+			t.Fatal(err)
+		}
+	}
+	credit := func(user, txn, state, reason string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`insert into reward_ledger (referral_id, referrer, referee, rc_event_id, event_type, transaction_id, period_type,
+			                            price_usd_cents, takehome_percentage, credit_cents, purchased_at, available_at, state, void_reason)
+			 values ($1, $2, $3, 'ev-' || $4, 'RENEWAL', $4, 'NORMAL', 699, 0.85, 178, $5, $6, $7, nullif($8, ''))`,
+			ids[user], referrer, user, txn, now, now.Add(RefundWindow), state, reason); err != nil {
+			t.Fatal(err)
+		}
+	}
+	credit(friends[0].user, "t1", "available", "")
+	credit(friends[0].user, "t2", "voided", "refunded")
+	credit(friends[1].user, "t3", "voided", "refunded")
+	credit(friends[3].user, "t4", "voided", "duplicate_apple_id")
+	rv, err := store.ReviewStats(ctx, referrer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv.Friends != 3 || rv.FriendsPaid != 1 || rv.ClaimDevices != 1 || rv.NoDevice != 1 || rv.Held != 1 || rv.Refunds != 2 {
+		t.Errorf("review = %+v", rv)
+	}
+	if rv.VoidByReason["duplicate_apple_id"] != 1 || rv.VoidByReason["rejected"] != 1 || len(rv.VoidByReason) != 2 {
+		t.Errorf("void by reason = %v", rv.VoidByReason)
+	}
+	if empty, err := store.ReviewStats(ctx, stranger); err != nil || empty.Friends != 0 || len(empty.VoidByReason) != 0 {
+		t.Errorf("stranger: %+v %v", empty, err)
 	}
 }

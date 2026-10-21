@@ -107,7 +107,7 @@ func (p *PGStore) VoidPending(ctx context.Context, transactionID string) (int64,
 		return 0, err
 	}
 	tag, err := tx.Exec(ctx,
-		`update reward_ledger set state = 'voided', voided_at = now()
+		`update reward_ledger set state = 'voided', voided_at = now(), void_reason = 'refunded'
 		  where transaction_id = $1 and state = 'pending'`, transactionID)
 	if err != nil {
 		return 0, err
@@ -241,4 +241,40 @@ func (p *PGStore) RequestPayout(ctx context.Context, userID, email string, amoun
 		return Payout{}, YearTotals{}, err
 	}
 	return po, year, nil
+}
+
+// ReviewStats: the gate-5 numbers for one referrer (rewards.md ### 入账与兑换).
+// Reads referrals' 016 columns (claim_install_id) and reward_ledger.void_reason.
+func (p *PGStore) ReviewStats(ctx context.Context, userID string) (Review, error) {
+	rv := Review{VoidByReason: map[string]int{}}
+	if err := p.pool.QueryRow(ctx,
+		`select count(*) filter (where state <> 'void'),
+		        count(distinct claim_install_id) filter (where state <> 'void'),
+		        count(*) filter (where state <> 'void' and claim_install_id is null),
+		        count(*) filter (where state = 'held'),
+		        (select count(distinct l.referral_id)
+		           from reward_ledger l join referrals f on f.id = l.referral_id
+		          where l.referrer = $1 and f.state <> 'void' and l.state <> 'voided'),
+		        (select count(*) from reward_ledger
+		          where referrer = $1 and state = 'voided' and coalesce(void_reason, 'refunded') = 'refunded')
+		   from referrals where referrer = $1`, userID).
+		Scan(&rv.Friends, &rv.ClaimDevices, &rv.NoDevice, &rv.Held, &rv.FriendsPaid, &rv.Refunds); err != nil {
+		return rv, err
+	}
+	rows, err := p.pool.Query(ctx,
+		`select coalesce(void_reason, 'unknown'), count(*) from referrals
+		  where referrer = $1 and state = 'void' group by 1 order by 1`, userID)
+	if err != nil {
+		return rv, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var reason string
+		var n int
+		if err := rows.Scan(&reason, &n); err != nil {
+			return rv, err
+		}
+		rv.VoidByReason[reason] = n
+	}
+	return rv, rows.Err()
 }

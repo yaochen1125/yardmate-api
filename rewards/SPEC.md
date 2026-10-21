@@ -12,7 +12,8 @@
   退款先于扣费到达时记下交易号，那笔扣费晚到也不入账（`webhook.go`）。
 - 入账定时器（每 10 分钟，自己的循环，与 referral 结算同一个 `REFERRAL_SETTLE_INTERVAL`）：`available_at <= now()` 的 pending → **available**（`rewards.go`）。
 - `GET /v1/referral/me` 的 `rewards` 字段：经 `referral.RewardsReader` 注入（`Rewards`）；本包不碰 `/me` 别的字段。
-- `POST /v1/referral/payout`：可兑余额 ≥ $100 → 建一条 `requested` 申请（固定 $100）→ 给运营发邮件（`payout.go`）。
+- `POST /v1/referral/payout`：可兑余额 ≥ $100 → 建一条 `requested` 申请（固定 $100）→ 给运营发邮件（`payout.go`）；
+  邮件就是防刷第 5 道的人工审核，附这个推荐人的朋友数 / 朋友设备去重数 / 退款笔数 / 作废与待审核推荐数（`ReviewStats`，§2.3）。
 - 运营侧：`deploy/referral-payout.sh list | mark-sent <id> | cancel <id>`（PostgREST + service role）。
 
 ### 1.2 不负责什么
@@ -32,7 +33,7 @@
 | `/payout` 头 | 同 `/claim`：`Authorization: Bearer <Supabase access token>`、`X-Device-Install-Id`、`X-App-Version` |
 | `/payout` body | `{"email": "you@example.com"}` |
 | vault | `REVENUECAT_WEBHOOK_SECRET`；`SUPABASE_URL` / `SUPABASE_DB_URL`（与 referral 共用）；`FEEDBACK_SMTP_*` / `FEEDBACK_EMAIL_TO`（运营邮件，main 经 `mail_wiring.go` 建一次、与 feedback / 码池告警共用，缺了只记日志）；`REFERRAL_SETTLE_INTERVAL`（可选）|
-| 库 | migration `015_referral_rewards.sql` 的 `reward_ledger` / `reward_voided_txns` / `reward_payouts`（依赖 013 的 `referral_users` / `referrals`）|
+| 库 | migration `015_referral_rewards.sql` 的 `reward_ledger` / `reward_voided_txns` / `reward_payouts`（依赖 013 的 `referral_users` / `referrals`）；`016_referral_antiabuse.sql` 的 `reward_ledger.void_reason`、`referrals.claim_install_id` |
 
 ### 1.4 输出
 
@@ -83,7 +84,8 @@ type == CANCELLATION 且 cancel_reason == CUSTOMER_SUPPORT:
 其他（TRANSFER / EXPIRATION / PRODUCT_CHANGE / TEST / 别的 CANCELLATION …）→ 200 ignored_type
 ```
 
-- **已兑换**：`referrals.state` ∈ `redeemed / qualified / saved / rewarded`；另外 `claimed` 且这笔是 **`INITIAL_PURCHASE`**、`purchased_at` 晚于 `claimed_at` 也算
+- **已兑换**：`referrals.state` ∈ `redeemed / qualified / held / saved / rewarded`（`held` = referral 防刷第 4 道的待审核，朋友已兑换，钱照记、照常过 90 天；
+  reject 时由 SQL `referral_void` 连带作废）；另外 `claimed` 且这笔是 **`INITIAL_PURCHASE`**、`purchased_at` 晚于 `claimed_at` 也算
   —— 那正是 referral 结算第 ① 步十分钟内会认定为 redeemed 的情形，朋友填码后直接付费的第一笔不能被这十分钟竞态吃掉。
   `claimed` 下的 `RENEWAL` **不算**（`not_redeemed`）：续费说明订阅早于填码，典型是小号领码后「恢复购买」把老订阅转过来，
   算了就会每期都给推荐人记钱。`void` 不算。
@@ -94,7 +96,11 @@ type == CANCELLATION 且 cancel_reason == CUSTOMER_SUPPORT:
 - **时间**：`purchased_at = purchased_at_ms`（缺 → 收到时间），`available_at = purchased_at + 90 天`。
 - **app_user_id**：RevenueCat 里是 Supabase uuid **大写**，库里是小写 → 统一 `ToLower` 再比。`$RCAnonymousID:…` 直接 not_referee。
 - **退款**只按 `transaction_id` 找 pending，不再看 app_user_id（账本里本来只有朋友的扣费；TRANSFER 之后来的退款也能找到）。
-  已 available 的不追回。`environment != PRODUCTION` 的退款同样忽略。
+  已 available 的不追回。`environment != PRODUCTION` 的退款同样忽略。作废时记 `void_reason = 'refunded'`（016）。
+- **推荐整条作废**（referral 防刷第 3 道 `duplicate_apple_id` / 第 4 道或礼品卡审核的 `rejected`）：不在本包——SQL `referral_void`（016）在同一事务里
+  把这条推荐名下 pending + available 的账本一起标 `voided`，`void_reason` 记推荐的作废原因；之后的事件因为推荐是 void 答 `not_redeemed`。
+  原因是退款 / 没订阅（`refunded` / `no_subscription`）时账本不动（退款那笔 webhook 自己会作废）。voided 的 available 不再算余额，
+  已申请过的礼品卡照常扣，所以余额可能被压到 0（`Summarize` 不显示负数）。
 - **退款先于扣费到达**（扣费那次投递 500、RevenueCat 稍后重试，退款反而先到）：作废时没命中 pending → 交易号记进
   `reward_voided_txns`；扣费事件到了，insert 带 `where not exists (… reward_voided_txns …)` 被挡下 → 200 `voided`。
   没命中 pending 的退款一律记（已 available / 不是朋友的也记，无害：前者账本里已有这笔、transaction_id 唯一；后者永远不会来扣费）。
@@ -120,6 +126,18 @@ pending_cents   = sum(pending 账本)
 正文 user_id、收卡邮箱、$100、本年已发 / 申请中 / 合计、mark-sent / cancel 命令；**合计 ≥ $500**（含这一张）时加一行
 `W-9 FIRST (先收 W-9 再发)`。邮件丢了不影响记录，`deploy/referral-payout.sh list` 兜底。
 
+**审核那几行**（防刷第 5 道，rewards.md `### 入账与兑换`；`ReviewStats` 在发信的 goroutine 里读，读失败邮件照发、写「numbers unavailable」）：
+
+| 行 | 口径 |
+|---|---|
+| `Friends (not void): N, of whom M brought in money` | 这个推荐人没作废的推荐条数；其中账本里有没作废记账的推荐数 |
+| `Friend devices (distinct): D of R with a recorded device → all different / NOT all different` | 没作废推荐的 `claim_install_id` 去重数 / 记了设备的条数（016 之前填的码没记设备，另行注明）|
+| `Refunded charges: K` | 名下 `voided` 且 `void_reason` 为 `refunded`（016 之前的作废只可能是退款，迁移回填）的账本笔数 |
+| `Void referrals: duplicate_apple_id a, rejected b, refunded c[, 其他原因…]` | 按 `referrals.void_reason` 分别数，三个主要原因 0 也列 |
+| `Held (awaiting review): H` | 现在 `held` 的推荐数 |
+
+后面跟一句：看着不对就 cancel 这张申请，再 `deploy/referral-review.sh reject <referral id>` 把刷的推荐作废（钱一起作废）。
+
 ### 2.4 删账号
 
 - 推荐人删：`referral_users` 行没了 → `reward_ledger.referrer` / `reward_payouts.user_id` **级联删**（余额作废；requested 的照发，运营看邮件，脚本 mark-sent 会报「不存在」）。
@@ -137,6 +155,8 @@ pending_cents   = sum(pending 账本)
 ## 3. 配置与运维
 
 - 迁移：`proxy/enrichment/migrations/015_referral_rewards.sql`（依赖 013，可重复跑），**先 staging 后 prod，且先于二进制**。
+  `016_referral_antiabuse.sql` 也先于二进制：退款作废写 `void_reason`、申请邮件读 `claim_install_id`，没跑 016 时退款事件答 500（RevenueCat 重试，跑了自愈）、
+  邮件的审核行写「numbers unavailable」。
   表不存在时：webhook 记账答 500（RevenueCat 重试，迁移补上后自愈）、`/me` 省略 `rewards` 字段并记日志、`/payout` 502。
 - `REVENUECAT_WEBHOOK_SECRET`：`openssl rand -hex 32`，同一个值填 secrets.env 与 RevenueCat 后台 Webhooks 的 Authorization header。
 - 路由：`server.go` 在**顶层**注册 `/v1/revenuecat/webhook`，**不在** `/v1` 组里，不吃 App 用的每 IP 600 / h
@@ -156,6 +176,9 @@ webhook 鉴权十种头 / 未配置 / 坏 body / 64 KB；文档每条记与不�
 入账只动到期 pending；余额口径（cancelled 回余额、不为负）；时间 RFC 3339 无小数秒；
 payout 三个错误码 + 201、头 / 鉴权 / 未配置、邮箱黑白名单、共享设备桶（邮箱错不扣次数）、20 路并发只成一张、库错误 502、无邮件 / 邮件失败照 201、
 邮件正文与 W-9 阈值（$400 无、$500 有、去年的不算）、主题纯 ASCII。
+防刷（016）：webhook `held` 状态照记（首购 / 续费）；申请邮件审核行逐项（朋友数 / 带来钱的 / 设备去重含重复与没记设备 / 退款笔数只数退款 / 各作废原因含 0 和其他 / held）、
+全不同的写法、读审核数据失败邮件照发且 201；PG：退款写 `void_reason = refunded`、`ReviewStats` 各口径（016 跑两遍）。
+
 `go test .`：两条路由已注册、未配置答 503 / 401；webhook 不占 `/v1` 的 IP 桶、自己 600 / min 后 429。`go test ./referral/`：`/me` 有 / 无 / 失败三种、共享桶。
 
 SQL（按线上顺序 013 → 014 → 015，015 跑两遍）在真库上的测试（含 transaction_id 去重、退款先到、新表 RLS）：`REWARDS_PG_TEST_URL=postgres://…/scratch go test ./rewards/ -run PG -v`

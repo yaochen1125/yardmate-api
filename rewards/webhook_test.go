@@ -244,6 +244,10 @@ func TestWebhookReferralStates(t *testing.T) {
 	}{
 		{"redeemed", "INITIAL_PURCHASE", t0.Add(time.Hour), outRecorded},
 		{"qualified", "INITIAL_PURCHASE", t0.Add(time.Hour), outRecorded},
+		// held (referral anti-abuse gate 4, waiting for review): the friend
+		// has redeemed, money is recorded as usual; a reject voids it.
+		{"held", "INITIAL_PURCHASE", t0.Add(time.Hour), outRecorded},
+		{"held", "RENEWAL", t0.Add(time.Hour), outRecorded},
 		{"saved", "INITIAL_PURCHASE", t0.Add(time.Hour), outRecorded},
 		{"rewarded", "INITIAL_PURCHASE", t0.Add(time.Hour), outRecorded},
 		{"redeemed", "RENEWAL", t0.Add(time.Hour), outRecorded},
