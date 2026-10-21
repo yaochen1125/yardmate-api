@@ -14,8 +14,8 @@ import (
 
 // The plpgsql side (migrations 013 + 014) against a real Postgres: the issue
 // margin, the expires_at order, re-claim keeping / replacing the issued code
-// (swap grace, old code kept when the pool has no replacement, claimed_at
-// refreshed on a swap), pool_empty rolling the referral back, and PoolStatus
+// (swap grace, old code kept when the pool has no replacement, reissued_at
+// stamped and claimed_at kept on a swap), pool_empty rolling the referral back, and PoolStatus
 // grouping. Needs a scratch database:
 //
 //	REFERRAL_PG_TEST_URL=postgres://postgres:postgres@localhost:5432/scratch go test ./referral/ -run PG -v
@@ -118,6 +118,14 @@ func pgReferral(t *testing.T, pool *pgxpool.Pool, ctx context.Context, referee s
 	return offer, claimedAt
 }
 
+func pgReissued(t *testing.T, pool *pgxpool.Pool, ctx context.Context, referee string) (reissuedAt *time.Time) {
+	t.Helper()
+	if err := pool.QueryRow(ctx, `select reissued_at from referrals where referee = $1`, referee).Scan(&reissuedAt); err != nil {
+		t.Fatalf("reissued_at of %s: %v", referee, err)
+	}
+	return reissuedAt
+}
+
 func pgInviteCode(t *testing.T, st *PGStore, ctx context.Context, user string) string {
 	t.Helper()
 	me, err := st.Me(ctx, user)
@@ -200,7 +208,9 @@ func TestPGReclaimSwapsOnlyInsideTheSwapGrace(t *testing.T) {
 		t.Errorf("D90 state = %s, want free (not burnt)", s)
 	}
 	// 2 days left: inside the swap grace → fresh code, old one retired,
-	// referral re-pointed and claimed_at refreshed.
+	// referral re-pointed, reissued_at stamped. claimed_at stays the first
+	// claim: settlement compares the RC subscription start against it, and B
+	// may have redeemed the old code just before re-claiming.
 	pgExpiresIn(t, pool, ctx, "D20", 2*day)
 	if offer, err := st.Claim(ctx, userB, codeA); err != nil || offer != "D90" {
 		t.Fatalf("re-claim at 2 days = %q, %v; want a fresh D90", offer, err)
@@ -208,8 +218,11 @@ func TestPGReclaimSwapsOnlyInsideTheSwapGrace(t *testing.T) {
 	if s := pgState(t, pool, ctx, "D20"); s != "expired" {
 		t.Errorf("D20 state = %s, want expired", s)
 	}
-	if offer, claimed1 := pgReferral(t, pool, ctx, userB); offer != "D90" || !claimed1.After(claimed0) {
-		t.Errorf("referral = %s claimed_at %v (was %v); want D90 and a later claimed_at", offer, claimed1, claimed0)
+	if offer, claimed1 := pgReferral(t, pool, ctx, userB); offer != "D90" || !claimed1.Equal(claimed0) {
+		t.Errorf("referral = %s claimed_at %v (was %v); want D90 and claimed_at unchanged", offer, claimed1, claimed0)
+	}
+	if r := pgReissued(t, pool, ctx, userB); r == nil || r.Before(claimed0) {
+		t.Errorf("reissued_at = %v; want stamped at the swap", r)
 	}
 	// A redeemed code is always the answer, however close its date.
 	if _, err := pool.Exec(ctx, `update code_pool set state = 'redeemed' where code = 'D90'`); err != nil {
@@ -242,6 +255,9 @@ func TestPGReclaimKeepsTheOldCodeWhenThereIsNoReplacement(t *testing.T) {
 	if _, claimed1 := pgReferral(t, pool, ctx, userB); !claimed1.Equal(claimed0) {
 		t.Errorf("claimed_at moved (%v → %v) without a swap", claimed0, claimed1)
 	}
+	if r := pgReissued(t, pool, ctx, userB); r != nil {
+		t.Errorf("reissued_at = %v without a swap, want null", r)
+	}
 	// Old code dead and still nothing to swap to: now it is pool_empty, and
 	// the existing referral stays (only the first claim's insert rolls back).
 	pgExpiresIn(t, pool, ctx, "ONLY", -time.Hour)
@@ -259,6 +275,46 @@ func TestPGReclaimKeepsTheOldCodeWhenThereIsNoReplacement(t *testing.T) {
 	}
 	if s := pgState(t, pool, ctx, "ONLY"); s != "expired" {
 		t.Errorf("ONLY state = %s, want expired after the swap", s)
+	}
+}
+
+func TestPGListClaimedWindowFollowsTheLatestIssue(t *testing.T) {
+	st, pool, ctx := pgTest(t)
+	codeA := pgInviteCode(t, st, ctx, userA)
+	pgSeed(t, pool, ctx, "b90", 90*day, "D90")
+	if _, err := st.Claim(ctx, userB, codeA); err != nil {
+		t.Fatal(err)
+	}
+	listed := func() (Referral, bool) {
+		t.Helper()
+		refs, err := st.ListClaimed(ctx, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range refs {
+			if r.Referee == userB {
+				return r, true
+			}
+		}
+		return Referral{}, false
+	}
+	// First claim long ago, never swapped: out of the polling window.
+	if _, err := pool.Exec(ctx, `update referrals set claimed_at = now() - interval '300 days' where referee = $1`, userB); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := listed(); ok {
+		t.Fatal("a 300-day-old claim is still polled")
+	}
+	// Swapped 10 days ago: back in the window, eligibility still from the first claim.
+	if _, err := pool.Exec(ctx, `update referrals set reissued_at = now() - interval '10 days' where referee = $1`, userB); err != nil {
+		t.Fatal(err)
+	}
+	r, ok := listed()
+	if !ok {
+		t.Fatal("a claim reissued 10 days ago is not polled")
+	}
+	if age := time.Since(r.ClaimedAt); age < 299*day {
+		t.Errorf("ClaimedAt is %v old, want the first claim (~300 days)", age)
 	}
 }
 

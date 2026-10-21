@@ -179,10 +179,13 @@ func scanReferrals(rows pgx.Rows) ([]Referral, error) {
 
 func (p *PGStore) ListClaimed(ctx context.Context, limit int) ([]Referral, error) {
 	// Stop polling RevenueCat for claims old enough that the issued code has
-	// long expired (6 months) — they stay 'claimed' and cost nothing.
+	// long expired (6 months) — they stay 'claimed' and cost nothing. A
+	// re-claim that swapped the code restarts the window (reissued_at, 014);
+	// claimed_at itself stays the first claim, which is what StartedAfter
+	// compares against.
 	rows, err := p.pool.Query(ctx,
 		`select `+referralColumns+` from referrals
-		  where state = 'claimed' and claimed_at > now() - interval '200 days'
+		  where state = 'claimed' and coalesce(reissued_at, claimed_at) > now() - interval '200 days'
 		  order by redeem_reported_at desc nulls last, claimed_at
 		  limit $1`, limit)
 	if err != nil {

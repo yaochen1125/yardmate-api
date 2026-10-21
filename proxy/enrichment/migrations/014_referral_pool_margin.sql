@@ -10,7 +10,9 @@
 --     都会被再 claim 系统性换掉、白烧第二张好码；
 --   * 要换码时**先选替换码再划老码**：池子里没有留够余量的替换码、老码在苹果那边还能用
 --     （expires_at > now()）→ 原样回老码；老码也不能用了才 pool_empty；
---   * 换码时刷新 referrals.claimed_at，不然很晚才兑的会掉出结算 ListClaimed 的 200 天窗口；
+--   * 换码时记 referrals.reissued_at（新列），结算 ListClaimed 的 200 天窗口按它算，不然很晚
+--     才兑的会掉出去；claimed_at 不动——结算认「订阅起始晚于第一次填码」，B 可能换码前刚用
+--     老码兑了、RC 还没反映，刷了 claimed_at 那笔就永远对不上（Codex P2）；
 --   * pool_empty 的口径改成「没有留够余量的 free 码（且老码也不能用）」——余量期内的 free 码
 --     不发、也不改状态，等结算循环的 ExpireCodes 到期划 expired。
 -- 四个阈值放 referral_settings，改库即生效、不用发版（referral/settle.go 每轮读）。
@@ -29,6 +31,11 @@ alter table referral_settings
         check (low_stock_threshold >= 0),    -- 可发（free 且余量够）少于这个数 → 告警
     add column if not exists expiry_warn_days    int not null default 30
         check (expiry_warn_days >= 0);       -- 最早一批可发码在这么多天内到期、且到期后可发数会低于阈值 → 告警
+
+-- 最近一次换码的时间：只用来延长结算 ListClaimed 的轮询窗口（coalesce(reissued_at, claimed_at)），
+-- 没换过 = null。claimed_at 永远是第一次填码。
+alter table referrals
+    add column if not exists reissued_at timestamptz;
 
 -- ---------------------------------------------------------------- POST /v1/referral/claim
 
@@ -111,7 +118,8 @@ begin
     end if;
 
     -- 换码：老码划 expired（苹果那边它可能还活几天，但我们不再认它），
-    -- claimed_at 刷到现在——结算的 ListClaimed 只看 200 天内的、订阅起始也要晚于它。
+    -- reissued_at 记到现在——结算的 ListClaimed 按它延长 200 天窗口。claimed_at 不动：
+    -- 订阅起始要和第一次填码比，B 可能换码前刚用老码兑了、RC 还没反映（Codex P2）。
     if v_ref.offer_code is not null and v_state = 'issued' then
         update code_pool set state = 'expired' where code = v_ref.offer_code;
     end if;
@@ -119,7 +127,10 @@ begin
     update code_pool
        set state = 'issued', issued_to = p_user, issued_at = now(), referral_id = v_ref.id
      where code = v_offer;
-    update referrals set offer_code = v_offer, claimed_at = now() where id = v_ref.id;
+    update referrals
+       set offer_code  = v_offer,
+           reissued_at = case when v_ref.offer_code is not null then now() else reissued_at end
+     where id = v_ref.id;
 
     return json_build_object('offer_code', v_offer);
 end;

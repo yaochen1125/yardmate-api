@@ -37,19 +37,25 @@ with s as (select issue_margin_days, low_stock_threshold, expiry_warn_days from 
      a as (select count(*) filter (where usable)                          as usable,
                   count(*) filter (where not usable)                      as free_but_short,
                   min(expires_at) filter (where usable)                   as earliest
-             from c)
+             from c),
+     -- 投影：最早那批（同一到期日的都算）死后还剩多少可发——低于阈值才报 expiring，
+     -- 后面有新批顶着就不报；阈值 0 = 两种告警都关（同 TakeStock）。
+     p as (select count(*) filter (where c.usable and c.expires_at > a.earliest) as after_earliest
+             from c, a)
 select s.issue_margin_days                                   as margin_days,
        s.low_stock_threshold                                 as low_stock_threshold,
        s.expiry_warn_days                                    as expiry_warn_days,
        a.usable,
        a.free_but_short,
        to_char(a.earliest at time zone 'UTC', 'YYYY-MM-DD')  as earliest_usable_expiry,
+       p.after_earliest                                      as usable_after_earliest,
        coalesce(nullif(concat_ws('+',
            case when a.usable < s.low_stock_threshold then 'low_stock' end,
            case when a.earliest is not null and s.expiry_warn_days > 0
-                 and a.earliest <= now() + make_interval(days => s.expiry_warn_days) then 'expiring' end), ''), 'ok')
+                 and a.earliest <= now() + make_interval(days => s.expiry_warn_days)
+                 and p.after_earliest < s.low_stock_threshold then 'expiring' end), ''), 'ok')
                                                              as alert
-  from s, a;
+  from s, a, p;
 SQL
 
 if [[ "${1:-}" == "--sql" ]]; then

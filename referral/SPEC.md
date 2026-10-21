@@ -92,13 +92,14 @@ RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidStr
 - 同一人同一码再 claim → 拿回同一张；已 redeemed 永远原样回；issued 且 `expires_at > now + swap_grace_days`
   （默认 3 天）也原样回。换码阈值故意**小于**发码余量：等于的话每张快到余量线的码都会被再 claim 换掉、白烧第二张。
 - 要换（老码过期 / 不足宽限 / 状态不对 / 行没了）时**先选替换码再动老码**（老码行 `for update` 锁住）：
-  选到 → 老码划 expired、`referrals.offer_code` 换新、`claimed_at = now()`（不然很晚才兑的会掉出 `ListClaimed`
-  的 200 天窗口）；选不到且老码在苹果那边还能用（issued 且 `expires_at > now()`）→ 原样回老码；老码也不能用了才
+  选到 → 老码划 expired、`referrals.offer_code` 换新、`reissued_at = now()`（`ListClaimed` 的 200 天窗口按
+  `coalesce(reissued_at, claimed_at)` 算，不然很晚才兑的会掉出去）；`claimed_at` 不动——结算 ① 认「订阅起始晚于第一次填码」，
+  B 可能换码前刚用老码兑了、RC 还没反映，刷了它那笔就永远对不上（Codex P2）；选不到且老码在苹果那边还能用（issued 且 `expires_at > now()`）→ 原样回老码；老码也不能用了才
   `pool_empty`（首次 claim 的 raise 会回滚刚插的 referral，再 claim 的不动已有行）。
 - 发码余量：`referral_claim` 只在 `state = 'free' and expires_at > now + issue_margin_days` 里按 `expires_at`
   升序取（先用快过期的，但保证 B 有 ≥ 余量天数去兑）。余量期内 / 已过期的 free 码不发也不改状态
   （claim 不再全表划 expired，那是并发争用点），等结算的 `ExpireCodes` 到期划；巡检把余量期内的单独计作「余量不足」。
-- `/redeemed` 重复调无副作用；`ListClaimed` 只看 200 天内的（码最长 6 个月）。
+- `/redeemed` 重复调无副作用；`ListClaimed` 只看最近一次发码（`coalesce(reissued_at, claimed_at)`）200 天内的（码最长 6 个月）。
 - 赠送先 RC 后账本；账本写失败会大声记日志，下一轮**再赠一次**（宁多发不少发）。
 - `end_time_ms` 与现有赠送到期相差 < 2h 会被 RC 当重复忽略；我们每次至少 +30d。
 
@@ -165,9 +166,9 @@ RevenueCat 对象解码与五个判断（订阅史 / 填码后开始 / 退款 / 
 发信失败计错下轮重试 / 库读失败不挡结算 / 没配邮件只打日志 / 设置问题只打一次、修好后清 / 邮件正文含各批、到期日、补货命令。
 SQL 函数（013 + 014）：`pgstore_pg_test.go` 要一个空库（`REFERRAL_PG_TEST_URL=postgres://… go test ./referral/ -run PG`，
 在临时 schema 里跑完就删，没设就 skip；每批码同一个时间戳插入，和 import-codes.sh 口径一致）：
-余量过滤 / 升序 + claim 不划过期码 / 重领：3 天宽限外原样回 → 宽限内换新 + 老码 expired + `claimed_at` 刷新 → 已兑换永远原样回 /
+余量过滤 / 升序 + claim 不划过期码 / 重领：3 天宽限外原样回 → 宽限内换新 + 老码 expired + `reissued_at` 记上、`claimed_at` 不动 → 已兑换永远原样回 /
 没替换码时老码还能用就回老码（不动任何行）→ 老码也死了才 pool_empty 且已有 referral 不动 → 补货后换 /
-首次 claim 只剩余量不足的码 = pool_empty 且 referral 回滚 / PoolStatus 按批分组 + 四列默认值。
+`ListClaimed` 窗口跟最近一次发码、`ClaimedAt` 仍是第一次填码 / 首次 claim 只剩余量不足的码 = pool_empty 且 referral 回滚 / PoolStatus 按批分组 + 四列默认值。
 013 的函数此前在 staging 用临时 id 实跑过（own_code / unknown_code / 领码 / 重领同一张 / pool_empty / already_claimed）；
 **014 还没在 staging 跑过**，上线前先 staging 跑迁移 + `deploy/referral-smoke.sh`。
 
@@ -178,6 +179,5 @@ SQL 函数（013 + 014）：`pgstore_pg_test.go` 要一个空库（`REFERRAL_PG_
 - RevenueCat 对一个 customer 多次 `end_time_ms` 赠送是「替换到期日」还是「叠加」—— 文档只说 2h 内算重复；
   我们按「替换为更晚的到期日」理解，并把 RC 现有到期日也算进基准。prod 第一笔赠送后看一眼 customer 页核实。
 - 再 claim 换码（老码不足 3 天宽限）时：如果 B 其实已经在苹果那边用旧码兑了、结算还没跑到（≤ 10 分钟）、
-  App 也没报 `/redeemed`，旧码在库里被划 expired、新码白发一张，而且 `claimed_at` 刷新后订阅起始早于它，
-  结算 ① 永远对不上 → 这条 referral 停在 claimed、A 拿不到奖励。窗口极窄（老码只剩 ≤ 3 天 × 10 分钟内），
-  先记着；真出现就手工把 `claimed_at` 改回去。
+  App 也没报 `/redeemed`，旧码在库里被划 expired、新码白发一张（结算 ① 照样按第一次填码对上 RC 订阅，A 的奖励不受影响；
+  `MarkRedeemed` 会把新码记成 redeemed，库存账少一张）。窗口极窄（老码只剩 ≤ 3 天 × 结算 10 分钟内），先记着。
