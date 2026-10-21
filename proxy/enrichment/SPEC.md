@@ -43,6 +43,8 @@
 Field validation:
 
 - `scientificName` — required, trimmed length **1–200** chars, must contain at least one letter (not all whitespace / digits / punctuation). Server normalizes via `proxy.normalizeScientificName` before lookup or DB write.
+- `scientificName` must **not be a catalog id** — three ASCII letters + ≥4 digits, case-insensitive (`AAA1758`, `proxy.LooksLikeCatalogPlantID`). Refused with `404 catalog_id_not_scientific_name` before cache / catalog / Supabase / LLM, so nothing is generated or written to `plants_pending` (2026-10-21: an app whose local index lagged a fresh promotion sent `AAA1758`; the model wrote 10 languages of "Unknown Plant"). Logged as `enrichment catalog-id rejected: deviceID=… appVer=… sciName=…`.
+- **Placeholder epithets resolve to a genus entry.** `"Calathea species"` / `"Rosa sp."` / `"Salvia spp"` / `"X ssp."` hit the catalog's genus-level row for that genus (`LookupPlantID` tier 3 — see the proxy SPEC §2.1 `plant_id` mapping). With no genus row they miss as before and go through Supabase / LLM under their own (unchanged) PK.
 - `commonName` — optional. Length ≤ 200; longer values are ignored (no 4xx). Used as LLM-prompt context only; not stored as a separate column (already inside generated `data.common_name`).
 - `plantId` — optional, **not trusted**. Server re-derives via `ContentIndex.LookupPlantID(scientificName)`. The field exists for future use (e.g. the client wants to assert a specific id); V1 ignores it.
 - `lang` — optional. Normalized to the nearest supported code — the 11 iOS `Localizable.xcstrings` languages: `en`, `de`, `es`, `fr`, `it`, `ja`, `ko`, `pt`, `vi`, `zh-Hans`, `zh-Hant`. Region subtags drop for single-variant languages (`pt-BR`→`pt`, `en-US`→`en`); **Chinese script is preserved** (`zh-Hans`/`zh-CN`→`zh-Hans`; `zh-Hant`/`zh-TW`/`zh-HK`→`zh-Hant`; bare `zh`→`zh-Hans`). Absent / empty / unsupported → `en`. Used as the second component of the composite key `(scientific_name_normalized, lang)` for both the LRU and Supabase (§7 multi-language).
@@ -213,6 +215,7 @@ All errors return `{ "error": "<machine_code>" }`. Code is stable for client bra
 | `bad_json` | 400 | malformed request body | bug fix client |
 | `missing_scientific_name` | 400 | `scientificName` empty / whitespace / no letters | bug fix client |
 | `scientific_name_too_long` | 400 | > 200 chars after trim | bug fix client |
+| `catalog_id_not_scientific_name` | 404 | `scientificName` is a catalog id (`AAA1758`), not a name; nothing generated | client bug (stale local index): resolve the id locally. iOS: warmer drops it silently; detail page shows "Tap Try again" |
 | `missing_device_id` | 400 | `X-Device-Install-Id` absent or not a UUID | bug fix client |
 | `missing_app_version` | 400 | `X-App-Version` absent | bug fix client |
 | `rate_limit_ip` | 429 | per-IP bucket exhausted; `Retry-After` set | back off + UX message |
