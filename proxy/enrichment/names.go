@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"golang.org/x/sync/singleflight"
@@ -207,18 +208,25 @@ func (r *NameResolver) lookup(ctx context.Context, sciName, lang string) Resolut
 		return ch
 	}
 	inatCh, wdCh := ask(r.inat), ask(r.wikidata)
-	in, wd := <-inatCh, <-wdCh
 
 	answered := func(a sourceAnswer) bool { return a.err == nil || errors.Is(a.err, errNameNoMatch) }
 	valid := func(n string) bool { return n != "" && !strings.EqualFold(n, sciName) }
 
+	in := <-inatCh
 	out := Resolution{INatAnswered: r.inat != nil && answered(in)}
 	if out.INatAnswered {
 		out.Kingdom = proxy.NormalizeKingdom(in.kingdom)
 	}
-	switch {
-	case valid(in.local):
+	// iNat's localized name is the top-priority answer and iNat is the only
+	// kingdom source, so once it has one nothing Wikidata says can change the
+	// result — don't wait for a slow Wikidata (its request is cancelled when the
+	// caller's deferred cancel fires; the buffered channel never blocks).
+	if valid(in.local) {
 		out.Name, out.OK = ResolvedName{in.local, NameSourceINat}, true
+		return out
+	}
+	wd := <-wdCh
+	switch {
 	case valid(wd.local):
 		out.Name, out.OK = ResolvedName{wd.local, NameSourceWikidata}, true
 	case !answered(in) || !answered(wd):
@@ -287,6 +295,10 @@ func (c *WikidataClient) CommonNames(ctx context.Context, sciName, lang string) 
 	if c == nil || c.HTTP == nil {
 		return "", "", errors.New("wikidata: client not configured")
 	}
+	// P225 is an exact, case-sensitive literal: query the canonical spelling so
+	// "trifolium  hirtum" still finds "Trifolium hirtum" (the resolver caches
+	// under a normalized key, so a spelling-only miss would stick for 24 h).
+	sciName = canonicalSciName(sciName)
 	tags := append(wikidataLangs(lang), "en")
 	quoted := make([]string, len(tags))
 	for i, t := range tags {
@@ -368,6 +380,45 @@ func (c *WikidataClient) CommonNames(ctx context.Context, sciName, lang string) 
 		return ""
 	}
 	return pick(wikidataLangs(lang)), pick([]string{"en"}), nil
+}
+
+// canonicalSciName rewrites a scientific name into the conventional spelling
+// taxon databases store: single spaces, genus capitalized ("×" hybrid marker
+// kept), every other token lowercase (epithets and rank markers) — except a
+// quoted cultivar name, which is kept as written ("Rosa 'Knock Out'").
+func canonicalSciName(s string) string {
+	closes := func(t string) bool { return strings.HasSuffix(t, "'") || strings.HasSuffix(t, "’") }
+	fields := strings.Fields(s)
+	inQuote := false
+	for i, f := range fields {
+		if inQuote { // inside a cultivar name: keep, until the closing quote
+			inQuote = !closes(f)
+			continue
+		}
+		if rest := strings.TrimLeft(f, "'‘"); rest != f { // opening quote ('Peace' closes at once)
+			inQuote = !closes(rest)
+			continue
+		}
+		if i == 0 {
+			fields[i] = capitalizeGenus(f)
+		} else {
+			fields[i] = strings.ToLower(f)
+		}
+	}
+	return strings.Join(fields, " ")
+}
+
+// capitalizeGenus upper-cases the first letter of a genus token (after an
+// optional "×" hybrid marker) and lower-cases the rest.
+func capitalizeGenus(g string) string {
+	r := []rune(strings.ToLower(g))
+	for i, c := range r {
+		if c != '×' {
+			r[i] = unicode.ToUpper(c)
+			break
+		}
+	}
+	return string(r)
 }
 
 // sparqlString renders s as a SPARQL string literal.

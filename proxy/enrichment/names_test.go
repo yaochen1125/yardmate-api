@@ -166,6 +166,55 @@ func TestNameResolverTimeout(t *testing.T) {
 	}
 }
 
+// iNat's localized name wins outright: a slow Wikidata is not waited for.
+func TestNameResolverReturnsOnINatLocalWithoutWaitingForWikidata(t *testing.T) {
+	hang := func(ctx context.Context, _, _ string) sourceAnswer {
+		<-ctx.Done()
+		return sourceAnswer{err: ctx.Err()}
+	}
+	inat := func(context.Context, string, string) sourceAnswer {
+		return sourceAnswer{local: "Sumpf-Porst", kingdom: "Plantae"}
+	}
+	r := newTestResolver(inat, hang)
+	r.timeout = 2 * time.Second
+	start := time.Now()
+	res := r.Resolve(context.Background(), "Rhododendron tomentosum", "de")
+	if el := time.Since(start); el > 500*time.Millisecond {
+		t.Errorf("Resolve took %v, want an immediate return on iNat's localized name", el)
+	}
+	if !res.OK || res.Name != (ResolvedName{"Sumpf-Porst", NameSourceINat}) || kStr(res.Kingdom) != "Plantae" || !res.INatAnswered {
+		t.Errorf("got %+v, want the iNat name + kingdom", res)
+	}
+}
+
+// P225 is matched exactly, so the query uses the canonical spelling.
+func TestCanonicalSciName(t *testing.T) {
+	cases := map[string]string{
+		"trifolium   HIRTUM":              "Trifolium hirtum",
+		"Brassica oleracea VAR. Capitata": "Brassica oleracea var. capitata",
+		"rosa 'Knock Out'":                "Rosa 'Knock Out'",
+		"rosa 'Peace' X":                  "Rosa 'Peace' x",
+		"×graptoveria 'Fred Ives'":        "×Graptoveria 'Fred Ives'",
+		"  Echinops bannaticus ":          "Echinops bannaticus",
+	}
+	for in, want := range cases {
+		if got := canonicalSciName(in); got != want {
+			t.Errorf("canonicalSciName(%q) = %q, want %q", in, got, want)
+		}
+	}
+	var gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query().Get("query")
+		_, _ = w.Write([]byte(`{"results":{"bindings":[]}}`))
+	}))
+	defer srv.Close()
+	wd := &WikidataClient{HTTP: srv.Client(), Endpoint: srv.URL}
+	_, _, _ = wd.CommonNames(context.Background(), "trifolium  hirtum", "de")
+	if !strings.Contains(gotQuery, `wdt:P225 "Trifolium hirtum"`) {
+		t.Errorf("SPARQL query does not use the canonical name:\n%s", gotQuery)
+	}
+}
+
 // The iNat answer's kingdom rides on the name resolution; an iNat that could
 // not be asked reports INatAnswered=false and no kingdom, a definitive miss
 // reports INatAnswered=true.
