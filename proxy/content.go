@@ -977,3 +977,47 @@ func isSpeciesEpithet(t string) bool {
 	}
 	return true
 }
+
+// genusOnlyName returns the bare genus for a genus-level name — "Begonia",
+// "Begonia sp.", "Begonia spp." (only the "sp"/"spp" markers may follow) —
+// and "" for anything else. Used by HandleIdentify's final guard to keep a
+// genus answer instead of dropping it to the Unknown sentinel (genus detail
+// pages load: catalog genus entries + out-of-catalog genus enrichment).
+//
+// The genus token must look like a Latin genus (Capitalised, letters only,
+// ≥3 letters). Family / order / tribe / subtribe names (-aceae, -ales, -eae,
+// -inae, -idae, -oideae, -phyta, -opsida) and the eight conserved family names
+// are rejected — enriching "Asteraceae" as if it were a plant would be wrong —
+// as are the generic words a vision model may emit instead of a taxon.
+func genusOnlyName(sci string) string {
+	fields := strings.Fields(strings.TrimSpace(sci))
+	if len(fields) == 0 {
+		return ""
+	}
+	for _, t := range fields[1:] {
+		switch strings.ToLower(strings.TrimSuffix(t, ".")) {
+		case "sp", "spp":
+		default:
+			return ""
+		}
+	}
+	g := fields[0]
+	if len(g) < 3 || g[0] < 'A' || g[0] > 'Z' || !isLowerLatin(g[1:]) {
+		return ""
+	}
+	lower := strings.ToLower(g)
+	for _, suf := range []string{"aceae", "ales", "eae", "inae", "idae", "oideae", "phyta", "opsida"} {
+		if strings.HasSuffix(lower, suf) {
+			return ""
+		}
+	}
+	switch lower {
+	case "compositae", "gramineae", "leguminosae", "palmae", "umbelliferae",
+		"labiatae", "cruciferae", "guttiferae",
+		"unknown", "plant", "plants", "none", "tree", "shrub", "flower", "grass",
+		"fern", "moss", "succulent", "cactus", "weed", "herb", "vine", "fungus",
+		"mushroom", "lichen", "algae", "seaweed":
+		return ""
+	}
+	return g
+}

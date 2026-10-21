@@ -1317,14 +1317,42 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     usable scientific name, iOS would store a dead Recent-snaps record
 		//     whose detail can never load — fall back to the Unknown sentinel,
 		//     which iOS refuses to record. Skipped when already the sentinel.
+		//
+		//     Genus-level exception (2026-10-21): a genus-only top ("Begonia spp." /
+		//     "Begonia sp." / "Begonia") is KEPT as the bare genus. Genus detail
+		//     pages load now — the catalog carries genus entries (Rosa, Forsythia…,
+		//     resolved here to their plant_id) and enrichment generates out-of-
+		//     catalog genus pages (search already serves them) — so dropping it only
+		//     turned a correct genus answer into "can't identify" (prod: Verbena,
+		//     Potamogeton sp., Begonia spp.; the Begonia one cost a paying user).
 		if !unknownSentinel && len(result.Suggestions) > 0 {
 			s0 := result.Suggestions[0]
 			noPID := s0.PlantID == nil || strings.TrimSpace(*s0.PlantID) == ""
 			if noPID && !hasUsableScientificName(s0.ScientificName) {
-				log.Printf("identify nameless-guard: deviceID=%s engine=%s sci=%q dropped→unknown-sentinel", deviceID, engine, s0.ScientificName)
-				result = unknownSentinelResult()
-				unknownSentinel = true
-				engine += "-nameless-guard"
+				if g := genusOnlyName(s0.ScientificName); g != "" {
+					orig := s0.ScientificName
+					s0.ScientificName = g
+					if strings.TrimSpace(s0.Name) == "" || strings.EqualFold(strings.TrimSpace(s0.Name), strings.TrimSpace(orig)) {
+						s0.Name = g
+					}
+					if content != nil {
+						if pid, ok := content.LookupPlantID(g); ok {
+							p := pid
+							s0.PlantID = &p
+							if cn, ok := content.LookupCommonName(pid); ok {
+								s0.Name = cn
+							}
+						}
+					}
+					result.Suggestions[0] = s0
+					log.Printf("identify genus-keep: deviceID=%s engine=%s sci=%q→%q catalog=%v", deviceID, engine, orig, g, s0.PlantID != nil)
+					engine += "-genus"
+				} else {
+					log.Printf("identify nameless-guard: deviceID=%s engine=%s sci=%q dropped→unknown-sentinel", deviceID, engine, s0.ScientificName)
+					result = unknownSentinelResult()
+					unknownSentinel = true
+					engine += "-nameless-guard"
+				}
 			}
 		}
 

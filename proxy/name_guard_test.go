@@ -121,30 +121,141 @@ func TestPlantIDToIdentifyResult_DropsNamelessAndGenusOnly(t *testing.T) {
 	}
 }
 
-// TestHandleIdentify_NamelessGuard_GenusOnlyVision_Sentinel exercises the final
-// 7d guard: engine returns zero candidates and AI vision recovers only a
-// GENUS-ONLY guess ("Bellis"). Without the guard this would surface as an
-// ai-raw-oob suggestion the client stores as a dead record; the guard converts
-// it to the Unknown sentinel, which iOS refuses to record.
-func TestHandleIdentify_NamelessGuard_GenusOnlyVision_Sentinel(t *testing.T) {
+// genusGuardHandler — PlantNet valid no-match (zero candidates) + AI vision
+// answering sci, so the 7d final guard sees the AI guess as Suggestions[0].
+// extraIndex (optional) is appended to the embedded plants_index so a test can
+// add a catalog GENUS entry (the embed snapshot predates genus promotion).
+func genusGuardHandler(t *testing.T, sci string, extraIndex []map[string]string) (http.Handler, func()) {
+	t.Helper()
 	vsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Bellis\",\"common_names\":[\"Daisy\"],\"confidence\":0.4}"}}]}`)
+		inner, _ := json.Marshal(map[string]any{"is_plant": true, "scientific_name": sci, "common_names": []string{"Daisy"}, "confidence": 0.4})
+		outer, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": string(inner)}}}})
+		_, _ = w.Write(outer)
 	}))
-	defer vsrv.Close()
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
+	pnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound) // PlantNet valid no-match (zero)
+		_, _ = io.WriteString(w, cannedPlantNetNoMatch)
+	}))
+	pn := &PlantNetClient{APIKey: "test-key", Endpoint: pnSrv.URL, Lang: "en", NbResults: 10, HTTP: pnSrv.Client()}
+	content, err := LoadContent()
+	if err != nil {
+		t.Fatalf("LoadContent: %v", err)
+	}
+	if len(extraIndex) > 0 {
+		var rows []map[string]any
+		if err := json.Unmarshal(plantsIndexRaw, &rows); err != nil {
+			t.Fatalf("unmarshal embedded index: %v", err)
+		}
+		for _, e := range extraIndex {
+			rows = append(rows, map[string]any{"id": e["id"], "scientific_name": e["scientific_name"], "common_name": e["common_name"]})
+		}
+		raw, _ := json.Marshal(rows)
+		if _, err := content.ReloadCatalogNames(raw, "test"); err != nil {
+			t.Fatalf("ReloadCatalogNames: %v", err)
+		}
+	}
+	h := HandleIdentify(pn, nil, content, vision, nil, nil, false, false, false, false, false, false, false, PlantIDFallbackAlways, nil, nil)
+	return h, func() { pnSrv.Close(); vsrv.Close() }
+}
 
-	h, cleanup := newCascadeHandlerWithVision(t,
-		func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusNotFound) // PlantNet valid no-match (zero)
-			_, _ = io.WriteString(w, cannedPlantNetNoMatch)
-		}, nil, vision)
-	defer cleanup()
-
-	rec := doCascadeReq(t, h)
+func decodeIdentify(t *testing.T, rec *httptest.ResponseRecorder) IdentifyResult {
+	t.Helper()
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
 	}
-	assertUnknownSentinel(t, rec.Body.Bytes())
+	var got IdentifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return got
+}
+
+// TestHandleIdentify_NamelessGuard_GenusOnlyVision_KeptAsGenus — the 7d guard
+// used to drop a GENUS-ONLY AI guess to the Unknown sentinel (genus detail pages
+// could not load, 2026-07). Genus pages load now (catalog genus entries + out-
+// of-catalog genus enrichment), so a genus answer is kept as the bare genus
+// (2026-10-21: "Begonia spp." → "can't identify" cost a paying user).
+func TestHandleIdentify_NamelessGuard_GenusOnlyVision_KeptAsGenus(t *testing.T) {
+	for _, sci := range []string{"Bellis", "Bellis sp.", "Bellis spp."} {
+		t.Run(sci, func(t *testing.T) {
+			h, cleanup := genusGuardHandler(t, sci, nil)
+			defer cleanup()
+			got := decodeIdentify(t, doCascadeReq(t, h))
+			if len(got.Suggestions) != 1 {
+				t.Fatalf("Suggestions = %+v, want 1 genus suggestion", got.Suggestions)
+			}
+			s0 := got.Suggestions[0]
+			if s0.ScientificName != "Bellis" {
+				t.Errorf("scientific_name = %q, want bare genus %q", s0.ScientificName, "Bellis")
+			}
+			if s0.PlantID != nil {
+				t.Errorf("plant_id = %q, want nil (no catalog genus entry → out-of-catalog enrichment)", *s0.PlantID)
+			}
+			if !got.IsPlant {
+				t.Error("IsPlant = false, want true (not the Unknown sentinel)")
+			}
+		})
+	}
+}
+
+// A genus that IS a catalog entry resolves to its plant_id + curated name.
+func TestHandleIdentify_NamelessGuard_GenusOnlyVision_CatalogGenusEntry(t *testing.T) {
+	h, cleanup := genusGuardHandler(t, "Bellis spp.", []map[string]string{
+		{"id": "AAA9999", "scientific_name": "Bellis", "common_name": "Daisies"},
+	})
+	defer cleanup()
+	got := decodeIdentify(t, doCascadeReq(t, h))
+	if len(got.Suggestions) != 1 {
+		t.Fatalf("Suggestions = %+v, want 1", got.Suggestions)
+	}
+	s0 := got.Suggestions[0]
+	if s0.PlantID == nil || *s0.PlantID != "AAA9999" {
+		t.Fatalf("plant_id = %v, want AAA9999 (catalog genus entry)", s0.PlantID)
+	}
+	if s0.ScientificName != "Bellis" || s0.Name != "Daisies" {
+		t.Errorf("sci/name = %q/%q, want Bellis/Daisies", s0.ScientificName, s0.Name)
+	}
+}
+
+// Blank names, family names and generic words are still not enrichable plants →
+// Unknown sentinel, exactly as before.
+func TestHandleIdentify_NamelessGuard_NonGenusVision_Sentinel(t *testing.T) {
+	for _, sci := range []string{"", "   ", "Asteraceae", "Compositae", "Unknown", "Succulent"} {
+		t.Run(sci, func(t *testing.T) {
+			h, cleanup := genusGuardHandler(t, sci, nil)
+			defer cleanup()
+			rec := doCascadeReq(t, h)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+			}
+			assertUnknownSentinel(t, rec.Body.Bytes())
+		})
+	}
+}
+
+func TestGenusOnlyName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"Begonia", "Begonia"},
+		{"Begonia spp.", "Begonia"},
+		{"Begonia sp.", "Begonia"},
+		{"  Potamogeton   sp. ", "Potamogeton"},
+		{"Begonia rex", ""},  // a binomial is not genus-only
+		{"begonia", ""},      // not Capitalised
+		{"Rosa 'Peace'", ""}, // cultivar — handled as usable elsewhere
+		{"Asteraceae", ""},   // family
+		{"Lamiales", ""},     // order
+		{"Gramineae", ""},    // conserved family name
+		{"Unknown", ""},      // generic word
+		{"Ab", ""},           // too short
+		{"Begonia cf.", ""},  // only sp/spp may follow
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := genusOnlyName(c.in); got != c.want {
+			t.Errorf("genusOnlyName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
 }
 
 func scientificNames(s []Suggestion) []string {
