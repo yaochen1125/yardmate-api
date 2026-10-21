@@ -378,8 +378,10 @@ func TestPGVelocityWindowAndOff(t *testing.T) {
 	if h, err := st.MarkQualified(ctx, ids[0]); err != nil || h {
 		t.Fatalf("first: %v %v", h, err)
 	}
-	// The first success is 25 hours old: outside the window.
-	if _, err := pool.Exec(ctx, `update referrals set qualified_at = now() - interval '25 hours' where id = $1`, ids[0]); err != nil {
+	// The first success's theoretical time (redeemed_at + hold_days, 017) is
+	// 25 hours before the second's: outside the window — however close
+	// together the two are actually judged.
+	if _, err := pool.Exec(ctx, `update referrals set redeemed_at = redeemed_at - interval '25 hours' where id = $1`, ids[0]); err != nil {
 		t.Fatal(err)
 	}
 	if h, err := st.MarkQualified(ctx, ids[1]); err != nil || h {
