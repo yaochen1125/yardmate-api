@@ -172,9 +172,12 @@ func TestHandleIdentify_OOBEscape_BloomTiebreak_MarginUsesStrongestCatalogHit(t 
 	// TestHandleIdentify_BloomTiebreak): A does NOT bloom (strongest catalog hit,
 	// 0.41), B blooms (near-tie, 0.40).
 	names := content.CatalogScientificNames()
+	// hasUsableScientificName: the Pl@ntNet parser drops names that aren't a
+	// real species ("Petunia spp.", unquoted "Graptoveria Fred Ives"). Feeding
+	// one as A or B would silently remove that candidate and void the scenario.
 	roundTrips := func(id, sci string) bool {
 		got, ok := resolvePlantID(content, sci)
-		return ok && got == id
+		return ok && got == id && hasUsableScientificName(sci)
 	}
 	bloomMonths := func(id string) []int {
 		if d, ok := content.LookupFullDetail(id); ok && d != nil {
@@ -247,9 +250,13 @@ func TestHandleIdentify_OOBEscape_BloomTiebreak_MarginUsesStrongestCatalogHit(t 
 	}
 	// Escape must NOT fire (margin uses A, 0.49 < 0.50) → result is the bloom
 	// winner B (in-catalog, PlantID set), not the out-of-catalog top.
-	if result.Suggestions[0].ScientificName != sciB {
-		t.Errorf("Suggestions[0] = %q, want %q (bloom winner; escape must not fire — margin uses strongest hit %q)",
-			result.Suggestions[0].ScientificName, sciB, sciA)
+	// The pair comes from random map iteration, and ~0.6% of eligible B names
+	// carry an infraspecific tail ("Brassica oleracea var. botrytis"); the
+	// handler displays those species-level (SPEC §2.1, step 7b), so compare
+	// against speciesBinomial(sciB), not the raw catalog spelling.
+	if want := speciesBinomial(sciB); result.Suggestions[0].ScientificName != want {
+		t.Errorf("Suggestions[0] = %q, want %q (bloom winner %q; escape must not fire — margin uses strongest hit %q)",
+			result.Suggestions[0].ScientificName, want, sciB, sciA)
 	}
 	if result.Suggestions[0].PlantID == nil || *result.Suggestions[0].PlantID != idB {
 		t.Errorf("Suggestions[0].PlantID = %v, want %s (in-catalog, not escaped)", result.Suggestions[0].PlantID, idB)
@@ -272,7 +279,9 @@ func TestHandleIdentify_OOBEscape_SameGenusNotStrongest_NoEscape(t *testing.T) {
 	names := content.CatalogScientificNames()
 	var diffSci, diffID string
 	for id, sci := range names {
-		if g, ok := resolvePlantID(content, sci); ok && g == id && genusOf(sci) != "Abelia" {
+		// hasUsableScientificName: an unusable name ("Petunia spp.") is dropped by
+		// the Pl@ntNet parser, leaving only Abelia chinensis as the catalog hit.
+		if g, ok := resolvePlantID(content, sci); ok && g == id && genusOf(sci) != "Abelia" && hasUsableScientificName(sci) {
 			diffSci, diffID = sci, id
 			break
 		}
