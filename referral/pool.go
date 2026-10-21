@@ -51,8 +51,10 @@ type Stock struct {
 	Short int
 	// Earliest is the expiry of the earliest usable batch; zero when none.
 	Earliest time.Time
-	// AfterEarliest is what Usable drops to once the earliest batch (every
-	// batch sharing that date) has expired.
+	// AfterEarliest is what is still issuable on the day the earliest batch
+	// expires: batches that outlive it by more than the issue margin. A batch
+	// expiring a day later is no stand-in — the margin retires it at almost
+	// the same time (Codex P2).
 	AfterEarliest int
 	LowStock      bool
 	Expiring      bool
@@ -78,8 +80,8 @@ func (st Stock) conditions() string {
 // earliest expiry first (pgstore orders them), but nothing here relies on it.
 func TakeStock(ps PoolStatus, now time.Time) Stock {
 	var st Stock
-	cutoff := now.Add(time.Duration(ps.Settings.IssueMarginDays) * poolDay)
-	earliestFree := 0
+	margin := time.Duration(ps.Settings.IssueMarginDays) * poolDay
+	cutoff := now.Add(margin)
 	for _, b := range ps.Batches {
 		if !b.ExpiresAt.After(cutoff) {
 			st.Short += b.Free
@@ -89,14 +91,18 @@ func TakeStock(ps PoolStatus, now time.Time) Stock {
 			continue
 		}
 		st.Usable += b.Free
-		switch {
-		case st.Earliest.IsZero() || b.ExpiresAt.Before(st.Earliest):
-			st.Earliest, earliestFree = b.ExpiresAt, b.Free
-		case b.ExpiresAt.Equal(st.Earliest):
-			earliestFree += b.Free
+		if st.Earliest.IsZero() || b.ExpiresAt.Before(st.Earliest) {
+			st.Earliest = b.ExpiresAt
 		}
 	}
-	st.AfterEarliest = st.Usable - earliestFree
+	if !st.Earliest.IsZero() {
+		horizon := st.Earliest.Add(margin)
+		for _, b := range ps.Batches {
+			if b.ExpiresAt.After(horizon) {
+				st.AfterEarliest += b.Free
+			}
+		}
+	}
 	st.LowStock = st.Usable < ps.Settings.LowStockThreshold
 	if !st.Earliest.IsZero() && ps.Settings.ExpiryWarnDays > 0 {
 		soon := !st.Earliest.After(now.Add(time.Duration(ps.Settings.ExpiryWarnDays) * poolDay))

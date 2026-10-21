@@ -128,14 +128,15 @@ RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidStr
   | `issue_margin_days` | 14 | 发码余量：**新发**只发到期日在 `now + 这么多天` 之后的码 |
   | `swap_grace_days` | 3 | 再 claim 时手上那张 issued 码不足这么多天才换新；必须 < `issue_margin_days` |
   | `low_stock_threshold` | 100 | 可发码少于这个数 → 告警；0 = 两种告警都关（临期是投影的低库存） |
-  | `expiry_warn_days` | 30 | 最早一批可发码在这么多天内到期、**且它死后可发数会低于阈值** → 告警；0 = 关；必须 > `issue_margin_days` 才可达 |
+  | `expiry_warn_days` | 30 | 最早一批可发码在这么多天内到期、**且它到期那天仍可发的会低于阈值**（只算比它晚到期超过 `issue_margin_days` 的批）→ 告警；0 = 关；必须 > `issue_margin_days` 才可达 |
 
   `014_referral_pool_margin.sql` 加的四列 + 替换 `referral_claim`；**先于二进制**（新二进制每轮读这四列，
   列不存在只是每轮记一条 `pool status` 错误 + `rep.Errors`，结算其它步照跑；旧 `referral_claim` 也能用，只是没余量）。
   组合不可达（`expiry_warn_days <= issue_margin_days` / `swap_grace_days > issue_margin_days`）→ 巡检打一条
   `WARN referral pool settings: …`，改好之前不重复、改好后再错再打。
 - 码池告警（`pool.go`）：结算每轮算一次可发数 / 最早到期 / 它死后还剩多少 / 各批剩余；`low_stock`（可发 < 阈值）
-  或 `expiring`（最早可发批 `expiry_warn_days` 内到期 **且** 死后可发 < 阈值——投影口径，后面有新批顶着就不吵）
+  或 `expiring`（最早可发批 `expiry_warn_days` 内到期 **且** 它到期那天仍可发 < 阈值——投影口径，后面有新批顶着就不吵；
+  「仍可发」= 比它晚到期超过 `issue_margin_days` 的批，紧挨着到期的那批几乎同时被余量挡掉，不算顶替（Codex P2））
   成立 → 每轮一条 `WARN referral pool: …` 日志 + **每天每种条件组合最多一封邮件**（内存记当天已发的条件组合，
   条件来回翻也只各一封；日期按 UTC，重启后可能重复一封；发信失败不算发过、下轮重试）。
   邮件走 `FEEDBACK_SMTP_*` 同一账号到 `FEEDBACK_EMAIL_TO`（`FeedbackMailer` 由 main 建一次、`/v1/feedback` 和
@@ -161,7 +162,7 @@ RevenueCat 对象解码与五个判断（订阅史 / 填码后开始 / 退款 / 
 结算：直接发 / 攒着 → 付费结束补发 / 多个 saved 一次发 / 第 11 个照样 +30d / 退款不算 /
 取消不退款照算 / 填码前的订阅不算 / hold_days 读设置 / 账本写失败重发 / RC 挂了跳过；
 码池巡检（`pool_test.go`）：余量口径（恰在 cutoff 上不算）/ 最早到期取可发批次里最早的（同日期的批一起算死后余量）/
-投影口径（后面有 ≥ 阈值顶着不报、不够才报、恰好等于阈值不报）/ 阈值与 0 = 关 / 不可达组合的 `SettingsProblem` /
+投影口径（后面有 ≥ 阈值顶着不报、不够才报、恰好等于阈值不报、下一批晚到期不超过余量不算顶替）/ 阈值与 0 = 关 / 不可达组合的 `SettingsProblem` /
 低库存每天一封 / 临期一封 / 补货后旧批滑进窗口 25 天静默 / 同日条件变了再发一封、翻回去不再发 / 健康静默 /
 发信失败计错下轮重试 / 库读失败不挡结算 / 没配邮件只打日志 / 设置问题只打一次、修好后清 / 邮件正文含各批、到期日、补货命令。
 SQL 函数（013 + 014）：`pgstore_pg_test.go` 要一个空库（`REFERRAL_PG_TEST_URL=postgres://… go test ./referral/ -run PG`，

@@ -38,10 +38,11 @@ with s as (select issue_margin_days, low_stock_threshold, expiry_warn_days from 
                   count(*) filter (where not usable)                      as free_but_short,
                   min(expires_at) filter (where usable)                   as earliest
              from c),
-     -- 投影：最早那批（同一到期日的都算）死后还剩多少可发——低于阈值才报 expiring，
-     -- 后面有新批顶着就不报；阈值 0 = 两种告警都关（同 TakeStock）。
-     p as (select count(*) filter (where c.usable and c.expires_at > a.earliest) as after_earliest
-             from c, a)
+     -- 投影：最早那批到期那天还能发多少——届时也得留够余量，所以只算比它晚到期超过
+     -- issue_margin_days 的批（紧挨着到期的那批几乎同时退场，不算顶替）。低于阈值才报
+     -- expiring，后面有新批顶着就不报；阈值 0 = 两种告警都关（同 TakeStock）。
+     p as (select count(*) filter (where c.expires_at > a.earliest + make_interval(days => s.issue_margin_days)) as after_earliest
+             from c, a, s)
 select s.issue_margin_days                                   as margin_days,
        s.low_stock_threshold                                 as low_stock_threshold,
        s.expiry_warn_days                                    as expiry_warn_days,

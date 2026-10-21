@@ -83,6 +83,11 @@ func TestTakeStockConditions(t *testing.T) {
 		{"earliest within 30 days, plenty behind it", poolDefaults(), []PoolBatch{batch("a", 20*day, 500), batch("b", 150*day, 500)}, false, false},
 		{"earliest within 30 days, too little behind it", poolDefaults(), []PoolBatch{batch("a", 20*day, 500), batch("b", 150*day, 99)}, false, true},
 		{"exactly 100 left behind it is fine", poolDefaults(), []PoolBatch{batch("a", 20*day, 500), batch("b", 150*day, 100)}, false, false},
+		// The next batch must outlive the earliest by more than the issue
+		// margin to count: one dying a day later is retired with it (Codex P2).
+		{"next batch a day behind is no stand-in", poolDefaults(), []PoolBatch{batch("a", 20*day, 500), batch("b", 21*day, 500)}, false, true},
+		{"next batch exactly a margin behind is no stand-in", poolDefaults(), []PoolBatch{batch("a", 20*day, 500), batch("b", 34*day, 500)}, false, true},
+		{"next batch past the margin counts", poolDefaults(), []PoolBatch{batch("a", 20*day, 500), batch("b", 34*day+time.Second, 500)}, false, false},
 		{"only batch, exactly 30 days counts", poolDefaults(), []PoolBatch{batch("a", 30*day, 500)}, false, true},
 		{"only batch, 31 days does not", poolDefaults(), []PoolBatch{batch("a", 31*day, 500)}, false, false},
 		{"both", poolDefaults(), []PoolBatch{batch("a", 20*day, 10)}, true, true},
