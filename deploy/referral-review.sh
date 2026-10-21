@@ -6,9 +6,11 @@
 #   SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... deploy/referral-review.sh reject 123
 #
 # list           列出待审核（held）的推荐，最早进闸的在前：推荐 id / 推荐人 / 朋友 / 填码时间 /
-#                认定时间 / 填码设备 / 是否已发过运营邮件。同一推荐人设备重复、填码时间扎堆 = 可疑。
-# approve <id>   放行：held → qualified（记 reviewed_at）。下一轮结算（≤ 10 分钟）照常给推荐人
-#                发月份或攒着；推荐人那边 months_earned 变了，App 照常发到账通知。只动 held 的那条。
+#                兑换时间（+ hold_days = 速度闸数的理论成功时间，017）/ 认定时间 / 填码设备 /
+#                是否已发过运营邮件。同一推荐人设备重复、填码 / 兑换时间扎堆 = 可疑。
+# approve <id>   放行：held → qualified（记 reviewed_at）。下一轮结算（≤ 10 分钟）先再查一次朋友的
+#                退款 / 订阅（审核期间退了款 → void refunded，不发），过了照常给推荐人发月份或攒着；
+#                推荐人那边 months_earned 变了，App 照常发到账通知。只动 held 的那条。
 # reject <id>    作废：任何没作废的状态 → void（void_reason = rejected，记 reviewed_at），不发月份，
 #                这条推荐名下 pending / available 的礼品卡钱一起标 voided（礼品卡审核看着是刷的
 #                时也用它）。已经 rewarded 的：RevenueCat 那边赠出去的月份不收回，脚本会提示。
@@ -48,12 +50,12 @@ rpc() {
 
 case "$cmd" in
   list)
-    curl -fsS "$rest/referrals?select=id,referrer,referee,claimed_at,qualified_at,claim_install_id,held_notified_at&state=eq.held&order=qualified_at.asc" "${auth[@]}" | show
+    curl -fsS "$rest/referrals?select=id,referrer,referee,claimed_at,redeemed_at,qualified_at,claim_install_id,held_notified_at&state=eq.held&order=qualified_at.asc" "${auth[@]}" | show
     ;;
   approve)
     out=$(rpc referral_approve "${2:-}")
     if [[ "$out" == *'"approved" : true'* || "$out" == *'"approved":true'* ]]; then
-      echo "#$2 → qualified（下一轮结算照常发 / 攒）"
+      echo "#$2 → qualified（下一轮结算先再查朋友退款，过了照常发 / 攒）"
     else
       echo "#$2 不是 held（不存在 / 已审 / 已作废），没改任何东西：$out" >&2
       exit 1

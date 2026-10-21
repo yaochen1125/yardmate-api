@@ -311,22 +311,33 @@ then prod.
 referred friend once in its life); gate 2 refuses a friend claiming on a device
 the referrer has used (`own_code`); gate 3 voids a second referral whose friend
 subscription is the same Apple ID chain (`duplicate_apple_id`); gate 4 parks
-the 6th+ success of one referrer within 24 h as `held` and mails the operator.
+the 6th+ success of one referrer within 24 h as `held` and mails the operator
+(counted on theoretical success time — redeemed + `hold_days`, migration 017 —
+so a backlog judged in one pass after a settlement outage is not held
+wholesale). An approved held referral has the friend's refund checked again
+before it pays.
 
 **Rollout order** (nothing here touches prod until step 6):
 
-1. **Migration 016 on staging**: `psql "$STAGING_SUPABASE_DB_URL" -f
-   proxy/enrichment/migrations/016_referral_antiabuse.sql` (after 013 → 014 →
-   015; re-runnable). It must land **before** the binary: the new binary calls
-   016's functions (`referral_claim(text,text,text)`, `referral_me(text,text)`,
-   `referral_mark_redeemed`, `referral_qualify`, …). The old binary keeps
-   working on a 016 database (its two-argument functions are untouched), so a
-   binary rollback needs no database rollback.
+1. **Migrations 016 then 017 on staging**: `psql "$STAGING_SUPABASE_DB_URL" -f
+   proxy/enrichment/migrations/016_referral_antiabuse.sql`, then the same with
+   `017_referral_review_fixes.sql` (after 013 → 014 → 015; both re-runnable —
+   but re-running 016 after 017 puts 016's `referral_claim` / `referral_qualify`
+   back, so always follow a 016 re-run with 017). Both must land **before** the
+   binary: the new binary calls 016's functions (`referral_claim(text,text,text)`,
+   `referral_me(text,text)`, `referral_mark_redeemed`, `referral_qualify`, …)
+   and reads / writes 017's `referrals.last_checked_at` (without 017,
+   settlement ① / ④ fail every pass; `/me` and `/claim` still work). Older
+   binaries keep working on a 017 database (017 only replaces two functions
+   with the same signatures; the two-argument ones are untouched), so a binary
+   rollback needs no database rollback.
 2. **Staging secrets** (`secrets-staging.env`): add `DEVICECHECK_KEY_ID`
    (`W3YN83SB24`), `DEVICECHECK_PRIVATE_KEY` (the .p8 on one line with literal
-   `\n`, exactly like `APPLE_PRIVATE_KEY`; or `DEVICECHECK_PRIVATE_KEY_PATH`)
-   and **`DEVICECHECK_MODE=log`**. `APPLE_TEAM_ID` is already there. Unset mode
-   means `enforce`.
+   `\n`, exactly like `APPLE_PRIVATE_KEY`; or `DEVICECHECK_PRIVATE_KEY_PATH`),
+   **`DEVICECHECK_MODE=log`** and **`DEVICECHECK_ALLOW_DEVELOPMENT=true`**
+   (staging only: lets enforce take a DEBUG build's `development` token when
+   you switch to enforce in step 4). `APPLE_TEAM_ID` is already there. Unset
+   mode means `enforce`; unset allow-development means `false`.
 3. **Deploy staging** (`deploy/deploy-staging.sh`). The log must show
    `referral devicecheck ready: mode=log`; a `WARN: referral devicecheck not
    configured (missing [...])` line names what is missing (never the key).
@@ -336,19 +347,25 @@ the 6th+ success of one referrer within 24 h as `held` and mails the operator.
    `set bit0 failed`). `deploy/referral-smoke.sh` passes only in log mode (it
    has no real-device token). To test gate 1 itself: set
    `DEVICECHECK_MODE=enforce` on staging, redeploy, run the real-device
-   acceptance list (invite-friends.md ## 验收 · 防刷) **with a TestFlight
-   build** — enforce only accepts `device_check_env = production`; a DEBUG
-   build (`development`), the simulator or a request without the field gets
-   `400 device_unverified` and Apple's development host is never asked.
-   Then back to `log` (which asks whichever environment the request names).
+   acceptance list (invite-friends.md ## 验收 · 防刷). With
+   `DEVICECHECK_ALLOW_DEVELOPMENT=true` a DEBUG build from Xcode works
+   (`device_check_env = development` → Apple's development host, whose bits
+   are separate from production's) as well as a TestFlight build; without it
+   enforce only accepts `production`. The simulator or a request without the
+   field gets `400 device_unverified`. The startup log has a `WARN:
+   DEVICECHECK_ALLOW_DEVELOPMENT=true …` line while it is on. Then back to
+   `log` (which asks whichever environment the request names).
    Gates 2–4 work the same in both modes; tune the velocity gate in the
    database (`update referral_settings set velocity_limit = …,
    velocity_window_hours = … where id = 1` — `0` turns it off).
-5. **Migration 016 on prod**, same command against the prod database.
+5. **Migrations 016 then 017 on prod**, same commands against the prod
+   database.
 6. **Prod secrets** (`secrets.env`): the same two DeviceCheck values (already in
    the local `~/.config/yardmate-api/secrets.env.prod`) and
-   **`DEVICECHECK_MODE=enforce`**, then `deploy/deploy.sh`. Check for
-   `referral devicecheck ready: mode=enforce`. In enforce, a missing or broken
+   **`DEVICECHECK_MODE=enforce`** — and **no** `DEVICECHECK_ALLOW_DEVELOPMENT`
+   (on prod it would give every device a second life) — then
+   `deploy/deploy.sh`. Check for `referral devicecheck ready: mode=enforce` and
+   that there is no `DEVICECHECK_ALLOW_DEVELOPMENT` WARN line. In enforce, a missing or broken
    key makes every **new** claim `503 device_check_unavailable` (re-claims,
    `/me`, `/redeemed` keep working), so look at that line before turning the
    `referralEnabled` flag on. Only Release builds (TestFlight / App Store,
@@ -362,8 +379,9 @@ referrer`, at most one per referrer per 24 h):
 2. `SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… deploy/referral-review.sh list`
    shows every held referral.
 3. Fine: `… deploy/referral-review.sh approve <referral_id>` — the next
-   settlement pass (≤ 10 min) grants or saves the month as usual, and the app's
-   arrival notification fires on its next `/me`.
+   settlement pass (≤ 10 min) first re-checks the friend's subscription (a
+   refund while it was held voids it as `refunded`), then grants or saves the
+   month as usual, and the app's arrival notification fires on its next `/me`.
 4. Abuse: `… deploy/referral-review.sh reject <referral_id>` — void
    (`rejected`), no month, and its gift-card money (pending + available) is
    voided with it. Also the tool for a suspicious gift-card request (§8):
