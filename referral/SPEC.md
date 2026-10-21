@@ -37,7 +37,7 @@
 | 来源 | 内容 |
 |---|---|
 | 请求头 | `Authorization: Bearer <Supabase access token>`、`X-Device-Install-Id`（UUID）、`X-App-Version` |
-| `claim` body（≤ 16 KB）| `{"code": "ym 7kq2", "subscribed_before": false, "device_token": "<DCDevice base64>", "device_check_env": "production"}`；`device_token` 可缺（模拟器 / 拿不到），`device_check_env` 缺 = `production`，只认 `development` 一个别的值 |
+| `claim` body（≤ 16 KB）| `{"code": "ym 7kq2", "subscribed_before": false, "device_token": "<DCDevice base64>", "device_check_env": "production"}`；`device_token` 可缺（模拟器 / 拿不到）。`device_check_env`：**`enforce` 只认 `production`**（大小写、首尾空格不计），`development` / 缺 / 其他值一律当没带 token；`log` 按请求的环境查（`development` → 开发环境地址，其余含缺省 → 生产）|
 | `redeemed` body | `{"offer_code": "XK7P2M9Q"}` |
 | vault | `REVENUECAT_SECRET_KEY`（v1 secret）、`REVENUECAT_ENTITLEMENT_ID`、`REFERRAL_SETTLE_INTERVAL`（可选，默认 10m）；DeviceCheck：`DEVICECHECK_KEY_ID`、`DEVICECHECK_PRIVATE_KEY`（.p8 压一行、`\n` 转义，同 `APPLE_PRIVATE_KEY`；或 `DEVICECHECK_PRIVATE_KEY_PATH`）、`APPLE_TEAM_ID`、`DEVICECHECK_MODE`（`enforce` / `log`，缺 = `enforce`）|
 | 库 | migration `013_referral.sql` 的五张表 + 两个函数，`014_referral_pool_margin.sql` 的四列设置 + 改过的 `referral_claim`，`016_referral_antiabuse.sql` 的防刷列 / 两张表 / 九个函数（经共享 pgx 池 `enrichment.DB.Pool()`）|
@@ -57,7 +57,7 @@
 | 400 | `unknown_code` / `own_code` / `already_claimed` | SQL `referral_claim_check` / `referral_claim` 的 `raise exception`；`own_code` 也包括「在码主人记过的设备上填」（第 2 道）|
 | 400 | `not_new_user` | App 报 `subscribed_before`，或 RevenueCat 有本人的 store 订阅记录 |
 | 400 | `device_used` | DeviceCheck `bit0` 已置：这台设备当过被推荐的朋友（第 1 道，只 `enforce`）|
-| 400 | `device_unverified` | 没带 `device_token`，或苹果答 400（token 无效）（第 1 道，只 `enforce`）|
+| 400 | `device_unverified` | 没带 `device_token`、`device_check_env` 不是 `production`，或苹果答 400（token 无效）（第 1 道，只 `enforce`）|
 | 401 | `unauthorized` | token 验签失败（不说哪一步） |
 | 429 | `rate_limit_device` / `rate_limit_ip` | 本包的桶 / `/v1` 的 IP 桶 |
 | 502 | `store_failed` | 库或 RevenueCat 不可达 |
@@ -139,6 +139,7 @@ RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidStr
 |---|---|---|
 | 没配 DeviceCheck（缺 Key ID / Team ID / .p8，或 .p8 解析不了）| 新填码一律 503 `device_check_unavailable` | 不查不置，记日志放行 |
 | 没带 `device_token`（或 > 12 KB / 有控制字符）| 400 `device_unverified` | 记日志放行，不置位 |
+| `device_check_env` 不是 `production`（`development` / 缺 / 其他）| 当没带 token：400 `device_unverified`，不问苹果（开发环境的 bit 与生产分开存，认它等于每台设备两条命；Release 包一律带 `production`）| 照请求的环境查 / 置（`development` → `api.development.devicecheck.apple.com`），结果只记日志 |
 | 苹果答 400（token 无效）| 400 `device_unverified` | 记日志放行，不置位 |
 | 苹果超时 / 其他错误 | 503 `device_check_unavailable` | 记日志放行，照样尝试置位 |
 | `bit0` 已置 | 400 `device_used` | 记日志放行，照样置位 |
@@ -238,7 +239,7 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
 防刷（016）：`claim_gates_test.go`（memStore 复刻 016 的判定规则 + fake DeviceCheck）：判定顺序每一步的先后（unknown 先于一切、already_claimed 先于 own_code、
 重领不问 RC 也不问 DeviceCheck、own_code 先于 not_new_user、not_new_user 先于 DeviceCheck、DeviceCheck 先于码池）/ 推荐人设备 own_code（大小写无关、别人的码不拦）/
 enforce 四种拒绝都不取码不置位 / 置位失败回滚码仍在、再试成功 / pool_empty 不置位 / 换账号同设备 device_used / log 档六种情况都放行且照查照置 /
-没配 DeviceCheck 两档 / 苹果挂起 50 ms 超时两档都不卡 / `device_check_env` 选环境 / 16 KB body、12 KB token 上限。
+没配 DeviceCheck 两档 / 苹果挂起 50 ms 超时两档都不卡 / enforce 只认 `production`（`development` / 缺 / 其他值 → `device_unverified`、不问苹果）、log 按请求的环境查 / 置（含 development + bit0 已置仍放行）/ 16 KB body、12 KB token 上限。
 `devicecheck_test.go`（httptest 假苹果）：JWT 用公钥验得过、`kid` / `iss` / `iat`、请求体三字段、update 只发 `bit0`、按环境选 host、
 九种回答（含两种「没有 bit」文本、400 = token 无效、401 / 5xx / 怪 200 = 不可用）、客户端超时和 context 超时、坏配置不回显 key、模式解析。
 `settle_gates_test.go`：subscription key 跟订阅链走（续费 / 换 product 不变）/ 同一订阅第二条 void、只发一个月 / 删号留存的 key 照样拦 / 作废了的推荐不占 key /
@@ -269,11 +270,12 @@ SQL 函数（013 + 014）：`pgstore_pg_test.go` 要一个空库（`REFERRAL_PG_
 
 ## 5. 待确认
 
-- **第 3 道的 key 不是 `original_transaction_id`**（§2.4）：RevenueCat REST 拿不到；用 `original_purchase_date` 代替，同一秒两人会撞。
-  要真的原始交易号，得接 App Store Server API（另一种 In-App Purchase 密钥 + Issuer ID，用 `store_transaction_id` 查 `originalTransactionId`）。
-- `device_check_env = development` 在 prod 也照文档放行到开发环境的苹果地址：开发环境的 bit 和生产分开存，若苹果的开发环境接受 Release 包的 token，
-  同一台设备在 prod 等于有两条命。要堵可以让 `enforce` 只认 `production`（DEBUG 包打 prod 本来就不该领码）。没核实苹果是否接受，先照文档。
-- `log` 档里「苹果超时 / 5xx」也只记日志放行（文档「503 不放行」那句没分档；按「log = 只记日志不拦」理解）。
+- **第 3 道用 `subscription_key` 代替 `original_transaction_id`**（§2.4；2026-10-20 api#126 已定接受）：RevenueCat REST 拿不到原始交易号，
+  用 `<store>:<original_purchase_date>` 代替。**已知代价：两个不同的人在同一秒开始订阅，后认定的那条会被误作废为 `duplicate_apple_id`**
+  （推荐人少一个月、名下的钱一起作废）。运营从 `referrals.subscription_key` / `void_reason` 能看到；出现了再考虑接 App Store Server API
+  （另一种 In-App Purchase 密钥 + Issuer ID，用 `store_transaction_id` 查 `originalTransactionId`）换成真的原始交易号。
+- `log` 档里「苹果超时 / 5xx」也只记日志放行（文档「503 不放行」那句没分档；按「log = 只记日志不拦」理解，api#126 已定保留）。
+- `enforce` 下 `device_check_env` 缺省也当没带 token（文档原写「缺了当 production」；api#126 定为只认显式 `production`，Release 包本来就一律带）。
 - 速度闸的「24 小时内成功超过 5 个」按 `qualified_at` 数，朋友是 7 天前批量兑换的，会在同一轮结算里一起到期——第 6 个起全进 held。
 
 - 推荐人正在付费时的「覆盖」把家人共享也算进去（赠了也用不上）；要不要反过来算「没付费」直接发。

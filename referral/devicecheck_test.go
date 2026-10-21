@@ -198,6 +198,12 @@ func TestAppleDeviceCheckPicksTheHostByEnvironment(t *testing.T) {
 			t.Errorf("deviceEnv(%q) = %s, want %s", in, got, want)
 		}
 	}
+	for in, want := range map[string]bool{"production": true, " PRODUCTION ": true, "": false,
+		"development": false, "prod": false} {
+		if got := isProductionEnv(in); got != want {
+			t.Errorf("isProductionEnv(%q) = %v, want %v", in, got, want)
+		}
+	}
 }
 
 func TestAppleDeviceCheckReadsEveryAnswer(t *testing.T) {

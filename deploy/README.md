@@ -336,7 +336,11 @@ the 6th+ success of one referrer within 24 h as `held` and mails the operator.
    `set bit0 failed`). `deploy/referral-smoke.sh` passes only in log mode (it
    has no real-device token). To test gate 1 itself: set
    `DEVICECHECK_MODE=enforce` on staging, redeploy, run the real-device
-   acceptance list (invite-friends.md ## 验收 · 防刷), then back to `log`.
+   acceptance list (invite-friends.md ## 验收 · 防刷) **with a TestFlight
+   build** — enforce only accepts `device_check_env = production`; a DEBUG
+   build (`development`), the simulator or a request without the field gets
+   `400 device_unverified` and Apple's development host is never asked.
+   Then back to `log` (which asks whichever environment the request names).
    Gates 2–4 work the same in both modes; tune the velocity gate in the
    database (`update referral_settings set velocity_limit = …,
    velocity_window_hours = … where id = 1` — `0` turns it off).
@@ -347,7 +351,8 @@ the 6th+ success of one referrer within 24 h as `held` and mails the operator.
    `referral devicecheck ready: mode=enforce`. In enforce, a missing or broken
    key makes every **new** claim `503 device_check_unavailable` (re-claims,
    `/me`, `/redeemed` keep working), so look at that line before turning the
-   `referralEnabled` flag on.
+   `referralEnabled` flag on. Only Release builds (TestFlight / App Store,
+   `device_check_env = production`) can claim in enforce.
 
 **A held mail arrives** (`[YardMate] Referral review: N held for one
 referrer`, at most one per referrer per 24 h):

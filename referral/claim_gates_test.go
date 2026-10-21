@@ -40,7 +40,7 @@ func claimWith(code, token string, subscribedBefore bool) string {
 		b += `,"subscribed_before":true`
 	}
 	if token != "" {
-		b += `,"device_token":"` + token + `"`
+		b += `,"device_token":"` + token + `","device_check_env":"production"`
 	}
 	return b + "}"
 }
@@ -335,19 +335,55 @@ func TestClaimAppleHangingDoesNotHangTheClaim(t *testing.T) {
 	}
 }
 
-func TestClaimDeviceCheckEnvironment(t *testing.T) {
+func TestClaimEnforceOnlyAcceptsProductionTokens(t *testing.T) {
+	// enforce: anything but an explicit "production" is "no token" —
+	// device_unverified, Apple (and its development host) never asked.
+	for _, env := range []string{`"development"`, `"DEVELOPMENT"`, `"staging"`, `""`, ``} {
+		body := `{"code":"YM-AAAA","device_token":"t"`
+		if env != "" {
+			body += `,"device_check_env":` + env
+		}
+		body += "}"
+		svc, store, _, dc := gated(DeviceCheckEnforce)
+		status, code, _ := claimAs(t, svc, body, nil)
+		if status != 400 || code != ErrDeviceUnverified {
+			t.Errorf("enforce, env %s: %d %q, want 400 device_unverified", env, status, code)
+		}
+		if dc.queries != 0 || dc.sets != 0 || store.claimCalls != 0 {
+			t.Errorf("enforce, env %s: queries %d sets %d claims %d, want nothing asked or taken", env, dc.queries, dc.sets, store.claimCalls)
+		}
+	}
+	for _, env := range []string{"production", " Production "} {
+		svc, _, _, dc := gated(DeviceCheckEnforce)
+		body := `{"code":"YM-AAAA","device_token":"t","device_check_env":"` + env + `"}`
+		if status, code, _ := claimAs(t, svc, body, nil); status != 200 {
+			t.Fatalf("enforce, env %q: %d %q, want 200", env, status, code)
+		}
+		if len(dc.envs) != 1 || dc.envs[0] != DeviceEnvProduction || !dc.bit(DeviceEnvProduction, "t") {
+			t.Errorf("enforce, env %q: envs %v, want production for query and set", env, dc.envs)
+		}
+	}
+}
+
+func TestClaimLogModeAsksTheEnvironmentTheRequestNames(t *testing.T) {
 	for body, want := range map[string]string{
 		`{"code":"YM-AAAA","device_token":"t","device_check_env":"development"}`: DeviceEnvDevelopment,
 		`{"code":"YM-AAAA","device_token":"t","device_check_env":"production"}`:  DeviceEnvProduction,
 		`{"code":"YM-AAAA","device_token":"t"}`:                                  DeviceEnvProduction,
 	} {
-		svc, _, _, dc := gated(DeviceCheckEnforce)
+		svc, _, _, dc := gated(DeviceCheckLog)
 		if status, code, _ := claimAs(t, svc, body, nil); status != 200 {
-			t.Fatalf("%s: %d %q", body, status, code)
+			t.Fatalf("log, %s: %d %q", body, status, code)
 		}
 		if len(dc.envs) != 1 || dc.envs[0] != want || !dc.bit(want, "t") {
-			t.Errorf("%s: envs %v, want %s for both query and set", body, dc.envs, want)
+			t.Errorf("log, %s: envs %v, want %s for both query and set", body, dc.envs, want)
 		}
+	}
+	// log + development with Apple refusing: still only logged.
+	svc, store, _, dc := gated(DeviceCheckLog)
+	dc.bits[DeviceEnvDevelopment+"|t"] = true
+	if status, _, offer := claimAs(t, svc, `{"code":"YM-AAAA","device_token":"t","device_check_env":"development"}`, nil); status != 200 || offer != "P1" || store.claims[userB] == nil {
+		t.Errorf("log, development, bit0 set: %d %q, want 200 P1", status, offer)
 	}
 }
 

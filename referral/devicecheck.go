@@ -57,18 +57,34 @@ func ParseDeviceCheckMode(s string) (mode DeviceCheckMode, ok bool) {
 	return DeviceCheckEnforce, false
 }
 
-// device_check_env values (claim body). Anything but "development" is
-// production — that is also what a missing field means (docs ## 数据契约).
+// device_check_env values (claim body).
+//
+// enforce only accepts "production": a token from any other environment —
+// "development", the field missing, anything else — is treated as no token
+// (device_unverified) and Apple's development host is never asked. Its bits
+// are kept apart from production's, so honouring it would give every device
+// a second life (decided 2026-10-20 on api#126; the app's Release builds
+// always send "production").
+//
+// log asks the environment the request names: "development" → the
+// development host, anything else (missing included) → production.
 const (
 	DeviceEnvProduction  = "production"
 	DeviceEnvDevelopment = "development"
 )
 
+// deviceEnv is the host log mode asks for a device_check_env value.
 func deviceEnv(s string) string {
 	if strings.EqualFold(strings.TrimSpace(s), DeviceEnvDevelopment) {
 		return DeviceEnvDevelopment
 	}
 	return DeviceEnvProduction
+}
+
+// isProductionEnv is enforce's test: the request explicitly says
+// "production" (case and surrounding space ignored).
+func isProductionEnv(s string) bool {
+	return strings.EqualFold(strings.TrimSpace(s), DeviceEnvProduction)
 }
 
 // ErrDeviceTokenInvalid is Apple refusing the device token itself (HTTP 400

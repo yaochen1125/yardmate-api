@@ -216,7 +216,7 @@ func TestMeStoreDownIsStoreFailed(t *testing.T) {
 
 func TestClaimHappyPath(t *testing.T) {
 	svc, store, rc, dc := configuredDC()
-	w := call(t, svc.HandleClaim(), "POST", `{"code":"ym 7kq2","subscribed_before":false,"device_token":"tok"}`, nil)
+	w := call(t, svc.HandleClaim(), "POST", `{"code":"ym 7kq2","subscribed_before":false,"device_token":"tok","device_check_env":"production"}`, nil)
 	if w.Code != 200 {
 		t.Fatalf("status %d %s", w.Code, w.Body)
 	}

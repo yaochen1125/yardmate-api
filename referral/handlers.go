@@ -258,8 +258,8 @@ type claimRequest struct {
 	// simulator or when the app could not get one.
 	DeviceToken string `json:"device_token"`
 	// DeviceCheckEnv is "development" (DEBUG build) or "production"
-	// (TestFlight / App Store; also what absent means): which Apple host,
-	// whose bits are kept apart.
+	// (TestFlight / App Store): which Apple host, whose bits are kept apart.
+	// enforce only accepts "production" (see isProductionEnv).
 	DeviceCheckEnv string `json:"device_check_env"`
 }
 
@@ -274,8 +274,9 @@ type claimRequest struct {
 //     RevenueCat, no DeviceCheck); another code → already_claimed
 //  4. own_code: their own code, or this device is one the owner has used
 //  5. not_new_user: the app says so, or RevenueCat has a store subscription
-//  6. DeviceCheck: no / rejected token → device_unverified (enforce only);
-//     bit0 set → device_used; Apple unusable → device_check_unavailable
+//  6. DeviceCheck: no / rejected token, or (enforce) device_check_env not
+//     "production" → device_unverified (enforce only); bit0 set →
+//     device_used; Apple unusable → device_check_unavailable
 //  7. a pool code: none → pool_empty (bit0 untouched); taken → bit0 set in
 //     the same transaction, a failed set rolls the claim back →
 //     device_check_unavailable
@@ -302,6 +303,12 @@ func (s *Service) HandleClaim() http.HandlerFunc {
 			token = "" // not a DeviceCheck token; treated as none
 		}
 		env := deviceEnv(req.DeviceCheckEnv)
+		if s.dcMode != DeviceCheckLog && !isProductionEnv(req.DeviceCheckEnv) {
+			// enforce: only a production token counts. Anything else is "no
+			// token" → device_unverified, and Apple's development host (whose
+			// bits are separate) is never asked.
+			token = ""
+		}
 		installID := r.Header.Get("X-Device-Install-Id")
 		if allowed, retry := s.claimBucket.Allow(installID, s.now()); !allowed {
 			ratelimit.Write429(w, retry, "rate_limit_device")
