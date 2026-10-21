@@ -30,10 +30,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -75,7 +77,7 @@ type supabaseListItem struct {
 func deleteUserStorageObjects(ctx context.Context, supabaseURL, serviceRoleKey, userID string) error {
 	children, err := storageList(ctx, supabaseURL, serviceRoleKey, diaryImagesBucket, userID)
 	if err != nil {
-		return fmt.Errorf("list %q: %w", userID, err)
+		return fmt.Errorf("list the user's folder: %w", err) // never the user id (the caller logs this)
 	}
 
 	var keys []string
@@ -209,7 +211,7 @@ func supabaseDo(ctx context.Context, method, endpoint, serviceRoleKey string, js
 	}
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, rdr)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("supabase %s: cannot build request", method)
 	}
 	req.Header.Set("Authorization", "Bearer "+serviceRoleKey)
 	req.Header.Set("apikey", serviceRoleKey)
@@ -218,12 +220,24 @@ func supabaseDo(ctx context.Context, method, endpoint, serviceRoleKey string, js
 	}
 	resp, err := supabaseHTTPClient.Do(req)
 	if err != nil {
-		return nil, 0, err
+		// *url.Error prints the whole endpoint, and DELETE …/admin/users/{id}
+		// carries the user id: keep the method and the cause only (the
+		// handler logs this).
+		return nil, 0, fmt.Errorf("supabase %s: %w", method, supabaseErrWithoutURL(err))
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, resp.StatusCode, err
+		return nil, resp.StatusCode, fmt.Errorf("supabase %s: read body: %w", method, supabaseErrWithoutURL(err))
 	}
 	return respBody, resp.StatusCode, nil
+}
+
+// supabaseErrWithoutURL unwraps net/http's *url.Error to its cause.
+func supabaseErrWithoutURL(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		return ue.Err
+	}
+	return err
 }

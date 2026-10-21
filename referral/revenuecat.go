@@ -242,7 +242,7 @@ func (c *Client) Subscriber(ctx context.Context, appUserID string) (*Subscriber,
 	if c == nil {
 		return nil, errors.New("revenuecat: no client")
 	}
-	raw, status, err := c.do(ctx, http.MethodGet, "/subscribers/"+url.PathEscape(appUserID), nil)
+	raw, status, err := c.do(ctx, "get subscriber", http.MethodGet, "/subscribers/"+url.PathEscape(appUserID), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +270,7 @@ func (c *Client) GrantPromotional(ctx context.Context, appUserID, entitlement st
 		return err
 	}
 	path := "/subscribers/" + url.PathEscape(appUserID) + "/entitlements/" + url.PathEscape(entitlement) + "/promotional"
-	_, status, err := c.do(ctx, http.MethodPost, path, body)
+	_, status, err := c.do(ctx, "grant promotional", http.MethodPost, path, body)
 	if err != nil {
 		return err
 	}
@@ -280,16 +280,21 @@ func (c *Client) GrantPromotional(ctx context.Context, appUserID, entitlement st
 	return nil
 }
 
-// do issues one authenticated request. Only the status and body come back;
-// the key and the app user id never appear in errors or logs.
-func (c *Client) do(ctx context.Context, method, path string, body []byte) ([]byte, int, error) {
+// do issues one authenticated request; op names it in errors ("get
+// subscriber"). Only the status and body come back. The key and the app user
+// id never appear in errors or logs: the path carries the user id, and
+// net/http's *url.Error prints the whole URL ("Get
+// \"https://…/subscribers/<APP_USER_ID>\": …"), so errors keep op + the
+// underlying cause only (still wrapped: errors.Is(err,
+// context.DeadlineExceeded) works).
+func (c *Client) do(ctx context.Context, op, method, path string, body []byte) ([]byte, int, error) {
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.base+path, rdr)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("revenuecat: %s: cannot build request", op)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.key)
 	req.Header.Set("Accept", "application/json")
@@ -299,12 +304,22 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) ([]by
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("revenuecat: %s: %w", method, err)
+		return nil, 0, fmt.Errorf("revenuecat: %s: %w", op, withoutURL(err))
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, revenueCatMaxBody))
 	if err != nil {
-		return nil, resp.StatusCode, err
+		return nil, resp.StatusCode, fmt.Errorf("revenuecat: %s: read body: %w", op, withoutURL(err))
 	}
 	return raw, resp.StatusCode, nil
+}
+
+// withoutURL unwraps net/http's *url.Error to its cause, dropping the URL
+// (and with it any id in the path).
+func withoutURL(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		return ue.Err
+	}
+	return err
 }
