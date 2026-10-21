@@ -36,6 +36,9 @@ pn_slow=$(grep -F "identify plantnet down:" <<<"$LOG" | grep -cF "reason=slow" |
 pid_takeover=$(( $(count "identify plantnet fallback:") + $(count "并行叫 Plant.id") ))
 pnfail=$(count "identify plantnet down:")
 race_lost=$(grep -F "identify engine race:" <<<"$LOG" | grep -cF "winner=" || true)
+# 极速模式（只做展示、不触发报警）：额度用完被跳过的 Pl@ntNet 请求、走极速模式的识别数。
+pn_quota_skip=$(count "identify plantnet quota-skip:")
+fast_mode=$(grep -F "identify decision:" <<<"$LOG" | grep -cF "fast=true" || true)
 rescued_ok=$(count "rescued=true")
 genus_kept=$(count "identify genus-keep:")
 
@@ -68,6 +71,7 @@ BODY="最近 11 分钟 /v1/identify 异常汇总：
   Plant.id 上限挡下  : ${pid_capped}
   GPT 兜底救回       : ${rescued_ok}
   只认到属（保留属）: ${genus_kept}
+  极速模式           : ${fast_mode}（Pl@ntNet 额度用完被跳过: ${pn_quota_skip}）
 
 解读：
   - Pl@ntNet失败多 + 救回多 = 上游 outage 但兜底在工作，观察即可
@@ -80,7 +84,7 @@ BODY="最近 11 分钟 /v1/identify 异常汇总：
 PLANTID_DAILY_CAP 全站 / PLANTID_PER_IP_DAILY_CAP 单 IP 每日上限约束）。
 
 最近相关日志（最多 20 条）：
-$(grep -E "identify (plantnet down|plantid-skip|plantnet fallback|plantnet hedge|engine race|plantid-budget|genus-keep|gpt on-demand fallback|upstream err)|plantnet trace|v1/identify.*- (502|200) " <<<"$LOG" | tail -20)
+$(grep -E "identify (plantnet down|plantnet quota-skip|fast-mode|plantid-skip|plantnet fallback|plantnet hedge|engine race|plantid-budget|genus-keep|gpt on-demand fallback|upstream err)|plantnet trace|v1/identify.*- (502|200) " <<<"$LOG" | tail -20)
 
 排查: journalctl -u yardmate-api --since '30 min ago' | grep identify
 30 分钟冷却已启动，持续异常将再次提醒。"

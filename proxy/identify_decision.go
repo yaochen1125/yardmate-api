@@ -105,12 +105,13 @@ func identifyDecisionLine(deviceID, engine string, engTop *Suggestion, engCands 
 			from = "gpt"
 		}
 	}
-	return fmt.Sprintf("identify decision: deviceID=%s engine=%s engTop=%q engConf=%s engCat=%s gpt=%q gptConf=%s gptCat=%s gptState=%s agree=%s final=%q finalCat=%s from=%s",
+	fast := res != nil && res.FastMode
+	return fmt.Sprintf("identify decision: deviceID=%s engine=%s engTop=%q engConf=%s engCat=%s gpt=%q gptConf=%s gptCat=%s gptState=%s agree=%s final=%q finalCat=%s from=%s fast=%v",
 		deviceID, engine,
 		decisionName(engTop), decisionConf(engTop), decisionCat(engTop, content),
 		decisionName(gpt), decisionConf(gpt), decisionCat(gpt, content), gptState,
 		agree,
-		decisionName(final), decisionCat(final, content), from)
+		decisionName(final), decisionCat(final, content), from, fast)
 }
 
 func logIdentifyDecision(deviceID, engine string, engTop *Suggestion, engCands []string, gpt *Suggestion, gptErr error, res *IdentifyResult, sentinel bool, content *ContentIndex) {

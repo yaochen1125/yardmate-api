@@ -13,6 +13,10 @@ type IdentifyResult struct {
 	IsPlantConfidence float64      `json:"is_plant_confidence"`
 	Suggestions       []Suggestion `json:"suggestions"`
 	AIEnhancedAt      *string      `json:"ai_enhanced_at"`
+	// FastMode — 极速模式（identify_fastmode.go）：结果直接取自 GPT、没再等识别引擎
+	// （当天只剩 GPT，或 GPT 种级且把握 ≥ 0.95）。App 收到即跳转、不走进度节奏。
+	// 缺省（omitempty）= false，旧 App 忽略。
+	FastMode bool `json:"fast_mode,omitempty"`
 }
 
 // Suggestion is one plant-identification suggestion. Top-3 only per SPEC §2.1.
