@@ -159,3 +159,56 @@ func TestClaimLogModeSetFailureIsNotReadBack(t *testing.T) {
 		t.Errorf("queries = %d, want no read-back in log mode (nothing is refused anyway)", dc.queries)
 	}
 }
+
+// MARK: DEVICECHECK_ALLOW_DEVELOPMENT (staging)
+
+func TestClaimEnforceWithAllowDevelopmentTakesDebugTokens(t *testing.T) {
+	gatedDev := func() (*Service, *memStore, *fakeDC) {
+		store, rc, dc := newMemStore(), newFakeRC(), newFakeDC()
+		store.emulateClaims("P1", "P2")
+		store.own(userA, codeA)
+		svc := New(store, rc, entID, asB, Options{DeviceCheck: dc, DeviceCheckMode: DeviceCheckEnforce, DeviceCheckAllowDevelopment: true})
+		return svc, store, dc
+	}
+	// A DEBUG build's token goes to Apple's development host — query and set
+	// — and enforce refuses on it as usual.
+	for _, env := range []string{"development", " Development "} {
+		svc, _, dc := gatedDev()
+		body := `{"code":"YM-AAAA","device_token":"t","device_check_env":"` + env + `"}`
+		if status, code, _ := claimAs(t, svc, body, nil); status != http.StatusOK {
+			t.Fatalf("env %q: %d %q, want 200", env, status, code)
+		}
+		if len(dc.envs) != 1 || dc.envs[0] != DeviceEnvDevelopment || !dc.bit(DeviceEnvDevelopment, "t") || dc.bit(DeviceEnvProduction, "t") {
+			t.Errorf("env %q: envs %v, want the development host for query and set", env, dc.envs)
+		}
+	}
+	svc, store, dc := gatedDev()
+	dc.bits[DeviceEnvDevelopment+"|t"] = true
+	if status, code, _ := claimAs(t, svc, `{"code":"YM-AAAA","device_token":"t","device_check_env":"development"}`, nil); status != http.StatusBadRequest || code != ErrDeviceUsed {
+		t.Errorf("development, bit0 set: %d %q, want 400 device_used (enforce still refuses)", status, code)
+	}
+	if store.claims[userB] != nil {
+		t.Error("refused claim kept")
+	}
+	// Production tokens still work; anything else is still no token.
+	svc, _, dc = gatedDev()
+	if status, code, _ := claimAs(t, svc, claimWith(codeA, "t", false), nil); status != http.StatusOK || dc.envs[0] != DeviceEnvProduction {
+		t.Errorf("production: %d %q envs %v", status, code, dc.envs)
+	}
+	for _, env := range []string{`"staging"`, `""`, ``} {
+		svc, _, dc := gatedDev()
+		body := `{"code":"YM-AAAA","device_token":"t"`
+		if env != "" {
+			body += `,"device_check_env":` + env
+		}
+		body += "}"
+		if status, code, _ := claimAs(t, svc, body, nil); status != http.StatusBadRequest || code != ErrDeviceUnverified || dc.queries != 0 {
+			t.Errorf("env %s: %d %q queries %d, want 400 device_unverified, Apple not asked", env, status, code, dc.queries)
+		}
+	}
+	// Off (the default, and prod): development is no token — unchanged
+	// (TestClaimEnforceOnlyAcceptsProductionTokens).
+	if New(nil, nil, "", nil, Options{}).DeviceCheckAllowsDevelopment() {
+		t.Error("allow development must default to off")
+	}
+}

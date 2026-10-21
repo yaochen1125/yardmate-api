@@ -69,7 +69,10 @@ func ParseDeviceCheckMode(s string) (mode DeviceCheckMode, ok bool) {
 // (device_unverified) and Apple's development host is never asked. Its bits
 // are kept apart from production's, so honouring it would give every device
 // a second life (decided 2026-10-20 on api#126; the app's Release builds
-// always send "production").
+// always send "production"). The one exception is
+// DEVICECHECK_ALLOW_DEVELOPMENT=true (staging only, never prod): enforce then
+// also accepts "development" and asks the development host, so gate 1 can be
+// tested in enforce with a DEBUG build.
 //
 // log asks the environment the request names: "development" → the
 // development host, anything else (missing included) → production.
@@ -90,6 +93,12 @@ func deviceEnv(s string) string {
 // "production" (case and surrounding space ignored).
 func isProductionEnv(s string) bool {
 	return strings.EqualFold(strings.TrimSpace(s), DeviceEnvProduction)
+}
+
+// isDevelopmentEnv: the request explicitly says "development" (what enforce
+// also accepts with DEVICECHECK_ALLOW_DEVELOPMENT).
+func isDevelopmentEnv(s string) bool {
+	return strings.EqualFold(strings.TrimSpace(s), DeviceEnvDevelopment)
 }
 
 // ErrDeviceTokenInvalid is Apple refusing the device token itself (HTTP 400

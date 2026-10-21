@@ -80,3 +80,18 @@ func TestBuildDeviceCheckMissingPiecesFailClosed(t *testing.T) {
 		t.Errorf("service DeviceCheck() = %s %v", mode, ok)
 	}
 }
+
+func TestDeviceCheckAllowDevelopmentIsOffUnlessSet(t *testing.T) {
+	for text, want := range map[string]bool{
+		"":                                      false, // prod: never set
+		"DEVICECHECK_ALLOW_DEVELOPMENT=false\n": false,
+		"DEVICECHECK_ALLOW_DEVELOPMENT=maybe\n": false, // not a bool → off
+		"DEVICECHECK_ALLOW_DEVELOPMENT=true\n":  true,  // staging
+		"DEVICECHECK_ALLOW_DEVELOPMENT=1\n":     true,
+	} {
+		svc := buildReferralService(vaultOf(t, text), nil, nil)
+		if got := svc.DeviceCheckAllowsDevelopment(); got != want {
+			t.Errorf("%q: allow development = %v, want %v", text, got, want)
+		}
+	}
+}

@@ -80,6 +80,11 @@ type Options struct {
 	DeviceCheck DeviceChecker
 	// DeviceCheckMode is DEVICECHECK_MODE; "" = enforce.
 	DeviceCheckMode DeviceCheckMode
+	// DeviceCheckAllowDevelopment is DEVICECHECK_ALLOW_DEVELOPMENT (staging
+	// only, never prod): enforce also accepts device_check_env =
+	// "development" and asks Apple's development host, so gate 1 can be
+	// tested in enforce with a DEBUG build. Log mode ignores it.
+	DeviceCheckAllowDevelopment bool
 	// DeviceCheckTimeout bounds each Apple call (default 3 s).
 	DeviceCheckTimeout time.Duration
 }
@@ -101,9 +106,10 @@ type Service struct {
 
 	// gate 1 (devicecheck.go): Apple's client (nil = not configured), the
 	// mode, and the per-call bound.
-	dc        DeviceChecker
-	dcMode    DeviceCheckMode
-	dcTimeout time.Duration
+	dc         DeviceChecker
+	dcMode     DeviceCheckMode
+	dcTimeout  time.Duration
+	dcAllowDev bool // DEVICECHECK_ALLOW_DEVELOPMENT
 
 	interval     time.Duration
 	startupDelay time.Duration
@@ -163,6 +169,7 @@ func New(store Store, rc Subscribers, entitlement string, auth Authenticator, op
 		dc:           opt.DeviceCheck,
 		dcMode:       opt.DeviceCheckMode,
 		dcTimeout:    opt.DeviceCheckTimeout,
+		dcAllowDev:   opt.DeviceCheckAllowDevelopment,
 	}
 }
 
@@ -170,6 +177,15 @@ func New(store Store, rc Subscribers, entitlement string, auth Authenticator, op
 // the startup log.
 func (s *Service) DeviceCheck() (mode DeviceCheckMode, configured bool) {
 	return s.dcMode, s.dc != nil
+}
+
+// DeviceCheckAllowsDevelopment reports DEVICECHECK_ALLOW_DEVELOPMENT.
+func (s *Service) DeviceCheckAllowsDevelopment() bool { return s.dcAllowDev }
+
+// enforceAccepts is enforce's test of a request's device_check_env:
+// "production", or "development" when DEVICECHECK_ALLOW_DEVELOPMENT is on.
+func (s *Service) enforceAccepts(env string) bool {
+	return isProductionEnv(env) || (s.dcAllowDev && isDevelopmentEnv(env))
 }
 
 // Configured reports whether every dependency is present.
@@ -259,7 +275,7 @@ type claimRequest struct {
 	DeviceToken string `json:"device_token"`
 	// DeviceCheckEnv is "development" (DEBUG build) or "production"
 	// (TestFlight / App Store): which Apple host, whose bits are kept apart.
-	// enforce only accepts "production" (see isProductionEnv).
+	// enforce only accepts "production" (see enforceAccepts).
 	DeviceCheckEnv string `json:"device_check_env"`
 }
 
@@ -305,10 +321,11 @@ func (s *Service) HandleClaim() http.HandlerFunc {
 			token = "" // not a DeviceCheck token; treated as none
 		}
 		env := deviceEnv(req.DeviceCheckEnv)
-		if s.dcMode != DeviceCheckLog && !isProductionEnv(req.DeviceCheckEnv) {
-			// enforce: only a production token counts. Anything else is "no
-			// token" → device_unverified, and Apple's development host (whose
-			// bits are separate) is never asked.
+		if s.dcMode != DeviceCheckLog && !s.enforceAccepts(req.DeviceCheckEnv) {
+			// enforce: only a production token counts (plus development ones
+			// on a staging server with DEVICECHECK_ALLOW_DEVELOPMENT). Anything
+			// else is "no token" → device_unverified, and Apple's development
+			// host (whose bits are separate) is never asked.
 			token = ""
 		}
 		installID := r.Header.Get("X-Device-Install-Id")
