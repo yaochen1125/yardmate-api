@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log"
 	"net/http"
 	"time"
 
@@ -68,6 +67,7 @@ func newServer(
 	rarityPub *rarity.Publisher,
 	scanCounter *proxy.IdentifyScanCounter,
 	referralSvc *referral.Service,
+	mailer *enrichment.FeedbackMailer, // operator mailbox (mail_wiring.go); nil = feedback stored, not forwarded
 	rewardsSvc *rewards.Service, // referral gift-card rewards (rewards/SPEC.md); nil = routes unregistered (tests)
 ) *Server {
 	// Rose cultivar rerank is ON by default; ROSE_RERANK_ENABLED=false kill-switches it.
@@ -254,17 +254,10 @@ func newServer(
 		// expensive-call group, bounded by this /v1 scope's per-IP limit plus a
 		// per-device daily cap enforced in SQL (RecordFeedback). The handler
 		// requires + validates X-Device-Install-Id itself. Each stored message
-		// is also emailed to the operator (FEEDBACK_SMTP_* / FEEDBACK_EMAIL_TO
-		// in the Vault; all-absent = mail disabled, rows still stored).
+		// is also emailed to the operator mailbox main built once
+		// (mail_wiring.go; nil = mail disabled, rows still stored).
 		if enrichDB != nil {
-			feedbackMailer := enrichment.NewFeedbackMailer(
-				vault.Get("FEEDBACK_SMTP_HOST"), vault.Get("FEEDBACK_SMTP_PORT"),
-				vault.Get("FEEDBACK_SMTP_FROM"), vault.Get("FEEDBACK_SMTP_PASS"),
-				vault.Get("FEEDBACK_EMAIL_TO"))
-			if feedbackMailer == nil {
-				log.Printf("feedback mail disabled (FEEDBACK_SMTP_FROM/PASS/EMAIL_TO not all set)")
-			}
-			r.Post("/feedback", enrichment.HandleFeedback(enrichDB, feedbackMailer))
+			r.Post("/feedback", enrichment.HandleFeedback(enrichDB, mailer))
 		}
 
 		// /v1/attribution — Apple Search Ads (AdServices) install attribution.

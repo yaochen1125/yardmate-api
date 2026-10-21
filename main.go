@@ -307,16 +307,24 @@ func main() {
 	// routes answer 503 not_configured until SUPABASE_URL / SUPABASE_DB_URL /
 	// REVENUECAT_SECRET_KEY / REVENUECAT_ENTITLEMENT_ID are all present); the
 	// 10-minute settlement loop starts only when fully configured.
-	referralSvc := buildReferralService(vault, enrichDB)
+	// One operator mailbox (mail_wiring.go), built once: /v1/feedback forwards
+	// each message to it, the referral pool watch sends its alert to it, and
+	// referral gift-card payout requests are mailed to it.
+	mailer := operatorMailer(vault)
+	if mailer == nil {
+		log.Printf("operator mail disabled (FEEDBACK_SMTP_FROM/PASS/EMAIL_TO not all set): feedback stored but not forwarded, referral pool alert is WARN log only, gift-card payout requests stored but not mailed (deploy/referral-payout.sh list)")
+	}
+	referralSvc := buildReferralService(vault, enrichDB, mailer)
 	referralSvc.StartSettler(context.Background())
 
 	// Referral rewards (rewards/SPEC.md): RevenueCat webhook → 30% gift-card
 	// ledger, /me "rewards" block, POST /v1/referral/payout, and the loop that
-	// clears credits after Apple's 90-day refund window.
-	rewardsSvc := buildRewardsService(vault, enrichDB, referralSvc)
+	// clears credits after Apple's 90-day refund window. Payout requests go to
+	// the same operator mailbox.
+	rewardsSvc := buildRewardsService(vault, enrichDB, referralSvc, mailer)
 	rewardsSvc.Start(context.Background())
 
-	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim, doctorSvc, doctorInflight, doctorBudget, rarityPub, scanCounter, referralSvc, rewardsSvc)
+	srv := newServer(verifier, vault, lim, plantNet, plantID, vision, inat, content, enrichSvc, diseaseSvc, ingestSvc, enrichDB, inflightLim, doctorSvc, doctorInflight, doctorBudget, rarityPub, scanCounter, referralSvc, mailer, rewardsSvc)
 
 	// ReadTimeout / WriteTimeout cover the slowest endpoint (/v1/identify
 	// streams to Plant.id, up to ~30 s upstream) with 5 s headroom = 35 s base.

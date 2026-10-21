@@ -67,6 +67,9 @@ type Options struct {
 	ReadWindow   time.Duration
 	Interval     time.Duration // settlement cadence (default 10 min)
 	StartupDelay time.Duration // before the first settlement pass (default 1 min)
+	// Alerter receives the code-pool low-stock / expiry email (pool.go);
+	// nil = WARN log only.
+	Alerter Alerter
 }
 
 // Service owns the three handlers, their per-device buckets, and the
@@ -88,6 +91,17 @@ type Service struct {
 	startupDelay time.Duration
 	nudge        chan struct{}
 	now          func() time.Time
+
+	// pool watch (pool.go): where the alert goes, and which condition sets
+	// have already been mailed today (alertDay, UTC) so a day sends at most
+	// one email per set even when the conditions flap. Only the settlement
+	// goroutine touches these.
+	alerter    Alerter
+	alertDay   string
+	alertsSent map[string]bool
+	// poolConfigWarned: the settings-problem line (pool.go) has been logged
+	// for the current misconfiguration; cleared once it is fixed.
+	poolConfigWarned bool
 }
 
 // New wires a Service. Pass nil for whatever is not configured.
@@ -121,6 +135,7 @@ func New(store Store, rc Subscribers, entitlement string, auth Authenticator, op
 		startupDelay: opt.StartupDelay,
 		nudge:        make(chan struct{}, 1),
 		now:          time.Now,
+		alerter:      opt.Alerter,
 	}
 }
 

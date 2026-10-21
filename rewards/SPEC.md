@@ -31,7 +31,7 @@
 | webhook body（≤ 64 KB）| `{"event": {...}, "api_version": "1.0"}`；读 `id, type, environment, app_user_id, product_id, period_type, price, takehome_percentage, transaction_id, original_transaction_id, purchased_at_ms, cancel_reason`，另读 `is_family_share` |
 | `/payout` 头 | 同 `/claim`：`Authorization: Bearer <Supabase access token>`、`X-Device-Install-Id`、`X-App-Version` |
 | `/payout` body | `{"email": "you@example.com"}` |
-| vault | `REVENUECAT_WEBHOOK_SECRET`；`SUPABASE_URL` / `SUPABASE_DB_URL`（与 referral 共用）；`FEEDBACK_SMTP_*` / `FEEDBACK_EMAIL_TO`（运营邮件，缺了只记日志）；`REFERRAL_SETTLE_INTERVAL`（可选）|
+| vault | `REVENUECAT_WEBHOOK_SECRET`；`SUPABASE_URL` / `SUPABASE_DB_URL`（与 referral 共用）；`FEEDBACK_SMTP_*` / `FEEDBACK_EMAIL_TO`（运营邮件，main 经 `mail_wiring.go` 建一次、与 feedback / 码池告警共用，缺了只记日志）；`REFERRAL_SETTLE_INTERVAL`（可选）|
 | 库 | migration `015_referral_rewards.sql` 的 `reward_ledger` / `reward_voided_txns` / `reward_payouts`（依赖 013 的 `referral_users` / `referrals`）|
 
 ### 1.4 输出

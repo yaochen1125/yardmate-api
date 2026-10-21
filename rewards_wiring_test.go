@@ -39,9 +39,9 @@ func rewardsTestServerIPLimit(t *testing.T, vaultText string, ipLimit int) *Serv
 		t.Fatal(err)
 	}
 	lim := ratelimit.New(ipLimit, time.Hour, 1000, time.Hour, 1000, time.Hour)
-	referralSvc := buildReferralService(vault, nil)
-	rewardsSvc := buildRewardsService(vault, nil, referralSvc)
-	return newServer(verifier, vault, lim, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, referralSvc, rewardsSvc)
+	referralSvc := buildReferralService(vault, nil, nil)
+	rewardsSvc := buildRewardsService(vault, nil, referralSvc, nil)
+	return newServer(verifier, vault, lim, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, referralSvc, nil, rewardsSvc)
 }
 
 func TestRevenueCatWebhookRouteRegistered(t *testing.T) {
