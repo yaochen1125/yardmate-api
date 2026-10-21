@@ -344,10 +344,15 @@ func TestPGProgress(t *testing.T) {
 	now := time.Now()
 	paid := seedReferral(t, ctx, pool, referrer, "f1111111-0000-4000-8000-000000000000", "rewarded")
 	free := seedReferral(t, ctx, pool, referrer, "f2222222-0000-4000-8000-000000000000", "redeemed")
-	seedReferral(t, ctx, pool, referrer, "f3333333-0000-4000-8000-000000000000", "claimed")
+	claimed := seedReferral(t, ctx, pool, referrer, "f3333333-0000-4000-8000-000000000000", "claimed")
 	void := seedReferral(t, ctx, pool, referrer, "f4444444-0000-4000-8000-000000000000", "void")
 	gone := seedReferral(t, ctx, pool, referrer, "f5555555-0000-4000-8000-000000000000", "rewarded")
 	if _, err := pool.Exec(ctx, `update referrals set redeemed_at = $2 where id = $1`, free, now.Add(-day(3))); err != nil {
+		t.Fatal(err)
+	}
+	// Claimed 300 days ago, code reissued 20 days ago: still inside the unredeemed window.
+	if _, err := pool.Exec(ctx, `update referrals set claimed_at = $2, reissued_at = $3 where id = $1`,
+		claimed, now.Add(-day(300)), now.Add(-day(20))); err != nil {
 		t.Fatal(err)
 	}
 	credit := func(refID int64, txn, state, product string, purchased time.Time) {
@@ -386,9 +391,20 @@ func TestPGProgress(t *testing.T) {
 		if r.ID != free && !r.RedeemedAt.IsZero() {
 			t.Errorf("ref %d redeemed_at = %s, want zero", r.ID, r.RedeemedAt)
 		}
+		if r.ID == claimed && r.IssuedAt.Sub(now.Add(-day(20))).Abs() > time.Millisecond {
+			t.Errorf("issued_at = %s, want reissued_at", r.IssuedAt)
+		}
+		if r.ID == paid && !r.IssuedAt.Equal(r.ClaimedAt) {
+			t.Errorf("issued_at %s != claimed_at %s without a reissue", r.IssuedAt, r.ClaimedAt)
+		}
 	}
 	if len(credits) != 4 { // t1, t2, t4 (void referral, Progress skips it), t5 (deleted friend)
 		t.Fatalf("credits = %+v", credits)
+	}
+	for _, c := range credits {
+		if c.State == LedgerAvailable && c.PurchasedAt.Sub(now.Add(-day(100))).Abs() > time.Millisecond {
+			t.Errorf("available row purchased %s: want the latest one (t2, 100 days ago), not t2b", c.PurchasedAt)
+		}
 	}
 	counts, list := Progress(refs, credits, now)
 	if counts != (Counts{Joined: 3, FreeMonth: 1, Paying: 1}) {
