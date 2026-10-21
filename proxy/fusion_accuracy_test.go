@@ -228,9 +228,12 @@ func TestHandleIdentify_BloomTiebreak(t *testing.T) {
 
 	// Discover a suitable (blooming plantB, non-blooming plantA, month) triple.
 	names := content.CatalogScientificNames() // id -> scientific name
+	// hasUsableScientificName: the Pl@ntNet parser drops names that aren't a
+	// real species ("Petunia spp.", unquoted "Graptoveria Fred Ives"), which
+	// would remove A or B from the engine candidates and void the near-tie.
 	roundTrips := func(id, sci string) bool {
 		got, ok := resolvePlantID(content, sci)
-		return ok && got == id
+		return ok && got == id && hasUsableScientificName(sci)
 	}
 	bloomMonths := func(id string) []int {
 		if d, ok := content.LookupFullDetail(id); ok && d != nil {
