@@ -42,7 +42,7 @@ func newSupabaseAuthenticator(vault *secrets.Vault) referral.Authenticator {
 // RevenueCat dashboard — verified on prod 2026-10-19 to be the display-name
 // string "YardMate: AI Plant ID & Care Pro", spaces and colon included).
 // REFERRAL_SETTLE_INTERVAL (Go duration) overrides the 10-minute cadence.
-func buildReferralService(vault *secrets.Vault, db *enrichment.DB) *referral.Service {
+func buildReferralService(vault *secrets.Vault, db *enrichment.DB, mailer *enrichment.FeedbackMailer) *referral.Service {
 	var store referral.Store
 	if db != nil {
 		if p := referral.NewPGStore(db.Pool()); p != nil {
@@ -53,8 +53,16 @@ func buildReferralService(vault *secrets.Vault, db *enrichment.DB) *referral.Ser
 	if c := referral.NewClient(vault.Get("REVENUECAT_SECRET_KEY")); c != nil {
 		rc = c
 	}
+	// The code-pool low-stock / expiry alert goes to the operator mailbox main
+	// built once (mail_wiring.go). A typed nil must not reach the interface,
+	// or the watch would call Alert on a nil mailer.
+	var alerter referral.Alerter
+	if mailer != nil {
+		alerter = mailer
+	}
 	svc := referral.New(store, rc, vault.Get("REVENUECAT_ENTITLEMENT_ID"), newSupabaseAuthenticator(vault), referral.Options{
 		Interval: vaultDurationOr(vault, "REFERRAL_SETTLE_INTERVAL", 0),
+		Alerter:  alerter,
 	})
 	if !svc.Configured() {
 		log.Printf("WARN: referral not configured (missing %v); /v1/referral/* answers 503 not_configured", svc.Missing())

@@ -114,6 +114,44 @@ func (p *PGStore) ExpireCodes(ctx context.Context) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
+// PoolStatus reads the three pool settings (migration 014) and groups
+// code_pool by batch. A batch is (offer_ref_name, expires_at): import-codes.sh
+// gives one CSV one name and one date, and the same name re-imported with a
+// later date is a new batch with its own expiry.
+func (p *PGStore) PoolStatus(ctx context.Context) (PoolStatus, error) {
+	var st PoolStatus
+	if err := p.pool.QueryRow(ctx,
+		`select issue_margin_days, swap_grace_days, low_stock_threshold, expiry_warn_days
+		   from referral_settings where id = 1`).
+		Scan(&st.Settings.IssueMarginDays, &st.Settings.SwapGraceDays, &st.Settings.LowStockThreshold, &st.Settings.ExpiryWarnDays); err != nil {
+		return st, fmt.Errorf("pool settings: %w", err)
+	}
+	rows, err := p.pool.Query(ctx,
+		`select offer_ref_name, expires_at,
+		        count(*) filter (where state = 'free'),
+		        count(*) filter (where state = 'issued'),
+		        count(*) filter (where state = 'redeemed'),
+		        count(*) filter (where state = 'expired')
+		   from code_pool
+		  group by offer_ref_name, expires_at
+		  order by expires_at, offer_ref_name`)
+	if err != nil {
+		return st, fmt.Errorf("pool batches: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var b PoolBatch
+		if err := rows.Scan(&b.Name, &b.ExpiresAt, &b.Free, &b.Issued, &b.Redeemed, &b.Expired); err != nil {
+			return st, fmt.Errorf("pool batches: %w", err)
+		}
+		st.Batches = append(st.Batches, b)
+	}
+	if err := rows.Err(); err != nil {
+		return st, fmt.Errorf("pool batches: %w", err)
+	}
+	return st, nil
+}
+
 func (p *PGStore) HoldDays(ctx context.Context) (int, error) {
 	var days int
 	err := p.pool.QueryRow(ctx, `select hold_days from referral_settings where id = 1`).Scan(&days)
@@ -141,10 +179,13 @@ func scanReferrals(rows pgx.Rows) ([]Referral, error) {
 
 func (p *PGStore) ListClaimed(ctx context.Context, limit int) ([]Referral, error) {
 	// Stop polling RevenueCat for claims old enough that the issued code has
-	// long expired (6 months) — they stay 'claimed' and cost nothing.
+	// long expired (6 months) — they stay 'claimed' and cost nothing. A
+	// re-claim that swapped the code restarts the window (reissued_at, 014);
+	// claimed_at itself stays the first claim, which is what StartedAfter
+	// compares against.
 	rows, err := p.pool.Query(ctx,
 		`select `+referralColumns+` from referrals
-		  where state = 'claimed' and claimed_at > now() - interval '200 days'
+		  where state = 'claimed' and coalesce(reissued_at, claimed_at) > now() - interval '200 days'
 		  order by redeem_reported_at desc nulls last, claimed_at
 		  limit $1`, limit)
 	if err != nil {

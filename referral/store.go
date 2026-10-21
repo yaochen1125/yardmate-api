@@ -70,8 +70,48 @@ const (
 	ErrOwnCode        = "own_code"        // it is their own
 	ErrAlreadyClaimed = "already_claimed" // this account has already used someone's code
 	ErrNotNewUser     = "not_new_user"    // this account has had Premium before
-	ErrPoolEmpty      = "pool_empty"      // no unexpired free code left
+	ErrPoolEmpty      = "pool_empty"      // no free code with the issue margin left
 )
+
+// PoolSettings is the tunable part of referral_settings the code pool reads
+// (migration 014). Changing the row takes effect on the next claim / pass —
+// no deploy.
+type PoolSettings struct {
+	// IssueMarginDays: /claim only hands out NEW codes that expire later than
+	// now + this many days, so the friend has time to redeem (default 14).
+	IssueMarginDays int
+	// SwapGraceDays: on a re-claim the code already in hand is swapped only
+	// when it has fewer than this many days left (default 3). Deliberately
+	// smaller than the issue margin, or every code nearing the margin would
+	// be replaced on a re-claim and burn a second good one.
+	SwapGraceDays int
+	// LowStockThreshold: fewer usable free codes than this → alert (default
+	// 100). 0 turns both alerts off (expiring is a projected low stock).
+	LowStockThreshold int
+	// ExpiryWarnDays: the earliest usable batch expiring within this many
+	// days, with fewer than LowStockThreshold usable codes left once it is
+	// gone → alert (default 30).
+	ExpiryWarnDays int
+}
+
+// PoolBatch is one import batch of code_pool: the codes that share an App
+// Store Connect reference name and expiry (import-codes.sh gives a CSV one
+// name and one date).
+type PoolBatch struct {
+	Name      string
+	ExpiresAt time.Time
+	Free      int // on the shelf (may be inside the issue margin — see Stock)
+	Issued    int
+	Redeemed  int
+	Expired   int
+}
+
+// PoolStatus is code_pool as the settlement loop's watch sees it: the
+// settings row plus every batch, earliest expiry first.
+type PoolStatus struct {
+	Settings PoolSettings
+	Batches  []PoolBatch
+}
 
 // named reports whether err is one of the refusals above, and which.
 func named(err error) (Failure, bool) {
@@ -102,6 +142,9 @@ type Store interface {
 
 	// ExpireCodes marks free/issued pool codes past their expiry.
 	ExpireCodes(ctx context.Context) (int64, error)
+	// PoolStatus takes stock of code_pool (settings + per-batch counts) for
+	// the low-stock / expiry watch.
+	PoolStatus(ctx context.Context) (PoolStatus, error)
 	// HoldDays reads referral_settings.hold_days.
 	HoldDays(ctx context.Context) (int, error)
 	// ListClaimed returns referrals still waiting for the referee to redeem,

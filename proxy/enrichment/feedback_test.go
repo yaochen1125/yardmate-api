@@ -98,6 +98,25 @@ func TestFeedbackMailerCompose(t *testing.T) {
 	}
 }
 
+func TestFeedbackMailerComposeAlert(t *testing.T) {
+	m := NewFeedbackMailer("", "", "from@example.com", "pw", "to@example.com")
+	msg := m.composeAlert("[YardMate] Referral code pool: low stock\r\nBcc: evil@example.com", "各批剩余：\n  A 42\n")
+	header, body, _ := strings.Cut(msg, "\r\n\r\n")
+	for _, line := range strings.Split(header, "\r\n") {
+		if strings.HasPrefix(line, "Bcc:") {
+			t.Fatalf("header injection not neutralized:\n%s", header)
+		}
+	}
+	for _, want := range []string{"From: YardMate Alerts <from@example.com>", "To: to@example.com", "Subject: [YardMate] Referral code pool: low stock", "charset=UTF-8"} {
+		if !strings.Contains(header, want) {
+			t.Errorf("header missing %q:\n%s", want, header)
+		}
+	}
+	if body != "各批剩余：\n  A 42\n" {
+		t.Errorf("body = %q", body)
+	}
+}
+
 func TestNewFeedbackMailerDisabledWhenIncomplete(t *testing.T) {
 	if NewFeedbackMailer("", "", "from@example.com", "", "to@example.com") != nil {
 		t.Fatal("mailer must be nil when pass missing")

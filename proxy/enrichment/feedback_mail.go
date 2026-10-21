@@ -66,8 +66,34 @@ func (m *FeedbackMailer) notify(id string, row feedbackRow) {
 }
 
 func (m *FeedbackMailer) send(id string, row feedbackRow) error {
-	msg := m.compose(id, row, time.Now().UTC())
+	return m.deliver(m.compose(id, row, time.Now().UTC()))
+}
 
+// Alert emails an operator notice over the same account: subject must be
+// plain ASCII (a non-ASCII header would need RFC 2047 encoding), body is
+// UTF-8 plain text. Synchronous and bounded by the connection deadline (≤ 40
+// s); the caller decides whether to retry. Used by the referral code-pool
+// watch (referral/pool.go) — the same inbox that gets each feedback message.
+func (m *FeedbackMailer) Alert(subject, body string) error {
+	return m.deliver(m.composeAlert(subject, body))
+}
+
+// composeAlert renders a notice. The subject is operator-authored, but it is
+// still a header: CR/LF stripped so no line of it can become one.
+func (m *FeedbackMailer) composeAlert(subject, body string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "From: YardMate Alerts <%s>\r\n", m.from)
+	fmt.Fprintf(&b, "To: %s\r\n", m.to)
+	fmt.Fprintf(&b, "Subject: %s\r\n", headerSafe(subject))
+	b.WriteString("MIME-Version: 1.0\r\n")
+	b.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
+	b.WriteString("\r\n")
+	b.WriteString(body)
+	return b.String()
+}
+
+// deliver pushes one rendered RFC 5322 message through SMTP + STARTTLS.
+func (m *FeedbackMailer) deliver(msg string) error {
 	// smtp.SendMail has no deadline — a stalled SMTP server would leak the
 	// goroutine. Dial + absolute connection deadline bounds the whole exchange.
 	conn, err := net.DialTimeout("tcp", m.addr, 10*time.Second)
