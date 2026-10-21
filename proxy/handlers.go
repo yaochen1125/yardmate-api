@@ -51,6 +51,24 @@ var identifyPlantIDMaxTimeout = 7 * time.Second
 // 直接交给 GPT（var 供测试缩短）。
 var minPlantIDHopBudget = 3 * time.Second
 
+// plantIDHopSafety — Plant.id 单跳切断后到 GPT 兜底判剩余时间之间的调度 / 记日志耗时
+// 余量。没有它，单跳被压缩时 Plant.id 一超时剩余恰好是 6s − δ，兜底判
+// `< minIdentifyRescueBudget` 被跳过 → 502（独立评审复现）。
+const plantIDHopSafety = 500 * time.Millisecond
+
+// plantIDHopBudget 计算 Plant.id 单跳时长：上限 identifyPlantIDMaxTimeout；GPT 能兜底时
+// 再从 22s 墙钟里扣掉已用时间、GPT 保底 minIdentifyRescueBudget 和 plantIDHopSafety，
+// 保证 Plant.id 切断后 GPT 仍有 ≥ minIdentifyRescueBudget。可能为负（调用方据此跳过）。
+func plantIDHopBudget(elapsed time.Duration, gptCanRescue bool) time.Duration {
+	hop := identifyPlantIDMaxTimeout
+	if gptCanRescue {
+		if left := identifyWallClockBudget - elapsed - minIdentifyRescueBudget - plantIDHopSafety; left < hop {
+			hop = left
+		}
+	}
+	return hop
+}
+
 // identifyWallClockBudget bounds the GPT on-demand rescue by wall clock from
 // reqStart（= identifyUpstreamTimeout：真正的紧约束是客户端 30s 计时器，不是 35s
 // WriteTimeout —— 见 identifyUpstreamTimeout 的预算推导；镜像 diagnose 的
@@ -516,13 +534,14 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			// Plant.id 单跳时长：GPT 能兜底时给它留够 minIdentifyRescueBudget，否则
 			// Plant.id 一慢，GPT 就只剩不足 6s 被跳过 → 502。GPT 兜不了时沿用共享 ctx。
 			pidCtx, pidCancel := ctx, context.CancelFunc(func() {})
-			hop := identifyPlantIDMaxTimeout
-			if gptCanRescue {
-				if left := identifyWallClockBudget - time.Since(reqStart) - minIdentifyRescueBudget; left < hop {
-					hop = left
-				}
-			}
+			hop := plantIDHopBudget(time.Since(reqStart), gptCanRescue)
 			switch {
+			case r.Context().Err() != nil:
+				// 客户端已断开：没人在听，不预占额度、不调 Plant.id（err 保留，下方兜底同样跳过）。
+				log.Printf("identify plantid-skip: deviceID=%s reason=client_gone plantnetErr=%v", deviceID, err)
+				if plantNet == nil {
+					err = fmt.Errorf("%w: %v", ErrPlantIDUnavailable, r.Context().Err())
+				}
 			case gptCanRescue && hop < minPlantIDHopBudget:
 				// 剩的时间不够 Plant.id 跑完 —— 不白扣 credit，直接交 GPT。
 				log.Printf("identify plantid-skip: deviceID=%s reason=hop_budget hop=%v plantnetErr=%v → 跳过 Plant.id, GPT 兜底接管", deviceID, hop, err)
@@ -1336,12 +1355,20 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 						s0.Name = g
 					}
 					if content != nil {
-						if pid, ok := content.LookupPlantID(g); ok {
+						// 库内属级条目可能写成 "Petunia spp."（AAA1591）或裸属名 "Rosa"。
+						for _, key := range []string{g, g + " spp.", g + " sp."} {
+							pid, ok := content.LookupPlantID(key)
+							if !ok {
+								continue
+							}
 							p := pid
 							s0.PlantID = &p
 							if cn, ok := content.LookupCommonName(pid); ok {
 								s0.Name = cn
+								s0.CommonNames = prependUnique(cn, s0.CommonNames)
 							}
+							s0.Kingdom = MergeKingdom(s0.Kingdom, content.KingdomFor(key))
+							break
 						}
 					}
 					result.Suggestions[0] = s0
@@ -1756,6 +1783,11 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 		// Plant.id 每日上限（与 identify 共用同一份额度，plantid_budget.go）。超了就
 		// 当作 Plant.id 限流 → 走下方既有的 AI vision 兜底，不调 Plant.id。
 		var api *plantIDDiagnoseResponse
+		if ce := r.Context().Err(); ce != nil {
+			// 客户端已断开：响应写不回去，不预占额度、不调任何上游。
+			log.Printf("diagnose skipped (client gone): deviceID=%s ctxErr=%v", deviceID, ce)
+			return
+		}
 		if ok, limit := client.Budget.TryAcquire(clientIPFromRequest(r), plantIDDiagnoseCredits); !ok {
 			used, capN := client.Budget.Snapshot()
 			log.Printf("diagnose plantid-budget: deviceID=%s limit=%s used=%d cap=%d → 跳过 Plant.id", deviceID, limit, used, capN)

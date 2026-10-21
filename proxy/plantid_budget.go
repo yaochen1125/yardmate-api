@@ -99,6 +99,11 @@ type PlantIDBudget struct {
 	globalCap int // <= 0 → 不限
 	perIPCap  int // <= 0 → 不限
 	now       func() time.Time
+	// requireSeed=true 时，第一次 SeedUsedToday 之前一律拒绝（reason "unseeded"）：
+	// 没拿到 Plant.id 官方当日已用量就放行，重启一次就可能多花一整份全站额度，
+	// 种子在途时本地预占也会被取较大值吞掉（独立评审）。prod 由 main.go 打开。
+	requireSeed bool
+	seeded      bool
 }
 
 // NewPlantIDBudget 构造两道上限；cap <= 0 表示该道不限。
@@ -121,14 +126,27 @@ func (b *PlantIDBudget) rollLocked() {
 	}
 }
 
+// RequireSeed 让预算在第一次 SeedUsedToday 之前拒绝一切预占（fail-closed）。
+func (b *PlantIDBudget) RequireSeed() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.requireSeed = true
+}
+
 // TryAcquire 为 ip 预占 credits 个 credit。任一道上限会被突破时不预占、返回
-// false + 原因（"global" / "per_ip"）。ip 为空时只查全站上限。
+// false + 原因（"unseeded" / "global" / "per_ip"）。ip 为空时只查全站上限。
 func (b *PlantIDBudget) TryAcquire(ip string, credits int) (bool, string) {
 	if b == nil {
 		return true, ""
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.requireSeed && !b.seeded {
+		return false, "unseeded"
+	}
 	b.rollLocked()
 	if b.globalCap > 0 && b.used+credits > b.globalCap {
 		return false, "global"
@@ -143,15 +161,16 @@ func (b *PlantIDBudget) TryAcquire(ip string, credits int) (bool, string) {
 	return true, ""
 }
 
-// SeedUsedToday 把 Plant.id 官方的当日已用量并入计数（取较大者，不会把本进程已
-// 预占的部分冲掉）。
+// SeedUsedToday 把 Plant.id 官方的当日已用量并入计数（取较大者）并标记已起算。
+// requireSeed 下种子之前不会有本地预占，取较大者不会吞掉任何预占。
 func (b *PlantIDBudget) SeedUsedToday(used int) {
-	if b == nil || used <= 0 {
+	if b == nil {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.rollLocked()
+	b.seeded = true
 	if used > b.used {
 		b.used = used
 	}

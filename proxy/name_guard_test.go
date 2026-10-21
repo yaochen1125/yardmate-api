@@ -249,6 +249,19 @@ func TestGenusOnlyName(t *testing.T) {
 		{"Unknown", ""},      // generic word
 		{"Ab", ""},           // too short
 		{"Begonia cf.", ""},  // only sp/spp may follow
+		{"Plantae", ""},
+		{"Fungi", ""},
+		{"Basidiomycota", ""},
+		{"Agaricomycetes", ""},
+		{"Angiospermae", ""},
+		{"Eudicots", ""},
+		{"Orchid", ""},
+		{"Palm", ""},
+		{"Ivy", ""},
+		{"Lily", ""},
+		{"Succulents", ""},
+		{"Iris", "Iris"}, // English word that IS a genus
+		{"Aster", "Aster"},
 		{"", ""},
 	}
 	for _, c := range cases {
@@ -264,4 +277,28 @@ func scientificNames(s []Suggestion) []string {
 		out[i] = s[i].ScientificName
 	}
 	return out
+}
+
+// 库内属级条目写成 "Petunia spp."（真实库 AAA1591）时，GPT 答 "Petunia sp." / "Petunia"
+// 也要对上，并补上库内俗名，不能另生成一个重复的库外 Petunia。
+func TestHandleIdentify_NamelessGuard_GenusMatchesSppCatalogEntry(t *testing.T) {
+	for _, sci := range []string{"Petunia sp.", "Petunia", "Petunia spp."} {
+		t.Run(sci, func(t *testing.T) {
+			h, cleanup := genusGuardHandler(t, sci, nil)
+			defer cleanup()
+			got := decodeIdentify(t, doCascadeReq(t, h))
+			s0 := got.Suggestions[0]
+			if s0.PlantID == nil || *s0.PlantID != "AAA1591" {
+				t.Fatalf("plant_id = %v, want AAA1591 (catalog 'Petunia spp.')", s0.PlantID)
+			}
+			if len(s0.CommonNames) == 0 || s0.CommonNames[0] != "Garden Petunia" {
+				t.Errorf("common_names = %v, want curated 'Garden Petunia' first", s0.CommonNames)
+			}
+			// "Petunia spp." 已被既有的 ai-catalog-recovery 精确命中（不经 genus-keep），
+			// Name 沿用那条路径的既有行为；只断言 genus-keep 路径会把 Name 换成库内名。
+			if sci != "Petunia spp." && s0.Name != "Garden Petunia" {
+				t.Errorf("name = %q, want curated 'Garden Petunia'", s0.Name)
+			}
+		})
+	}
 }

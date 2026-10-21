@@ -1006,7 +1006,7 @@ func genusOnlyName(sci string) string {
 		return ""
 	}
 	lower := strings.ToLower(g)
-	for _, suf := range []string{"aceae", "ales", "eae", "inae", "idae", "oideae", "phyta", "opsida"} {
+	for _, suf := range []string{"aceae", "ales", "eae", "inae", "idae", "oideae", "phyta", "phytina", "opsida", "mycota", "mycotina", "mycetes", "phyceae"} {
 		if strings.HasSuffix(lower, suf) {
 			return ""
 		}
@@ -1016,7 +1016,15 @@ func genusOnlyName(sci string) string {
 		"labiatae", "cruciferae", "guttiferae",
 		"unknown", "plant", "plants", "none", "tree", "shrub", "flower", "grass",
 		"fern", "moss", "succulent", "cactus", "weed", "herb", "vine", "fungus",
-		"mushroom", "lichen", "algae", "seaweed":
+		"mushroom", "lichen", "algae", "seaweed",
+		// 界 / 门 / 分支等高阶类群（不带标准后缀的）
+		"plantae", "fungi", "animalia", "angiospermae", "angiosperms", "gymnospermae",
+		"gymnosperms", "eudicots", "monocots", "dicots", "embryophyta", "tracheophyta",
+		// 英文俗称（不是属名；Iris / Aster / Dahlia 这类本身就是属名的不在此列）
+		"orchid", "orchids", "palm", "palms", "ivy", "lily", "lilies", "rose", "roses",
+		"daisy", "tulip", "ferns", "mosses", "grasses", "flowers", "trees",
+		"shrubs", "herbs", "vines", "weeds", "succulents", "cacti", "bamboo", "conifer",
+		"conifers", "houseplant", "houseplants", "bonsai":
 		return ""
 	}
 	return g

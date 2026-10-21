@@ -163,7 +163,13 @@ type outageRig struct {
 func newOutageRig(t *testing.T, mode PlantIDFallbackMode, plantNetUp, plantIDUp http.HandlerFunc, budget *PlantIDBudget) *outageRig {
 	t.Helper()
 	rig := &outageRig{plantIDHit: &atomic.Int32{}, visionHit: &atomic.Int32{}, budget: budget}
-	pnSrv := httptest.NewServer(plantNetUp)
+	var pn *PlantNetClient
+	pnClose := func() {}
+	if plantNetUp != nil { // nil → Plant.id-only 部署（无 Pl@ntNet）
+		pnSrv := httptest.NewServer(plantNetUp)
+		pn = &PlantNetClient{APIKey: "test-key", Endpoint: pnSrv.URL, Lang: "en", NbResults: 10, HTTP: pnSrv.Client()}
+		pnClose = pnSrv.Close
+	}
 	if plantIDUp == nil {
 		plantIDUp = func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, cannedPlantIDOK) }
 	}
@@ -175,7 +181,6 @@ func newOutageRig(t *testing.T, mode PlantIDFallbackMode, plantNetUp, plantIDUp 
 		rig.visionHit.Add(1)
 		_, _ = io.WriteString(w, cannedVisionRescueGenus)
 	}))
-	pn := &PlantNetClient{APIKey: "test-key", Endpoint: pnSrv.URL, Lang: "en", NbResults: 10, HTTP: pnSrv.Client()}
 	pi := &PlantIDClient{APIKey: "test-key", Endpoint: piSrv.URL, HTTP: piSrv.Client(), Budget: budget}
 	vision := &VisionClient{APIKey: "k", Endpoint: vsrv.URL, Model: "t", HTTP: vsrv.Client()}
 	content, err := LoadContent()
@@ -185,7 +190,7 @@ func newOutageRig(t *testing.T, mode PlantIDFallbackMode, plantNetUp, plantIDUp 
 	rig.h = HandleIdentify(pn, pi, content, vision, nil, nil,
 		false, false, false, false, false, false,
 		true /* arbiterOnDemand */, mode, nil, nil)
-	rig.close = func() { pnSrv.Close(); piSrv.Close(); vsrv.Close() }
+	rig.close = func() { pnClose(); piSrv.Close(); vsrv.Close() }
 	return rig
 }
 
@@ -334,5 +339,74 @@ func TestHandleDiagnose_PlantIDBudgetExhausted_UsesVisionFallback(t *testing.T) 
 	}
 	if plantIDHit.Load() != 0 {
 		t.Fatalf("Plant.id calls = %d, want 0 (budget exhausted)", plantIDHit.Load())
+	}
+}
+
+// 单跳时长算术：Plant.id 用满 hop 后，GPT 兜底仍有 ≥ minIdentifyRescueBudget（含余量）。
+// 评审复现的 bug：hop 恰好 = 22s − 已用 − 6s 时，Plant.id 一超时剩余 6s − δ → 兜底被跳过 → 502。
+func TestPlantIDHopBudget_LeavesRescueBudget(t *testing.T) {
+	for _, elapsed := range []time.Duration{0, time.Second, 3 * time.Second, 8 * time.Second, 9500 * time.Millisecond, 12 * time.Second, 20 * time.Second} {
+		hop := plantIDHopBudget(elapsed, true)
+		if hop > identifyPlantIDMaxTimeout {
+			t.Errorf("elapsed=%v hop=%v > max %v", elapsed, hop, identifyPlantIDMaxTimeout)
+		}
+		if hop >= minPlantIDHopBudget {
+			left := identifyWallClockBudget - (elapsed + hop)
+			if left < minIdentifyRescueBudget+plantIDHopSafety {
+				t.Errorf("elapsed=%v hop=%v leaves %v for GPT, want >= %v", elapsed, hop, left, minIdentifyRescueBudget+plantIDHopSafety)
+			}
+		}
+	}
+	if hop := plantIDHopBudget(20*time.Second, false); hop != identifyPlantIDMaxTimeout {
+		t.Errorf("no GPT rescue: hop = %v, want max %v (shared ctx bounds it)", hop, identifyPlantIDMaxTimeout)
+	}
+}
+
+// fail-closed：没拿到官方当日用量之前一律拒绝；种子即使是 0 也算起算完成。
+func TestPlantIDBudget_RequireSeed(t *testing.T) {
+	b := NewPlantIDBudget(30, 3)
+	b.RequireSeed()
+	if ok, why := b.TryAcquire("1.1.1.1", 1); ok || why != "unseeded" {
+		t.Fatalf("before seed = %v/%q, want denied unseeded", ok, why)
+	}
+	b.SeedUsedToday(0)
+	if ok, _ := b.TryAcquire("1.1.1.1", 1); !ok {
+		t.Fatal("after seed(0) denied, want allowed")
+	}
+}
+
+// 客户端已断开：不调 Plant.id、不预占额度。
+func TestHandleIdentify_ClientGone_NoPlantIDReservation(t *testing.T) {
+	b := NewPlantIDBudget(30, 3)
+	rig := newOutageRig(t, PlantIDFallbackOutage, plantNetStatus(http.StatusInternalServerError), nil, b)
+	defer rig.close()
+	body, ct := buildMultipart(t, "image", jpegMagic)
+	req := httptest.NewRequest(http.MethodPost, "/v1/identify", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("X-Device-Install-Id", testUUID)
+	req.Header.Set("X-App-Version", "1.1.1")
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	rec := httptest.NewRecorder()
+	rig.h.ServeHTTP(rec, req.WithContext(canceled))
+	if rig.plantIDHit.Load() != 0 {
+		t.Fatalf("Plant.id calls = %d, want 0 for a disconnected client", rig.plantIDHit.Load())
+	}
+	if used, _ := b.Snapshot(); used != 0 {
+		t.Fatalf("budget used = %d, want 0 (no reservation for a disconnected client)", used)
+	}
+}
+
+// Plant.id-only 部署（无 Pl@ntNet）被上限挡下 → 不调 Plant.id，GPT 兜底仍出 200。
+func TestHandleIdentify_PlantIDOnly_CapDenied_GPTRescues(t *testing.T) {
+	b := NewPlantIDBudget(30, 3)
+	b.SeedUsedToday(30)
+	rig := newOutageRig(t, PlantIDFallbackAlways, nil, nil, b)
+	defer rig.close()
+	if sci := firstSci(t, doCascadeReq(t, rig.h)); sci != "Rescuea fakeium" {
+		t.Fatalf("top = %q, want GPT rescue", sci)
+	}
+	if rig.plantIDHit.Load() != 0 {
+		t.Fatalf("Plant.id calls = %d, want 0", rig.plantIDHit.Load())
 	}
 }
