@@ -271,12 +271,12 @@ func TestHandleIdentify_PlantIDGlobalCap(t *testing.T) {
 	}
 }
 
-// Plant.id 一跳挂起 → 被单跳预算切断，GPT 仍有时间兜底出 200（不 502）。
+// Pl@ntNet 与 Plant.id 都挂起 → 赛跑截止后 GPT（0s 起并行）兜底出 200（不 502）。
 func TestHandleIdentify_PlantIDHang_HopCutGPTRescues(t *testing.T) {
-	oldPN, oldPID, oldMin := identifyPlantNetTimeout, identifyPlantIDMaxTimeout, minPlantIDHopBudget
-	identifyPlantNetTimeout, identifyPlantIDMaxTimeout, minPlantIDHopBudget = 200*time.Millisecond, 200*time.Millisecond, 50*time.Millisecond
+	oldHedge, oldRace, oldMin := identifyPlantNetHedgeDelay, identifyEngineRaceBudget, minPlantIDHopBudget
+	identifyPlantNetHedgeDelay, identifyEngineRaceBudget, minPlantIDHopBudget = 100*time.Millisecond, 400*time.Millisecond, 50*time.Millisecond
 	defer func() {
-		identifyPlantNetTimeout, identifyPlantIDMaxTimeout, minPlantIDHopBudget = oldPN, oldPID, oldMin
+		identifyPlantNetHedgeDelay, identifyEngineRaceBudget, minPlantIDHopBudget = oldHedge, oldRace, oldMin
 	}()
 
 	release := make(chan struct{})
@@ -342,23 +342,15 @@ func TestHandleDiagnose_PlantIDBudgetExhausted_UsesVisionFallback(t *testing.T) 
 	}
 }
 
-// 单跳时长算术：Plant.id 用满 hop 后，GPT 兜底仍有 ≥ minIdentifyRescueBudget（含余量）。
-// 评审复现的 bug：hop 恰好 = 22s − 已用 − 6s 时，Plant.id 一超时剩余 6s − δ → 兜底被跳过 → 502。
-func TestPlantIDHopBudget_LeavesRescueBudget(t *testing.T) {
-	for _, elapsed := range []time.Duration{0, time.Second, 3 * time.Second, 8 * time.Second, 9500 * time.Millisecond, 12 * time.Second, 20 * time.Second} {
-		hop := plantIDHopBudget(elapsed, true)
-		if hop > identifyPlantIDMaxTimeout {
-			t.Errorf("elapsed=%v hop=%v > max %v", elapsed, hop, identifyPlantIDMaxTimeout)
-		}
-		if hop >= minPlantIDHopBudget {
-			left := identifyWallClockBudget - (elapsed + hop)
-			if left < minIdentifyRescueBudget+plantIDHopSafety {
-				t.Errorf("elapsed=%v hop=%v leaves %v for GPT, want >= %v", elapsed, hop, left, minIdentifyRescueBudget+plantIDHopSafety)
-			}
-		}
+// 赛跑截止算术：引擎赛跑结束后，GPT 兜底仍有 ≥ minIdentifyRescueBudget + 余量。
+// 评审复现过的 bug：余量为 0 时剩余恰为 6s − δ，兜底被 `<` 判跳过 → 502。
+func TestEngineRaceBudget_LeavesRescueBudget(t *testing.T) {
+	left := identifyWallClockBudget - identifyEngineRaceBudget
+	if left < minIdentifyRescueBudget+300*time.Millisecond {
+		t.Fatalf("race budget %v leaves %v for GPT, want >= %v + margin", identifyEngineRaceBudget, left, minIdentifyRescueBudget)
 	}
-	if hop := plantIDHopBudget(20*time.Second, false); hop != identifyPlantIDMaxTimeout {
-		t.Errorf("no GPT rescue: hop = %v, want max %v (shared ctx bounds it)", hop, identifyPlantIDMaxTimeout)
+	if identifyPlantNetHedgeDelay+minPlantIDHopBudget > identifyEngineRaceBudget {
+		t.Fatalf("hedge %v + min Plant.id hop %v exceeds race budget %v — Plant.id could never be hedged in", identifyPlantNetHedgeDelay, minPlantIDHopBudget, identifyEngineRaceBudget)
 	}
 }
 

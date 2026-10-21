@@ -296,7 +296,8 @@ func (c *PlantNetClient) Identify(ctx context.Context, image io.Reader, mime, or
 	q.Set("include-related-images", "true")
 	reqURL.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL.String(), &body)
+	traceCtx, trace := newPlantNetTrace(ctx)
+	req, err := http.NewRequestWithContext(traceCtx, http.MethodPost, reqURL.String(), &body)
 	if err != nil {
 		return nil, fmt.Errorf("plantnet: build request: %w", err)
 	}
@@ -308,7 +309,9 @@ func (c *PlantNetClient) Identify(ctx context.Context, image io.Reader, mime, or
 		// handler advances to the Plant.id fallback. Sanitize first: the raw
 		// *url.Error embeds the request URL, which carries the secret api-key
 		// query param (see sanitizePlantNetErr).
-		return nil, fmt.Errorf("%w: %v", ErrPlantNetUnavailable, sanitizePlantNetErr(err))
+		safe := sanitizePlantNetErr(err)
+		log.Printf("plantnet trace: %s err=%v", trace, safe)
+		return nil, fmt.Errorf("%w: %v", ErrPlantNetUnavailable, safe)
 	}
 	defer drainAndClose(resp.Body)
 
@@ -318,6 +321,7 @@ func (c *PlantNetClient) Identify(ctx context.Context, image io.Reader, mime, or
 		// Plant.id client which sees 201 in prod).
 		var apiResp plantNetAPIResponse
 		if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+			log.Printf("plantnet trace: %s status=%d decodeErr=%v", trace, resp.StatusCode, err)
 			return nil, fmt.Errorf("%w: decode: %v", ErrPlantNetBadResponse, err)
 		}
 		c.logQuota(apiResp.RemainingIdentificationRequests)
@@ -342,6 +346,7 @@ func (c *PlantNetClient) Identify(ctx context.Context, image io.Reader, mime, or
 	case resp.StatusCode == http.StatusTooManyRequests:
 		return nil, ErrPlantNetRateLimit
 	case resp.StatusCode >= 500:
+		log.Printf("plantnet trace: %s status=%d", trace, resp.StatusCode)
 		return nil, ErrPlantNetUnavailable
 	default:
 		return nil, fmt.Errorf("%w: status %d", ErrPlantNetBadResponse, resp.StatusCode)

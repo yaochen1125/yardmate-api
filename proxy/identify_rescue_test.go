@@ -37,12 +37,12 @@ func newOnDemandRescueHandler(t *testing.T, plantNetUp http.HandlerFunc, vision 
 
 const cannedVisionRescueOK = `{"choices":[{"message":{"content":"{\"is_plant\":true,\"scientific_name\":\"Rescuea fakeium\",\"common_names\":[],\"confidence\":0.42}"}}]}`
 
-// (1) Pl@ntNet 挂起 → identifyPlantNetTimeout 切断 → GPT 兜底接管 → 200。
+// (1) Pl@ntNet 挂起 → 过 hedge 点后备交给已并行在跑的 GPT（无 Plant.id）→ 200。
 // 事故形态：挂起吃满共享 30s ctx，兜底拿到已取消的 ctx 必死 → 502。
 func TestHandleIdentify_OnDemandRescue_PlantNetHang_GPTRescues(t *testing.T) {
-	oldTimeout := identifyPlantNetTimeout
-	identifyPlantNetTimeout = 200 * time.Millisecond
-	defer func() { identifyPlantNetTimeout = oldTimeout }()
+	oldHedge, oldRace := identifyPlantNetHedgeDelay, identifyEngineRaceBudget
+	identifyPlantNetHedgeDelay, identifyEngineRaceBudget = 100*time.Millisecond, 300*time.Millisecond
+	defer func() { identifyPlantNetHedgeDelay, identifyEngineRaceBudget = oldHedge, oldRace }()
 
 	// 挂到调用方放弃为止，模拟上游无响应。必须先读完 body：multipart 还有未读字节时
 	// Go server 的 background read 被 body 数据打断，检测不到客户端断连 → r.Context()

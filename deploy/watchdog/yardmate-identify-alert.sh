@@ -9,7 +9,8 @@
 #   - identify 200 但耗时 > SLOW_SECS ≥ 1    （危险区：接近客户端 30s 计时器）
 #   - GPT 兜底失败/预算耗尽跳过 ≥ 1          （兜底链路自身出问题）
 #   - Pl@ntNet 失败 ≥ 2                      （上游 outage 进行中，即使兜底救回）
-#     = plantid-skip（交 GPT）+ plantnet fallback（交 Plant.id）+ identify plantid-budget（上限挡下）
+#     = 快速失败（plantid-skip 交 GPT / plantnet fallback 交 Plant.id / plantid-budget 上限挡下）
+#       + 6s 没回被叫后备（plantnet hedge；引擎赛跑，Pl@ntNet 不掐断）
 # 30 分钟冷却：持续 outage 期间最多每半小时一封，不淹邮箱（healthz watchdog
 # 的 2026-07-28 教训是只发一封会被淹没；这里反向教训是别变成邮件炸弹）。
 set -uo pipefail
@@ -20,7 +21,7 @@ COOLDOWN_FILE=/run/yardmate-identify-alert.last   # tmpfs, 重启即清
 COOLDOWN_SECS=1800
 SLOW_SECS=18
 
-LOG=$(journalctl -u yardmate-api --since "$WINDOW" --no-pager 2>/dev/null | grep -F "identify" || true)
+LOG=$(journalctl -u yardmate-api --since "$WINDOW" --no-pager 2>/dev/null | grep -E "identify|plantnet trace:" || true)
 [ -z "$LOG" ] && exit 0
 
 count() { grep -cF "$1" <<<"$LOG" 2>/dev/null || true; }
@@ -30,9 +31,12 @@ slow200=$(grep -E 'v1/identify HTTP/1\.[01]" from [0-9.]+ - 200 ' <<<"$LOG" \
     | awk -v t="$SLOW_SECS" '{d=$NF; sub(/s$/,"",d); if (d+0 > t) n++} END {print n+0}')
 rescue_err=$(count "gpt on-demand fallback err:")
 rescue_nobudget=$(count "fallback skipped (budget exhausted)")
-pid_takeover=$(count "identify plantnet fallback:")
+pn_fallback=$(count "identify plantnet fallback:")
 pid_capped=$(count "plantid-budget:")
-pnfail=$(( $(count "identify plantid-skip:") + pid_takeover + $(count "identify plantid-budget:") ))
+pn_slow=$(count "identify plantnet hedge:")
+pid_takeover=$(( pn_fallback + $(count "并行叫 Plant.id") ))
+pnfail=$(( $(count "identify plantid-skip:") + pn_fallback + $(count "identify plantid-budget:") + pn_slow ))
+race_lost=$(count "identify engine race:")
 rescued_ok=$(count "rescued=true")
 genus_kept=$(count "identify genus-keep:")
 
@@ -59,7 +63,8 @@ BODY="最近 11 分钟 /v1/identify 异常汇总：
   200 但 >${SLOW_SECS}s（危险区）: ${slow200}
   GPT 兜底失败       : ${rescue_err}
   兜底预算耗尽跳过   : ${rescue_nobudget}
-  Pl@ntNet 失败      : ${pnfail}
+  Pl@ntNet 失败      : ${pnfail}（其中 6s 没回: ${pn_slow}）
+  后备抢先出结果     : ${race_lost}
   Plant.id 接管      : ${pid_takeover}
   Plant.id 上限挡下  : ${pid_capped}
   GPT 兜底救回       : ${rescued_ok}
@@ -76,7 +81,7 @@ BODY="最近 11 分钟 /v1/identify 异常汇总：
 PLANTID_DAILY_CAP 全站 / PLANTID_PER_IP_DAILY_CAP 单 IP 每日上限约束）。
 
 最近相关日志（最多 20 条）：
-$(grep -E "identify (plantid-skip|plantnet fallback|plantid-budget|genus-keep|gpt on-demand fallback|upstream err)|v1/identify.*- (502|200) " <<<"$LOG" | tail -20)
+$(grep -E "identify (plantid-skip|plantnet fallback|plantnet hedge|engine race|plantid-budget|genus-keep|gpt on-demand fallback|upstream err)|plantnet trace|v1/identify.*- (502|200) " <<<"$LOG" | tail -20)
 
 排查: journalctl -u yardmate-api --since '30 min ago' | grep identify
 30 分钟冷却已启动，持续异常将再次提醒。"
