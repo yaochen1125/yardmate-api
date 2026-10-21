@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math"
@@ -36,8 +37,19 @@ const identifyUpstreamTimeout = 22 * time.Second
 // 2026-08-26 事故：Pl@ntNet 上游挂起，一跳吃满共享的 30s ctx —— iOS 侧 30s（含上传）
 // 先到期断线，GPT on-demand 兜底拿到的是已取消的 ctx，必死 → 502。单跳 12s 切断后，
 // 兜底接手时客户端仍在线、且 22s 总预算还有 10s 余量（≥ minIdentifyRescueBudget）。
-// 正常 Pl@ntNet 延迟中位 ~1s，12s 只砍 outage 尾部，不误伤慢请求。
-var identifyPlantNetTimeout = 12 * time.Second
+// 2026-10-21 由 12s 收到 8s：要在 22s 里同时塞下 Plant.id 一跳（identifyPlantIDMaxTimeout）
+// 和 GPT 保底（minIdentifyRescueBudget）—— 8 + 7 + 6 = 21s。依据：8-27 以来 151 次
+// Pl@ntNet 成功的 identify，含 GPT 复核的整请求最长 9.3s、>8s 仅 1 次（Pl@ntNet
+// 单跳只会更短）；正常中位 ~1s，8s 仍只砍 outage 尾部。
+var identifyPlantNetTimeout = 8 * time.Second
+
+// identifyPlantIDMaxTimeout — Plant.id 单跳上限（var 供测试缩短）。实际给的时长还要
+// 再扣掉 GPT 保底（见 plantIDHopBudget）。prod 历史 Plant.id 兜底整请求 4.3–5.7s。
+var identifyPlantIDMaxTimeout = 7 * time.Second
+
+// minPlantIDHopBudget — 留给 Plant.id 的时长低于此值就不调（大概率超时、白扣 credit），
+// 直接交给 GPT（var 供测试缩短）。
+var minPlantIDHopBudget = 3 * time.Second
 
 // identifyWallClockBudget bounds the GPT on-demand rescue by wall clock from
 // reqStart（= identifyUpstreamTimeout：真正的紧约束是客户端 30s 计时器，不是 35s
@@ -260,7 +272,7 @@ func parseCoord(s string, min, max float64) *float64 {
 	return &v
 }
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand, plantIDIdentifyFallback bool, spendGate SpendGate, scanCounter *IdentifyScanCounter) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand bool, plantIDFallback PlantIDFallbackMode, spendGate SpendGate, scanCounter *IdentifyScanCounter) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -483,26 +495,62 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				errors.Is(err, ErrPlantNetUnauthorized) ||
 				errors.Is(err, ErrPlantNetBadResponse))
 
-		// PLANTID_IDENTIFY_FALLBACK=false：Pl@ntNet 失败（超限/宕机/失效）时跳过贵的
-		// Plant.id，保留 err 让下方 on-demand 的 GPT 兜底接管（省钱：溢出量走 GPT ~$4/1000
-		// 而非 Plant.id 的 credit）。只作用于 plantNetFellBack —— plantNet==nil 的
-		// Plant.id-only 部署不受影响（那种情况 Plant.id 是主引擎，不能跳）。诊病仍用 Plant.id。
+		// PLANTID_IDENTIFY_FALLBACK 三档（PlantIDFallbackMode，plantid_budget.go）：
+		//   true   —— Pl@ntNet 任何失败都兜底到 Plant.id；
+		//   false  —— 一律跳过贵的 Plant.id，保留 err 让下方 on-demand 的 GPT 兜底接管
+		//             （#112 省钱：溢出量走 GPT ~$4/1000 而非 Plant.id 的 credit）；
+		//   outage —— 只在 Pl@ntNet 故障（超时/5xx/鉴权/坏响应）时用 Plant.id，429 额度
+		//             溢出照旧交 GPT（2026-10-21：故障期 GPT 常只认到属，Plant.id 认种更准）。
+		// 只作用于 plantNetFellBack —— plantNet==nil 的 Plant.id-only 部署不受影响（那种
+		// 情况 Plant.id 是主引擎，不能跳）。诊病仍用 Plant.id。
 		//
 		// 守卫（Codex #112）：只有当 GPT 兜底真能接管（arbiterOnDemand 开 + vision 可用）
 		// 时才允许跳过 Plant.id；否则（错配：flag=false 但 on-demand 关 / 无 OPENAI key）
 		// 保留 Plant.id 兜底，避免 PlantNet 失败既跳过 Plant.id 又无 GPT → 直接 502。
-		usePlantIDFallback := plantIDIdentifyFallback || !arbiterOnDemand || vision == nil
+		gptCanRescue := arbiterOnDemand && vision != nil
+		usePlantIDFallback := plantIDFallback.allowsFallback(err) || !gptCanRescue
 		if plantNetFellBack && !usePlantIDFallback {
-			log.Printf("identify plantid-skip: deviceID=%s plantnetErr=%v → 跳过 Plant.id, GPT 兜底接管", deviceID, err)
+			log.Printf("identify plantid-skip: deviceID=%s mode=%s plantnetErr=%v → 跳过 Plant.id, GPT 兜底接管", deviceID, plantIDFallback, err)
 		}
 		if (plantNet == nil || (plantNetFellBack && usePlantIDFallback)) && plantID != nil {
-			if plantNetFellBack {
-				log.Printf("identify plantnet fallback: deviceID=%s err=%v", deviceID, err)
-				engine = "plantid-fallback"
-			} else {
-				engine = "plantid"
+			// Plant.id 单跳时长：GPT 能兜底时给它留够 minIdentifyRescueBudget，否则
+			// Plant.id 一慢，GPT 就只剩不足 6s 被跳过 → 502。GPT 兜不了时沿用共享 ctx。
+			pidCtx, pidCancel := ctx, context.CancelFunc(func() {})
+			hop := identifyPlantIDMaxTimeout
+			if gptCanRescue {
+				if left := identifyWallClockBudget - time.Since(reqStart) - minIdentifyRescueBudget; left < hop {
+					hop = left
+				}
 			}
-			result, err = plantID.Identify(ctx, bytes.NewReader(imgBytes), mime, priorLat, priorLon)
+			switch {
+			case gptCanRescue && hop < minPlantIDHopBudget:
+				// 剩的时间不够 Plant.id 跑完 —— 不白扣 credit，直接交 GPT。
+				log.Printf("identify plantid-skip: deviceID=%s reason=hop_budget hop=%v plantnetErr=%v → 跳过 Plant.id, GPT 兜底接管", deviceID, hop, err)
+				if plantNet == nil {
+					err = fmt.Errorf("%w: hop budget exhausted", ErrPlantIDUnavailable)
+				}
+			default:
+				// 每日上限（全站 credit + 单 IP 次数）：调用前预占，失败也不退。
+				if ok, limit := plantID.Budget.TryAcquire(clientIPFromRequest(r), plantIDIdentifyCredits); !ok {
+					used, capN := plantID.Budget.Snapshot()
+					log.Printf("identify plantid-budget: deviceID=%s limit=%s used=%d cap=%d plantnetErr=%v → 跳过 Plant.id", deviceID, limit, used, capN, err)
+					if plantNet == nil {
+						err = fmt.Errorf("%w: daily budget (%s)", ErrPlantIDRateLimit, limit)
+					}
+					break
+				}
+				if plantNetFellBack {
+					log.Printf("identify plantnet fallback: deviceID=%s err=%v", deviceID, err)
+					engine = "plantid-fallback"
+				} else {
+					engine = "plantid"
+				}
+				if gptCanRescue {
+					pidCtx, pidCancel = context.WithTimeout(ctx, hop)
+				}
+				result, err = plantID.Identify(pidCtx, bytes.NewReader(imgBytes), mime, priorLat, priorLon)
+				pidCancel()
+			}
 		}
 
 		// --- Catalog-preference selection cascade (SPEC §1.1 / §2.1 / §7).
@@ -1677,7 +1725,16 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 		ctx, cancel := context.WithDeadline(r.Context(), reqStart.Add(diagnoseUpstreamTimeout))
 		defer cancel()
 
-		api, err := client.Diagnose(ctx, imgBytes, mime)
+		// Plant.id 每日上限（与 identify 共用同一份额度，plantid_budget.go）。超了就
+		// 当作 Plant.id 限流 → 走下方既有的 AI vision 兜底，不调 Plant.id。
+		var api *plantIDDiagnoseResponse
+		if ok, limit := client.Budget.TryAcquire(clientIPFromRequest(r), plantIDDiagnoseCredits); !ok {
+			used, capN := client.Budget.Snapshot()
+			log.Printf("diagnose plantid-budget: deviceID=%s limit=%s used=%d cap=%d → 跳过 Plant.id", deviceID, limit, used, capN)
+			err = fmt.Errorf("%w: daily budget (%s)", ErrPlantIDRateLimit, limit)
+		} else {
+			api, err = client.Diagnose(ctx, imgBytes, mime)
+		}
 		if err != nil {
 			log.Printf("diagnose upstream err: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v err=%v",
 				deviceID, appVer, attKeyID, attAssertPresent, err)

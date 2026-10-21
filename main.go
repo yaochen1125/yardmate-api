@@ -188,6 +188,23 @@ func main() {
 	var plantID *proxy.PlantIDClient
 	if v := vault.Get("PLANT_ID_API_KEY"); v != "" {
 		plantID = proxy.NewPlantIDClient(v)
+		// Plant.id 每日花费上限（proxy/plantid_budget.go）：全站 credit + 单 IP 次数，
+		// 按 UTC 日计；<= 0 表示该道不限。全站计数用 Plant.id 官方当日已用量起算
+		// （异步、best-effort：查不到就从 0 数，单 IP 那道照常生效）。
+		dailyCap := vaultIntOr(vault, "PLANTID_DAILY_CAP", 30)
+		perIPCap := vaultIntOr(vault, "PLANTID_PER_IP_DAILY_CAP", 3)
+		plantID.Budget = proxy.NewPlantIDBudget(dailyCap, perIPCap)
+		go func(c *proxy.PlantIDClient) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			used, err := c.UsedToday(ctx)
+			if err != nil {
+				log.Printf("WARN: plant.id usage_info unavailable (%v); daily cap counts from 0", err)
+				return
+			}
+			c.Budget.SeedUsedToday(used)
+			log.Printf("plant.id budget: usedToday=%d dailyCap=%d perIPCap=%d", used, dailyCap, perIPCap)
+		}(plantID)
 	} else {
 		log.Printf("WARN: PLANT_ID_API_KEY missing; /v1/diagnose will not be registered (identify falls back to Pl@ntNet-only)")
 	}

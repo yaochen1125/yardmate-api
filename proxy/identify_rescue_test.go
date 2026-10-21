@@ -31,7 +31,7 @@ func newOnDemandRescueHandler(t *testing.T, plantNetUp http.HandlerFunc, vision 
 	}
 	h := HandleIdentify(pnClient, nil, content, vision, nil, nil,
 		false, false, false, false, false, false,
-		true /* arbiterOnDemand */, false /* plantIDIdentifyFallback */, nil, nil)
+		true /* arbiterOnDemand */, PlantIDFallbackNever /* plantIDIdentifyFallback */, nil, nil)
 	return h, pnSrv.Close
 }
 

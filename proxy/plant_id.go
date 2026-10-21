@@ -41,7 +41,11 @@ type PlantIDClient struct {
 	APIKey           string
 	Endpoint         string
 	DiagnoseEndpoint string
+	UsageEndpoint    string // "" → defaultPlantIDUsageEndpoint（UsedToday）
 	HTTP             *http.Client
+	// Budget 是 Plant.id 的每日花费闸门（plantid_budget.go）。identify 与 diagnose
+	// 共用同一个 client，因此共用同一份额度。nil → 不限（测试 / 旧部署）。
+	Budget *PlantIDBudget
 }
 
 // NewPlantIDClient returns a PlantIDClient with production defaults.
