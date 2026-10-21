@@ -14,6 +14,11 @@ import (
 // exercise real transitions, and exposes a few knobs for the handler tests.
 type memStore struct {
 	mu sync.Mutex
+	// deviceMu is the PG store's global device lock (pg_advisory_xact_lock,
+	// ClaimGate): held by a gated Claim from before its gate's Check to the
+	// end. mu alone is released around the gate's Apple calls, so without
+	// deviceMu two gated claims could both check before either sets.
+	deviceMu sync.Mutex
 
 	// handler knobs
 	meStanding Standing
@@ -183,32 +188,63 @@ func (m *memStore) judgeLocked(userID, code, installID string) (ClaimKind, error
 	return ClaimNew, nil
 }
 
-func (m *memStore) Claim(_ context.Context, userID, code, installID string, hook ClaimHook) (string, error) {
+func (m *memStore) Claim(_ context.Context, userID, code, installID string, gate *ClaimGate) (string, error) {
+	if gate != nil {
+		m.deviceMu.Lock()
+		defer m.deviceMu.Unlock()
+	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.claimCalls++
 	m.gotUser, m.gotCode, m.gotInstall = userID, code, installID
 	if m.claimErr != nil {
-		return "", m.claimErr
+		err := m.claimErr
+		m.mu.Unlock()
+		return "", err
 	}
-	if m.codes == nil {
-		if hook != nil {
-			if err := hook(true); err != nil {
-				return "", err
-			}
+	emulate := m.codes != nil
+	kind := ClaimNew
+	if emulate {
+		// Steps 2–4 again under the device lock (PG: referral_claim_check).
+		k, err := m.judgeLocked(userID, code, installID)
+		if err != nil {
+			m.mu.Unlock()
+			return "", err
+		}
+		kind = k
+	}
+	m.mu.Unlock()
+
+	// Apple is asked without mu, like the PG store asks it without holding
+	// any row: only deviceMu keeps two gated claims apart here.
+	if gate != nil && gate.Check != nil && kind == ClaimNew {
+		if err := gate.Check(); err != nil {
+			return "", err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	set := func(fresh bool) error {
+		if gate == nil || gate.Set == nil {
+			return nil
+		}
+		return gate.Set(fresh)
+	}
+	if !emulate {
+		if err := set(true); err != nil {
+			return "", err
 		}
 		return m.claimOffer, nil
 	}
+	// referral_claim's own atomic re-check.
 	kind, err := m.judgeLocked(userID, code, installID)
 	if err != nil {
 		return "", err
 	}
 	if kind == ClaimAgain {
 		offer := m.claims[userID].offer
-		if hook != nil {
-			if err := hook(false); err != nil {
-				return "", err
-			}
+		if err := set(false); err != nil {
+			return "", err
 		}
 		return offer, nil
 	}
@@ -216,10 +252,8 @@ func (m *memStore) Claim(_ context.Context, userID, code, installID string, hook
 		return "", Failure{ErrPoolEmpty}
 	}
 	offer := m.shelf[0]
-	if hook != nil {
-		if err := hook(true); err != nil {
-			return "", err // rolled back: the code stays on the shelf, no claim
-		}
+	if err := set(true); err != nil {
+		return "", err // rolled back: the code stays on the shelf, no claim
 	}
 	m.shelf = m.shelf[1:]
 	m.claims[userID] = &memClaim{referrer: m.codes[code], offer: offer, install: strings.ToLower(installID)}
@@ -360,22 +394,35 @@ func (m *memStore) MarkVoid(_ context.Context, id int64, reason string) error {
 
 // fakeDC is an in-memory DeviceChecker: bits by (env, token). invalid tokens
 // get ErrDeviceTokenInvalid; queryErr / setErr fail every call; block makes
-// each call wait for its context (a hung Apple).
+// each call wait for its context (a hung Apple); delay makes each call take
+// that long (widens race windows). setApplies: a failing set still sets the
+// bit (Apple did it, the answer got lost). queryFails, when set, may fail
+// query number n (1-based).
 type fakeDC struct {
-	mu       sync.Mutex
-	bits     map[string]bool // env + "|" + token → bit0
-	invalid  map[string]bool
-	queryErr error
-	setErr   error
-	block    bool
-	queries  int
-	sets     int
-	envs     []string
+	mu         sync.Mutex
+	bits       map[string]bool // env + "|" + token → bit0
+	invalid    map[string]bool
+	queryErr   error
+	setErr     error
+	setApplies bool
+	queryFails func(n int) error
+	block      bool
+	delay      time.Duration
+	queries    int
+	sets       int
+	envs       []string
 }
 
 func newFakeDC() *fakeDC { return &fakeDC{bits: map[string]bool{}, invalid: map[string]bool{}} }
 
 func (f *fakeDC) wait(ctx context.Context) error {
+	if f.delay > 0 {
+		select {
+		case <-time.After(f.delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	if !f.block {
 		return nil
 	}
@@ -394,6 +441,11 @@ func (f *fakeDC) QueryBit0(ctx context.Context, env, token string) (bool, error)
 	if f.queryErr != nil {
 		return false, f.queryErr
 	}
+	if f.queryFails != nil {
+		if err := f.queryFails(f.queries); err != nil {
+			return false, err
+		}
+	}
 	if f.invalid[token] {
 		return false, ErrDeviceTokenInvalid
 	}
@@ -408,6 +460,9 @@ func (f *fakeDC) SetBit0(ctx context.Context, env, token string) error {
 	defer f.mu.Unlock()
 	f.sets++
 	if f.setErr != nil {
+		if f.setApplies {
+			f.bits[env+"|"+token] = true
+		}
 		return f.setErr
 	}
 	f.bits[env+"|"+token] = true

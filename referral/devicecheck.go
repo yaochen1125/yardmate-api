@@ -23,12 +23,17 @@ import (
 // bit1 is left alone. The bits survive a reinstall and are invisible to the
 // user; the production and development environments keep separate bits.
 //
-//	/claim (new claim only) ──query_two_bits──▶ bit0 set → device_used
-//	                        ──referral_claim + update_two_bits(bit0) in ONE
-//	                          database transaction: the set fails → rollback,
-//	                          the pool code stays free → device_check_unavailable
+//	/claim (new claim only), all in ONE database transaction:
+//	    global device lock (ClaimGate) → steps 2–4 again
+//	    → query_two_bits: bit0 set → device_used (rollback)
+//	    → referral_claim (a pool code) → update_two_bits(bit0) → commit
+//	  the set answers an error → read bit0 back: set → keep the claim;
+//	  clear / unreadable → rollback, the code stays free → device_check_unavailable
 //
-// A re-claim (same account, same code) never calls Apple.
+// The lock is what makes check-then-set atomic: Apple's bits are not in our
+// transaction, and one device can come in as many accounts at once, each
+// with its own (forged) install id. A re-claim (same account, same code)
+// never calls Apple.
 
 // DeviceCheckMode is DEVICECHECK_MODE.
 type DeviceCheckMode string

@@ -32,9 +32,10 @@ func NewPGStore(pool *pgxpool.Pool) *PGStore {
 }
 
 const (
-	pgRaiseException  = "P0001" // plpgsql `raise exception` — our named refusals
-	pgUndefinedTable  = "42P01" // migration not applied yet
-	pgUndefinedColumn = "42703" // migration not applied yet (a column of it)
+	pgRaiseException   = "P0001" // plpgsql `raise exception` — our named refusals
+	pgUndefinedTable   = "42P01" // migration not applied yet
+	pgUndefinedColumn  = "42703" // migration not applied yet (a column of it)
+	pgLockNotAvailable = "55P03" // lock_timeout ran out (the gated claim's device lock)
 )
 
 // asFailure pulls a named refusal out of a Postgres error; anything else
@@ -82,19 +83,49 @@ func (p *PGStore) ClaimCheck(ctx context.Context, userID, code, installID string
 	return ClaimNew, fmt.Errorf("referral_claim_check: unexpected %q", kind)
 }
 
-// Claim runs the three-argument referral_claim (016) in a transaction and,
-// when a hook is given, calls it before commit: the DeviceCheck bit0 set
-// happens while the pool code is still only ours, and a failed set rolls the
-// claim back with the code untouched (docs: 置位失败 → 回滚).
-func (p *PGStore) Claim(ctx context.Context, userID, code, installID string, hook ClaimHook) (string, error) {
+// deviceLockWait bounds how long a gated claim waits for the device lock
+// (lock_timeout, which also covers the claim's row locks): the holder is at
+// most a few Apple calls away from commit. Past it → device_check_unavailable.
+const deviceLockWait = 3 * time.Second
+
+// deviceLockSQL is the one transaction-scoped advisory lock every gated claim
+// takes (ClaimGate). Transaction-scoped, so it is safe behind Supabase's
+// transaction-mode pooler and can never outlive the claim.
+const deviceLockSQL = `select pg_advisory_xact_lock(hashtextextended('referral_devicecheck', 0))`
+
+// Claim runs the three-argument referral_claim (016 / 017) in a transaction.
+// With a gate: lock_timeout, the global device lock, referral_claim_check
+// again under it (a claim of this account that committed while we waited
+// makes this a re-claim — Apple is not asked), gate.Check for a first
+// claim, then referral_claim, then gate.Set — all before commit: bit0 is set
+// while the pool code is still only ours, and a failed check or set rolls
+// the claim back with the code untouched (docs: 置位失败 → 回滚).
+func (p *PGStore) Claim(ctx context.Context, userID, code, installID string, gate *ClaimGate) (string, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if gate != nil {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("set local lock_timeout = '%dms'", deviceLockWait.Milliseconds())); err != nil {
+			return "", err
+		}
+		if _, err := tx.Exec(ctx, deviceLockSQL); err != nil {
+			return "", claimFailure(err)
+		}
+		var kind string
+		if err := tx.QueryRow(ctx, `select referral_claim_check($1::text, $2::text, $3::text)`, userID, code, installID).Scan(&kind); err != nil {
+			return "", claimFailure(err)
+		}
+		if kind == "new" && gate.Check != nil {
+			if err := gate.Check(); err != nil {
+				return "", err
+			}
+		}
+	}
 	var raw []byte
 	if err := tx.QueryRow(ctx, `select referral_claim($1::text, $2::text, $3::text)::text`, userID, code, installID).Scan(&raw); err != nil {
-		return "", asFailure(err)
+		return "", claimFailure(err)
 	}
 	var out struct {
 		OfferCode string `json:"offer_code"`
@@ -109,18 +140,30 @@ func (p *PGStore) Claim(ctx context.Context, userID, code, installID string, hoo
 	// The three-argument function always says; if it ever does not, treat it
 	// as new (setting bit0 on a re-claim only re-marks a friend's device).
 	fresh := out.Fresh == nil || *out.Fresh
-	if hook != nil {
-		if err := hook(fresh); err != nil {
+	if gate != nil && gate.Set != nil {
+		if err := gate.Set(fresh); err != nil {
 			return "", err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		if hook != nil && fresh {
-			log.Printf("referral claim: commit failed AFTER the DeviceCheck hook ran (bit0 may be set without a claim): %v", err)
+		if gate != nil && fresh {
+			log.Printf("referral claim: commit failed AFTER the DeviceCheck set (bit0 may be set without a claim): %v", err)
 		}
 		return "", err
 	}
 	return out.OfferCode, nil
+}
+
+// claimFailure is asFailure plus the device lock (or a row lock behind it)
+// not coming free within deviceLockWait: busy, not broken — 503
+// device_check_unavailable, "try again".
+func claimFailure(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgLockNotAvailable {
+		log.Printf("referral claim: device lock busy for %s; answering device_check_unavailable", deviceLockWait)
+		return Failure{Code: ErrDeviceUnavailable}
+	}
+	return asFailure(err)
 }
 
 // ReportRedeemed restamps redeem_reported_at on every report while the

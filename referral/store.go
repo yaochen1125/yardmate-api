@@ -87,12 +87,20 @@ const (
 	ClaimAgain
 )
 
-// ClaimHook runs inside the claim's database transaction after a pool code
-// has been taken, with fresh = this call created the referral. An error
-// rolls the whole claim back (the code goes back to free) and comes out of
-// Claim unchanged. /claim uses it to set DeviceCheck bit0 "同进退" with the
-// code.
-type ClaimHook func(fresh bool) error
+// ClaimGate is gate 1 (DeviceCheck) as a new claim's database transaction
+// runs it. Apple's bits know nothing of our transactions, so "query bit0,
+// hand out a code, set bit0" is only atomic if no two claims do it at once:
+// Store.Claim first takes ONE global lock (held until commit / rollback; the
+// claim volume is tiny), re-checks steps 2–4 under it, calls Check (only for
+// a first claim), takes the pool code, then calls Set with fresh = this call
+// created the referral. Of several accounts claiming on one device at the
+// same moment — each with its own install id — only the first sees bit0
+// clear. An error from either rolls the whole claim back (the code goes back
+// to free) and comes out of Claim unchanged. Either func may be nil.
+type ClaimGate struct {
+	Check func() error
+	Set   func(fresh bool) error
+}
 
 // HeldReferral is one line of a gate-4 review digest.
 type HeldReferral struct {
@@ -211,9 +219,11 @@ type Store interface {
 	ClaimCheck(ctx context.Context, userID, code, installID string) (ClaimKind, error)
 	// Claim re-checks 2–4 atomically, records referrer→referee (with the
 	// claiming device) and hands back an Apple one-time code from the pool;
-	// a re-claim gets the code it already has (or a swap). hook, when not
-	// nil, runs before commit (see ClaimHook). code is already normalised.
-	Claim(ctx context.Context, userID, code, installID string, hook ClaimHook) (offerCode string, err error)
+	// a re-claim gets the code it already has (or a swap; never once the
+	// referral has left claimed). gate, when not nil, is run inside the
+	// transaction under the global device lock (see ClaimGate). code is
+	// already normalised.
+	Claim(ctx context.Context, userID, code, installID string, gate *ClaimGate) (offerCode string, err error)
 	// ReportRedeemed notes that the app says offerCode was redeemed by userID.
 	// A hint for the settlement loop, never a proof. Each report restamps the
 	// time (while the referral is claimed), which puts the row at the front

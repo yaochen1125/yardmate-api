@@ -185,8 +185,10 @@ func TestClaimDeviceCheckEnforce(t *testing.T) {
 		if status != c.status || code != c.code {
 			t.Errorf("%s: %d %q, want %d %s", c.name, status, code, c.status, c.code)
 		}
-		if store.claimCalls != 0 || len(store.shelf) != 2 || dc.sets != 0 {
-			t.Errorf("%s: claim calls %d shelf %v sets %d — nothing may be taken or set", c.name, store.claimCalls, store.shelf, dc.sets)
+		// Apple's verdict now comes inside the claim's transaction (under
+		// the device lock), so the claim is attempted — and rolled back.
+		if store.claims[userB] != nil || len(store.shelf) != 2 || dc.sets != 0 {
+			t.Errorf("%s: claim %+v shelf %v sets %d — nothing may be taken or set", c.name, store.claims[userB], store.shelf, dc.sets)
 		}
 	}
 }

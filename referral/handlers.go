@@ -282,7 +282,9 @@ type claimRequest struct {
 //     device_check_unavailable
 //
 // 2–4 are a read-only pre-check (ClaimCheck) and are checked again,
-// atomically, by the claim itself.
+// atomically, by the claim itself. The Apple half of 6 and all of 7 run
+// inside the claim's transaction under one global lock (ClaimGate), so two
+// accounts claiming on one device at once cannot both see bit0 clear.
 func (s *Service) HandleClaim() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, ok := s.caller(w, r)
@@ -346,27 +348,31 @@ func (s *Service) HandleClaim() http.HandlerFunc {
 			return
 		}
 
-		// 6
-		gate := s.checkDevice(r.Context(), env, token)
-		if gate.refuse != "" {
-			writeError(w, gate.status, gate.refuse)
+		// 6 + 7: what needs no Apple (no client, no token) is decided here;
+		// asking Apple, taking the code and setting bit0 happen inside the
+		// claim's transaction under the device lock (ClaimGate).
+		gate, refuse, status := s.deviceGate(r.Context(), env, token)
+		if refuse != "" {
+			writeError(w, status, refuse)
 			return
 		}
-
-		// 7
-		s.finishClaim(w, r, userID, code, installID, s.bitHook(r.Context(), env, token, gate.setBit))
+		s.finishClaim(w, r, userID, code, installID, gate)
 	}
 }
 
-// finishClaim takes (or re-hands) the pool code and answers.
-func (s *Service) finishClaim(w http.ResponseWriter, r *http.Request, userID, code, installID string, hook ClaimHook) {
-	ctx, cancel := context.WithTimeout(r.Context(), storeTimeout)
-	defer cancel()
-	offer, err := s.store.Claim(ctx, userID, code, installID, hook)
-	if errors.Is(err, errDeviceSetFailed) {
-		writeError(w, http.StatusServiceUnavailable, ErrDeviceUnavailable)
-		return
+// finishClaim takes (or re-hands) the pool code and answers. A gated claim
+// gets room for the lock wait and up to three Apple calls (query, set, the
+// re-read after a failed set) on top of the database's own budget, so the
+// transaction never runs out under an Apple call that has already been
+// sent.
+func (s *Service) finishClaim(w http.ResponseWriter, r *http.Request, userID, code, installID string, gate *ClaimGate) {
+	budget := storeTimeout
+	if gate != nil {
+		budget += deviceLockWait + 3*s.dcTimeout
 	}
+	ctx, cancel := context.WithTimeout(r.Context(), budget)
+	defer cancel()
+	offer, err := s.store.Claim(ctx, userID, code, installID, gate)
 	if err != nil {
 		fail(w, err, "claim")
 		return
@@ -374,90 +380,108 @@ func (s *Service) finishClaim(w http.ResponseWriter, r *http.Request, userID, co
 	writeJSON(w, http.StatusOK, map[string]string{"offer_code": offer})
 }
 
-// deviceGate is step 6's verdict: a refusal to send, or a pass and whether
-// bit0 is to be set once a code is taken.
-type deviceGate struct {
-	refuse string
-	status int
-	setBit bool
-}
-
-// checkDevice is step 6. In log mode nothing is refused, but Apple is asked
-// (and later told) exactly as in enforce, so staging shows what prod would
-// do. Log lines carry the verdict only — never the token.
-func (s *Service) checkDevice(parent context.Context, env, token string) deviceGate {
+// deviceGate is step 6 up to the point where Apple has to be asked. No
+// client (enforce: 503) or no token (enforce: device_unverified) is decided
+// here; otherwise it returns the gate Store.Claim runs under the device
+// lock. A nil gate and no refusal = log mode letting the claim through
+// unchecked. Log lines carry the verdict only — never the token.
+func (s *Service) deviceGate(parent context.Context, env, token string) (gate *ClaimGate, refuse string, status int) {
 	enforce := s.dcMode != DeviceCheckLog
-	pass := func(setBit bool, why string) deviceGate {
-		if why != "" {
-			log.Printf("referral claim: devicecheck log mode, not refusing: %s (env=%s)", why, env)
-		}
-		return deviceGate{setBit: setBit}
-	}
 	if s.dc == nil {
 		if enforce {
 			log.Printf("referral claim: devicecheck not configured (DEVICECHECK_KEY_ID / DEVICECHECK_PRIVATE_KEY / APPLE_TEAM_ID); refusing in enforce mode")
-			return deviceGate{refuse: ErrDeviceUnavailable, status: http.StatusServiceUnavailable}
+			return nil, ErrDeviceUnavailable, http.StatusServiceUnavailable
 		}
-		return pass(false, "devicecheck not configured")
+		logPass(env, "devicecheck not configured")
+		return nil, "", 0
 	}
 	if token == "" {
 		if enforce {
-			return deviceGate{refuse: ErrDeviceUnverified, status: http.StatusBadRequest}
+			return nil, ErrDeviceUnverified, http.StatusBadRequest
 		}
-		return pass(false, "no device_token (would be device_unverified)")
+		logPass(env, "no device_token (would be device_unverified)")
+		return nil, "", 0
 	}
-	ctx, cancel := context.WithTimeout(parent, s.dcTimeout)
-	used, err := s.dc.QueryBit0(ctx, env, token)
+	run := &deviceRun{s: s, parent: parent, env: env, token: token}
+	return &ClaimGate{Check: run.check, Set: run.set}, "", 0
+}
+
+func logPass(env, why string) {
+	log.Printf("referral claim: devicecheck log mode, not refusing: %s (env=%s)", why, env)
+}
+
+// deviceRun is gate 1's Apple half for one new claim. Both calls run inside
+// the claim transaction, under the device lock. In log mode nothing is
+// refused, but Apple is asked and told exactly as in enforce, so staging
+// shows what prod would do.
+type deviceRun struct {
+	s          *Service
+	parent     context.Context
+	env, token string
+	setBit     bool // check decided bit0 is to be set once a code is taken
+}
+
+// check queries bit0: device_used / device_unverified /
+// device_check_unavailable refusals in enforce (the claim rolls back, the
+// code stays free); log mode only logs.
+func (d *deviceRun) check() error {
+	enforce := d.s.dcMode != DeviceCheckLog
+	ctx, cancel := context.WithTimeout(d.parent, d.s.dcTimeout)
+	used, err := d.s.dc.QueryBit0(ctx, d.env, d.token)
 	cancel()
 	switch {
 	case errors.Is(err, ErrDeviceTokenInvalid):
 		if enforce {
-			return deviceGate{refuse: ErrDeviceUnverified, status: http.StatusBadRequest}
+			return Failure{Code: ErrDeviceUnverified}
 		}
-		return pass(false, "apple rejected the device token (would be device_unverified)")
+		logPass(d.env, "apple rejected the device token (would be device_unverified)")
+		return nil
 	case err != nil:
 		log.Printf("referral claim: devicecheck query failed: %v", err)
 		if enforce {
-			return deviceGate{refuse: ErrDeviceUnavailable, status: http.StatusServiceUnavailable}
+			return Failure{Code: ErrDeviceUnavailable}
 		}
-		return pass(true, "apple query failed (would be device_check_unavailable)")
+		logPass(d.env, "apple query failed (would be device_check_unavailable)")
 	case used:
 		if enforce {
-			return deviceGate{refuse: ErrDeviceUsed, status: http.StatusBadRequest}
+			return Failure{Code: ErrDeviceUsed}
 		}
-		return pass(true, "bit0 already set (would be device_used)")
+		logPass(d.env, "bit0 already set (would be device_used)")
 	}
-	return deviceGate{setBit: true}
+	d.setBit = true
+	return nil
 }
 
-// errDeviceSetFailed is the hook's way of rolling the claim back when bit0
-// could not be set (enforce). Never leaves this package.
-var errDeviceSetFailed = errors.New("devicecheck: set bit0 failed")
-
-// bitHook sets bit0 inside the claim transaction for a FRESH claim — "与从码池
-// 取码同进退": in enforce a failed set rolls the claim back; in log mode it is
-// only logged and the claim stands.
-func (s *Service) bitHook(parent context.Context, env, token string, setBit bool) ClaimHook {
-	if !setBit {
+// set sets bit0 for a FRESH claim — "与从码池取码同进退". When Apple's answer
+// to the set is an error (a timeout, a 5xx) the bit may still have been set
+// with only the answer lost; rolling back then would leave a real friend
+// with a code-less device that reads device_used forever. So bit0 is read
+// back once: set → the claim stands; clear, or the read failing too → in
+// enforce the claim rolls back (device_check_unavailable); log mode only
+// logs.
+func (d *deviceRun) set(fresh bool) error {
+	if !fresh || !d.setBit {
+		return nil // a re-claim (or lost a race to this account's other device: that claim set it)
+	}
+	ctx, cancel := context.WithTimeout(d.parent, d.s.dcTimeout)
+	err := d.s.dc.SetBit0(ctx, d.env, d.token)
+	cancel()
+	if err == nil {
 		return nil
 	}
-	return func(fresh bool) error {
-		if !fresh {
-			return nil // lost a race to our own other device: that claim set it
-		}
-		ctx, cancel := context.WithTimeout(parent, s.dcTimeout)
-		err := s.dc.SetBit0(ctx, env, token)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		if s.dcMode == DeviceCheckLog {
-			log.Printf("referral claim: devicecheck log mode, set bit0 failed (claim kept): %v", err)
-			return nil
-		}
-		log.Printf("referral claim: devicecheck set bit0 failed, claim rolled back: %v", err)
-		return errDeviceSetFailed
+	if d.s.dcMode == DeviceCheckLog {
+		log.Printf("referral claim: devicecheck log mode, set bit0 failed (claim kept): %v", err)
+		return nil
 	}
+	ctx, cancel = context.WithTimeout(d.parent, d.s.dcTimeout)
+	set, qerr := d.s.dc.QueryBit0(ctx, d.env, d.token)
+	cancel()
+	if qerr == nil && set {
+		log.Printf("referral claim: devicecheck set bit0 answered an error but bit0 reads back set; claim kept: %v", err)
+		return nil
+	}
+	log.Printf("referral claim: devicecheck set bit0 failed, claim rolled back: %v (read back: set=%v err=%v)", err, set, qerr)
+	return Failure{Code: ErrDeviceUnavailable}
 }
 
 type redeemedRequest struct {

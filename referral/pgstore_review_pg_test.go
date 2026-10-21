@@ -1,8 +1,12 @@
 package referral
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -164,5 +168,106 @@ func TestPGListSaversRotatesAndMarkSavedClears(t *testing.T) {
 	}
 	if third, err := st.ListSavers(ctx, 1); err != nil || !sameList(third, []string{userC}) {
 		t.Errorf("after C's new saved referral = %v, %v; want C first", third, err)
+	}
+}
+
+// MARK: gate 1 under the device lock
+
+func TestPGGatedClaimsOnOneDeviceAreSerialised(t *testing.T) {
+	st, pool, ctx := pgTest(t)
+	codeA := pgInviteCode(t, st, ctx, userA)
+	const n = 6
+	codes := make([]string, n)
+	for i := range codes {
+		codes[i] = fmt.Sprintf("Q%d", i)
+	}
+	pgSeed(t, pool, ctx, "b90", 90*day, codes...)
+	// One device's bit0 at "Apple", shared by every claim; each Apple call
+	// takes a moment, so without the lock all of them would check before any
+	// of them sets.
+	var mu sync.Mutex
+	bit := false
+	gate := func() *ClaimGate {
+		return &ClaimGate{
+			Check: func() error {
+				mu.Lock()
+				used := bit
+				mu.Unlock()
+				time.Sleep(20 * time.Millisecond)
+				if used {
+					return Failure{Code: ErrDeviceUsed}
+				}
+				return nil
+			},
+			Set: func(fresh bool) error {
+				time.Sleep(20 * time.Millisecond)
+				if fresh {
+					mu.Lock()
+					bit = true
+					mu.Unlock()
+				}
+				return nil
+			},
+		}
+	}
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// A different account and a forged install id each.
+			_, errs[i] = st.Claim(ctx, fmt.Sprintf("friend-%d", i), codeA, fmt.Sprintf("dev-%d", i), gate())
+		}(i)
+	}
+	wg.Wait()
+	ok := 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case !errors.Is(err, Failure{Code: ErrDeviceUsed}):
+			t.Errorf("claim %d: %v, want nil or device_used", i, err)
+		}
+	}
+	if ok != 1 {
+		t.Errorf("%d claims got a code, want exactly 1", ok)
+	}
+	var issued, refs int
+	_ = pool.QueryRow(ctx, `select count(*) from code_pool where state = 'issued'`).Scan(&issued)
+	_ = pool.QueryRow(ctx, `select count(*) from referrals`).Scan(&refs)
+	if issued != 1 || refs != 1 {
+		t.Errorf("issued %d referrals %d, want 1 / 1 (the refused ones rolled back)", issued, refs)
+	}
+}
+
+func TestPGGatedClaimGivesUpOnABusyDeviceLock(t *testing.T) {
+	st, pool, ctx := pgTest(t)
+	codeA := pgInviteCode(t, st, ctx, userA)
+	pgSeed(t, pool, ctx, "b90", 90*day, "P1")
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(ctx) //nolint:errcheck
+	if _, err := holder.Exec(ctx, deviceLockSQL); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	// A deadline of our own, so a lock_timeout that did not apply fails the
+	// test instead of hanging it.
+	cctx, cancel := context.WithTimeout(ctx, deviceLockWait+10*time.Second)
+	defer cancel()
+	_, err = st.Claim(cctx, userB, codeA, "", &ClaimGate{})
+	if !errors.Is(err, Failure{Code: ErrDeviceUnavailable}) {
+		t.Fatalf("claim behind a held lock = %v, want device_check_unavailable", err)
+	}
+	if took := time.Since(start); took < deviceLockWait || took > deviceLockWait+5*time.Second {
+		t.Errorf("gave up after %v, want about %v (lock_timeout)", took, deviceLockWait)
+	}
+	_ = holder.Rollback(ctx)
+	// Nothing was taken.
+	if s := pgState(t, pool, ctx, "P1"); s != "free" {
+		t.Errorf("P1 = %s, want free", s)
 	}
 }
