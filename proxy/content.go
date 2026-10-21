@@ -61,6 +61,15 @@ type catalogNameTable struct {
 	// colliding on "brassica oleracea". LookupPlantID consults this first.
 	scientificNameToIDPrecise map[string]string
 
+	// genusToID maps a bare lowercase genus to the plantId of a GENUS-LEVEL
+	// catalog row — one whose scientific_name is a bare genus ("Rosa") or a
+	// genus plus a placeholder epithet ("Petunia spp."), see genusLevelKey.
+	// Species / cultivar rows never enter it, so a placeholder query
+	// ("Calathea species") resolves only to a real genus entry, never to an
+	// arbitrary species of that genus. Built first-write-wins like the others.
+	// LookupPlantID consults it last (tier 3).
+	genusToID map[string]string
+
 	// commonByID gives the curated common_name by plantId (from plants_index).
 	// Drives the "catalog hit -> curated common name" step of /v1/identify name
 	// resolution (SPEC §2.1): a catalog hit prefers this over iNat / upstream.
@@ -214,6 +223,7 @@ func buildCatalogNameTable(raw []byte, version string) (*catalogNameTable, error
 	// LookupPlantID for the two-tier read.
 	sci := make(map[string]string, len(plants))
 	sciPrecise := make(map[string]string, len(plants))
+	genus := make(map[string]string)
 	common := make(map[string]string, len(plants))
 	sciByID := make(map[string]string, len(plants))
 	for _, p := range plants {
@@ -232,6 +242,11 @@ func buildCatalogNameTable(raw []byte, version string) (*catalogNameTable, error
 				sciPrecise[pkey] = p.ID
 			}
 		}
+		if g := genusLevelKey(p.ScientificName); g != "" {
+			if _, exists := genus[g]; !exists {
+				genus[g] = p.ID
+			}
+		}
 		key := normalizeScientificName(p.ScientificName)
 		if key == "" {
 			continue
@@ -246,6 +261,7 @@ func buildCatalogNameTable(raw []byte, version string) (*catalogNameTable, error
 	return &catalogNameTable{
 		scientificNameToID:        sci,
 		scientificNameToIDPrecise: sciPrecise,
+		genusToID:                 genus,
 		commonByID:                common,
 		sciByID:                   sciByID,
 		version:                   version,
@@ -440,6 +456,13 @@ func (c *ContentIndex) SpeciesGroupFor(key string) ([]rosererank.RoseCandidate, 
 //     ASCII "x", and strips variety / cultivar / subspecies suffixes (`var.`,
 //     `cv.`, `subsp.`, `f.`) — so a query whose variety / hybrid marker the
 //     catalog doesn't carry separately still resolves to the species entry.
+//   - Tier 3 (genus level) treats a placeholder epithet as "genus only":
+//     "Calathea species" / "Rosa sp." / "Salvia spp." / "X ssp." resolve to a
+//     GENUS-LEVEL catalog row for that genus, whether the catalog spells it
+//     "Calathea" or "Petunia spp." (genusLevelKey on both sides). Only genus
+//     rows are candidates — with no genus row the lookup still misses (the
+//     caller falls back to enrichment as before). A real epithet that merely
+//     starts like a placeholder ("Prunus speciosa") is never folded.
 //
 // Returns ("", false) on miss — iOS detail page must tolerate plantId=null
 // (renders Plant.id-only data without YardMate cross-reference).
@@ -467,6 +490,12 @@ func (c *ContentIndex) LookupPlantID(scientificName string) (string, bool) {
 	}
 	if id, ok := nt.scientificNameToID[key]; ok {
 		return id, true
+	}
+	// Tier 3: genus-level. "Calathea species" → the catalog's "Calathea" row.
+	if g := genusLevelKey(scientificName); g != "" {
+		if id, ok := nt.genusToID[g]; ok {
+			return id, true
+		}
 	}
 	return "", false
 }
@@ -740,6 +769,74 @@ func normalizeScientificNamePrecise(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = strings.ReplaceAll(s, "×", " ")
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// placeholderEpithets are the "species not determined" markers an engine or
+// vision model puts after a genus (already lowercased by normalizeScientificName).
+// "ssp." never reaches here — normalizeScientificName cuts it as a rank marker,
+// leaving the bare genus — but the dotless "ssp" does.
+var placeholderEpithets = map[string]bool{
+	"species": true,
+	"sp":      true, "sp.": true,
+	"spp": true, "spp.": true,
+	"ssp": true, "ssp.": true,
+}
+
+// genusLevelKey returns the lowercase genus for a GENUS-LEVEL name — a bare
+// genus ("Calathea") or a genus followed by exactly one placeholder epithet
+// ("Calathea species", "Rosa sp.", "Salvia spp", "Begonia ssp.") — and "" for
+// anything else. Built on normalizeScientificName, so case, extra spaces and
+// hybrid markers fold the same way as the catalog keys. A real epithet is never
+// a placeholder ("Prunus speciosa" → ""), and the genus token must be plain
+// Latin letters (so an id like "AAA1758" → ""). Shared by the catalog genus
+// index (buildCatalogNameTable) and LookupPlantID tier 3 so both sides agree.
+func genusLevelKey(s string) string {
+	fields := strings.Fields(normalizeScientificName(s))
+	switch {
+	case len(fields) == 1:
+	case len(fields) == 2 && placeholderEpithets[fields[1]]:
+	default:
+		return ""
+	}
+	if !isLowerLatin(fields[0]) {
+		return ""
+	}
+	return fields[0]
+}
+
+// genusDisplayName is genusLevelKey in display form ("calathea sp." →
+// "Calathea"), or "" when s is not genus level.
+func genusDisplayName(s string) string {
+	g := genusLevelKey(s)
+	if g == "" {
+		return ""
+	}
+	return strings.ToUpper(g[:1]) + g[1:]
+}
+
+// LooksLikeCatalogPlantID reports whether s (trimmed) has the shape of a curated
+// catalog id — three ASCII letters followed by at least four digits, e.g.
+// "AAA1758" (case-insensitive). A Latin scientific name never looks like this.
+// /v1/plants/enrichment uses it to refuse an id sent as a scientific name: an
+// app whose local index lagged a fresh promotion sent "AAA1758", and the model
+// dutifully generated an "Unknown Plant" row into plants_pending (2026-10-21).
+// Same rule as the iOS CatalogPlantID guard (≥4 digits, so AAA10000 still counts).
+func LooksLikeCatalogPlantID(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 7 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if i < 3 {
+			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
+				return false
+			}
+		} else if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // normalizeDiseaseName lowercases, trims, and strips common boilerplate

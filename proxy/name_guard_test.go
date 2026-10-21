@@ -294,10 +294,11 @@ func TestHandleIdentify_NamelessGuard_GenusMatchesSppCatalogEntry(t *testing.T) 
 			if len(s0.CommonNames) == 0 || s0.CommonNames[0] != "Garden Petunia" {
 				t.Errorf("common_names = %v, want curated 'Garden Petunia' first", s0.CommonNames)
 			}
-			// "Petunia spp." 已被既有的 ai-catalog-recovery 精确命中（不经 genus-keep），
-			// Name 沿用那条路径的既有行为；只断言 genus-keep 路径会把 Name 换成库内名。
-			if sci != "Petunia spp." && s0.Name != "Garden Petunia" {
-				t.Errorf("name = %q, want curated 'Garden Petunia'", s0.Name)
+			// LookupPlantID 第 3 层（占位种加词 → 属级条目）让三种写法都在
+			// ai-catalog-recovery 就命中库内（不再落到 genus-keep）；7b 对属级命中按
+			// genus-keep 同规则展示：裸属名 + 库内俗名（"Petunia spp." 现在也一样）。
+			if s0.Name != "Garden Petunia" || s0.ScientificName != "Petunia" {
+				t.Errorf("name/sci = %q/%q, want 'Garden Petunia'/'Petunia'", s0.Name, s0.ScientificName)
 			}
 		})
 	}

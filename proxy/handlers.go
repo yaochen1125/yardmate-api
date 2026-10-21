@@ -1231,6 +1231,19 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					pid := id
 					result.Suggestions[i].PlantID = &pid
 					plantIDsResolved++
+					// Genus-level hit ("Bellis spp." / "Calathea species" → the
+					// catalog's genus row, LookupPlantID tier 3): show it the way
+					// the 7d genus-keep does — bare genus + curated name — not the
+					// engine's placeholder spelling.
+					if g := genusDisplayName(sci); g != "" {
+						s := &result.Suggestions[i]
+						if cn, ok := content.LookupCommonName(id); ok {
+							s.Name = cn
+						} else if strings.TrimSpace(s.Name) == "" || strings.EqualFold(strings.TrimSpace(s.Name), strings.TrimSpace(sci)) {
+							s.Name = g
+						}
+						sci = g
+					}
 				}
 				// kingdom (mushroom-safety signal, SPEC §2.1): merge the candidate's
 				// own GPT-vision self-report (nil for engine candidates) with what

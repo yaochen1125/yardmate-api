@@ -92,6 +92,17 @@ func HandleEnrichment(svc *Service) http.HandlerFunc {
 // handleServiceError maps Service errors to HTTP error codes per SPEC §3.
 func handleServiceError(w http.ResponseWriter, _ *http.Request, err error, deviceID, appVer, sciName, attKeyID string, attAssertPresent bool) {
 	switch {
+	case errors.Is(err, ErrCatalogIDAsScientificName):
+		// A client bug, not a server failure: an app whose local index lagged a
+		// fresh promotion asked to enrich a catalog id. 404 = "no enrichment data
+		// for this name" — the warmer drops it silently and the detail page
+		// offers "Tap Try again", which then resolves the id from the refreshed
+		// local index. Dedicated log line so the remaining old-app traffic is
+		// easy to count.
+		writeError(w, http.StatusNotFound, "catalog_id_not_scientific_name")
+		log.Printf("enrichment catalog-id rejected: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v sciName=%q",
+			deviceID, appVer, attKeyID, attAssertPresent, sciName)
+		return
 	case errors.Is(err, ErrInvalidScientificName):
 		writeError(w, http.StatusBadRequest, "missing_scientific_name")
 	case errors.Is(err, ErrScientificNameTooLong):

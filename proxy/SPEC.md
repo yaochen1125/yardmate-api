@@ -199,7 +199,8 @@ Each suggestion carries its own `plant_id` because the three candidates are dist
 
 1. Resolved in the HTTP handler (not in `PlantIDClient`) from `suggestion.scientific_name` via `ContentIndex.LookupPlantID` — the **same resolver `/v1/diagnose` uses** (§2.2). Match against the embedded `plants_index.json` (1522 entries) is case-insensitive. **Two-pass on `/v1/identify`** (NEW): the original `scientific_name` is tried first (so a curated *subspecies* row like `Ceanothus griseus horizontalis` still hits), then — on a miss — the `speciesBinomial` species-level form (so a reported subspecies whose SPECIES is in the catalog resolves to it). `/v1/diagnose` stays single-pass.
 2. Fuzzy match with the shared `normalizeScientificName`: lowercased, trimmed, hybrid markers (`×` / stand-alone `x`) dropped, variety / cultivar / subspecies suffixes stripped (`var. X`, `cv. X`, `subsp. X`, `ssp. X`, `f. X`, `forma X`). Identify and diagnose MUST stay on the one normalizer so a name resolves identically on both endpoints. The identify-side `speciesBinomial` collapse (§2.1 name resolution) is a **separate** helper that does NOT alter this catalog key builder.
-3. `plant_id: null` on miss (plant outside the 1522 catalog) — the iOS client must tolerate this and fall back to the enrichment path / a not-found state; it must **not** render an empty detail page.
+3. **Genus level (tier 3, 2026-10-21).** A placeholder epithet means "genus only": `Calathea species` / `Rosa sp.` / `Salvia spp` / `X ssp.` (case-insensitive) resolve to the catalog's **genus-level row** for that genus — a row whose `scientific_name` is a bare genus (`Rosa`) or genus + placeholder (`Petunia spp.`); `genusLevelKey` folds both sides to the bare lowercase genus. Only genus rows are candidates, so with no genus row the name still misses (→ enrichment, unchanged), and a real epithet that merely looks similar (`Prunus speciosa`) is never folded. Being inside `LookupPlantID`, it applies everywhere the resolver is used (identify two-pass + candidate selection, diagnose, enrichment path-1, `KingdomFor`).
+4. `plant_id: null` on miss (plant outside the 1522 catalog) — the iOS client must tolerate this and fall back to the enrichment path / a not-found state; it must **not** render an empty detail page.
 
 `plant_id` resolution failures never change the 200 contract: a miss is `null`, the same as the rerank soft-degrade leaving `ai_enhanced_at: null`.
 
@@ -502,6 +503,7 @@ Only the `plants_index.json`-derived **name→id** maps hot-load — the exact d
 |---|---|---|
 | `scientificNameToID` (species-level) | `LookupPlantID` tier-2 | ✅ |
 | `scientificNameToIDPrecise` (infraspecific) | `LookupPlantID` tier-1 | ✅ |
+| `genusToID` (genus-level rows only) | `LookupPlantID` tier-3 | ✅ |
 | `commonByID` (plantId → curated common_name) | `/v1/identify` name resolution (§2.1) | ✅ |
 | `sciByID` (id → verbatim scientific_name) | `CatalogScientificNames` (imageingest) | ✅ (see note) |
 | `fullPlantByID`, `plantToCommonDiseases`, `speciesGroups` | enrichment path-1, diagnose fallback, cultivar rerank | ❌ embed-only (from `plants_detail.json`) |

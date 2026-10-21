@@ -22,6 +22,12 @@ var (
 
 	// ErrScientificNameTooLong — > 200 chars after trim.
 	ErrScientificNameTooLong = errors.New("enrichment: scientific name too long")
+
+	// ErrCatalogIDAsScientificName — the "scientific name" is a curated catalog
+	// id ("AAA1758", proxy.LooksLikeCatalogPlantID). Refused before cache /
+	// catalog / Supabase / LLM: the model would otherwise invent an
+	// "Unknown Plant" row and write it to plants_pending (2026-10-21).
+	ErrCatalogIDAsScientificName = errors.New("enrichment: catalog id used as scientific name")
 )
 
 // Maximum trimmed length for scientificName (SPEC §2.1).
@@ -170,6 +176,9 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	}
 	if len(name) > maxScientificNameLen {
 		return nil, "", ErrScientificNameTooLong
+	}
+	if proxy.LooksLikeCatalogPlantID(name) {
+		return nil, "", ErrCatalogIDAsScientificName
 	}
 	normalized := proxy.NormalizeScientificName(name)
 	if normalized == "" {
