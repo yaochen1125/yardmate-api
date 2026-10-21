@@ -80,6 +80,8 @@ type PlantNetClient struct {
 	// resolves it from env YARDMATE_API_PLANTNET_QUOTA_WARN (default 50),
 	// grouped with the other operational tuning knobs, and passes it in.
 	QuotaWarnThreshold int
+	// quota — 当日额度是否已用完（429 后不再白打，每 10 分钟试探，identify_fastmode.go）。
+	quota plantNetQuotaGate
 }
 
 // NewPlantNetClient returns a PlantNetClient with production defaults.

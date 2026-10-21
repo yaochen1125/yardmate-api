@@ -66,6 +66,11 @@ type raceOutcome struct {
 	engine string
 	err    error
 	gpt    *visionArbiterResult
+	// fast — GPT 先回且种级、把握 ≥ 0.95，已交给 GPT（极速模式②，identify_fastmode.go）。
+	fast bool
+	// onlyGPT — 当天只剩 GPT：Pl@ntNet 当日额度用完（429 / 已知用完被跳过）且 Plant.id
+	// 这次没被叫（档位不允许 / 每日上限满 / 无 Plant.id）（极速模式①）。
+	onlyGPT bool
 }
 
 // gptUsable — 兜底阶段（引擎已全部失败）能否直接用并行 GPT 的结果：有猜测，或明确
@@ -117,7 +122,9 @@ func (e *engineRace) run() raceOutcome {
 		// 独立评审复现过 hedge 叫一次、Pl@ntNet 随后报错又叫一次 → 扣 2 次额度）。
 		pidStarted bool
 		pnDown     bool // 本请求的 `identify plantnet down:` 已打（报警按请求计数，只打一行）
+		pnQuota    bool // Pl@ntNet 这次是因当日额度用完而没结果（429 或已知用完被跳过）
 	)
+	onlyGPTNow := func() bool { return !pidStarted && (e.plantNet == nil || pnQuota) }
 	out.engine = "plantid"
 	if e.plantNet != nil {
 		out.engine = "plantnet" // 失败时日志 / 错误映射也知道是哪个引擎
@@ -182,10 +189,18 @@ func (e *engineRace) run() raceOutcome {
 	var hedge <-chan time.Time
 	if e.plantNet != nil {
 		pnCh = make(chan engineOut, 1)
-		go func() {
-			r, err := e.plantNet.Identify(pnCtx, bytes.NewReader(e.img), e.mime, e.organ)
-			pnCh <- engineOut{r, err}
-		}()
+		if e.plantNet.quota.skip() {
+			// 当日额度已知用完：不再白打 Pl@ntNet（省一趟 429 往返），每 plantNetQuotaProbeInterval
+			// 放一个请求过去试探恢复（identify_fastmode.go）。
+			log.Printf("identify plantnet quota-skip: deviceID=%s → 当日额度已用完，不打 Pl@ntNet（每 %v 试探一次）", e.deviceID, plantNetQuotaProbeInterval)
+			pnCh <- engineOut{nil, fmt.Errorf("%w: skipped, daily quota exhausted", ErrPlantNetRateLimit)}
+		} else {
+			go func() {
+				r, err := e.plantNet.Identify(pnCtx, bytes.NewReader(e.img), e.mime, e.organ)
+				e.plantNet.quota.note(err)
+				pnCh <- engineOut{r, err}
+			}()
+		}
 		t := time.NewTimer(time.Until(e.reqStart.Add(identifyPlantNetHedgeDelay)))
 		defer t.Stop()
 		hedge = t.C
@@ -217,12 +232,23 @@ func (e *engineRace) run() raceOutcome {
 				lastErr = fmt.Errorf("%w: no engine available", ErrPlantIDUnavailable)
 			}
 			out.err = lastErr
+			out.onlyGPT = onlyGPTNow()
 			return out
 		}
-		// 后备 = GPT 的条件：Pl@ntNet 已慢（过了 hedge 点）且 Plant.id 不在跑。GPT 在 hedge
-		// 之前就答完的，结果留在 buffered gptCh 里，hedge 一到这里立即收到。
+		// 已收下的 GPT 答案（hedge 前就回了、当时没把握到 0.95）：过了 hedge 点、Plant.id
+		// 不在跑时，按 0.80 那条线交给 GPT（用户 2026-10-21：把握低就继续等引擎）。
+		if gptRes != nil && hedged && !pidPending && pnPending && gptCanPreempt(*gptRes) {
+			log.Printf("identify engine race: deviceID=%s winner=gpt after=%v (Pl@ntNet slow, no Plant.id)", e.deviceID, time.Since(e.reqStart).Round(time.Millisecond))
+			if lastErr == nil {
+				lastErr = fmt.Errorf("%w: slow, GPT answered first", ErrPlantNetUnavailable)
+			}
+			out.err = lastErr
+			return out
+		}
+		// 并行 GPT 从 0s 起就盯着：种级且把握 ≥ 0.95 → 极速模式直接出（不等引擎）；否则先收下，
+		// 过了 hedge 点再按 0.80 那条线判。GPT 在 hedge 之前就答完的，结果留在 buffered gptCh。
 		var gptWait chan visionArbiterResult
-		if gptCh != nil && gptRes == nil && !pidPending && hedged {
+		if gptCh != nil && gptRes == nil {
 			gptWait = gptCh
 		}
 
@@ -249,7 +275,11 @@ func (e *engineRace) run() raceOutcome {
 				if lastErr == nil {
 					lastErr = o.err
 				}
-				markPlantNetDown("error", o.err)
+				if isPlantNetQuotaErr(o.err) {
+					pnQuota = true // 额度用完不是故障：不打 `plantnet down`（报警只数故障）
+				} else {
+					markPlantNetDown("error", o.err)
+				}
 				if pidPending || pidStarted {
 					break // 后备已叫过（一个请求只叫一次 Plant.id）
 				}
@@ -294,18 +324,30 @@ func (e *engineRace) run() raceOutcome {
 			gptRes = &a
 			out.gpt = gptRes
 			gptCh = nil
-			if gptCanPreempt(a) {
-				// Pl@ntNet 慢、Plant.id 不在跑，GPT 先答完 → 交给 GPT（不再等 Pl@ntNet）。
+			switch {
+			case gptFastGuess(a):
+				// 极速模式②：GPT 种级、把握 ≥ 0.95，比引擎先回 → 直接出，引擎取消。
+				log.Printf("identify engine race: deviceID=%s winner=gpt-fast after=%v conf=%.2f (engines canceled)", e.deviceID, time.Since(e.reqStart).Round(time.Millisecond), gptConfOf(a))
+				out.fast = true
+				if lastErr == nil {
+					lastErr = fmt.Errorf("%w: GPT confident first (fast mode)", ErrPlantNetUnavailable)
+				}
+				out.err = lastErr
+				return out
+			case hedged && !pidPending && pnPending && gptCanPreempt(a):
+				// Pl@ntNet 慢、Plant.id 不在跑，GPT 有把握 → 交给 GPT（不再等 Pl@ntNet）。
 				log.Printf("identify engine race: deviceID=%s winner=gpt after=%v (Pl@ntNet slow, no Plant.id)", e.deviceID, time.Since(e.reqStart).Round(time.Millisecond))
 				if lastErr == nil {
 					lastErr = fmt.Errorf("%w: slow, GPT answered first", ErrPlantNetUnavailable)
 				}
 				out.err = lastErr
 				return out
+			case hedged:
+				// GPT 没把握（低置信 / 只到属）、失败或判「不是植物」：不抢先，继续等引擎到截止；
+				// 都没有结果时兜底照旧用 GPT 的答案（gptUsable）。
+				log.Printf("identify engine race: deviceID=%s gpt answered but not confident enough to preempt (sci=%q conf=%.2f err=%v) → 继续等引擎", e.deviceID, gptSciOf(a), gptConfOf(a), a.err)
 			}
-			// GPT 没把握（低置信 / 只到属）、失败或判「不是植物」：不抢先，继续等引擎到截止；
-			// 都没有结果时兜底照旧用 GPT 的答案（gptUsable）。
-			log.Printf("identify engine race: deviceID=%s gpt answered but not confident enough to preempt (sci=%q conf=%.2f err=%v) → 继续等引擎", e.deviceID, gptSciOf(a), gptConfOf(a), a.err)
+			// hedge 前回的 GPT（没到 0.95）：先收下，引擎回来照常合判；过了 hedge 点由循环开头按 0.80 判。
 		case <-raceCtx.Done():
 			if pnPending {
 				markPlantNetDown("deadline", raceCtx.Err())
@@ -321,6 +363,7 @@ func (e *engineRace) run() raceOutcome {
 			}
 			log.Printf("identify engine race: deviceID=%s no engine result by %v (err=%v)", e.deviceID, time.Since(e.reqStart).Round(time.Millisecond), lastErr)
 			out.err = lastErr
+			out.onlyGPT = onlyGPTNow()
 			return out
 		}
 	}

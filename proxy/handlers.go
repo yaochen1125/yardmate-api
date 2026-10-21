@@ -485,6 +485,9 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		}).run()
 		result, engine, err = race.result, race.engine, race.err
 		raceGPT := race.gpt // 赛跑已消费的并行 GPT 结果（非 nil 时不得再读 gptCh）
+		// 极速模式（identify_fastmode.go）：①当天只剩 GPT ②GPT 种级且把握 ≥ 0.95。响应带
+		// fast_mode=true，App 收到即跳转；本次也跳过库外 iNat 俗名升级。
+		fastMode := race.fast || race.onlyGPT
 		if raceGPT != nil {
 			gptCh = nil
 		}
@@ -639,8 +642,14 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					// rescued=false，2026-08-26 事故只能靠读代码倒推原因。
 					log.Printf("identify gpt on-demand fallback err: deviceID=%s visionErr=%v", deviceID, e)
 				}
-				log.Printf("identify gpt on-demand fallback: deviceID=%s enginesDownErr=%v rescued=%v notPlant=%v",
-					deviceID, engErr, err == nil, errors.Is(gptErr, ErrVisionNotAPlant))
+				if fastMode {
+					// 极速模式不是引擎故障兜底：另起一行，不混进报警的「GPT 兜底救回」计数。
+					log.Printf("identify fast-mode: deviceID=%s reason=%s ok=%v notPlant=%v",
+						deviceID, map[bool]string{true: "gpt-confident", false: "only-gpt"}[race.fast], err == nil, errors.Is(gptErr, ErrVisionNotAPlant))
+				} else {
+					log.Printf("identify gpt on-demand fallback: deviceID=%s enginesDownErr=%v rescued=%v notPlant=%v",
+						deviceID, engErr, err == nil, errors.Is(gptErr, ErrVisionNotAPlant))
+				}
 			}
 		}
 		if err == nil {
@@ -650,6 +659,10 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			if gptCh != nil {
 				arb := <-gptCh
 				gptSug, gptErr = arb.sug, arb.err
+			}
+			// 极速模式②也覆盖「引擎先回、GPT 随后种级且 ≥ 0.95」：答案照原有规则合判，App 免等。
+			if !fastMode && gptErr == nil && isFastGPTSuggestion(gptSug) {
+				fastMode = true
 			}
 
 			base := engine // "plantnet" or "plantid-fallback"/"plantid"
@@ -1263,7 +1276,7 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					if cn, ok := content.LookupCommonName(*s0.PlantID); ok {
 						s0.CommonNames = prependUnique(cn, s0.CommonNames)
 					}
-				} else if inat != nil {
+				} else if inat != nil && !fastMode {
 					// Best-effort common-name upgrade — MUST NOT dominate the
 					// identify latency budget. The species is already resolved;
 					// cap this to a short derived deadline so a slow iNat (its
@@ -1367,6 +1380,7 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			}
 		}
 		catalogHit := len(result.Suggestions) > 0 && result.Suggestions[0].PlantID != nil
+		result.FastMode = fastMode
 		logIdentifyDecision(deviceID, engine, engTop, engCands, gptSug, gptErr, result, unknownSentinel, content)
 		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v engine=%s mime=%s isPlant=%v suggestions=%d plantIdsResolved=%d catalogHit=%v suggestionsWithImage=%d aiEnhanced=%v",
 			deviceID, appVer, attKeyID, attAssertPresent, engine, mime, result.IsPlant, len(result.Suggestions), plantIDsResolved, catalogHit, suggestionsWithImage, result.AIEnhancedAt != nil)
