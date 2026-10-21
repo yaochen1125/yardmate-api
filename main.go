@@ -188,6 +188,32 @@ func main() {
 	var plantID *proxy.PlantIDClient
 	if v := vault.Get("PLANT_ID_API_KEY"); v != "" {
 		plantID = proxy.NewPlantIDClient(v)
+		// Plant.id 每日花费上限（proxy/plantid_budget.go）：全站 credit + 单 IP 次数，
+		// 按 UTC 日计；<= 0 表示该道不限。全站计数必须从 Plant.id 官方当日已用量起算：
+		// 起算之前 Plant.id 一律不放行（identify 交 GPT、diagnose 走 AI 兜底），后台每分钟
+		// 重试直到成功 —— 宁可暂时不用 Plant.id，也不能因重启 / 种子在途多花。
+		dailyCap := vaultIntOr(vault, "PLANTID_DAILY_CAP", 30)
+		perIPCap := vaultIntOr(vault, "PLANTID_PER_IP_DAILY_CAP", 3)
+		plantID.Budget = proxy.NewPlantIDBudget(dailyCap, perIPCap)
+		if dailyCap > 0 {
+			plantID.Budget.RequireSeed()
+			go func(c *proxy.PlantIDClient) {
+				for attempt := 1; ; attempt++ {
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					used, err := c.UsedToday(ctx)
+					cancel()
+					if err == nil {
+						c.Budget.SeedUsedToday(used)
+						log.Printf("plant.id budget: usedToday=%d dailyCap=%d perIPCap=%d", used, dailyCap, perIPCap)
+						return
+					}
+					if attempt == 1 || attempt%60 == 0 {
+						log.Printf("WARN: plant.id usage_info unavailable (attempt %d: %v); Plant.id blocked until seeded", attempt, err)
+					}
+					time.Sleep(time.Minute)
+				}
+			}(plantID)
+		}
 	} else {
 		log.Printf("WARN: PLANT_ID_API_KEY missing; /v1/diagnose will not be registered (identify falls back to Pl@ntNet-only)")
 	}

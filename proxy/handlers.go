@@ -1,10 +1,10 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math"
@@ -32,12 +32,11 @@ const identifyMaxBody = 9 << 20 // 9 MiB
 // 慢上传因此真正计入本预算（只 WithTimeout 会漏掉上传，Codex review P1 二连）。
 const identifyUpstreamTimeout = 22 * time.Second
 
-// identifyPlantNetTimeout — Pl@ntNet 单跳预算（22s 总预算的子集，var 供测试缩短）。
-// 2026-08-26 事故：Pl@ntNet 上游挂起，一跳吃满共享的 30s ctx —— iOS 侧 30s（含上传）
-// 先到期断线，GPT on-demand 兜底拿到的是已取消的 ctx，必死 → 502。单跳 12s 切断后，
-// 兜底接手时客户端仍在线、且 22s 总预算还有 10s 余量（≥ minIdentifyRescueBudget）。
-// 正常 Pl@ntNet 延迟中位 ~1s，12s 只砍 outage 尾部，不误伤慢请求。
-var identifyPlantNetTimeout = 12 * time.Second
+// Pl@ntNet 不再有单跳切断（2026-08-26 的 12s → 10-21 一度 8s → 现由引擎赛跑取代）：
+// 6s 未回叫后备、Pl@ntNet 继续跑、谁先出结果用谁，见 identify_race.go
+// （identifyPlantNetHedgeDelay / identifyEngineRaceBudget / minPlantIDHopBudget）。
+// 08-26 事故的教训仍成立并由赛跑截止保证：引擎阶段不得吃满共享 ctx，GPT 兜底接手时
+// 剩余 ≥ minIdentifyRescueBudget。
 
 // identifyWallClockBudget bounds the GPT on-demand rescue by wall clock from
 // reqStart（= identifyUpstreamTimeout：真正的紧约束是客户端 30s 计时器，不是 35s
@@ -260,7 +259,7 @@ func parseCoord(s string, min, max float64) *float64 {
 	return &v
 }
 
-func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand, plantIDIdentifyFallback bool, spendGate SpendGate, scanCounter *IdentifyScanCounter) http.HandlerFunc {
+func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *ContentIndex, vision *VisionClient, inat *INatClient, visionKNN *VisionKNNClient, roseEnabled, disambigEnabled, agreementBoostEnabled, bloomTiebreakEnabled, geoPriorEnabled, oobEscapeEnabled, arbiterOnDemand bool, plantIDFallback PlantIDFallbackMode, spendGate SpendGate, scanCounter *IdentifyScanCounter) http.HandlerFunc {
 	// Rose cultivar rerank candidates, built once here at route registration
 	// (startup) and captured by the closure — no server.go/main.go change needed,
 	// the factory already receives content (rosererank SPEC §2.2 / §7 #5).
@@ -412,9 +411,12 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     for EVERY identify now — the arbiter is universal, no ai_enhance /
 		//     free-vs-paid branch (free is gated only by request count). ---
 		var gptCh chan visionArbiterResult
-		// GPT_ARBITER_ON_DEMAND: on-demand 模式不预 fire —— 改为级联后按需串行调，
-		// 高置信库内命中时省掉这次调用（always 模式并行 fire，行为不变）。
-		if vision != nil && !arbiterOnDemand {
+		// GPT_ARBITER_ON_DEMAND: on-demand 模式原本不预 fire —— 级联后按需串行调，想在
+		// 「Pl@ntNet 高置信库内命中 + KNN 印证」时省掉这次调用。但 KNN 关着（prod 现状）时
+		// 这个跳过条件永远凑不齐（8-27 起 254 次 CALLED / 0 次 SKIPPED），串行只白白多等
+		// GPT 2–3s。所以 KNN 关时 on-demand 也在 0s 并行开跑：花费不变、每次快 2–3s，
+		// 引擎赛跑还能在 Pl@ntNet 慢时直接拿它当后备（2026-10-21）。KNN 开时保持按需串行。
+		if vision != nil && (!arbiterOnDemand || visionKNN == nil) {
 			gptCh = make(chan visionArbiterResult, 1)
 			go func() {
 				s, e := vision.IdentifyPlant(ctx, imgBytes, mime)
@@ -463,46 +465,28 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			priorLat, priorLon = geoLat, geoLon
 		}
 
-		if plantNet != nil {
-			engine = "plantnet"
-			// 单跳预算：不许 Pl@ntNet 一跳吃满共享 ctx（见 identifyPlantNetTimeout）。
-			// 超时被 plantnet.go 包成 ErrPlantNetUnavailable → plantNetFellBack 正常成立。
-			pnCtx, pnCancel := context.WithTimeout(ctx, identifyPlantNetTimeout)
-			result, err = plantNet.Identify(pnCtx, bytes.NewReader(imgBytes), mime, organ)
-			pnCancel()
-		}
-
-		// Decide whether to fall back to Plant.id. Fall back iff Pl@ntNet was
-		// not available at all, OR the Pl@ntNet call failed with one of the
-		// transient/auth/bad-body sentinels. A successful Pl@ntNet answer
-		// (including the 404 empty result) and ErrPlantNetImageRejected do
-		// NOT fall back.
-		plantNetFellBack := plantNet != nil &&
-			(errors.Is(err, ErrPlantNetUnavailable) ||
-				errors.Is(err, ErrPlantNetRateLimit) ||
-				errors.Is(err, ErrPlantNetUnauthorized) ||
-				errors.Is(err, ErrPlantNetBadResponse))
-
-		// PLANTID_IDENTIFY_FALLBACK=false：Pl@ntNet 失败（超限/宕机/失效）时跳过贵的
-		// Plant.id，保留 err 让下方 on-demand 的 GPT 兜底接管（省钱：溢出量走 GPT ~$4/1000
-		// 而非 Plant.id 的 credit）。只作用于 plantNetFellBack —— plantNet==nil 的
-		// Plant.id-only 部署不受影响（那种情况 Plant.id 是主引擎，不能跳）。诊病仍用 Plant.id。
+		// --- 引擎赛跑（identify_race.go）：Pl@ntNet 0s 开跑、不掐断；快速失败或 6s 未回
+		//     → 按 PLANTID_IDENTIFY_FALLBACK 档位 + 每日上限叫后备（Plant.id，否则就是
+		//     已并行在跑的 GPT）；谁先出「有候选」的结果用谁。
 		//
-		// 守卫（Codex #112）：只有当 GPT 兜底真能接管（arbiterOnDemand 开 + vision 可用）
-		// 时才允许跳过 Plant.id；否则（错配：flag=false 但 on-demand 关 / 无 OPENAI key）
-		// 保留 Plant.id 兜底，避免 PlantNet 失败既跳过 Plant.id 又无 GPT → 直接 502。
-		usePlantIDFallback := plantIDIdentifyFallback || !arbiterOnDemand || vision == nil
-		if plantNetFellBack && !usePlantIDFallback {
-			log.Printf("identify plantid-skip: deviceID=%s plantnetErr=%v → 跳过 Plant.id, GPT 兜底接管", deviceID, err)
-		}
-		if (plantNet == nil || (plantNetFellBack && usePlantIDFallback)) && plantID != nil {
-			if plantNetFellBack {
-				log.Printf("identify plantnet fallback: deviceID=%s err=%v", deviceID, err)
-				engine = "plantid-fallback"
-			} else {
-				engine = "plantid"
-			}
-			result, err = plantID.Identify(ctx, bytes.NewReader(imgBytes), mime, priorLat, priorLon)
+		// PLANTID_IDENTIFY_FALLBACK 三档（PlantIDFallbackMode，plantid_budget.go）：
+		//   true   —— Pl@ntNet 任何失败 / 慢都可叫 Plant.id；
+		//   false  —— 一律不叫贵的 Plant.id，后备是 GPT（#112 省钱：溢出量走 GPT ~$4/1000
+		//             而非 Plant.id 的 credit）；
+		//   outage —— Pl@ntNet 故障（超时/慢/5xx/鉴权/坏响应）叫 Plant.id，429 额度溢出
+		//             交 GPT（2026-10-21：故障期 GPT 常只认到属，Plant.id 认种更准）。
+		// 守卫（Codex #112）：GPT 兜不了时任何档都保留 Plant.id，避免既跳过 Plant.id 又无 GPT → 502。
+		race := (&engineRace{
+			ctx: ctx, clientCtx: r.Context(), reqStart: reqStart,
+			plantNet: plantNet, plantID: plantID, mode: plantIDFallback,
+			gptCanRescue: arbiterOnDemand && vision != nil, gptCh: gptCh,
+			clientIP: clientIPFromRequest(r), deviceID: deviceID,
+			img: imgBytes, mime: mime, organ: organ, lat: priorLat, lon: priorLon,
+		}).run()
+		result, engine, err = race.result, race.engine, race.err
+		raceGPT := race.gpt // 赛跑已消费的并行 GPT 结果（非 nil 时不得再读 gptCh）
+		if raceGPT != nil {
+			gptCh = nil
 		}
 
 		// --- Catalog-preference selection cascade (SPEC §1.1 / §2.1 / §7).
@@ -564,10 +548,17 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		// the err == nil path; nil when vision == nil or the cascade failed.
 		var gptSug *Suggestion
 		var gptErr error
+		// engTop — 引擎（Pl@ntNet / Plant.id）原始第一名的副本（cascade 重排 / 改写之前），
+		// 只供 `identify decision:` 日志对比 GPT（identify_decision.go）。
+		var engTop *Suggestion
+		var engCands []string
 		// on-demand 双信号印证会把并行 KNN 结果提前读到这里（switch 前需要它做跳过判据），
 		// 供下方 7a-4 复用，避免二次读已空的 knnCh。always 模式两者不动，7a-4 照旧读 knnCh。
 		var knnPreRead visionKNNResult
 		knnPreReadDone := false
+		if raceGPT != nil {
+			gptSug, gptErr = raceGPT.sug, raceGPT.err
+		}
 		// [GPT_ARBITER_ON_DEMAND] 需求1：两引擎全挂（err != nil，如 key 失效/超时/限流
 		// 到底）时，不再直接 502 —— 串行调 GPT 兜底，构造空候选让下方 cascade 的
 		// branch 3/4（ai-raw-oob / ai-catalog-recovery）接管出结果。GPT 也失败则 err
@@ -579,13 +570,38 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			// bad_image 让用户重拍，绝不送 GPT（否则坏图被 GPT 转成 200 结果）。Codex #111-1。
 			engErr := err
 			rescueBudget := identifyWallClockBudget - time.Since(reqStart)
+			// 并行 GPT（0s 起跑）的结果优先：赛跑里已拿到可用的直接用；还在跑就在剩余
+			// 墙钟内等它；它失败了且时间还够，才串行再试一次（旧行为）。
+			var parS *Suggestion
+			var parE error
+			haveParallel := false
+			if r.Context().Err() == nil {
+				switch {
+				case raceGPT != nil && gptUsable(*raceGPT):
+					parS, parE, haveParallel = raceGPT.sug, raceGPT.err, true
+				case raceGPT == nil && gptCh != nil:
+					t := time.NewTimer(rescueBudget)
+					select {
+					case a := <-gptCh:
+						gptCh = nil
+						if gptUsable(a) {
+							parS, parE, haveParallel = a.sug, a.err, true
+						} else {
+							log.Printf("identify gpt on-demand fallback err: deviceID=%s visionErr=%v (parallel)", deviceID, a.err)
+						}
+					case <-t.C:
+					}
+					t.Stop()
+					rescueBudget = identifyWallClockBudget - time.Since(reqStart)
+				}
+			}
 			if ce := r.Context().Err(); ce != nil {
 				// 客户端已断开（iOS 侧 30s 超时先到 / 用户退出）——没人在听，跳过 GPT
 				// 省一次调用；err 保留走原 502（响应写不回去，无人看到）。2026-08-26
 				// 事故中三次 "context canceled" 均属此类。
 				log.Printf("identify gpt on-demand fallback skipped (client gone): deviceID=%s ctxErr=%v enginesDownErr=%v",
 					deviceID, ce, engErr)
-			} else if rescueBudget < minIdentifyRescueBudget {
+			} else if !haveParallel && rescueBudget < minIdentifyRescueBudget {
 				// 主级联（PlantNet 12s + 可能的 Plant.id）+ 慢上传已把 wall clock 吃到
 				// 离 WriteTimeout 太近：GPT 注定在响应可写窗口内完不成，不发起
 				// （省钱 + 不留孤儿调用），保留 err → 502。Codex review P2。
@@ -599,9 +615,12 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 				// （IdentifyPlant 内部的 15s deadline 与此取更紧者，tier-3 决策 (g)）。
 				// 镜像 diagnose 兜底的 "don't reuse the timed-out ctx" + wall-clock
 				// budget 决策（SPEC §2.2）。
-				rctx, rcancel := context.WithTimeout(r.Context(), rescueBudget)
-				s, e := vision.IdentifyPlant(rctx, imgBytes, mime)
-				rcancel()
+				s, e := parS, parE
+				if !haveParallel {
+					rctx, rcancel := context.WithTimeout(r.Context(), rescueBudget)
+					s, e = vision.IdentifyPlant(rctx, imgBytes, mime)
+					rcancel()
+				}
 				switch {
 				case e == nil && s != nil:
 					result = &IdentifyResult{IsPlant: true, IsPlantConfidence: 1.0}
@@ -641,6 +660,13 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			var cands []Suggestion
 			if result != nil {
 				cands = result.Suggestions
+			}
+			if len(cands) > 0 && !strings.HasPrefix(engine, "ai-") {
+				top := cands[0]
+				engTop = &top
+				for _, c := range cands {
+					engCands = append(engCands, c.ScientificName)
+				}
 			}
 
 			// Find the highest-engine-confidence candidate that resolves to
@@ -1269,14 +1295,50 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		//     usable scientific name, iOS would store a dead Recent-snaps record
 		//     whose detail can never load — fall back to the Unknown sentinel,
 		//     which iOS refuses to record. Skipped when already the sentinel.
+		//
+		//     Genus-level exception (2026-10-21): a genus-only top ("Begonia spp." /
+		//     "Begonia sp." / "Begonia") is KEPT as the bare genus. Genus detail
+		//     pages load now — the catalog carries genus entries (Rosa, Forsythia…,
+		//     resolved here to their plant_id) and enrichment generates out-of-
+		//     catalog genus pages (search already serves them) — so dropping it only
+		//     turned a correct genus answer into "can't identify" (prod: Verbena,
+		//     Potamogeton sp., Begonia spp.; the Begonia one cost a paying user).
 		if !unknownSentinel && len(result.Suggestions) > 0 {
 			s0 := result.Suggestions[0]
 			noPID := s0.PlantID == nil || strings.TrimSpace(*s0.PlantID) == ""
 			if noPID && !hasUsableScientificName(s0.ScientificName) {
-				log.Printf("identify nameless-guard: deviceID=%s engine=%s sci=%q dropped→unknown-sentinel", deviceID, engine, s0.ScientificName)
-				result = unknownSentinelResult()
-				unknownSentinel = true
-				engine += "-nameless-guard"
+				if g := genusOnlyName(s0.ScientificName); g != "" {
+					orig := s0.ScientificName
+					s0.ScientificName = g
+					if strings.TrimSpace(s0.Name) == "" || strings.EqualFold(strings.TrimSpace(s0.Name), strings.TrimSpace(orig)) {
+						s0.Name = g
+					}
+					if content != nil {
+						// 库内属级条目可能写成 "Petunia spp."（AAA1591）或裸属名 "Rosa"。
+						for _, key := range []string{g, g + " spp.", g + " sp."} {
+							pid, ok := content.LookupPlantID(key)
+							if !ok {
+								continue
+							}
+							p := pid
+							s0.PlantID = &p
+							if cn, ok := content.LookupCommonName(pid); ok {
+								s0.Name = cn
+								s0.CommonNames = prependUnique(cn, s0.CommonNames)
+							}
+							s0.Kingdom = MergeKingdom(s0.Kingdom, content.KingdomFor(key))
+							break
+						}
+					}
+					result.Suggestions[0] = s0
+					log.Printf("identify genus-keep: deviceID=%s engine=%s sci=%q→%q catalog=%v", deviceID, engine, orig, g, s0.PlantID != nil)
+					engine += "-genus"
+				} else {
+					log.Printf("identify nameless-guard: deviceID=%s engine=%s sci=%q dropped→unknown-sentinel", deviceID, engine, s0.ScientificName)
+					result = unknownSentinelResult()
+					unknownSentinel = true
+					engine += "-nameless-guard"
+				}
 			}
 		}
 
@@ -1292,6 +1354,7 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			}
 		}
 		catalogHit := len(result.Suggestions) > 0 && result.Suggestions[0].PlantID != nil
+		logIdentifyDecision(deviceID, engine, engTop, engCands, gptSug, gptErr, result, unknownSentinel, content)
 		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v engine=%s mime=%s isPlant=%v suggestions=%d plantIdsResolved=%d catalogHit=%v suggestionsWithImage=%d aiEnhanced=%v",
 			deviceID, appVer, attKeyID, attAssertPresent, engine, mime, result.IsPlant, len(result.Suggestions), plantIDsResolved, catalogHit, suggestionsWithImage, result.AIEnhancedAt != nil)
 		// Plantdex rarity counter (proxy/rarity/SPEC.md): best-effort in-memory
@@ -1677,7 +1740,21 @@ func HandleDiagnose(client *PlantIDClient, content *ContentIndex, vision *Vision
 		ctx, cancel := context.WithDeadline(r.Context(), reqStart.Add(diagnoseUpstreamTimeout))
 		defer cancel()
 
-		api, err := client.Diagnose(ctx, imgBytes, mime)
+		// Plant.id 每日上限（与 identify 共用同一份额度，plantid_budget.go）。超了就
+		// 当作 Plant.id 限流 → 走下方既有的 AI vision 兜底，不调 Plant.id。
+		var api *plantIDDiagnoseResponse
+		if ce := r.Context().Err(); ce != nil {
+			// 客户端已断开：响应写不回去，不预占额度、不调任何上游。
+			log.Printf("diagnose skipped (client gone): deviceID=%s ctxErr=%v", deviceID, ce)
+			return
+		}
+		if ok, limit := client.Budget.TryAcquire(clientIPFromRequest(r), plantIDDiagnoseCredits); !ok {
+			used, capN := client.Budget.Snapshot()
+			log.Printf("diagnose plantid-budget: deviceID=%s limit=%s used=%d cap=%d → 跳过 Plant.id", deviceID, limit, used, capN)
+			err = fmt.Errorf("%w: daily budget (%s)", ErrPlantIDRateLimit, limit)
+		} else {
+			api, err = client.Diagnose(ctx, imgBytes, mime)
+		}
 		if err != nil {
 			log.Printf("diagnose upstream err: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v err=%v",
 				deviceID, appVer, attKeyID, attAssertPresent, err)

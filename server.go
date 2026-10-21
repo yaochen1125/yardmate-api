@@ -110,7 +110,9 @@ func newServer(
 	arbiterOnDemand := vault.GetBool("GPT_ARBITER_ON_DEMAND", false)
 	// PLANTID_IDENTIFY_FALLBACK（默认 true=现状：PlantNet 失败兜底到 Plant.id）。设 false
 	// 则 PlantNet 失败时跳过贵的 Plant.id、直接走 GPT 兜底（省钱，需 GPT_ARBITER_ON_DEMAND 才有兜底）。
-	plantIDIdentifyFallback := vault.GetBool("PLANTID_IDENTIFY_FALLBACK", true)
+	// 设 outage 则只在 PlantNet 故障（超时/5xx/鉴权/坏响应）时用 Plant.id，429 额度溢出仍走 GPT。
+	// 无论哪档，Plant.id 都受 PLANTID_DAILY_CAP / PLANTID_PER_IP_DAILY_CAP 两道每日上限约束（main.go）。
+	plantIDIdentifyFallback := proxy.ParsePlantIDFallbackMode(vault.Get("PLANTID_IDENTIFY_FALLBACK"))
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(realIPFromNginx)
