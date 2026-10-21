@@ -168,4 +168,9 @@ type Store interface {
 	RequestPayout(ctx context.Context, userID, email string, amount, threshold int64, yearStart time.Time) (Payout, YearTotals, error)
 	// ReviewStats reads the referrer's review numbers for the payout mail.
 	ReviewStats(ctx context.Context, userID string) (Review, error)
+	// Progress reads what the card's counts and list are computed from
+	// (Progress in progress.go): the referrer's referrals that are not void,
+	// and their ledger rows that still count (pending / available, the
+	// deleted friends' included with ReferralID 0).
+	Progress(ctx context.Context, userID string) ([]TrackReferral, []TrackCredit, error)
 }

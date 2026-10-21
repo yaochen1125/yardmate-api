@@ -294,3 +294,61 @@ func (p *PGStore) ReviewStats(ctx context.Context, userID string) (Review, error
 	}
 	return rv, rows.Err()
 }
+
+func (p *PGStore) Progress(ctx context.Context, userID string) ([]TrackReferral, []TrackCredit, error) {
+	refs, err := p.progressReferrals(ctx, userID)
+	if err != nil {
+		return nil, nil, err
+	}
+	credits, err := p.progressCredits(ctx, userID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return refs, credits, nil
+}
+
+func (p *PGStore) progressReferrals(ctx context.Context, userID string) ([]TrackReferral, error) {
+	// referrals_referrer_idx (013) covers this.
+	rows, err := p.pool.Query(ctx,
+		`select id, state, claimed_at, redeemed_at from referrals
+		  where referrer = $1 and state <> 'void'`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []TrackReferral
+	for rows.Next() {
+		var r TrackReferral
+		var redeemed *time.Time
+		if err := rows.Scan(&r.ID, &r.State, &r.ClaimedAt, &redeemed); err != nil {
+			return nil, err
+		}
+		if redeemed != nil {
+			r.RedeemedAt = *redeemed
+		}
+		refs = append(refs, r)
+	}
+	return refs, rows.Err()
+}
+
+func (p *PGStore) progressCredits(ctx context.Context, userID string) ([]TrackCredit, error) {
+	// reward_ledger_referrer_state_idx (015) covers this. referral_id is null
+	// once the friend deleted their account: the money is still the referrer's.
+	rows, err := p.pool.Query(ctx,
+		`select coalesce(referral_id, 0), state, credit_cents, product_id, purchased_at, available_at
+		   from reward_ledger
+		  where referrer = $1 and state in ('pending','available')`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var credits []TrackCredit
+	for rows.Next() {
+		var c TrackCredit
+		if err := rows.Scan(&c.ReferralID, &c.State, &c.CreditCents, &c.ProductID, &c.PurchasedAt, &c.AvailableAt); err != nil {
+			return nil, err
+		}
+		credits = append(credits, c)
+	}
+	return credits, rows.Err()
+}

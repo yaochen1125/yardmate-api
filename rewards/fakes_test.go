@@ -27,7 +27,10 @@ type memStore struct {
 	nextID  int64
 
 	// error knobs
-	findErr, recordErr, voidErr, matureErr, balanceErr, payoutErr, reviewErr error
+	findErr, recordErr, voidErr, matureErr, balanceErr, payoutErr, reviewErr, progressErr error
+
+	// redeemed is referrals.redeemed_at by referral id (Progress only).
+	redeemed map[int64]time.Time
 
 	// beforeRecord runs at the start of RecordCredit, without the lock: what
 	// lands between the webhook's lookup and its write (a referral_void).
@@ -51,7 +54,8 @@ type ledgerRow struct {
 }
 
 func newMemStore(now time.Time) *memStore {
-	return &memStore{clock: now, users: map[string]bool{}, refs: map[string]Referral{}, voided: map[string]bool{}}
+	return &memStore{clock: now, users: map[string]bool{}, refs: map[string]Referral{}, voided: map[string]bool{},
+		redeemed: map[int64]time.Time{}}
 }
 
 func (m *memStore) addReferral(referrer, referee, state string, claimedAt time.Time) Referral {
@@ -190,6 +194,29 @@ func (m *memStore) sumsLocked(userID string) (available, pending, spent int64) {
 		}
 	}
 	return
+}
+
+func (m *memStore) Progress(_ context.Context, userID string) ([]TrackReferral, []TrackCredit, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.progressErr != nil {
+		return nil, nil, m.progressErr
+	}
+	var refs []TrackReferral
+	for _, r := range m.refs {
+		if r.Referrer == userID && r.State != "void" {
+			refs = append(refs, TrackReferral{ID: r.ID, State: r.State, ClaimedAt: r.ClaimedAt, RedeemedAt: m.redeemed[r.ID]})
+		}
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].ID < refs[j].ID })
+	var credits []TrackCredit
+	for _, l := range m.ledger {
+		if l.Referrer == userID && (l.State == LedgerPending || l.State == LedgerAvailable) {
+			credits = append(credits, TrackCredit{ReferralID: l.ReferralID, State: l.State, CreditCents: l.CreditCents,
+				ProductID: l.ProductID, PurchasedAt: l.PurchasedAt, AvailableAt: l.AvailableAt})
+		}
+	}
+	return refs, credits, nil
 }
 
 func (m *memStore) Balance(_ context.Context, userID string) (Balance, error) {

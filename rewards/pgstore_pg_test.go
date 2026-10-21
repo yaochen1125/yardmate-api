@@ -338,3 +338,66 @@ func TestPGReviewStats(t *testing.T) {
 		t.Errorf("stranger: %+v %v", empty, err)
 	}
 }
+
+func TestPGProgress(t *testing.T) {
+	store, pool, ctx := pgTest(t)
+	now := time.Now()
+	paid := seedReferral(t, ctx, pool, referrer, "f1111111-0000-4000-8000-000000000000", "rewarded")
+	free := seedReferral(t, ctx, pool, referrer, "f2222222-0000-4000-8000-000000000000", "redeemed")
+	seedReferral(t, ctx, pool, referrer, "f3333333-0000-4000-8000-000000000000", "claimed")
+	void := seedReferral(t, ctx, pool, referrer, "f4444444-0000-4000-8000-000000000000", "void")
+	gone := seedReferral(t, ctx, pool, referrer, "f5555555-0000-4000-8000-000000000000", "rewarded")
+	if _, err := pool.Exec(ctx, `update referrals set redeemed_at = $2 where id = $1`, free, now.Add(-day(3))); err != nil {
+		t.Fatal(err)
+	}
+	credit := func(refID int64, txn, state, product string, purchased time.Time) {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`insert into reward_ledger (referral_id, referrer, rc_event_id, event_type, transaction_id, product_id, period_type,
+			                            price_usd_cents, takehome_percentage, credit_cents, purchased_at, available_at, state)
+			 values ($1, $2, 'ev-' || $3, 'RENEWAL', $3, $4, 'NORMAL', 699, 0.85, 178, $5, $6, $7)`,
+			refID, referrer, txn, product, purchased, purchased.Add(RefundWindow), state); err != nil {
+			t.Fatal(err)
+		}
+	}
+	credit(paid, "t1", "pending", "com.chenyao.plantapp.premium.month", now.Add(-day(10)))
+	credit(paid, "t2", "available", "com.chenyao.plantapp.premium.month", now.Add(-day(100)))
+	credit(paid, "t3", "voided", "com.chenyao.plantapp.premium.month", now.Add(-day(5)))
+	credit(void, "t4", "pending", "com.chenyao.plantapp.premium.month", now.Add(-day(5)))
+	credit(gone, "t5", "pending", "com.chenyao.plantapp.premium.yearly.3d", now.Add(-day(20)))
+	// The friend behind `gone` deletes their account: the referral row goes,
+	// the ledger row stays with referral_id null.
+	if _, err := pool.Exec(ctx, `delete from referral_users where user_id = 'f5555555-0000-4000-8000-000000000000'`); err != nil {
+		t.Fatal(err)
+	}
+
+	refs, credits, err := store.Progress(ctx, referrer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 3 {
+		t.Fatalf("refs = %+v (void and deleted must be gone)", refs)
+	}
+	for _, r := range refs {
+		if r.ID == free && r.RedeemedAt.Sub(now.Add(-day(3))).Abs() > time.Millisecond {
+			t.Errorf("redeemed_at = %s", r.RedeemedAt)
+		}
+		if r.ID != free && !r.RedeemedAt.IsZero() {
+			t.Errorf("ref %d redeemed_at = %s, want zero", r.ID, r.RedeemedAt)
+		}
+	}
+	if len(credits) != 4 { // t1, t2, t4 (void referral, Progress skips it), t5 (deleted friend)
+		t.Fatalf("credits = %+v", credits)
+	}
+	counts, list := Progress(refs, credits, now)
+	if counts != (Counts{Joined: 3, FreeMonth: 1, Paying: 1}) {
+		t.Errorf("counts = %+v", counts)
+	}
+	if len(list) != 4 || list[0].JoinedAt != nil || list[0].Plan != PlanYearly || list[1].Plan != PlanMonthly ||
+		list[2].Phase != PhaseFreeMonth || list[3].Phase != PhaseUnredeemed {
+		t.Errorf("list = %+v", list)
+	}
+	if refs, credits, err := store.Progress(ctx, stranger); err != nil || len(refs) != 0 || len(credits) != 0 {
+		t.Errorf("stranger: %v %v %v", refs, credits, err)
+	}
+}
