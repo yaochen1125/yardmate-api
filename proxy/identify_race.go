@@ -189,7 +189,8 @@ func (e *engineRace) run() raceOutcome {
 	var hedge <-chan time.Time
 	if e.plantNet != nil {
 		pnCh = make(chan engineOut, 1)
-		if e.plantNet.quota.skip() {
+		skipPN, probe := e.plantNet.quota.skip()
+		if skipPN {
 			// 当日额度已知用完：不再白打 Pl@ntNet（省一趟 429 往返），每 plantNetQuotaProbeInterval
 			// 放一个请求过去试探恢复（identify_fastmode.go）。
 			log.Printf("identify plantnet quota-skip: deviceID=%s → 当日额度已用完，不打 Pl@ntNet（每 %v 试探一次）", e.deviceID, plantNetQuotaProbeInterval)
@@ -198,6 +199,9 @@ func (e *engineRace) run() raceOutcome {
 			go func() {
 				r, err := e.plantNet.Identify(pnCtx, bytes.NewReader(e.img), e.mime, e.organ)
 				e.plantNet.quota.note(err)
+				if probe && err != nil && !isPlantNetQuotaErr(err) {
+					e.plantNet.quota.probeInconclusive()
+				}
 				pnCh <- engineOut{r, err}
 			}()
 		}

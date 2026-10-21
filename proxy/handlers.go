@@ -486,7 +486,8 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		result, engine, err = race.result, race.engine, race.err
 		raceGPT := race.gpt // 赛跑已消费的并行 GPT 结果（非 nil 时不得再读 gptCh）
 		// 极速模式（identify_fastmode.go）：①当天只剩 GPT ②GPT 种级且把握 ≥ 0.95。响应带
-		// fast_mode=true，App 收到即跳转；本次也跳过库外 iNat 俗名升级。
+		// fast_mode=true，App 收到即跳转。答案直接取自 GPT（race.fast / onlyGPT）时跳过库外 iNat
+		// 俗名升级；引擎先回、只是 GPT ≥ 0.95 的照常升级（答案可能是引擎的库外株，评审）。
 		fastMode := race.fast || race.onlyGPT
 		if raceGPT != nil {
 			gptCh = nil
@@ -1276,7 +1277,7 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 					if cn, ok := content.LookupCommonName(*s0.PlantID); ok {
 						s0.CommonNames = prependUnique(cn, s0.CommonNames)
 					}
-				} else if inat != nil && !fastMode {
+				} else if inat != nil && !(race.fast || race.onlyGPT) {
 					// Best-effort common-name upgrade — MUST NOT dominate the
 					// identify latency budget. The species is already resolved;
 					// cap this to a short derived deadline so a slow iNat (its

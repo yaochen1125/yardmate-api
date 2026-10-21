@@ -43,19 +43,29 @@ func (g *plantNetQuotaGate) clock() time.Time {
 }
 
 // skip 报告这次是否不打 Pl@ntNet（额度已用完、离上次试探不足 probe 间隔）。到了试探点
-// 返回 false 并记下本次为试探。
-func (g *plantNetQuotaGate) skip() bool {
+// 返回 skip=false、probe=true 并记下本次为试探。
+func (g *plantNetQuotaGate) skip() (skip, probe bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if !g.exhausted {
-		return false
+		return false, false
 	}
 	now := g.clock()
 	if now.Sub(g.lastProbe) < plantNetQuotaProbeInterval {
-		return true
+		return true, false
 	}
 	g.lastProbe = now
-	return false
+	return false, true
+}
+
+// probeInconclusive — 试探没得出结论（被取消 / 超时 / 5xx 等，既不是成功也不是 429）：
+// 放开试探名额，下一个请求立即再试，不白等 10 分钟（独立评审）。
+func (g *plantNetQuotaGate) probeInconclusive() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.exhausted {
+		g.lastProbe = time.Time{}
+	}
 }
 
 // note 按 Pl@ntNet 这次的结果更新状态：429 → 用完；成功（含 valid no-match）→ 恢复。

@@ -24,26 +24,31 @@ func fastModeOf(t *testing.T, rec *httptest.ResponseRecorder) (bool, bool) {
 func TestPlantNetQuotaGate(t *testing.T) {
 	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
 	g := plantNetQuotaGate{now: func() time.Time { return now }}
-	if g.skip() {
+	if skip, _ := g.skip(); skip {
 		t.Fatal("fresh gate skipped")
 	}
 	g.note(fmt.Errorf("%w: 429", ErrPlantNetRateLimit))
-	if !g.skip() {
+	if skip, _ := g.skip(); !skip {
 		t.Fatal("after 429 the next request must skip Pl@ntNet")
 	}
 	now = now.Add(plantNetQuotaProbeInterval)
-	if g.skip() {
+	if skip, probe := g.skip(); skip || !probe {
 		t.Fatal("after the probe interval one request must probe Pl@ntNet")
 	}
-	if !g.skip() {
+	if skip, _ := g.skip(); !skip {
 		t.Fatal("only one probe per interval")
 	}
 	g.note(fmt.Errorf("%w: timeout", ErrPlantNetUnavailable))
 	if !g.isExhausted() {
 		t.Fatal("a non-quota error must not clear the exhausted state")
 	}
+	// 试探没结论（取消 / 超时 / 5xx）→ 下一个请求立即再试，不白等一个间隔。
+	g.probeInconclusive()
+	if skip, probe := g.skip(); skip || !probe {
+		t.Fatal("an inconclusive probe must let the next request probe immediately")
+	}
 	g.note(nil)
-	if g.isExhausted() || g.skip() {
+	if skip, _ := g.skip(); g.isExhausted() || skip {
 		t.Fatal("a successful probe must clear the exhausted state")
 	}
 }
@@ -52,7 +57,7 @@ func TestPlantNetQuotaGate(t *testing.T) {
 // 到试探点放一个过去。
 func TestFastMode_OnlyGPT_PlantNetQuotaExhausted(t *testing.T) {
 	old := plantNetQuotaProbeInterval
-	plantNetQuotaProbeInterval = 300 * time.Millisecond
+	plantNetQuotaProbeInterval = 2 * time.Second // 3 个请求要在试探间隔内跑完，留足 CI 余量
 	defer func() { plantNetQuotaProbeInterval = old }()
 
 	var pnHit atomic.Int32
