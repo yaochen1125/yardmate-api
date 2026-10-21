@@ -4,7 +4,8 @@
 -- takehome_percentage），过了苹果 90 天退款期才算可兑余额；满 $100 申请一张
 -- Amazon.com 礼品卡，运营手动发。代码在 yardmate-api 的 rewards/（webhook、账本、兑换）。
 --
--- 两张表，没有函数：记账是一条 insert（rc_event_id 唯一 = 去重），兑换是 Go 侧一个事务
+-- 三张表，没有函数：记账是一条 insert（rc_event_id、transaction_id 各自唯一 = 去重；
+-- 跳过 reward_voided_txns 里已退款的），兑换是 Go 侧一个事务
 -- （锁该用户的 referral_users 行 + 下面的 partial unique index 兜底）。
 --
 -- 用法：psql "$SUPABASE_DB_URL" -f 015_referral_rewards.sql，或 Supabase SQL Editor 整份跑。
@@ -43,9 +44,23 @@ create table if not exists reward_ledger (
 );
 create unique index if not exists reward_ledger_rc_event_uidx    on reward_ledger (rc_event_id);
 create index        if not exists reward_ledger_referrer_state_idx on reward_ledger (referrer, state);
-create index        if not exists reward_ledger_transaction_idx  on reward_ledger (transaction_id);
+-- 一笔 App Store 交易只记一次：rc_event_id 只挡同一事件的重发，这条再挡「同一笔交易换了 event.id
+-- 又来一次」。退款也按它找 pending。（本迁移早期草稿是同列的非唯一索引，有就删掉，唯一索引已覆盖查找。）
+create unique index if not exists reward_ledger_transaction_uidx on reward_ledger (transaction_id);
+drop index          if exists     reward_ledger_transaction_idx;
 -- 结算轮只扫还没入账的。
 create index        if not exists reward_ledger_due_idx          on reward_ledger (available_at) where state = 'pending';
+
+-- ---------------------------------------------------------------- 退款先于扣费到达
+
+-- 苹果退款（CANCELLATION + CUSTOMER_SUPPORT）作废时账本里没有这笔的 pending（扣费那次投递失败、
+-- RevenueCat 稍后才重试成功，退款反而先到）→ 把 transaction_id 记在这里。之后扣费事件到了，
+-- 记账 insert 带 where not exists 这张表，不入账、答 200 voided。没命中 pending 的退款都记
+-- （已 available / 不是朋友的也记，无害）。只有交易号和时间，不关联用户，删账号不用管它。
+create table if not exists reward_voided_txns (
+    transaction_id text        primary key,
+    voided_at      timestamptz not null default now()
+);
 
 -- ---------------------------------------------------------------- 兑换申请
 
@@ -71,8 +86,9 @@ create unique index if not exists reward_payouts_one_requested_uidx on reward_pa
 
 -- RLS 开、不加任何 policy：anon / authenticated 一行也看不到。只有后端
 -- （DB 密码 pgx 池 / service_role，deploy/referral-payout.sh 走 PostgREST + service role）能读写。
-alter table reward_ledger  enable row level security;
-alter table reward_payouts enable row level security;
+alter table reward_ledger      enable row level security;
+alter table reward_payouts     enable row level security;
+alter table reward_voided_txns enable row level security;
 
 -- 让 PostgREST 重新读 schema（deploy/referral-payout.sh 经 PostgREST 读写 reward_payouts）。
 notify pgrst, 'reload schema';

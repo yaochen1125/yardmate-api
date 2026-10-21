@@ -238,25 +238,31 @@ func TestWebhookCountsWhatTheDocCounts(t *testing.T) {
 func TestWebhookReferralStates(t *testing.T) {
 	claimedAt := t0
 	cases := []struct {
-		state     string
-		purchased time.Time
-		want      string
+		state, evType string
+		purchased     time.Time
+		want          string
 	}{
-		{"redeemed", t0.Add(time.Hour), outRecorded},
-		{"qualified", t0.Add(time.Hour), outRecorded},
-		{"saved", t0.Add(time.Hour), outRecorded},
-		{"rewarded", t0.Add(time.Hour), outRecorded},
-		{"void", t0.Add(time.Hour), outNotRedeemed},
-		// Not yet moved to redeemed by the settlement loop: counts only when
-		// this charge is after the claim (what step ① checks).
-		{"claimed", t0.Add(time.Hour), outRecorded},
-		{"claimed", t0.Add(-time.Hour), outNotRedeemed},
+		{"redeemed", "INITIAL_PURCHASE", t0.Add(time.Hour), outRecorded},
+		{"qualified", "INITIAL_PURCHASE", t0.Add(time.Hour), outRecorded},
+		{"saved", "INITIAL_PURCHASE", t0.Add(time.Hour), outRecorded},
+		{"rewarded", "INITIAL_PURCHASE", t0.Add(time.Hour), outRecorded},
+		{"redeemed", "RENEWAL", t0.Add(time.Hour), outRecorded},
+		{"void", "INITIAL_PURCHASE", t0.Add(time.Hour), outNotRedeemed},
+		// Not yet moved to redeemed by the settlement loop: only a FIRST
+		// purchase after the claim counts (what step ① will confirm within
+		// ten minutes). A renewal while still claimed is a subscription that
+		// predates the claim — e.g. one a second account pulled over with
+		// Restore Purchases — and must not pay the referrer every period.
+		{"claimed", "INITIAL_PURCHASE", t0.Add(time.Hour), outRecorded},
+		{"claimed", "INITIAL_PURCHASE", t0.Add(-time.Hour), outNotRedeemed},
+		{"claimed", "RENEWAL", t0.Add(time.Hour), outNotRedeemed},
+		{"claimed", "RENEWAL", t0.Add(-time.Hour), outNotRedeemed},
 	}
 	for _, c := range cases {
-		t.Run(fmt.Sprintf("%s/%s", c.state, c.purchased.Sub(claimedAt)), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s/%s/%s", c.state, c.evType, c.purchased.Sub(claimedAt)), func(t *testing.T) {
 			svc, store, _ := newTestSvc(t0)
 			store.addReferral(referrer, referee, c.state, claimedAt)
-			w := post(t, svc, secret, with(purchase("e"), "purchased_at_ms", c.purchased.UnixMilli()))
+			w := post(t, svc, secret, with(purchase("e"), "type", c.evType, "purchased_at_ms", c.purchased.UnixMilli()))
 			if got := status(t, w); w.Code != http.StatusOK || got != c.want {
 				t.Fatalf("%d %q, want %q", w.Code, got, c.want)
 			}
@@ -318,6 +324,50 @@ func TestWebhookRefundVoidsOnlyPending(t *testing.T) {
 	if w := post(t, svc, secret, with(purchase("x"), "type", "CANCELLATION", "cancel_reason", "CUSTOMER_SUPPORT",
 		"environment", "SANDBOX")); status(t, w) != outIgnoredEnvironment {
 		t.Fatalf("sandbox refund: %s", w.Body.String())
+	}
+}
+
+func TestWebhookDedupesOnTransactionID(t *testing.T) {
+	// The same store transaction under a second event id is still one credit.
+	svc, store := redeemedSvc(t)
+	if w := post(t, svc, secret, purchase("evt-a")); status(t, w) != outRecorded {
+		t.Fatalf("first: %s", w.Body.String())
+	}
+	if w := post(t, svc, secret, purchase("evt-b")); w.Code != http.StatusOK || status(t, w) != outDuplicate {
+		t.Fatalf("same transaction, new event id: %d %s", w.Code, w.Body.String())
+	}
+	if n := len(store.rows()); n != 1 {
+		t.Fatalf("rows = %d, want 1", n)
+	}
+}
+
+func TestWebhookRefundBeforeCharge(t *testing.T) {
+	// The charge's first delivery failed (500) and RevenueCat retries it after
+	// the refund has already come in: the charge must not be credited.
+	svc, store := redeemedSvc(t)
+	refund := with(purchase("evt-refund"), "type", "CANCELLATION", "cancel_reason", "CUSTOMER_SUPPORT", "price", -39.99)
+	if w := post(t, svc, secret, refund); w.Code != http.StatusOK || status(t, w) != outNothingToVoid {
+		t.Fatalf("refund first: %d %s", w.Code, w.Body.String())
+	}
+	if !store.tombstoned("2000000111111111") {
+		t.Fatal("refund with nothing pending left no tombstone")
+	}
+	for i := 0; i < 2; i++ { // the late charge, and a redelivery of it
+		if w := post(t, svc, secret, purchase("evt-late")); w.Code != http.StatusOK || status(t, w) != outVoided {
+			t.Fatalf("late charge %d: %d %s", i+1, w.Code, w.Body.String())
+		}
+	}
+	if rows := store.rows(); len(rows) != 0 {
+		t.Fatalf("credited after refund: %+v", rows)
+	}
+	// Another transaction of the same friend is unaffected.
+	if w := post(t, svc, secret, with(purchase("evt-renewal"), "type", "RENEWAL", "transaction_id", "2000000333333333")); status(t, w) != outRecorded {
+		t.Fatalf("other transaction: %s", w.Body.String())
+	}
+	// A refund that did void something leaves no tombstone.
+	post(t, svc, secret, with(refund, "id", "evt-refund-2", "transaction_id", "2000000333333333"))
+	if store.tombstoned("2000000333333333") {
+		t.Fatal("tombstone written although a pending credit was voided")
 	}
 }
 

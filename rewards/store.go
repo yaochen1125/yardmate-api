@@ -57,6 +57,15 @@ type Credit struct {
 	AvailableAt           time.Time
 }
 
+// CreditResult is what RecordCredit did with one credit.
+type CreditResult int
+
+const (
+	CreditInserted  CreditResult = iota // a new pending row
+	CreditDuplicate                     // its event id or transaction id is already in the ledger (a redelivery)
+	CreditVoided                        // its transaction was refunded before this charge arrived; nothing written
+)
+
 // Payout is one reward_payouts row.
 type Payout struct {
 	ID          int64
@@ -100,11 +109,15 @@ type Store interface {
 	// ReferralByReferee finds the referral whose friend is referee (a lowercase
 	// Supabase user id). ok=false when there is none.
 	ReferralByReferee(ctx context.Context, referee string) (ref Referral, ok bool, err error)
-	// RecordCredit writes one pending credit. inserted=false when the event id
-	// is already in the ledger (a RevenueCat redelivery) — not an error.
-	RecordCredit(ctx context.Context, c Credit) (inserted bool, err error)
+	// RecordCredit writes one pending credit. Not written, and not an error:
+	// CreditDuplicate when its event id or its transaction id is already in
+	// the ledger (a RevenueCat redelivery), CreditVoided when a refund of the
+	// transaction got here first (reward_voided_txns, see VoidPending).
+	RecordCredit(ctx context.Context, c Credit) (CreditResult, error)
 	// VoidPending voids the PENDING credits of one store transaction (refund).
-	// Already-available credits are left alone.
+	// Already-available credits are left alone. When it voids nothing, it
+	// remembers the transaction id (reward_voided_txns) so a charge for it
+	// that arrives later is not credited.
 	VoidPending(ctx context.Context, transactionID string) (int64, error)
 	// MatureDue turns pending credits whose available_at has passed into
 	// available.

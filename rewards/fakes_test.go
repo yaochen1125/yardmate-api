@@ -10,9 +10,11 @@ import (
 )
 
 // memStore is an in-memory Store. It keeps the same rules as pgstore.go /
-// 015_referral_rewards.sql (event-id dedupe, void only pending, mature on the
-// database clock, balance = available − requested − sent, one requested
-// payout per user) so the handler tests exercise real bookkeeping.
+// 015_referral_rewards.sql (event-id and transaction-id dedupe, void only
+// pending, a refund with nothing pending leaves a tombstone that blocks the
+// late charge, mature on the database clock, balance = available − requested
+// − sent, one requested payout per user) so the handler tests exercise real
+// bookkeeping.
 type memStore struct {
 	mu sync.Mutex
 
@@ -20,6 +22,7 @@ type memStore struct {
 	users   map[string]bool
 	refs    map[string]Referral // by referee
 	ledger  []*ledgerRow
+	voided  map[string]bool // reward_voided_txns
 	payouts []*Payout
 	nextID  int64
 
@@ -33,7 +36,7 @@ type ledgerRow struct {
 }
 
 func newMemStore(now time.Time) *memStore {
-	return &memStore{clock: now, users: map[string]bool{}, refs: map[string]Referral{}}
+	return &memStore{clock: now, users: map[string]bool{}, refs: map[string]Referral{}, voided: map[string]bool{}}
 }
 
 func (m *memStore) addReferral(referrer, referee, state string, claimedAt time.Time) Referral {
@@ -87,19 +90,29 @@ func (m *memStore) ReferralByReferee(_ context.Context, referee string) (Referra
 	return r, ok, nil
 }
 
-func (m *memStore) RecordCredit(_ context.Context, c Credit) (bool, error) {
+func (m *memStore) RecordCredit(_ context.Context, c Credit) (CreditResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.recordErr != nil {
-		return false, m.recordErr
+		return 0, m.recordErr
 	}
 	for _, r := range m.ledger {
-		if r.EventID == c.EventID {
-			return false, nil
+		if r.EventID == c.EventID || r.TransactionID == c.TransactionID {
+			return CreditDuplicate, nil
 		}
 	}
+	if m.voided[c.TransactionID] {
+		return CreditVoided, nil
+	}
 	m.ledger = append(m.ledger, &ledgerRow{Credit: c, State: LedgerPending})
-	return true, nil
+	return CreditInserted, nil
+}
+
+// tombstoned reports whether a refund left txn in reward_voided_txns.
+func (m *memStore) tombstoned(txn string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.voided[txn]
 }
 
 func (m *memStore) VoidPending(_ context.Context, txn string) (int64, error) {
@@ -114,6 +127,9 @@ func (m *memStore) VoidPending(_ context.Context, txn string) (int64, error) {
 			r.State = LedgerVoided
 			n++
 		}
+	}
+	if n == 0 {
+		m.voided[txn] = true
 	}
 	return n, nil
 }

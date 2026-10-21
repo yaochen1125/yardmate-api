@@ -88,6 +88,7 @@ Restart required to pick up changes.
 | `/v1/app-secrets` | ✅ | — | ✅ (after assertion verify) |
 | `/v1/identify` | ✅ | ✅ | — |
 | `/v1/diagnose` | ✅ | ✅ | — |
+| `/v1/revenuecat/webhook` | its own bucket: 600 / **min** per IP, NOT the /v1 600 / h (top-level route; server-to-server from RevenueCat's few IPs, shared-secret auth — rewards/SPEC.md §3) | — | — |
 
 ### Per-keyID is post-verify
 

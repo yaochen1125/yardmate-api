@@ -18,6 +18,13 @@ import (
 // SUPABASE_DB_URL / migration 015 are in place.
 func rewardsTestServer(t *testing.T, vaultText string) *Server {
 	t.Helper()
+	return rewardsTestServerIPLimit(t, vaultText, 1000)
+}
+
+// rewardsTestServerIPLimit is rewardsTestServer with the /v1 per-IP limit
+// (per hour) set to ipLimit.
+func rewardsTestServerIPLimit(t *testing.T, vaultText string, ipLimit int) *Server {
+	t.Helper()
 	store, err := attest.OpenStore(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -31,7 +38,7 @@ func rewardsTestServer(t *testing.T, vaultText string) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lim := ratelimit.New(1000, time.Hour, 1000, time.Hour, 1000, time.Hour)
+	lim := ratelimit.New(ipLimit, time.Hour, 1000, time.Hour, 1000, time.Hour)
 	referralSvc := buildReferralService(vault, nil)
 	rewardsSvc := buildRewardsService(vault, nil, referralSvc)
 	return newServer(verifier, vault, lim, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, referralSvc, rewardsSvc)
@@ -62,6 +69,35 @@ func TestRevenueCatWebhookRouteRegistered(t *testing.T) {
 	}
 	if w := do(s, "Bearer rc-hook-secret"); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("no db: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRevenueCatWebhookHasItsOwnIPLimit(t *testing.T) {
+	// /v1 allows one request per IP per hour here. The webhook must not spend
+	// from that bucket (RevenueCat posts everyone's events from a few IPs) but
+	// keeps its own 600 / min per IP. httptest requests all come from 192.0.2.1.
+	s := rewardsTestServerIPLimit(t, "REVENUECAT_WEBHOOK_SECRET=rc-hook-secret\n", 1)
+	do := func(path string) int {
+		r := httptest.NewRequest("POST", path, strings.NewReader(`{"event":{"type":"TEST","environment":"SANDBOX"}}`))
+		r.Header.Set("Authorization", "Bearer rc-hook-secret")
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, r)
+		return w.Code
+	}
+	for i := 0; i < 600; i++ {
+		if code := do("/v1/revenuecat/webhook"); code == http.StatusTooManyRequests {
+			t.Fatalf("webhook 429 at request %d", i+1)
+		}
+	}
+	if code := do("/v1/revenuecat/webhook"); code != http.StatusTooManyRequests {
+		t.Fatalf("webhook request 601 in a minute: %d, want 429", code)
+	}
+	// The /v1 bucket is untouched by all of that: its one request still passes.
+	if code := do("/v1/attest/challenge"); code == http.StatusTooManyRequests {
+		t.Fatal("/v1 bucket spent by webhook traffic")
+	}
+	if code := do("/v1/attest/challenge"); code != http.StatusTooManyRequests {
+		t.Fatalf("second /v1 request: %d, want 429 (limit 1)", code)
 	}
 }
 

@@ -303,18 +303,23 @@ func newServer(
 				}
 			})
 		}
-
-		// /v1/revenuecat/webhook — RevenueCat server-to-server events feeding
-		// the referral gift-card ledger (rewards/SPEC.md). Authenticated by the
-		// shared REVENUECAT_WEBHOOK_SECRET in the Authorization header (503 until
-		// it is set), so no device / JWT checks; only this /v1 scope's per-IP
-		// limit applies (RevenueCat posts from a handful of IPs — volume is one
-		// event per store transaction, far under 600/h at our size; a 429 is
-		// retried by RevenueCat). Always registered when the service exists.
-		if rewardsSvc != nil {
-			r.Post("/revenuecat/webhook", rewardsSvc.HandleWebhook())
-		}
 	})
+
+	// /v1/revenuecat/webhook — RevenueCat server-to-server events feeding the
+	// referral gift-card ledger (rewards/SPEC.md). Registered at the top level,
+	// deliberately OUTSIDE the /v1 group above, so it does not share the
+	// public 600 / h per-IP bucket: RevenueCat posts every app user's events
+	// from a handful of IPs, and a renewal burst or a redelivered backlog that
+	// trips the app-facing limit would be 429'd into retry backoff (credits
+	// late, or dropped once RevenueCat gives up). It authenticates with the
+	// shared REVENUECAT_WEBHOOK_SECRET (503 until set), so no device / JWT
+	// checks. Still a public URL (nginx location /v1/), so — like every public
+	// route here — it keeps a per-IP limit, its own and far higher: 600 / min
+	// (rewards.Service.WebhookLimiter). Static path, so chi matches it before
+	// the /v1 mount. Always registered when the service exists.
+	if rewardsSvc != nil {
+		r.With(rewardsSvc.WebhookLimiter()).Post("/v1/revenuecat/webhook", rewardsSvc.HandleWebhook())
+	}
 
 	return &Server{
 		verifier: verifier, vault: vault, limiter: lim,

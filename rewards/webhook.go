@@ -169,7 +169,13 @@ func (s *Service) credit(ctx context.Context, ev rcEvent) (string, error) {
 		return outNotCounted, nil
 	}
 	price, ok := decimal(ev.Price)
-	if !ok || price.Sign() <= 0 {
+	if !ok {
+		// A real charge without a price would silently cost the referrer this
+		// credit, so leave a trace (type + period only, never an id).
+		log.Printf("revenuecat webhook: %s %s event has price null / missing; not counted", safeType(ev.Type), ev.PeriodType)
+		return outNotCounted, nil
+	}
+	if price.Sign() <= 0 {
 		return outNotCounted, nil
 	}
 
@@ -191,7 +197,7 @@ func (s *Service) credit(ctx context.Context, ev rcEvent) (string, error) {
 	if ev.PurchasedAtMs > 0 {
 		purchased = time.UnixMilli(ev.PurchasedAtMs).UTC()
 	}
-	if !eligible(ref, purchased) {
+	if !eligible(ref, ev.Type, purchased) {
 		return outNotRedeemed, nil
 	}
 	if ev.ID == "" || ev.TransactionID == "" {
@@ -214,7 +220,7 @@ func (s *Service) credit(ctx context.Context, ev rcEvent) (string, error) {
 		return outNotCounted, nil // a few cents of price rounds to nothing
 	}
 
-	inserted, err := s.store.RecordCredit(ctx, Credit{
+	res, err := s.store.RecordCredit(ctx, Credit{
 		ReferralID:            ref.ID,
 		Referrer:              ref.Referrer,
 		Referee:               ref.Referee,
@@ -233,8 +239,12 @@ func (s *Service) credit(ctx context.Context, ev rcEvent) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !inserted {
+	switch res {
+	case CreditDuplicate:
 		return outDuplicate, nil
+	case CreditVoided:
+		log.Printf("revenuecat webhook: %s arrived after its refund; not credited", ev.Type)
+		return outVoided, nil
 	}
 	log.Printf("revenuecat webhook: recorded %s %s credit_cents=%d", ev.Type, ev.PeriodType, creditCents)
 	return outRecorded, nil
@@ -243,7 +253,10 @@ func (s *Service) credit(ctx context.Context, ev rcEvent) (string, error) {
 // refund voids the pending credit of the refunded transaction. Matched on
 // transaction_id alone: only friends' charges are in the ledger, and a
 // refund that arrives after a TRANSFER still finds its row. Available credits
-// are not clawed back (rewards.md ## 特殊情况).
+// are not clawed back (rewards.md ## 特殊情况). When nothing is pending the
+// store remembers the transaction id, so a charge event delivered after its
+// refund (its first delivery failed and RevenueCat retried later) is voided
+// on arrival instead of maturing in 90 days.
 func (s *Service) refund(ctx context.Context, ev rcEvent) (string, error) {
 	if ev.TransactionID == "" {
 		return outNothingToVoid, nil
@@ -260,16 +273,20 @@ func (s *Service) refund(ctx context.Context, ev rcEvent) (string, error) {
 }
 
 // eligible: the friend has redeemed (013 referrals.state redeemed / qualified /
-// saved / rewarded). A referral still 'claimed' counts when this charge is
-// after the claim: that is exactly what the settlement loop's step ① turns
-// into 'redeemed' within ten minutes, and a friend paying straight away would
-// otherwise lose their first charge to the race.
-func eligible(ref Referral, purchased time.Time) bool {
+// saved / rewarded). A referral still 'claimed' counts only for a first
+// purchase (INITIAL_PURCHASE) after the claim: that is exactly what the
+// settlement loop's step ① turns into 'redeemed' within ten minutes, and a
+// friend paying straight away would otherwise lose their first charge to the
+// race. A RENEWAL while still claimed is a subscription older than the claim
+// — e.g. a second account that claimed a code and then pulled an existing
+// subscription over with Restore Purchases — and counting it would pay the
+// referrer for every renewal of a code that was never redeemed.
+func eligible(ref Referral, evType string, purchased time.Time) bool {
 	switch ref.State {
 	case refRedeemed, refQualified, refSaved, refRewarded:
 		return true
 	case refClaimed:
-		return purchased.After(ref.ClaimedAt)
+		return evType == "INITIAL_PURCHASE" && purchased.After(ref.ClaimedAt)
 	default: // void
 		return false
 	}

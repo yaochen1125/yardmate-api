@@ -46,6 +46,14 @@ const (
 	defaultStartupDelay = time.Minute
 	matureTimeout       = 2 * time.Minute
 	storeTimeout        = 10 * time.Second
+
+	// The webhook's own per-IP ceiling (WebhookLimiter). It authenticates
+	// with a shared secret, so it stays out of the /v1 600 / h per-IP group —
+	// a burst of renewals (RevenueCat posts from a few IPs) or a backlog it
+	// redelivers must not be 429'd into hours of retry backoff — but it is
+	// still a public URL, so an unauthenticated flood from one IP is capped.
+	webhookIPLimit  = 600
+	webhookIPWindow = time.Minute
 )
 
 // Authenticator verifies the request's bearer token and returns the Supabase
@@ -82,6 +90,9 @@ type Service struct {
 	secret string
 	mailer Mailer
 	bucket *ratelimit.Bucket
+	// webhookIP is the webhook's per-IP bucket (WebhookLimiter), swept by
+	// the maturing pass.
+	webhookIP *ratelimit.Bucket
 
 	interval     time.Duration
 	startupDelay time.Duration
@@ -108,11 +119,19 @@ func New(store Store, auth Authenticator, opt Options) *Service {
 		secret:       strings.TrimSpace(opt.WebhookSecret),
 		mailer:       opt.Mailer,
 		bucket:       opt.DeviceBucket,
+		webhookIP:    ratelimit.NewBucket(webhookIPLimit, webhookIPWindow),
 		interval:     opt.Interval,
 		startupDelay: opt.StartupDelay,
 		now:          time.Now,
 		async:        func(f func()) { go f() },
 	}
+}
+
+// WebhookLimiter is the per-IP middleware for POST /v1/revenuecat/webhook:
+// 600 / min, its own bucket instead of the /v1 group's 600 / h (see
+// webhookIPLimit). 429 rate_limit_ip, which RevenueCat retries.
+func (s *Service) WebhookLimiter() func(http.Handler) http.Handler {
+	return ratelimit.PerIPMiddleware(s.webhookIP, "rate_limit_ip")
 }
 
 // Missing names the absent dependencies, for the startup log.
@@ -228,8 +247,11 @@ func (s *Service) loop(ctx context.Context) {
 // Mature runs one pass: pending credits past available_at become available.
 // Exported for tests; the loop calls it on its timer. The per-device bucket is
 // the referral package's (swept by its settlement pass) or our own private one
-// (swept here).
+// (swept here); the webhook's per-IP bucket is always ours.
 func (s *Service) Mature(ctx context.Context) int64 {
+	// Sweep first, so a database outage does not stop the buckets shrinking.
+	s.bucket.Sweep(s.now())
+	s.webhookIP.Sweep(s.now())
 	mctx, cancel := context.WithTimeout(ctx, matureTimeout)
 	defer cancel()
 	n, err := s.store.MatureDue(mctx)
@@ -240,6 +262,5 @@ func (s *Service) Mature(ctx context.Context) int64 {
 	if n > 0 {
 		log.Printf("referral rewards mature: available=%d", n)
 	}
-	s.bucket.Sweep(s.now())
 	return n
 }

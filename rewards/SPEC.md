@@ -8,7 +8,8 @@
 
 ### 1.1 负责什么
 
-- `POST /v1/revenuecat/webhook`：收 RevenueCat 事件 → 朋友的真实扣费记一笔 **pending**、苹果退款把 pending 置 **voided**（`webhook.go`）。
+- `POST /v1/revenuecat/webhook`：收 RevenueCat 事件 → 朋友的真实扣费记一笔 **pending**、苹果退款把 pending 置 **voided**；
+  退款先于扣费到达时记下交易号，那笔扣费晚到也不入账（`webhook.go`）。
 - 入账定时器（每 10 分钟，自己的循环，与 referral 结算同一个 `REFERRAL_SETTLE_INTERVAL`）：`available_at <= now()` 的 pending → **available**（`rewards.go`）。
 - `GET /v1/referral/me` 的 `rewards` 字段：经 `referral.RewardsReader` 注入（`Rewards`）；本包不碰 `/me` 别的字段。
 - `POST /v1/referral/payout`：可兑余额 ≥ $100 → 建一条 `requested` 申请（固定 $100）→ 给运营发邮件（`payout.go`）。
@@ -31,7 +32,7 @@
 | `/payout` 头 | 同 `/claim`：`Authorization: Bearer <Supabase access token>`、`X-Device-Install-Id`、`X-App-Version` |
 | `/payout` body | `{"email": "you@example.com"}` |
 | vault | `REVENUECAT_WEBHOOK_SECRET`；`SUPABASE_URL` / `SUPABASE_DB_URL`（与 referral 共用）；`FEEDBACK_SMTP_*` / `FEEDBACK_EMAIL_TO`（运营邮件，缺了只记日志）；`REFERRAL_SETTLE_INTERVAL`（可选）|
-| 库 | migration `015_referral_rewards.sql` 的 `reward_ledger` / `reward_payouts`（依赖 013 的 `referral_users` / `referrals`）|
+| 库 | migration `015_referral_rewards.sql` 的 `reward_ledger` / `reward_voided_txns` / `reward_payouts`（依赖 013 的 `referral_users` / `referrals`）|
 
 ### 1.4 输出
 
@@ -39,7 +40,7 @@
 时间字段 RFC 3339、UTC、整秒（`"2026-10-20T12:00:00Z"`），`sent_at` 没发时 `null`。
 `/payout` 201 → `{"payout": {...}}`（同上 object，`state == "requested"`）。webhook 200 → `{"status": "<outcome>"}`
 （`recorded` / `duplicate` / `voided` / `nothing_to_void` / `not_counted` / `not_referee` / `not_redeemed` / `ignored_type` / `ignored_environment`，
-RevenueCat 后台的投递记录里看得到）。错误体 `{"error":"<code>"}`：
+RevenueCat 后台的投递记录里看得到；`voided` 既指退款作废了 pending，也指扣费晚于自己的退款到达、没入账）。错误体 `{"error":"<code>"}`：
 
 | 接口 | HTTP | code | 说明 |
 |---|---|---|---|
@@ -53,6 +54,7 @@ RevenueCat 后台的投递记录里看得到）。错误体 `{"error":"<code>"}`
 | payout | 503 | `not_configured` | 缺库或缺 `SUPABASE_URL` |
 | webhook | 400 | `bad_json` / `bad_event` | body 不是 JSON；要记账的事件缺 `id` / `transaction_id` 或价格大到放不进 int4 |
 | webhook | 401 | `unauthorized` | 头对不上 |
+| webhook | 429 | `rate_limit_ip` | 同一 IP 每分钟 > 600 次（自己的桶，不占 `/v1` 的 600 / h）|
 | webhook | 413 | `body_too_large` | > 64 KB |
 | webhook | 500 | `store_failed` | 库出错 → RevenueCat 重试 |
 | webhook | 503 | `not_configured` | 没配 `REVENUECAT_WEBHOOK_SECRET`（不看头，直接 503）或没库（过了鉴权之后）|
@@ -73,13 +75,19 @@ type ∈ INITIAL_PURCHASE / RENEWAL:
     lower(app_user_id) 不是 uuid / 不是任何 referrals.referee   → 200 not_referee
     该推荐不算已兑换                                          → 200 not_redeemed
     缺 event.id / transaction_id                              → 400 bad_event
-    insert pending（rc_event_id 撞了 → 200 duplicate）        → 200 recorded
-type == CANCELLATION 且 cancel_reason == CUSTOMER_SUPPORT     → 同 transaction_id 的 pending → voided
+    这笔交易已在 reward_voided_txns（退款先到了）             → 200 voided（不写）
+    insert pending（rc_event_id 或 transaction_id 撞了 → 200 duplicate）→ 200 recorded
+type == CANCELLATION 且 cancel_reason == CUSTOMER_SUPPORT:
+    同 transaction_id 的 pending → voided                     → 200 voided
+    没有 pending → 交易号记进 reward_voided_txns              → 200 nothing_to_void
 其他（TRANSFER / EXPIRATION / PRODUCT_CHANGE / TEST / 别的 CANCELLATION …）→ 200 ignored_type
 ```
 
-- **已兑换**：`referrals.state` ∈ `redeemed / qualified / saved / rewarded`；另外 `claimed` 且这笔 `purchased_at` 晚于 `claimed_at` 也算
-  —— 那正是 referral 结算第 ① 步十分钟内会认定为 redeemed 的情形，朋友填码后直接付费的第一笔不能被这十分钟竞态吃掉。`void` 不算。
+- **已兑换**：`referrals.state` ∈ `redeemed / qualified / saved / rewarded`；另外 `claimed` 且这笔是 **`INITIAL_PURCHASE`**、`purchased_at` 晚于 `claimed_at` 也算
+  —— 那正是 referral 结算第 ① 步十分钟内会认定为 redeemed 的情形，朋友填码后直接付费的第一笔不能被这十分钟竞态吃掉。
+  `claimed` 下的 `RENEWAL` **不算**（`not_redeemed`）：续费说明订阅早于填码，典型是小号领码后「恢复购买」把老订阅转过来，
+  算了就会每期都给推荐人记钱。`void` 不算。
+- **价格缺 / null**：不记，并打一行日志（只有事件类型和 period_type，不带任何 id）—— 真扣费没价格会悄悄少记推荐人一笔，留个痕。
 - **金额**：`credit_cents = round(price × takehome_percentage × 0.30 × 100)`，`price_usd_cents = round(price × 100)`，
   在 JSON 原文的十进制上用 `big.Rat` 算、半数进位（float64 会把 4.5 算成 4.499…）。`takehome_percentage` 缺 / null → 0.85，
   不在 (0, 1] → 0.85 并记日志。算出来 0 分（几美分的价格）→ 不记。典型值：$39.99 → 1020、$6.99 → 178、$0.29 intro → 7。
@@ -87,6 +95,9 @@ type == CANCELLATION 且 cancel_reason == CUSTOMER_SUPPORT     → 同 transacti
 - **app_user_id**：RevenueCat 里是 Supabase uuid **大写**，库里是小写 → 统一 `ToLower` 再比。`$RCAnonymousID:…` 直接 not_referee。
 - **退款**只按 `transaction_id` 找 pending，不再看 app_user_id（账本里本来只有朋友的扣费；TRANSFER 之后来的退款也能找到）。
   已 available 的不追回。`environment != PRODUCTION` 的退款同样忽略。
+- **退款先于扣费到达**（扣费那次投递 500、RevenueCat 稍后重试，退款反而先到）：作废时没命中 pending → 交易号记进
+  `reward_voided_txns`；扣费事件到了，insert 带 `where not exists (… reward_voided_txns …)` 被挡下 → 200 `voided`。
+  没命中 pending 的退款一律记（已 available / 不是朋友的也记，无害：前者账本里已有这笔、transaction_id 唯一；后者永远不会来扣费）。
 
 ### 2.2 余额口径（`Summarize`）
 
@@ -116,8 +127,11 @@ pending_cents   = sum(pending 账本)
 
 ### 2.5 幂等 / 并发
 
-- RevenueCat 重发同一事件（同 `event.id`）→ `on conflict (rc_event_id) do nothing` → 200 duplicate。
-- 退款重复到达 → 第二次 nothing_to_void。入账 update 只动 pending，重复跑无副作用。
+- RevenueCat 重发同一事件（同 `event.id`）或同一笔交易换了 `event.id` 又来 → `rc_event_id`、`transaction_id` 两个唯一索引，
+  insert 用**不带冲突目标**的 `on conflict do nothing` 让两个都生效 → 200 duplicate（账本里已有这笔，哪怕已 voided）。
+- 退款重复到达 → 第二次 nothing_to_void（再记一次 reward_voided_txns 也是 no-op）。入账 update 只动 pending，重复跑无副作用。
+- 同一交易号的记账和作废各自一个事务，开头 `pg_advisory_xact_lock(hashtextextended('reward_txn:' || transaction_id, 0))`
+  串行化：扣费和退款同一瞬间处理时，不会出现「退款没看到 pending、扣费也没看到退款记录」两边都漏。
 - 我们出错一律 500（RevenueCat 指数退避重试）；永远不会接受的请求是 4xx；看过但不记的一律 200（否则 RevenueCat 会一直重发）。
 
 ## 3. 配置与运维
@@ -125,8 +139,11 @@ pending_cents   = sum(pending 账本)
 - 迁移：`proxy/enrichment/migrations/015_referral_rewards.sql`（依赖 013，可重复跑），**先 staging 后 prod，且先于二进制**。
   表不存在时：webhook 记账答 500（RevenueCat 重试，迁移补上后自愈）、`/me` 省略 `rewards` 字段并记日志、`/payout` 502。
 - `REVENUECAT_WEBHOOK_SECRET`：`openssl rand -hex 32`，同一个值填 secrets.env 与 RevenueCat 后台 Webhooks 的 Authorization header。
-- 路由：`server.go` 注册 `/v1/revenuecat/webhook`（`/v1` 作用域的按 IP 限流 600/h 照常生效，RevenueCat 被 429 会重试）、
-  `/v1/referral/payout`（挂在 referral 路由组里）；服务总是构建，缺配置答 503 不是 404。nginx `location /v1/` 已覆盖。
+- 路由：`server.go` 在**顶层**注册 `/v1/revenuecat/webhook`，**不在** `/v1` 组里，不吃 App 用的每 IP 600 / h
+  （RevenueCat 从少数几个 IP 推所有用户的事件，续费扎堆或补发积压时会被 429 进退避，晚记甚至丢）；它有密钥鉴权，
+  但仍是公网 URL，所以照仓库「公网路由都有按 IP 限流」的习惯单给一个高得多的桶：每 IP 每分钟 600（`Service.WebhookLimiter`，
+  桶由入账轮清扫）。静态路径，chi 先于 `/v1` mount 匹配。`/v1/referral/payout` 挂在 referral 路由组里。
+  服务总是构建，缺配置答 503 不是 404。nginx `location /v1/` 已覆盖。
 - 发卡流程与脚本：`deploy/README.md` §8。
 - 日志只有类型、金额、计数、payout id 和错误文本，没有 user id、邮箱、transaction id、token。
 
@@ -134,13 +151,14 @@ pending_cents   = sum(pending 账本)
 
 `go test ./rewards/`（fakes 照 `referral/*_test.go` 风格，`memStore` 复刻 SQL 规则）：
 webhook 鉴权十种头 / 未配置 / 坏 body / 64 KB；文档每条记与不记（NORMAL / INTRO 记，TRIAL / PROMOTIONAL / $0 / null / 负价 / 家庭共享 / SANDBOX / 非朋友 / 匿名 id 不记，大小写）；
-各推荐状态（含 claimed 前后、void）；金额四舍五入表（含正好 .5）；90 天；去重；退款只 void pending；库错误 500；
+各推荐状态（含 claimed 下首购前后、claimed 下续费不记、void）；金额四舍五入表（含正好 .5）；90 天；按 event id 和 transaction id 去重；
+退款只 void pending；退款先到 → 留记录、晚到的扣费及其重发答 voided、别的交易不受影响；库错误 500；
 入账只动到期 pending；余额口径（cancelled 回余额、不为负）；时间 RFC 3339 无小数秒；
 payout 三个错误码 + 201、头 / 鉴权 / 未配置、邮箱黑白名单、共享设备桶（邮箱错不扣次数）、20 路并发只成一张、库错误 502、无邮件 / 邮件失败照 201、
 邮件正文与 W-9 阈值（$400 无、$500 有、去年的不算）、主题纯 ASCII。
-`go test .`：两条路由已注册、未配置答 503 / 401。`go test ./referral/`：`/me` 有 / 无 / 失败三种、共享桶。
+`go test .`：两条路由已注册、未配置答 503 / 401；webhook 不占 `/v1` 的 IP 桶、自己 600 / min 后 429。`go test ./referral/`：`/me` 有 / 无 / 失败三种、共享桶。
 
-SQL（013 + 015 两遍）在真库上的测试：`REWARDS_PG_TEST_URL=postgres://…/scratch go test ./rewards/ -run PG -v`
+SQL（按线上顺序 013 → 014 → 015，015 跑两遍）在真库上的测试（含 transaction_id 去重、退款先到、新表 RLS）：`REWARDS_PG_TEST_URL=postgres://…/scratch go test ./rewards/ -run PG -v`
 （临时 schema，跑完即删；**绝不要指向 staging / prod**）。**本 PR 写的时候本机没有 Postgres，这组还没实跑过。**
 
 ## 5. 待确认
@@ -149,5 +167,11 @@ SQL（013 + 015 两遍）在真库上的测试：`REWARDS_PG_TEST_URL=postgres:/
 - `is_family_share` 不算是按「真扣费」推的，文档字段表里没有这个字段。
 - `payout_in_progress` 先于 `below_threshold` 判断；文档两条 409 没定先后。
 - W-9 提醒按「本年已发 + 申请中（含这一张）≥ $500」算，比「之前已到 $500 的下一次」早一张提醒。
-- 乱序：退款先于购买到达（RevenueCat 很少见）时那笔会留成 pending、90 天后入账。
+- 乱序：退款先于购买到达 —— 已处理（§2.1，`reward_voided_txns`，产品已定：按已作废、答 200）。
+- 只认 `app_user_id`，**不查** `aliases` / `original_app_user_id`：朋友若用匿名 id 付了费、之后才被 RevenueCat 合并到 Supabase id，
+  那笔事件的 `app_user_id` 可能还是 `$RCAnonymousID:…` → not_referee、不记。填码必须登录（JWT），之后的扣费一般就是 Supabase id，
+  影响面小；要补就在判 not_referee 前把 aliases 里的 uuid 也查一遍（注意别让一个事件命中两条推荐）。本 PR 不改。
+- `takehome_percentage` 的增值税问题：RevenueCat 对它的说明是扣完商店佣金、**未扣 VAT / 数字服务税**的比例，`price` 本身也含税
+  → 欧盟等含税地区按本公式算出的 30% 比苹果实际到账的 30% 偏高（大约高出该地税率那么多）。文档公式就是 price × takehome × 0.30，
+  本 PR 照文档不改；要按到手算需产品定口径（可考虑事件里的税率字段，是否每条都带未核实）。
 - 朋友删账号后推荐人已记的钱保留（文档只写了推荐人删账号）。

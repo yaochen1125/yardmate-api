@@ -13,10 +13,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// The SQL side (migrations 013 + 015) against a real Postgres: event-id
-// dedupe, void only pending, maturing on now(), the balance sums, the payout
-// transaction's three outcomes, and the account-deletion cascade. Needs a
-// scratch database:
+// The SQL side (migrations 013 → 014 → 015, the production order) against a
+// real Postgres: event-id and transaction-id dedupe, void only pending, the
+// refund-before-charge tombstone, maturing on now(), the balance sums, the
+// payout transaction's three outcomes, and the account-deletion cascade.
+// Needs a scratch database:
 //
 //	REWARDS_PG_TEST_URL=postgres://postgres:postgres@localhost:5432/scratch go test ./rewards/ -run PG -v
 //
@@ -65,8 +66,8 @@ func pgTest(t *testing.T) (*PGStore, *pgxpool.Pool, context.Context) {
 			c.Close(ctx)
 		}
 	})
-	// 015 twice: it must be re-runnable.
-	for _, f := range []string{"013_referral.sql", "015_referral_rewards.sql", "015_referral_rewards.sql"} {
+	// In the order production runs them; 015 twice: it must be re-runnable.
+	for _, f := range []string{"013_referral.sql", "014_referral_pool_margin.sql", "015_referral_rewards.sql", "015_referral_rewards.sql"} {
 		sql, err := os.ReadFile(filepath.Join("..", "proxy", "enrichment", "migrations", f))
 		if err != nil {
 			t.Fatalf("%s: %v", f, err)
@@ -118,13 +119,17 @@ func TestPGLedgerAndPayouts(t *testing.T) {
 	// 12 000 + 12 000 matured (past window), 1 020 still pending.
 	for i, c := range []Credit{credit("e1", "t1", 6000, past), credit("e2", "t2", 6000, past),
 		credit("e3", "t3", 6000, past), credit("e4", "t4", 6000, past), credit("e5", "t5", 1020, time.Now())} {
-		ins, err := store.RecordCredit(ctx, c)
-		if err != nil || !ins {
-			t.Fatalf("record %d: %v %v", i, ins, err)
+		res, err := store.RecordCredit(ctx, c)
+		if err != nil || res != CreditInserted {
+			t.Fatalf("record %d: %v %v", i, res, err)
 		}
 	}
-	if ins, err := store.RecordCredit(ctx, credit("e1", "t1", 6000, past)); err != nil || ins {
-		t.Fatalf("duplicate event recorded: %v %v", ins, err)
+	if res, err := store.RecordCredit(ctx, credit("e1", "t1", 6000, past)); err != nil || res != CreditDuplicate {
+		t.Fatalf("duplicate event: %v %v", res, err)
+	}
+	// Same transaction under a new event id: the transaction_id unique index.
+	if res, err := store.RecordCredit(ctx, credit("e1-again", "t1", 6000, past)); err != nil || res != CreditDuplicate {
+		t.Fatalf("duplicate transaction: %v %v", res, err)
 	}
 
 	// Refund of t4 while still pending → voided; of t5 later, too.
@@ -187,6 +192,57 @@ func TestPGLedgerAndPayouts(t *testing.T) {
 	var left int
 	if err := pool.QueryRow(ctx, `select (select count(*) from reward_ledger) + (select count(*) from reward_payouts)`).Scan(&left); err != nil || left != 0 {
 		t.Fatalf("rows left after referrer deletion: %d %v", left, err)
+	}
+}
+
+func TestPGRefundBeforeCharge(t *testing.T) {
+	store, pool, ctx := pgTest(t)
+	refID := seedReferral(t, ctx, pool, referrer, referee, "redeemed")
+	now := time.Now()
+	c := Credit{ReferralID: refID, Referrer: referrer, Referee: referee, EventID: "late", EventType: "INITIAL_PURCHASE",
+		TransactionID: "t-refunded", PeriodType: "NORMAL", PriceUSDCents: 3999, Takehome: "0.8500", CreditCents: 1020,
+		PurchasedAt: now, AvailableAt: now.Add(RefundWindow)}
+
+	// The refund comes first: nothing pending → tombstone.
+	if n, err := store.VoidPending(ctx, "t-refunded"); err != nil || n != 0 {
+		t.Fatalf("void before charge: %d %v", n, err)
+	}
+	// Twice is fine (redelivered refund).
+	if _, err := store.VoidPending(ctx, "t-refunded"); err != nil {
+		t.Fatalf("second void: %v", err)
+	}
+	// The late charge, and its redelivery, are not written.
+	for i := 0; i < 2; i++ {
+		if res, err := store.RecordCredit(ctx, c); err != nil || res != CreditVoided {
+			t.Fatalf("late charge %d: %v %v", i+1, res, err)
+		}
+	}
+	var rows, tombstones int
+	if err := pool.QueryRow(ctx, `select (select count(*) from reward_ledger), (select count(*) from reward_voided_txns)`).
+		Scan(&rows, &tombstones); err != nil || rows != 0 || tombstones != 1 {
+		t.Fatalf("ledger rows %d, tombstones %d, err %v", rows, tombstones, err)
+	}
+
+	// A normal order (charge, then refund) voids the row and leaves no tombstone.
+	c2 := c
+	c2.EventID, c2.TransactionID = "normal", "t-normal"
+	if res, err := store.RecordCredit(ctx, c2); err != nil || res != CreditInserted {
+		t.Fatalf("charge: %v %v", res, err)
+	}
+	if n, err := store.VoidPending(ctx, "t-normal"); err != nil || n != 1 {
+		t.Fatalf("void: %d %v", n, err)
+	}
+	// Its redelivery afterwards is a duplicate (the row is there, voided), not a new credit.
+	if res, err := store.RecordCredit(ctx, c2); err != nil || res != CreditDuplicate {
+		t.Fatalf("redelivered charge after void: %v %v", res, err)
+	}
+	if err := pool.QueryRow(ctx, `select count(*) from reward_voided_txns`).Scan(&tombstones); err != nil || tombstones != 1 {
+		t.Fatalf("tombstones %d %v", tombstones, err)
+	}
+	// anon / authenticated see nothing (RLS on, no policy).
+	var rls bool
+	if err := pool.QueryRow(ctx, `select relrowsecurity from pg_class where oid = 'reward_voided_txns'::regclass`).Scan(&rls); err != nil || !rls {
+		t.Fatalf("reward_voided_txns RLS: %v %v", rls, err)
 	}
 }
 

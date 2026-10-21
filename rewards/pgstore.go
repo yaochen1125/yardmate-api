@@ -41,33 +41,92 @@ func (p *PGStore) ReferralByReferee(ctx context.Context, referee string) (Referr
 	return r, true, nil
 }
 
-func (p *PGStore) RecordCredit(ctx context.Context, c Credit) (bool, error) {
+// txnLockSQL serialises RecordCredit and VoidPending of one transaction id
+// (a transaction-scoped advisory lock), so a charge and its refund handled at
+// the same moment cannot miss each other — the refund finding nothing pending
+// while the charge, not yet seeing the refund's tombstone, inserts.
+const txnLockSQL = `select pg_advisory_xact_lock(hashtextextended('reward_txn:' || $1::text, 0))`
+
+func (p *PGStore) RecordCredit(ctx context.Context, c Credit) (CreditResult, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, txnLockSQL, c.TransactionID); err != nil {
+		return 0, err
+	}
 	// Takehome goes in as text and is cast, so no float ever touches the
-	// stored value.
-	tag, err := p.pool.Exec(ctx,
+	// stored value. "on conflict do nothing" without a target: both unique
+	// indexes (rc_event_id, transaction_id) make a redelivery a no-op. The
+	// not-exists skips a transaction already refunded (VoidPending's tombstone).
+	tag, err := tx.Exec(ctx,
 		`insert into reward_ledger
 		   (referral_id, referrer, referee, rc_event_id, event_type, transaction_id,
 		    original_transaction_id, product_id, period_type, price_usd_cents,
 		    takehome_percentage, credit_cents, purchased_at, available_at)
-		 values ($1, $2, $3, $4, $5, $6, nullif($7, ''), $8, $9, $10, $11::text::numeric, $12, $13, $14)
-		 on conflict (rc_event_id) do nothing`,
+		 select $1::bigint, $2::text, $3::text, $4::text, $5::text, $6::text,
+		        nullif($7::text, ''), $8::text, $9::text, $10::int,
+		        $11::text::numeric, $12::int, $13::timestamptz, $14::timestamptz
+		  where not exists (select 1 from reward_voided_txns where transaction_id = $6::text)
+		 on conflict do nothing`,
 		c.ReferralID, c.Referrer, c.Referee, c.EventID, c.EventType, c.TransactionID,
 		c.OriginalTransactionID, c.ProductID, c.PeriodType, c.PriceUSDCents,
 		c.Takehome, c.CreditCents, c.PurchasedAt, c.AvailableAt)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
-	return tag.RowsAffected() > 0, nil
+	res := CreditInserted
+	if tag.RowsAffected() == 0 {
+		// Nothing written: a ledger row for this event / transaction (a
+		// redelivery — even one refunded since), else the tombstone.
+		var dup bool
+		if err := tx.QueryRow(ctx,
+			`select exists (select 1 from reward_ledger where rc_event_id = $1 or transaction_id = $2)`,
+			c.EventID, c.TransactionID).Scan(&dup); err != nil {
+			return 0, err
+		}
+		res = CreditVoided
+		if dup {
+			res = CreditDuplicate
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return res, nil
 }
 
 func (p *PGStore) VoidPending(ctx context.Context, transactionID string) (int64, error) {
-	tag, err := p.pool.Exec(ctx,
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, txnLockSQL, transactionID); err != nil {
+		return 0, err
+	}
+	tag, err := tx.Exec(ctx,
 		`update reward_ledger set state = 'voided', voided_at = now()
 		  where transaction_id = $1 and state = 'pending'`, transactionID)
 	if err != nil {
 		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	n := tag.RowsAffected()
+	if n == 0 {
+		// Refund before (or without) its charge: leave a tombstone that
+		// RecordCredit checks. Also written for a refund of an available or
+		// unknown transaction — harmless, the charge is in the ledger already
+		// or will never come.
+		if _, err := tx.Exec(ctx,
+			`insert into reward_voided_txns (transaction_id) values ($1) on conflict do nothing`, transactionID); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 func (p *PGStore) MatureDue(ctx context.Context) (int64, error) {
