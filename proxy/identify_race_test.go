@@ -8,6 +8,8 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -102,11 +104,20 @@ func TestEngineRace_PlantNetEmptyBeforeHedge_NoPlantID(t *testing.T) {
 	}
 }
 
-// false 档（prod 现状）：Pl@ntNet 慢 → 后备就是已并行算好的 GPT，过 hedge 点立即用它，
-// 不叫 Plant.id、不等 Pl@ntNet。
+// gptAnswer — vision 上游：回给定学名 + 置信。
+func gptAnswer(sci string, conf float64) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		inner := fmt.Sprintf(`{"is_plant":true,"scientific_name":%q,"common_names":[],"confidence":%.2f}`, sci, conf)
+		outer, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": inner}}}})
+		_, _ = w.Write(outer)
+	}
+}
+
+// false 档（prod 现状）：Pl@ntNet 慢 → 后备就是已并行算好的 GPT；GPT 有把握（种级、≥0.80）
+// 时过 hedge 点立即用它，不叫 Plant.id、不等 Pl@ntNet。
 func TestEngineRace_NeverMode_PlantNetSlow_GPTWinsAtHedge(t *testing.T) {
 	shortRace(t, 150*time.Millisecond, 3*time.Second)
-	rig := newOutageRig(t, PlantIDFallbackNever, after(2*time.Second, plantNetOK), plantIDOK, NewPlantIDBudget(30, 3))
+	rig := newOutageRigVision(t, PlantIDFallbackNever, after(2*time.Second, plantNetOK), plantIDOK, NewPlantIDBudget(30, 3), gptAnswer("Rescuea fakeium", 0.92))
 	defer rig.close()
 	start := time.Now()
 	if sci := firstSci(t, doCascadeReq(t, rig.h)); sci != "Rescuea fakeium" {
@@ -211,5 +222,45 @@ func TestEngineRace_GPTNotAPlantDoesNotPreemptSlowPlantNet(t *testing.T) {
 	}
 	if el := time.Since(start); el < 250*time.Millisecond {
 		t.Fatalf("elapsed = %v: returned at the hedge point on GPT's not-a-plant instead of waiting for Pl@ntNet (300ms)", el)
+	}
+}
+
+// GPT 把握低（<0.80）或只认到属：过 hedge 点不抢先，继续等 Pl@ntNet；Pl@ntNet 回来就按原有规则合判。
+func TestEngineRace_LowConfidenceGPT_WaitsForPlantNet(t *testing.T) {
+	for _, g := range []struct {
+		sci  string
+		conf float64
+	}{{"Rescuea fakeium", 0.42}, {"Begonia spp.", 0.95}} {
+		t.Run(g.sci, func(t *testing.T) {
+			shortRace(t, 100*time.Millisecond, 2*time.Second)
+			rig := newOutageRigVision(t, PlantIDFallbackNever, after(400*time.Millisecond, plantNetOK), plantIDOK, NewPlantIDBudget(30, 3), gptAnswer(g.sci, g.conf))
+			defer rig.close()
+			start := time.Now()
+			sci := firstSci(t, doCascadeReq(t, rig.h))
+			if el := time.Since(start); el < 350*time.Millisecond {
+				t.Fatalf("elapsed = %v: low-confidence GPT preempted at the hedge point instead of waiting for Pl@ntNet (400ms)", el)
+			}
+			if sci != "Abelia chinensis" {
+				t.Fatalf("top = %q, want Pl@ntNet's Abelia chinensis", sci)
+			}
+		})
+	}
+}
+
+// GPT 把握低、引擎到截止都没结果 → 兜底照旧用 GPT 的答案（不报错）。
+func TestEngineRace_LowConfidenceGPT_UsedAtDeadline(t *testing.T) {
+	shortRace(t, 100*time.Millisecond, 400*time.Millisecond)
+	hang := func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}
+	rig := newOutageRigVision(t, PlantIDFallbackNever, hang, plantIDOK, NewPlantIDBudget(30, 3), gptAnswer("Rescuea fakeium", 0.42))
+	defer rig.close()
+	start := time.Now()
+	if sci := firstSci(t, doCascadeReq(t, rig.h)); sci != "Rescuea fakeium" {
+		t.Fatalf("top = %q, want GPT's answer at the race deadline", sci)
+	}
+	if el := time.Since(start); el < 350*time.Millisecond {
+		t.Fatalf("elapsed = %v, want ≈ race deadline (400ms): low-confidence GPT must wait", el)
 	}
 }

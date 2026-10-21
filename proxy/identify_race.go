@@ -74,10 +74,21 @@ func gptUsable(a visionArbiterResult) bool {
 	return (a.err == nil && a.sug != nil) || errors.Is(a.err, ErrVisionNotAPlant)
 }
 
-// gptHasGuess — 赛跑中能否让 GPT 抢先：只有它给出了植物名才行。「不是植物」不能顶掉
-// 还在跑的引擎（原有规则：AI 判非植物不得压过引擎结果；独立评审复现过慢 Pl@ntNet 的
-// 库内结果被 101ms 的 not-a-plant 抢成「没认出来」）。
-func gptHasGuess(a visionArbiterResult) bool { return a.err == nil && a.sug != nil }
+// gptPreemptMinConfidence — GPT 在赛跑中抢先（不再等引擎）所需的最低自报置信。与
+// plantnetConfidentSkipAIConfidence 同一条「有把握」线（用户 2026-10-21 拍板：把握低就
+// 等另外的结果，都没有再用 GPT）。参考：8-27 起 GPT 与 Pl@ntNet 一致的 84 次，GPT 自报
+// 0.85–0.99、中位 0.95 —— 有把握的答案基本不受影响。
+const gptPreemptMinConfidence = 0.80
+
+// gptCanPreempt — 赛跑中能否让 GPT 抢先：给出了**种级**植物名（只到属的 "Begonia spp."
+// 算没把握）且置信 ≥ gptPreemptMinConfidence。不满足 → 继续等 Pl@ntNet / Plant.id 到截止，
+// 都没有再由兜底用 GPT 的答案。「不是植物」也不能顶掉还在跑的引擎（原有规则：AI 判非植物
+// 不得压过引擎结果；评审复现过慢 Pl@ntNet 的库内结果被 101ms 的 not-a-plant 抢成「没认出来」）。
+func gptCanPreempt(a visionArbiterResult) bool {
+	return a.err == nil && a.sug != nil &&
+		a.sug.Confidence >= gptPreemptMinConfidence &&
+		hasUsableScientificName(a.sug.ScientificName)
+}
 
 func hasCandidates(r *IdentifyResult) bool { return r != nil && len(r.Suggestions) > 0 }
 
@@ -283,7 +294,7 @@ func (e *engineRace) run() raceOutcome {
 			gptRes = &a
 			out.gpt = gptRes
 			gptCh = nil
-			if gptHasGuess(a) {
+			if gptCanPreempt(a) {
 				// Pl@ntNet 慢、Plant.id 不在跑，GPT 先答完 → 交给 GPT（不再等 Pl@ntNet）。
 				log.Printf("identify engine race: deviceID=%s winner=gpt after=%v (Pl@ntNet slow, no Plant.id)", e.deviceID, time.Since(e.reqStart).Round(time.Millisecond))
 				if lastErr == nil {
@@ -292,7 +303,9 @@ func (e *engineRace) run() raceOutcome {
 				out.err = lastErr
 				return out
 			}
-			// GPT 失败或判「不是植物」：不抢先，继续等引擎到截止（兜底处再按旧规则处理）。
+			// GPT 没把握（低置信 / 只到属）、失败或判「不是植物」：不抢先，继续等引擎到截止；
+			// 都没有结果时兜底照旧用 GPT 的答案（gptUsable）。
+			log.Printf("identify engine race: deviceID=%s gpt answered but not confident enough to preempt (sci=%q conf=%.2f err=%v) → 继续等引擎", e.deviceID, gptSciOf(a), gptConfOf(a), a.err)
 		case <-raceCtx.Done():
 			if pnPending {
 				markPlantNetDown("deadline", raceCtx.Err())
@@ -311,4 +324,18 @@ func (e *engineRace) run() raceOutcome {
 			return out
 		}
 	}
+}
+
+func gptSciOf(a visionArbiterResult) string {
+	if a.sug == nil {
+		return ""
+	}
+	return a.sug.ScientificName
+}
+
+func gptConfOf(a visionArbiterResult) float64 {
+	if a.sug == nil {
+		return 0
+	}
+	return a.sug.Confidence
 }
