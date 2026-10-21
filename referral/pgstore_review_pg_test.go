@@ -318,3 +318,61 @@ func TestPGListQualifiedSaysWhichWereReviewed(t *testing.T) {
 		t.Errorf("approved then refunded = %s %q, want void refunded", s, r)
 	}
 }
+
+// MARK: re-claim once the referral has left claimed
+
+func TestPGReclaimAfterRedeemingNeverBurnsAnotherCode(t *testing.T) {
+	st, pool, ctx := pgTest(t)
+	codeA := pgInviteCode(t, st, ctx, userA)
+	pgSeed(t, pool, ctx, "b20", 20*day, "OLD")
+	pgSeed(t, pool, ctx, "b90", 90*day, "NEW")
+	if offer, err := st.Claim(ctx, userB, codeA, "", nil); err != nil || offer != "OLD" {
+		t.Fatalf("claim = %q, %v; want OLD (earliest beyond the margin)", offer, err)
+	}
+	id := pgReferralID(t, pool, ctx, userB)
+	// B redeemed OLD at Apple just before it expired; ExpireCodes got to it
+	// before settlement ① did, so the pool row says expired.
+	pgExpiresIn(t, pool, ctx, "OLD", -time.Hour)
+	if _, err := st.ExpireCodes(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if voided, err := st.MarkRedeemed(ctx, id, time.Now().Add(-2*time.Hour), "app_store:b"); err != nil || voided {
+		t.Fatalf("mark redeemed: %v %v", voided, err)
+	}
+	if s := pgState(t, pool, ctx, "OLD"); s != "expired" {
+		t.Fatalf("OLD = %s, want expired (the case under test)", s)
+	}
+	// The app re-opens the code sheet (an automatic re-claim) at every later
+	// state: always OLD back, NEW stays on the shelf.
+	for _, state := range []string{StateRedeemed, StateQualified, StateHeld, StateSaved, StateRewarded} {
+		if _, err := pool.Exec(ctx, `update referrals set state = $2 where id = $1`, id, state); err != nil {
+			t.Fatal(err)
+		}
+		if k, err := st.ClaimCheck(ctx, userB, codeA, ""); err != nil || k != ClaimAgain {
+			t.Fatalf("%s: check = %v %v, want again (no RevenueCat, no Apple)", state, k, err)
+		}
+		if offer, err := st.Claim(ctx, userB, codeA, "", nil); err != nil || offer != "OLD" {
+			t.Errorf("%s: re-claim = %q, %v; want OLD", state, offer, err)
+		}
+	}
+	if s := pgState(t, pool, ctx, "NEW"); s != "free" {
+		t.Errorf("NEW = %s, want still free (no code burnt)", s)
+	}
+	if offer, _ := pgReferral(t, pool, ctx, userB); offer != "OLD" {
+		t.Errorf("referral offer = %s, want OLD", offer)
+	}
+	if r := pgReissued(t, pool, ctx, userB); r != nil {
+		t.Errorf("reissued_at = %v, want never", r)
+	}
+
+	// Still claimed with a dying code is the one case that swaps (014).
+	if _, err := st.Claim(ctx, userC, codeA, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	offerC, _ := pgReferral(t, pool, ctx, userC)
+	pgExpiresIn(t, pool, ctx, offerC, 2*day) // inside the 3-day swap grace
+	pgSeed(t, pool, ctx, "b60", 60*day, "SPARE")
+	if again, err := st.Claim(ctx, userC, codeA, "", nil); err != nil || again == offerC {
+		t.Errorf("claimed + dying code: re-claim = %q, %v; want a swap", again, err)
+	}
+}
