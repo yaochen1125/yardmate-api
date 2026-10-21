@@ -10,6 +10,10 @@
 # 带两个 token 时走：A /me 造码 → B /me → B claim A 的码（拿到码池里一张码）
 # → B 再 claim（拿回同一张）→ B /redeemed。token 不回显。
 #
+# 防刷（016）：脚本不带 DeviceCheck token，所以只在 DEVICECHECK_MODE=log（staging 默认）下
+# 能领到码；enforce 下 B 首次 claim 会是 400 device_unverified（这正是 enforce 该有的样子）。
+# DEV_A 是 A 打开推荐页的设备（/me 记下），B 用 DEV_B 填码，不会撞第 2 道的 own_code。
+#
 # 拿 token：staging Supabase 里的两个账号，
 #   curl -sS "$SUPABASE_URL/auth/v1/token?grant_type=password" -H "apikey: <anon key>" \
 #     -H "Content-Type: application/json" -d '{"email":"...","password":"..."}' | jq -r .access_token
@@ -73,7 +77,8 @@ lower=$(echo "$codeA" | tr 'A-Z' 'a-z' | sed 's/-/ /')
 c1=$(req POST /v1/referral/claim "$DEV_B" "$TOKEN_B" "{\"code\":\"$lower\",\"subscribed_before\":false}")
 case "${c1%% *}" in
   200) green "  ok   B claim -> $c1" ;;
-  503) red "  B claim -> $c1（码池空了？先灌码：deploy/supabase/import-codes.sh）"; FAILED=1 ;;
+  503) red "  B claim -> $c1（pool_empty = 码池空了，先灌码：deploy/supabase/import-codes.sh；device_check_unavailable = enforce 下没配 DeviceCheck / 苹果不通）"; FAILED=1 ;;
+  400) red "  B claim -> $c1（device_unverified = 服务端是 enforce，脚本没有真机 token；staging 用 log 档跑）"; FAILED=1 ;;
   *)   red "  FAIL B claim -> $c1"; FAILED=1 ;;
 esac
 offer=$(echo "${c1#* }" | sed -n 's/.*"offer_code":"\([^"]*\)".*/\1/p')
@@ -86,7 +91,10 @@ if [[ -n "$offer" ]]; then
     echo "== 错误码"
     expect "A claim 自己的码 own_code"       400 "$(req POST /v1/referral/claim "$DEV_A" "$TOKEN_A" "{\"code\":\"$codeA\"}")"
     expect "B claim 不存在的码 unknown_code" 400 "$(req POST /v1/referral/claim "$DEV_B" "$TOKEN_B" '{"code":"YM-2345"}')"
-    expect "B subscribed_before not_new_user" 400 "$(req POST /v1/referral/claim "$DEV_B" "$TOKEN_B" "{\"code\":\"$codeA\",\"subscribed_before\":true}")"
+    # 判定顺序：「这个账号填过同一个码」在「订阅过」之前 —— 已经领过的人（多半已兑换、App 会报
+    # subscribed_before）重领拿回原码，不是 not_new_user。
+    c3=$(req POST /v1/referral/claim "$DEV_A" "$TOKEN_B" "{\"code\":\"$codeA\",\"subscribed_before\":true}")
+    if [[ "${c3#* }" == *"\"offer_code\":\"$offer\""* ]]; then green "  ok   B 换到 A 的设备 + subscribed_before 重领 -> 同一张"; else red "  FAIL re-claim -> $c3"; FAILED=1; fi
     expect "bad_code"                        400 "$(req POST /v1/referral/claim "$DEV_B" "$TOKEN_B" '{"code":"YM-7KQ0"}')"
 
     echo "== B /redeemed（只是提醒服务端去查）"
