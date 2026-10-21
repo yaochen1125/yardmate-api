@@ -4,6 +4,7 @@
 > 接口路径、字段、错误码按那份文档原样；本文只写后端怎么实现。
 > 照搬 Atta Kid 后端 `referral/`，按 YardMate 三处拍板改：推荐人奖励**不限量叠加**、
 > **正在付费的推荐人先攒着**、身份**验 Supabase JWT**（不是 App 自报）。
+> 推荐奖励（朋友真扣费的 30% → Amazon 礼品卡）在 `rewards/`，见 `rewards/SPEC.md`；本包只给 `/me` 留 `RewardsReader` 钩子（`rewards` 字段）、把 `/claim` 的设备桶借给 `/payout`。
 
 ## 1. 五个问题（`AI_ENGINEERING_STANDARD.md` §6）
 

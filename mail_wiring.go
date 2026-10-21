@@ -3,9 +3,10 @@ package main
 // mail_wiring.go — the one operator mailbox. Built from FEEDBACK_SMTP_* /
 // FEEDBACK_EMAIL_TO in the vault (deploy/secrets.env.example); nil when any
 // of from / pass / to is missing, and every user of it then falls back to
-// logging. Shared by /v1/feedback (each message forwarded) and the referral
-// code-pool watch (low-stock / expiry alert), so there is one account to
-// rotate and one inbox to read.
+// logging. Shared by /v1/feedback (each message forwarded), the referral
+// code-pool watch (low-stock / expiry alert) and referral gift-card payout
+// requests (rewards_wiring.go), so there is one account to rotate and one
+// inbox to read.
 
 import (
 	"github.com/yaochen1125/yardmate-api/proxy/enrichment"

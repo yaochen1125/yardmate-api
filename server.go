@@ -16,6 +16,7 @@ import (
 	"github.com/yaochen1125/yardmate-api/proxy/rarity"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
 	"github.com/yaochen1125/yardmate-api/referral"
+	"github.com/yaochen1125/yardmate-api/rewards"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
 
@@ -67,6 +68,7 @@ func newServer(
 	scanCounter *proxy.IdentifyScanCounter,
 	referralSvc *referral.Service,
 	mailer *enrichment.FeedbackMailer, // operator mailbox (mail_wiring.go); nil = feedback stored, not forwarded
+	rewardsSvc *rewards.Service, // referral gift-card rewards (rewards/SPEC.md); nil = routes unregistered (tests)
 ) *Server {
 	// Rose cultivar rerank is ON by default; ROSE_RERANK_ENABLED=false kill-switches it.
 	roseEnabled := vault.GetBool("ROSE_RERANK_ENABLED", true)
@@ -286,9 +288,31 @@ func newServer(
 				r.With(referralSvc.ReadLimiter()).Get("/me", referralSvc.HandleMe())
 				r.Post("/claim", referralSvc.HandleClaim())
 				r.With(referralSvc.ReadLimiter()).Post("/redeemed", referralSvc.HandleRedeemed())
+				// Gift-card request (rewards/SPEC.md): same JWT as /claim and
+				// /claim's per-device bucket, consumed inside the handler after
+				// the email shape check.
+				if rewardsSvc != nil {
+					r.Post("/payout", rewardsSvc.HandlePayout())
+				}
 			})
 		}
 	})
+
+	// /v1/revenuecat/webhook — RevenueCat server-to-server events feeding the
+	// referral gift-card ledger (rewards/SPEC.md). Registered at the top level,
+	// deliberately OUTSIDE the /v1 group above, so it does not share the
+	// public 600 / h per-IP bucket: RevenueCat posts every app user's events
+	// from a handful of IPs, and a renewal burst or a redelivered backlog that
+	// trips the app-facing limit would be 429'd into retry backoff (credits
+	// late, or dropped once RevenueCat gives up). It authenticates with the
+	// shared REVENUECAT_WEBHOOK_SECRET (503 until set), so no device / JWT
+	// checks. Still a public URL (nginx location /v1/), so — like every public
+	// route here — it keeps a per-IP limit, its own and far higher: 600 / min
+	// (rewards.Service.WebhookLimiter). Static path, so chi matches it before
+	// the /v1 mount. Always registered when the service exists.
+	if rewardsSvc != nil {
+		r.With(rewardsSvc.WebhookLimiter()).Post("/v1/revenuecat/webhook", rewardsSvc.HandleWebhook())
+	}
 
 	return &Server{
 		verifier: verifier, vault: vault, limiter: lim,

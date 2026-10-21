@@ -262,7 +262,49 @@ supplementary gallery 400s until the copy is re-synced and the binary rebuilt.
 There is exactly **one** in-repo copy (the fix deliberately reuses this embed
 rather than adding a second) — keep it in lockstep with the swiftui source.
 
-## 8. References
+## 8. Referral rewards — RevenueCat webhook + gift-card payouts
+
+`rewards/SPEC.md`. A friend's real charge (RevenueCat `INITIAL_PURCHASE` /
+`RENEWAL`, `NORMAL` / `INTRO`, price > 0, `PRODUCTION`) credits the referrer
+30% of Apple's payout; it clears after 90 days; $100 of cleared balance buys
+one Amazon.com gift card, **sent by hand**. Everything below is staging first,
+then prod.
+
+**Turning it on**
+
+1. Apply `proxy/enrichment/migrations/015_referral_rewards.sql` (after 013 and 014)
+   **before** the binary that uses it. Re-runnable.
+2. Generate a secret (`openssl rand -hex 32`), add
+   `REVENUECAT_WEBHOOK_SECRET=<it>` to the secrets file, deploy. Unset → the
+   webhook answers `503` and nothing is credited (the rest of the app is
+   unaffected).
+3. RevenueCat dashboard → Project → Integrations → Webhooks → add one:
+   URL `https://<api host>/v1/revenuecat/webhook`, *Authorization header
+   value* = the same secret (with or without `Bearer ` — either side may carry
+   it), all events. Sandbox events are accepted and ignored (`200
+   ignored_environment`), so one webhook for both environments is fine.
+4. "Send test event" in that screen → `200 {"status":"ignored_environment"}`
+   (or `ignored_type`). `401` = secret mismatch; `503` = secret or database not
+   configured (see `journalctl -u yardmate-api | grep "revenuecat webhook"`).
+   A `500` is ours (database) and RevenueCat retries it with backoff.
+5. nginx: `location /v1/` already forwards it; nothing to change.
+
+**A gift-card request arrives** (mail `[YardMate] Referral gift card request
+#17` to `FEEDBACK_EMAIL_TO`, same account as `/v1/feedback`):
+
+1. If the mail says `W-9 FIRST`, the user is at $500+ in cards this calendar
+   year: collect a W-9 before sending (1099-NEC from $600).
+2. Within 3 business days buy a $100 Amazon.com eGift card and deliver it to
+   the address in the mail.
+3. `SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… deploy/referral-payout.sh mark-sent 17`
+   — the app shows `Sent {date}` on its next `/me`.
+4. Not sending after all (bad address, no W-9): `… deploy/referral-payout.sh cancel 17`
+   — the $100 is back in their balance by definition (balance = cleared
+   credits − requested − sent), no ledger edit.
+5. Missed a mail / mail not configured: `… deploy/referral-payout.sh list`
+   shows every open request (`list sent` / `list cancelled` for history).
+
+## 9. References
 
 - `attest/SPEC.md` — App Attest protocol implementation
 - `secrets/SPEC.md` — env file format + load semantics
@@ -270,3 +312,4 @@ rather than adding a second) — keep it in lockstep with the swiftui source.
 - `deploy/yardmate-api.service` — the unit file shipped to the host
 - `deploy/secrets.env.example` — template for the local secrets file
 - `deploy/deploy.sh` — the script
+- `rewards/SPEC.md` + `deploy/referral-payout.sh` — referral gift-card rewards (§8)
