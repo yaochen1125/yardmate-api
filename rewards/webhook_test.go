@@ -177,6 +177,28 @@ func TestWebhookRecordsAnnualPurchase(t *testing.T) {
 	}
 }
 
+// A referral voided between the webhook's lookup and its write (settlement's
+// duplicate_apple_id, an operator's reject) gets no fresh pending credit
+// (final review P2): referral_void has already swept the ledger, so a row
+// written now would mature into spendable money.
+func TestWebhookReferralVoidedMeanwhileIsNotCredited(t *testing.T) {
+	svc, store := redeemedSvc(t)
+	store.beforeRecord = func() {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		r := store.refs[referee]
+		r.State = "void"
+		store.refs[referee] = r
+	}
+	w := post(t, svc, secret, purchase("evt-raced"))
+	if w.Code != http.StatusOK || status(t, w) != outNotRedeemed {
+		t.Fatalf("status %d %s, want 200 %s", w.Code, w.Body.String(), outNotRedeemed)
+	}
+	if rows := store.rows(); len(rows) != 0 {
+		t.Fatalf("rows = %+v, want none for a void referral", rows)
+	}
+}
+
 func TestWebhookCountsWhatTheDocCounts(t *testing.T) {
 	cases := []struct {
 		name  string

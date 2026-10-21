@@ -56,6 +56,22 @@ func (p *PGStore) RecordCredit(ctx context.Context, c Credit) (CreditResult, err
 	if _, err := tx.Exec(ctx, txnLockSQL, c.TransactionID); err != nil {
 		return 0, err
 	}
+	// The webhook judged the referral from an earlier read. Re-read it under
+	// a share lock: referral_void (settlement's duplicate_apple_id, an
+	// operator's reject) updates this row before voiding its ledger, so either
+	// it committed first and the row reads void here, or it waits for this
+	// insert and then voids it along with the rest.
+	var refState string
+	err = tx.QueryRow(ctx, `select state from referrals where id = $1 for share`, c.ReferralID).Scan(&refState)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CreditReferralVoid, nil // deleted with an account since
+	}
+	if err != nil {
+		return 0, err
+	}
+	if refState == "void" {
+		return CreditReferralVoid, nil
+	}
 	// Takehome goes in as text and is cast, so no float ever touches the
 	// stored value. "on conflict do nothing" without a target: both unique
 	// indexes (rc_event_id, transaction_id) make a redelivery a no-op. The

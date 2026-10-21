@@ -252,6 +252,32 @@ func TestPGRefundBeforeCharge(t *testing.T) {
 	}
 }
 
+// RecordCredit re-reads the referral under a share lock (final review P2): a
+// referral voided after the webhook's lookup, or deleted with an account,
+// gets no new pending credit.
+func TestPGRecordCreditRechecksTheReferral(t *testing.T) {
+	store, pool, ctx := pgTest(t)
+	refID := seedReferral(t, ctx, pool, referrer, referee, "redeemed")
+	now := time.Now()
+	c := Credit{ReferralID: refID, Referrer: referrer, Referee: referee, EventID: "raced", EventType: "INITIAL_PURCHASE",
+		TransactionID: "t-raced", PeriodType: "NORMAL", PriceUSDCents: 3999, Takehome: "0.8500", CreditCents: 1020,
+		PurchasedAt: now, AvailableAt: now.Add(RefundWindow)}
+	if _, err := pool.Exec(ctx, `update referrals set state = 'void' where id = $1`, refID); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := store.RecordCredit(ctx, c); err != nil || res != CreditReferralVoid {
+		t.Fatalf("void referral: %v %v, want CreditReferralVoid", res, err)
+	}
+	c.ReferralID, c.EventID, c.TransactionID = refID+1000, "gone", "t-gone"
+	if res, err := store.RecordCredit(ctx, c); err != nil || res != CreditReferralVoid {
+		t.Fatalf("missing referral: %v %v, want CreditReferralVoid", res, err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `select count(*) from reward_ledger`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("ledger rows = %d (%v), want 0", n, err)
+	}
+}
+
 func TestPGOneRequestedPerUserIndex(t *testing.T) {
 	_, pool, ctx := pgTest(t)
 	seedReferral(t, ctx, pool, referrer, referee, "redeemed")

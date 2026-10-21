@@ -29,6 +29,10 @@ type memStore struct {
 	// error knobs
 	findErr, recordErr, voidErr, matureErr, balanceErr, payoutErr, reviewErr error
 
+	// beforeRecord runs at the start of RecordCredit, without the lock: what
+	// lands between the webhook's lookup and its write (a referral_void).
+	beforeRecord func()
+
 	// review knobs: referral rows beyond refs (by id) for ReviewStats —
 	// state, void reason, claim device.
 	reviewRefs []reviewRef
@@ -102,10 +106,17 @@ func (m *memStore) ReferralByReferee(_ context.Context, referee string) (Referra
 }
 
 func (m *memStore) RecordCredit(_ context.Context, c Credit) (CreditResult, error) {
+	if m.beforeRecord != nil {
+		m.beforeRecord()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.recordErr != nil {
 		return 0, m.recordErr
+	}
+	// PG: the referral re-read under a share lock.
+	if r, ok := m.refs[c.Referee]; !ok || r.ID != c.ReferralID || r.State == "void" {
+		return CreditReferralVoid, nil
 	}
 	for _, r := range m.ledger {
 		if r.EventID == c.EventID || r.TransactionID == c.TransactionID {
