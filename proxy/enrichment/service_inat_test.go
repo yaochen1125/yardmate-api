@@ -124,8 +124,9 @@ func TestGetOrGenerate_INatNoMatchFallsBackToScientificName(t *testing.T) {
 }
 
 // TestGetOrGenerate_INatOutageKeepsRowName: iNat could NOT be asked (5xx) →
-// the row's own name passes through untouched and nothing is cached, so the
-// next request retries (a transient outage must not flip names to Latin).
+// the row's own name passes through untouched (a transient outage must not flip
+// names to Latin) and the unresolved result is NOT cached for 24 h: it is held
+// only for the short retry window, then iNat is asked again.
 func TestGetOrGenerate_INatOutageKeepsRowName(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -138,7 +139,10 @@ func TestGetOrGenerate_INatOutageKeepsRowName(t *testing.T) {
 	cache := NewCache(10, time.Hour)
 	cache.Set("triteleia ixioides|en", &proxy.PlantDetail{CommonName: "Original", CommonNameSource: "plantnet"})
 	svc := NewService(nil, nil, nil, cache, inat)
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 3; i++ {
+		if i == 2 {
+			svc.names.retry.Purge() // the 2-minute retry window elapses
+		}
 		got, _, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Triteleia ixioides"})
 		if err != nil {
 			t.Fatalf("GetOrGenerate: %v", err)
@@ -146,9 +150,13 @@ func TestGetOrGenerate_INatOutageKeepsRowName(t *testing.T) {
 		if got.CommonName != "Original" || got.CommonNameSource != "plantnet" {
 			t.Errorf("outage must keep row name, got %q/%q", got.CommonName, got.CommonNameSource)
 		}
-	}
-	if n := atomic.LoadInt32(&calls); n != 2 {
-		t.Errorf("iNat calls = %d, want 2 (unresolved results must not be cached)", n)
+		want := int32(1)
+		if i == 2 {
+			want = 2
+		}
+		if n := atomic.LoadInt32(&calls); n != want {
+			t.Errorf("request %d: iNat calls = %d, want %d (held briefly, never cached for 24 h)", i+1, n, want)
+		}
 	}
 }
 

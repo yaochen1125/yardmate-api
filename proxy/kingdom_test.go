@@ -313,37 +313,63 @@ func TestINatPreferredCommonName_StillPlantaeScoped(t *testing.T) {
 
 // Enrichment's name lookup is the SAME round-trip as the kingdom: one
 // Plantae + Fungi query in the request locale returns the localized name, the
-// English name and the kingdom; an infraspecific input falls back to its species
-// binomial only when the full name has no exact match.
+// English name and the kingdom. The query drops rank markers (iNat names have
+// none, and a "var." query returns nothing); only when that misses does a
+// second query ask for the species binomial.
 func TestINatLocalizedCommonNames_NameAndKingdomInOneRequest(t *testing.T) {
-	var calls int
+	var queries []string
 	var gotScope, gotLocale string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		gotScope = r.URL.Query().Get("taxon_id")
-		gotLocale = r.URL.Query().Get("locale")
-		_, _ = io.WriteString(w, `{"results":[
-			{"name":"Amanita pantherina","preferred_common_name":"豹斑鹅膏","english_common_name":"Panthercap","iconic_taxon_name":"Fungi"},
-			{"name":"Amanita muscaria","preferred_common_name":"毒蝇伞","english_common_name":"Fly Agaric","iconic_taxon_name":"Fungi"}
-		]}`)
+		q := r.URL.Query()
+		queries = append(queries, q.Get("q"))
+		gotScope, gotLocale = q.Get("taxon_id"), q.Get("locale")
+		switch q.Get("q") {
+		case "Amanita muscaria":
+			_, _ = io.WriteString(w, `{"results":[
+				{"name":"Amanita pantherina","preferred_common_name":"豹斑鹅膏","english_common_name":"Panthercap","iconic_taxon_name":"Fungi"},
+				{"name":"Amanita muscaria","preferred_common_name":"毒蝇伞","english_common_name":"Fly Agaric","iconic_taxon_name":"Fungi"}
+			]}`)
+		case "Brassica oleracea capitata":
+			_, _ = io.WriteString(w, `{"results":[
+				{"name":"Brassica oleracea capitata","preferred_common_name":"甘蓝","english_common_name":"Cabbage","iconic_taxon_name":"Plantae"}
+			]}`)
+		default: // like real iNat: a rank-marker query, or an unknown variety
+			_, _ = io.WriteString(w, `{"results":[]}`)
+		}
 	}))
 	defer srv.Close()
 	c := &INatClient{HTTP: srv.Client(), BaseURL: srv.URL}
 
-	got, err := c.LocalizedCommonNames(context.Background(), "Amanita muscaria var. formosa", "zh-CN")
-	if err != nil {
-		t.Fatalf("LocalizedCommonNames: %v", err)
-	}
+	got, err := c.LocalizedCommonNames(context.Background(), "Amanita muscaria", "zh-CN")
 	want := INatTaxon{CommonName: "毒蝇伞", EnglishCommonName: "Fly Agaric", Kingdom: "Fungi"}
-	if got != want {
-		t.Errorf("got %+v, want %+v (binomial match, not the fuzzy first hit)", got, want)
+	if err != nil || got != want {
+		t.Errorf("species: got (%+v, %v), want %+v (exact match, not the fuzzy first hit)", got, err, want)
 	}
-	if calls != 1 || gotScope != "47126,47170" || gotLocale != "zh-CN" {
-		t.Errorf("calls=%d scope=%q locale=%q, want 1 / 47126,47170 / zh-CN", calls, gotScope, gotLocale)
+	if len(queries) != 1 || gotScope != "47126,47170" || gotLocale != "zh-CN" {
+		t.Errorf("queries=%q scope=%q locale=%q, want 1 / 47126,47170 / zh-CN", queries, gotScope, gotLocale)
 	}
 
-	if _, err := c.LocalizedCommonNames(context.Background(), "Amanita phalloides", "zh-CN"); !errors.Is(err, ErrINatNoMatch) {
-		t.Errorf("no exact match: err = %v, want ErrINatNoMatch", err)
+	queries = nil
+	got, err = c.LocalizedCommonNames(context.Background(), "Brassica oleracea var. capitata", "zh-CN")
+	if err != nil || got.CommonName != "甘蓝" || got.Kingdom != "Plantae" {
+		t.Errorf("variety: got (%+v, %v), want 甘蓝 / Plantae", got, err)
+	}
+	if len(queries) != 1 || queries[0] != "Brassica oleracea capitata" {
+		t.Errorf("variety queries = %q, want one query in iNat form (no \"var.\")", queries)
+	}
+
+	queries = nil
+	got, err = c.LocalizedCommonNames(context.Background(), "Amanita muscaria var. formosa", "zh-CN")
+	if err != nil || got != want {
+		t.Errorf("unknown variety: got (%+v, %v), want the species %+v", got, err, want)
+	}
+	if len(queries) != 2 || queries[0] != "Amanita muscaria formosa" || queries[1] != "Amanita muscaria" {
+		t.Errorf("unknown variety queries = %q, want [trinomial, binomial]", queries)
+	}
+
+	queries = nil
+	if _, err := c.LocalizedCommonNames(context.Background(), "Amanita phalloides", "zh-CN"); !errors.Is(err, ErrINatNoMatch) || len(queries) != 1 {
+		t.Errorf("no exact match: err = %v queries = %q, want ErrINatNoMatch after 1 query", err, queries)
 	}
 	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)

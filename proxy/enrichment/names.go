@@ -57,6 +57,13 @@ const (
 	defaultNameCacheSize = 20_000
 	defaultNameCacheTTL  = 24 * time.Hour
 
+	// An INCOMPLETE result (name unresolved, or iNat did not answer) is held
+	// only briefly: long enough that an iNat outage / 429 streak is not hammered
+	// by every request (LRU hits included — each awaits the resolver), short
+	// enough that the name and kingdom recover within minutes.
+	defaultNameRetrySize = 5_000
+	defaultNameRetryTTL  = 2 * time.Minute
+
 	defaultWikidataEndpoint = "https://query.wikidata.org/sparql"
 	userAgent               = "YardMate/1.0 (server; emanon.me@gmail.com)"
 )
@@ -110,9 +117,10 @@ var errNameNoMatch = errors.New("names: no matching taxon")
 // NameResolver resolves authoritative common names with a per-(name, lang)
 // cache. Nil-safe: a nil resolver resolves nothing.
 type NameResolver struct {
-	inat     commonNameLookup // may be nil
-	wikidata commonNameLookup // may be nil
-	cache    *expirable.LRU[string, Resolution]
+	inat     commonNameLookup                   // may be nil
+	wikidata commonNameLookup                   // may be nil
+	cache    *expirable.LRU[string, Resolution] // complete results, 24 h
+	retry    *expirable.LRU[string, Resolution] // incomplete results, 2 min
 	sf       singleflight.Group
 	timeout  time.Duration
 }
@@ -122,6 +130,7 @@ type NameResolver struct {
 func NewNameResolver(inat *proxy.INatClient, wd *WikidataClient) *NameResolver {
 	r := &NameResolver{
 		cache:   expirable.NewLRU[string, Resolution](defaultNameCacheSize, nil, defaultNameCacheTTL),
+		retry:   expirable.NewLRU[string, Resolution](defaultNameRetrySize, nil, defaultNameRetryTTL),
 		timeout: nameResolveTimeout,
 	}
 	if inat != nil {
@@ -146,10 +155,12 @@ func NewNameResolver(inat *proxy.INatClient, wd *WikidataClient) *NameResolver {
 // be determined — the caller then keeps the row's own name) together with the
 // iNat kingdom from the same query.
 //
-// A result is cached only when it is complete: the name resolved AND iNat
-// answered (or is not wired). When iNat failed but Wikidata supplied a localized
-// name, that name is still returned but not cached — iNat outranks Wikidata for
-// the name and is the only kingdom source, so the next request asks again.
+// A result is cached for 24 h only when it is complete: the name resolved AND
+// iNat answered (or is not wired). Anything less — a source outage without a
+// localized name, or iNat failing while Wikidata supplied one (iNat outranks
+// Wikidata for the name and is the only kingdom source) — is still returned but
+// held for just 2 min, so the sources are asked again soon without being
+// hammered while they are down.
 func (r *NameResolver) Resolve(ctx context.Context, sciName, lang string) Resolution {
 	if r == nil || (r.inat == nil && r.wikidata == nil) {
 		return Resolution{}
@@ -162,6 +173,9 @@ func (r *NameResolver) Resolve(ctx context.Context, sciName, lang string) Resolu
 	if v, ok := r.cache.Get(key); ok {
 		return v
 	}
+	if v, ok := r.retry.Get(key); ok {
+		return v
+	}
 	v, _, _ := r.sf.Do(key, func() (any, error) {
 		// Detached from the caller: coalesced followers must not inherit the
 		// leader's cancellation. Bounded by r.timeout.
@@ -170,6 +184,8 @@ func (r *NameResolver) Resolve(ctx context.Context, sciName, lang string) Resolu
 		res := r.lookup(cctx, sciName, lang)
 		if res.OK && (r.inat == nil || res.INatAnswered) {
 			r.cache.Add(key, res)
+		} else {
+			r.retry.Add(key, res)
 		}
 		return res, nil
 	})

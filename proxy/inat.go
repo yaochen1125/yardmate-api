@@ -220,32 +220,54 @@ func (c *INatClient) queryTaxa(ctx context.Context, sciName, taxonScope, locale 
 // callers must treat as "unknown" and not cache.
 var ErrINatNoMatch = errors.New("inat: no matching taxon")
 
-// LocalizedCommonNames returns, from ONE taxa query scoped to Plantae + Fungi,
+// LocalizedCommonNames returns, from one taxa query scoped to Plantae + Fungi,
 // iNat's preferred common name in the given iNat locale (e.g. "zh-CN", "ja",
-// "de") as CommonName, its EnglishCommonName, AND the Kingdom — enrichment's
-// authoritative display name and mushroom-safety kingdom ride on the same
-// round-trip. CommonName is "" when iNat has no name in that locale (iNat does
-// NOT fall back to English in preferred_common_name — english_common_name
-// carries that separately). A taxon matches when its name equals sciName or,
-// for an infraspecific input with no full-name match, its species binomial;
-// several matches merge as in LookupTaxon (mergeTaxa).
+// "de"; "" = iNat's default) as CommonName, its EnglishCommonName, AND the
+// Kingdom — enrichment's authoritative display name and mushroom-safety kingdom
+// ride on the same round-trip. CommonName is "" when iNat has no name in that
+// locale (iNat does NOT fall back to English in preferred_common_name —
+// english_common_name carries that separately). Several exact matches merge as
+// in LookupTaxon (mergeTaxa).
+//
+// The query uses iNat's name form (inatQueryName: rank markers dropped — a
+// "var." / "subsp." query finds nothing). Only when that has no exact match
+// and the input is infraspecific does a SECOND query ask for the species
+// binomial (iNat may not know the variety but does know the species).
 //
 // err == nil means iNat answered and a taxon matched (any field may still be
 // ""); ErrINatNoMatch means iNat answered with no matching taxon; any other
 // error means iNat could not be asked (timeout, non-2xx *INatStatusError, bad
 // JSON).
 func (c *INatClient) LocalizedCommonNames(ctx context.Context, sciName, locale string) (INatTaxon, error) {
-	sciName = strings.TrimSpace(sciName)
-	results, err := c.queryTaxa(ctx, sciName, inatPlantaeTaxonID+","+inatFungiTaxonID, locale)
-	if err != nil {
-		return INatTaxon{}, err
+	queries := []string{inatQueryName(sciName)}
+	if b := speciesBinomial(sciName); !strings.EqualFold(b, queries[0]) {
+		queries = append(queries, b)
 	}
-	matches := exactTaxa(results, sciName)
-	if b := speciesBinomial(sciName); len(matches) == 0 && !strings.EqualFold(b, sciName) {
-		matches = exactTaxa(results, b)
+	for _, q := range queries {
+		results, err := c.queryTaxa(ctx, q, inatPlantaeTaxonID+","+inatFungiTaxonID, locale)
+		if err != nil {
+			return INatTaxon{}, err
+		}
+		if matches := exactTaxa(results, q); len(matches) > 0 {
+			return mergeTaxa(matches), nil
+		}
 	}
-	if len(matches) == 0 {
-		return INatTaxon{}, ErrINatNoMatch
+	return INatTaxon{}, ErrINatNoMatch
+}
+
+// inatQueryName rewrites a scientific name into iNat's taxon-name form. iNat
+// stores infraspecific taxa WITHOUT rank markers ("Brassica oleracea
+// capitata", "Acer palmatum amoenum"), and a query that still carries "var." /
+// "subsp." returns no results at all. Everything else (cultivar quotes, hybrid
+// ×, "cv.") is left as is — speciesBinomial covers those via the fallback query.
+func inatQueryName(s string) string {
+	var out []string
+	for _, f := range strings.Fields(s) {
+		switch strings.ToLower(f) {
+		case "var.", "subsp.", "ssp.", "f.", "forma":
+			continue
+		}
+		out = append(out, f)
 	}
-	return mergeTaxa(matches), nil
+	return strings.Join(out, " ")
 }

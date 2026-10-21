@@ -225,6 +225,11 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 			return d
 		}
 		o := awaitName()
+		// Fold the same lookup's kingdom into EVERY non-catalog response, LRU hits
+		// included: a cached row was finalized when it was cached — possibly while
+		// iNat was unreachable — so a legacy mushroom row would otherwise be served
+		// unfiltered for the whole cache TTL. Returns d itself when nothing changes.
+		d = s.applyKingdom(d, name, o.Kingdom)
 		if !o.OK {
 			return d // unresolved (source outage) → keep the row's own name
 		}
@@ -401,7 +406,8 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 				kctx, kcancel := context.WithTimeout(ctx, inatKingdomTimeout)
 				defer kcancel()
 				var k *string
-				if t, ok := s.inat.LookupTaxon(kctx, name); ok {
+				// Same query + matching as the name lookup (locale is irrelevant here).
+				if t, err := s.inat.LocalizedCommonNames(kctx, name, ""); err == nil {
 					k = proxy.NormalizeKingdom(t.Kingdom)
 				}
 				kingdomCh <- k

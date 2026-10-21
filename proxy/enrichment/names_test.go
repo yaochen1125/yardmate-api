@@ -188,10 +188,10 @@ func TestNameResolverKingdom(t *testing.T) {
 	}
 }
 
-// Only a complete result is cached: when iNat failed, a Wikidata name is still
-// served but the next request asks iNat again (it outranks Wikidata for the name
-// and is the only kingdom source).
-func TestNameResolverDoesNotCacheWithoutINat(t *testing.T) {
+// Only a complete result is cached for 24 h: when iNat failed, a Wikidata name
+// is served and held briefly (no hammering a down iNat), then iNat is asked
+// again (it outranks Wikidata for the name and is the only kingdom source).
+func TestNameResolverIncompleteResultHeldBriefly(t *testing.T) {
 	var inatCalls int
 	inatOK := false
 	inat := func(context.Context, string, string) sourceAnswer {
@@ -205,15 +205,38 @@ func TestNameResolverDoesNotCacheWithoutINat(t *testing.T) {
 	if res := r.Resolve(context.Background(), "Rhododendron tomentosum", "de"); res.Name.Name != "Sumpfporst" {
 		t.Fatalf("iNat down: name = %q, want the Wikidata one", res.Name.Name)
 	}
+	r.Resolve(context.Background(), "Rhododendron tomentosum", "de")
+	if inatCalls != 1 {
+		t.Fatalf("within the retry window: iNat calls = %d, want 1 (not re-asked)", inatCalls)
+	}
 	inatOK = true
+	r.retry.Purge() // the 2-minute window elapses
 	res := r.Resolve(context.Background(), "Rhododendron tomentosum", "de")
 	if inatCalls != 2 || res.Name.Name != "Sumpf-Porst" || kStr(res.Kingdom) != "Plantae" {
 		t.Fatalf("after iNat recovers: calls=%d res=%+v, want a fresh iNat answer", inatCalls, res)
 	}
+	r.retry.Purge()
 	r.Resolve(context.Background(), "Rhododendron tomentosum", "de")
 	if inatCalls != 2 {
-		t.Errorf("complete result not cached: iNat calls = %d, want 2", inatCalls)
+		t.Errorf("complete result not cached for 24 h: iNat calls = %d, want 2", inatCalls)
 	}
+}
+
+// A row cached in the LRU while iNat was unreachable (legacy mushroom, no
+// kingdom yet) is filtered on a later hit once the name lookup learns Fungi.
+func TestGetOrGenerate_CacheHitFoldsLaterINatKingdom(t *testing.T) {
+	cache := NewCache(10, time.Hour)
+	cache.Set(proxy.NormalizeScientificNamePrecise("Amanita muscaria")+"|en", foodyDetail(nil))
+	svc := NewService(nil, &stubDB{}, &stubLLM{}, cache, nil)
+	svc.SetNameResolver(newTestResolver(func(context.Context, string, string) sourceAnswer {
+		return sourceAnswer{local: "Fly Agaric", kingdom: "Fungi"}
+	}, nil))
+
+	got, src, err := svc.GetOrGenerate(context.Background(), Request{ScientificName: "Amanita muscaria"})
+	if err != nil || src != SourceCache {
+		t.Fatalf("GetOrGenerate = (%q, %v), want a cache hit", src, err)
+	}
+	assertFungiSanitized(t, "cache hit", got)
 }
 
 // When the name lookup's iNat query got no answer, the kingdom is retried once
