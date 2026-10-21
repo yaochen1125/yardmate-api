@@ -66,7 +66,7 @@ func pgTest(t *testing.T) (*PGStore, *pgxpool.Pool, context.Context) {
 			c.Close(ctx)
 		}
 	})
-	for _, f := range []string{"013_referral.sql", "014_referral_pool_margin.sql", "015_referral_rewards.sql", "016_referral_antiabuse.sql"} {
+	for _, f := range []string{"013_referral.sql", "014_referral_pool_margin.sql", "015_referral_rewards.sql", "016_referral_antiabuse.sql", "017_referral_review_fixes.sql"} {
 		sql, err := os.ReadFile(filepath.Join("..", "proxy", "enrichment", "migrations", f))
 		if err != nil {
 			t.Fatalf("%s: %v", f, err)

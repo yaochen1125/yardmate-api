@@ -88,7 +88,8 @@ type == CANCELLATION 且 cancel_reason == CUSTOMER_SUPPORT:
   reject 时由 SQL `referral_void` 连带作废）；另外 `claimed` 且这笔是 **`INITIAL_PURCHASE`**、`purchased_at` 晚于 `claimed_at` 也算
   —— 那正是 referral 结算第 ① 步十分钟内会认定为 redeemed 的情形，朋友填码后直接付费的第一笔不能被这十分钟竞态吃掉。
   `claimed` 下的 `RENEWAL` **不算**（`not_redeemed`）：续费说明订阅早于填码，典型是小号领码后「恢复购买」把老订阅转过来，
-  算了就会每期都给推荐人记钱。`void` 不算。
+  算了就会每期都给推荐人记钱。真朋友的续费不受影响：referral 结算 ① 每 10 分钟一轮、批次轮转（referral 017，积压再多新来的也轮得到），
+  首购之后很快就认定 redeemed，第一次续费（最早一个月后）到的时候早已不是 `claimed`（2026-10-20 定：后端保持现状，产品文档跟着改）。`void` 不算。
 - **价格缺 / null**：不记，并打一行日志（只有事件类型和 period_type，不带任何 id）—— 真扣费没价格会悄悄少记推荐人一笔，留个痕。
 - **金额**：`credit_cents = round(price × takehome_percentage × 0.30 × 100)`，`price_usd_cents = round(price × 100)`，
   在 JSON 原文的十进制上用 `big.Rat` 算、半数进位（float64 会把 4.5 算成 4.499…）。`takehome_percentage` 缺 / null → 0.85，

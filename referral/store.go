@@ -40,6 +40,11 @@ type Referral struct {
 	ClaimedAt  time.Time
 	OfferCode  string
 	RedeemedAt time.Time // zero until state >= redeemed
+	// Reviewed: an operator approved / rejected it (reviewed_at, 016). A
+	// qualified referral that is Reviewed came out of held, so ③ checks the
+	// friend's refund again before paying (the ② check ran before the
+	// review, however long that took).
+	Reviewed bool
 }
 
 // Ledger is a referrer's reward account.
@@ -87,27 +92,39 @@ const (
 	ClaimAgain
 )
 
-// ClaimHook runs inside the claim's database transaction after a pool code
-// has been taken, with fresh = this call created the referral. An error
-// rolls the whole claim back (the code goes back to free) and comes out of
-// Claim unchanged. /claim uses it to set DeviceCheck bit0 "同进退" with the
-// code.
-type ClaimHook func(fresh bool) error
+// ClaimGate is gate 1 (DeviceCheck) as a new claim's database transaction
+// runs it. Apple's bits know nothing of our transactions, so "query bit0,
+// hand out a code, set bit0" is only atomic if no two claims do it at once:
+// Store.Claim first takes ONE global lock (held until commit / rollback; the
+// claim volume is tiny), re-checks steps 2–4 under it, calls Check (only for
+// a first claim), takes the pool code, then calls Set with fresh = this call
+// created the referral. Of several accounts claiming on one device at the
+// same moment — each with its own install id — only the first sees bit0
+// clear. An error from either rolls the whole claim back (the code goes back
+// to free) and comes out of Claim unchanged. Either func may be nil.
+type ClaimGate struct {
+	Check func() error
+	Set   func(fresh bool) error
+}
 
 // HeldReferral is one line of a gate-4 review digest.
 type HeldReferral struct {
 	ID          int64
 	Referee     string
-	State       string // held, or qualified / saved / rewarded inside the window
+	State       string // held, or qualified / saved / rewarded inside a held one's window
 	ClaimedAt   time.Time
-	QualifiedAt time.Time
-	InstallID   string // the claim's X-Device-Install-Id; "" for claims before migration 016
-	Notified    bool   // a held one already mailed before
+	QualifiedAt time.Time // when settlement judged it
+	// DueAt is the theoretical success time the gate counts by (017):
+	// redeemed_at + hold_days.
+	DueAt     time.Time
+	InstallID string // the claim's X-Device-Install-Id; "" for claims before migration 016
+	Notified  bool   // a held one already mailed before
 }
 
 // HeldDigest is what the operator mail about one referrer's new held
 // referrals is drawn from: every held referral of theirs plus every success
-// inside the velocity window, oldest first.
+// that counted against one of them (theoretical success time inside the
+// velocity window before that held one's), by theoretical success time.
 type HeldDigest struct {
 	Referrer    string
 	Limit       int // velocity_limit
@@ -211,11 +228,15 @@ type Store interface {
 	ClaimCheck(ctx context.Context, userID, code, installID string) (ClaimKind, error)
 	// Claim re-checks 2–4 atomically, records referrer→referee (with the
 	// claiming device) and hands back an Apple one-time code from the pool;
-	// a re-claim gets the code it already has (or a swap). hook, when not
-	// nil, runs before commit (see ClaimHook). code is already normalised.
-	Claim(ctx context.Context, userID, code, installID string, hook ClaimHook) (offerCode string, err error)
+	// a re-claim gets the code it already has (or a swap; never once the
+	// referral has left claimed). gate, when not nil, is run inside the
+	// transaction under the global device lock (see ClaimGate). code is
+	// already normalised.
+	Claim(ctx context.Context, userID, code, installID string, gate *ClaimGate) (offerCode string, err error)
 	// ReportRedeemed notes that the app says offerCode was redeemed by userID.
-	// A hint for the settlement loop, never a proof. Idempotent.
+	// A hint for the settlement loop, never a proof. Each report restamps the
+	// time (while the referral is claimed), which puts the row at the front
+	// of the next ListClaimed if it has been looked at since.
 	ReportRedeemed(ctx context.Context, userID, offerCode string) error
 	// DeleteUser removes the user's invite code, every referral they are on
 	// either side of, and their reward ledger (account deletion).
@@ -231,8 +252,15 @@ type Store interface {
 	// HoldDays reads referral_settings.hold_days.
 	HoldDays(ctx context.Context) (int, error)
 	// ListClaimed returns referrals still waiting for the referee to redeem,
-	// most recently reported first.
+	// in rotation order: first those reported /redeemed since their last
+	// look, then never looked at, then looked at longest ago — so a backlog
+	// bigger than one batch rotates instead of the same rows coming back
+	// every pass.
 	ListClaimed(ctx context.Context, limit int) ([]Referral, error)
+	// MarkClaimedChecked records that RevenueCat answered for this claimed
+	// referral at `at` (last_checked_at, migration 017) — ListClaimed's
+	// rotation key. A referral no longer claimed is left alone.
+	MarkClaimedChecked(ctx context.Context, id int64, at time.Time) error
 	// MarkRedeemed moves a claimed referral to redeemed at the subscription's
 	// real start time (from RevenueCat) and records subscriptionKey (gate 3,
 	// Subscriber.SubscriptionKey). When another live referral — or a deleted
@@ -245,7 +273,10 @@ type Store interface {
 	MarkVoid(ctx context.Context, id int64, reason string) error
 	// MarkQualified moves a redeemed referral to qualified — or to held when
 	// the referrer already has velocity_limit successes (held included)
-	// inside velocity_window_hours (gate 4); held is true then.
+	// inside velocity_window_hours (gate 4); held is true then. The window is
+	// on theoretical success time (redeemed_at + hold_days, 017), not on when
+	// settlement gets round to it, so a backlog judged in one pass after an
+	// outage is not held wholesale.
 	MarkQualified(ctx context.Context, id int64) (held bool, err error)
 	// HeldDigests returns, per referrer with held referrals not yet mailed
 	// and no review mail in the last 24 hours, what the operator mail needs.
@@ -255,12 +286,19 @@ type Store interface {
 	MarkHeldNotified(ctx context.Context, ids []int64) error
 	// ListQualified returns qualified referrals not yet rewarded or saved.
 	ListQualified(ctx context.Context, limit int) ([]Referral, error)
-	// MarkSaved parks a qualified referral until the referrer's paid plan ends.
+	// MarkSaved parks a qualified referral until the referrer's paid plan
+	// ends, with no last look yet (so ListSavers takes its referrer early).
 	MarkSaved(ctx context.Context, id int64) error
 	// Ledger reads a referrer's reward account (zero value when none).
 	Ledger(ctx context.Context, userID string) (Ledger, error)
-	// ListSavers returns referrers who have at least one saved referral.
+	// ListSavers returns referrers who have at least one saved referral, in
+	// rotation order: a referrer with a saved referral never looked at
+	// first, then the one looked at longest ago.
 	ListSavers(ctx context.Context, limit int) ([]string, error)
+	// MarkSaverChecked records that RevenueCat answered for this referrer at
+	// `at` and they are still covered: every saved referral of theirs gets
+	// last_checked_at = at (ListSavers' rotation key).
+	MarkSaverChecked(ctx context.Context, userID string, at time.Time) error
 	// SavedIDs returns the saved referral ids of one referrer.
 	SavedIDs(ctx context.Context, userID string) ([]int64, error)
 	// RecordGranted marks ids rewarded and advances the ledger to until,

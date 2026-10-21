@@ -3,9 +3,11 @@ package referral
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -114,5 +116,40 @@ func TestClientTalksToRevenueCat(t *testing.T) {
 	}
 	if NewClient("  ") != nil {
 		t.Error("blank key must yield no client")
+	}
+}
+
+// Errors are logged by /me, /claim and settlement: never the app user id
+// (it is in the path, and net/http's *url.Error prints the whole URL).
+func TestClientErrorsCarryNoUserID(t *testing.T) {
+	const id = "30BD9690-AAAA-BBBB-CCCC-DDDDEEEEFFFF"
+	srv := httptest.NewServer(http.NotFoundHandler())
+	base := srv.URL
+	srv.Close() // connection refused
+	c := NewClient("sk_test")
+	c.SetBase(base)
+	_, err := c.Subscriber(context.Background(), id)
+	if err == nil || strings.Contains(err.Error(), id) || strings.Contains(err.Error(), "/subscribers") {
+		t.Errorf("Subscriber error = %v, want one without the id / URL", err)
+	}
+	if err != nil && !strings.Contains(err.Error(), "get subscriber") {
+		t.Errorf("Subscriber error = %v, want the operation named", err)
+	}
+	err = c.GrantPromotional(context.Background(), id, entID, time.Now())
+	if err == nil || strings.Contains(err.Error(), id) || strings.Contains(err.Error(), "/subscribers") {
+		t.Errorf("GrantPromotional error = %v, want one without the id / URL", err)
+	}
+
+	// The cause stays wrapped: a timeout is still recognisable.
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer slow.Close()
+	c.SetBase(slow.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = c.Subscriber(ctx, id)
+	if !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), id) {
+		t.Errorf("timeout error = %v, want DeadlineExceeded without the id", err)
 	}
 }

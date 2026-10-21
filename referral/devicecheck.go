@@ -23,12 +23,17 @@ import (
 // bit1 is left alone. The bits survive a reinstall and are invisible to the
 // user; the production and development environments keep separate bits.
 //
-//	/claim (new claim only) ──query_two_bits──▶ bit0 set → device_used
-//	                        ──referral_claim + update_two_bits(bit0) in ONE
-//	                          database transaction: the set fails → rollback,
-//	                          the pool code stays free → device_check_unavailable
+//	/claim (new claim only), all in ONE database transaction:
+//	    global device lock (ClaimGate) → steps 2–4 again
+//	    → query_two_bits: bit0 set → device_used (rollback)
+//	    → referral_claim (a pool code) → update_two_bits(bit0) → commit
+//	  the set answers an error → read bit0 back: set → keep the claim;
+//	  clear / unreadable → rollback, the code stays free → device_check_unavailable
 //
-// A re-claim (same account, same code) never calls Apple.
+// The lock is what makes check-then-set atomic: Apple's bits are not in our
+// transaction, and one device can come in as many accounts at once, each
+// with its own (forged) install id. A re-claim (same account, same code)
+// never calls Apple.
 
 // DeviceCheckMode is DEVICECHECK_MODE.
 type DeviceCheckMode string
@@ -64,7 +69,10 @@ func ParseDeviceCheckMode(s string) (mode DeviceCheckMode, ok bool) {
 // (device_unverified) and Apple's development host is never asked. Its bits
 // are kept apart from production's, so honouring it would give every device
 // a second life (decided 2026-10-20 on api#126; the app's Release builds
-// always send "production").
+// always send "production"). The one exception is
+// DEVICECHECK_ALLOW_DEVELOPMENT=true (staging only, never prod): enforce then
+// also accepts "development" and asks the development host, so gate 1 can be
+// tested in enforce with a DEBUG build.
 //
 // log asks the environment the request names: "development" → the
 // development host, anything else (missing included) → production.
@@ -85,6 +93,12 @@ func deviceEnv(s string) string {
 // "production" (case and surrounding space ignored).
 func isProductionEnv(s string) bool {
 	return strings.EqualFold(strings.TrimSpace(s), DeviceEnvProduction)
+}
+
+// isDevelopmentEnv: the request explicitly says "development" (what enforce
+// also accepts with DEVICECHECK_ALLOW_DEVELOPMENT).
+func isDevelopmentEnv(s string) bool {
+	return strings.EqualFold(strings.TrimSpace(s), DeviceEnvDevelopment)
 }
 
 // ErrDeviceTokenInvalid is Apple refusing the device token itself (HTTP 400

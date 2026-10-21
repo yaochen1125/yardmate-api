@@ -32,9 +32,10 @@ func NewPGStore(pool *pgxpool.Pool) *PGStore {
 }
 
 const (
-	pgRaiseException  = "P0001" // plpgsql `raise exception` — our named refusals
-	pgUndefinedTable  = "42P01" // migration not applied yet
-	pgUndefinedColumn = "42703" // migration not applied yet (a column of it)
+	pgRaiseException   = "P0001" // plpgsql `raise exception` — our named refusals
+	pgUndefinedTable   = "42P01" // migration not applied yet
+	pgUndefinedColumn  = "42703" // migration not applied yet (a column of it)
+	pgLockNotAvailable = "55P03" // lock_timeout ran out (the gated claim's device lock)
 )
 
 // asFailure pulls a named refusal out of a Postgres error; anything else
@@ -82,19 +83,49 @@ func (p *PGStore) ClaimCheck(ctx context.Context, userID, code, installID string
 	return ClaimNew, fmt.Errorf("referral_claim_check: unexpected %q", kind)
 }
 
-// Claim runs the three-argument referral_claim (016) in a transaction and,
-// when a hook is given, calls it before commit: the DeviceCheck bit0 set
-// happens while the pool code is still only ours, and a failed set rolls the
-// claim back with the code untouched (docs: 置位失败 → 回滚).
-func (p *PGStore) Claim(ctx context.Context, userID, code, installID string, hook ClaimHook) (string, error) {
+// deviceLockWait bounds how long a gated claim waits for the device lock
+// (lock_timeout, which also covers the claim's row locks): the holder is at
+// most a few Apple calls away from commit. Past it → device_check_unavailable.
+const deviceLockWait = 3 * time.Second
+
+// deviceLockSQL is the one transaction-scoped advisory lock every gated claim
+// takes (ClaimGate). Transaction-scoped, so it is safe behind Supabase's
+// transaction-mode pooler and can never outlive the claim.
+const deviceLockSQL = `select pg_advisory_xact_lock(hashtextextended('referral_devicecheck', 0))`
+
+// Claim runs the three-argument referral_claim (016 / 017) in a transaction.
+// With a gate: lock_timeout, the global device lock, referral_claim_check
+// again under it (a claim of this account that committed while we waited
+// makes this a re-claim — Apple is not asked), gate.Check for a first
+// claim, then referral_claim, then gate.Set — all before commit: bit0 is set
+// while the pool code is still only ours, and a failed check or set rolls
+// the claim back with the code untouched (docs: 置位失败 → 回滚).
+func (p *PGStore) Claim(ctx context.Context, userID, code, installID string, gate *ClaimGate) (string, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if gate != nil {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("set local lock_timeout = '%dms'", deviceLockWait.Milliseconds())); err != nil {
+			return "", err
+		}
+		if _, err := tx.Exec(ctx, deviceLockSQL); err != nil {
+			return "", claimFailure(err)
+		}
+		var kind string
+		if err := tx.QueryRow(ctx, `select referral_claim_check($1::text, $2::text, $3::text)`, userID, code, installID).Scan(&kind); err != nil {
+			return "", claimFailure(err)
+		}
+		if kind == "new" && gate.Check != nil {
+			if err := gate.Check(); err != nil {
+				return "", err
+			}
+		}
+	}
 	var raw []byte
 	if err := tx.QueryRow(ctx, `select referral_claim($1::text, $2::text, $3::text)::text`, userID, code, installID).Scan(&raw); err != nil {
-		return "", asFailure(err)
+		return "", claimFailure(err)
 	}
 	var out struct {
 		OfferCode string `json:"offer_code"`
@@ -109,24 +140,39 @@ func (p *PGStore) Claim(ctx context.Context, userID, code, installID string, hoo
 	// The three-argument function always says; if it ever does not, treat it
 	// as new (setting bit0 on a re-claim only re-marks a friend's device).
 	fresh := out.Fresh == nil || *out.Fresh
-	if hook != nil {
-		if err := hook(fresh); err != nil {
+	if gate != nil && gate.Set != nil {
+		if err := gate.Set(fresh); err != nil {
 			return "", err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		if hook != nil && fresh {
-			log.Printf("referral claim: commit failed AFTER the DeviceCheck hook ran (bit0 may be set without a claim): %v", err)
+		if gate != nil && fresh {
+			log.Printf("referral claim: commit failed AFTER the DeviceCheck set (bit0 may be set without a claim): %v", err)
 		}
 		return "", err
 	}
 	return out.OfferCode, nil
 }
 
+// claimFailure is asFailure plus the device lock (or a row lock behind it)
+// not coming free within deviceLockWait: busy, not broken — 503
+// device_check_unavailable, "try again".
+func claimFailure(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgLockNotAvailable {
+		log.Printf("referral claim: device lock busy for %s; answering device_check_unavailable", deviceLockWait)
+		return Failure{Code: ErrDeviceUnavailable}
+	}
+	return asFailure(err)
+}
+
+// ReportRedeemed restamps redeem_reported_at on every report while the
+// referral is still claimed: ListClaimed puts a row reported since its last
+// look first, so a report after a look that found nothing yet is not lost.
 func (p *PGStore) ReportRedeemed(ctx context.Context, userID, offerCode string) error {
 	_, err := p.pool.Exec(ctx,
 		`update referrals set redeem_reported_at = now()
-		  where referee = $1 and offer_code = $2 and redeem_reported_at is null`,
+		  where referee = $1 and offer_code = $2 and state = 'claimed'`,
 		userID, offerCode)
 	return err
 }
@@ -218,7 +264,7 @@ func (p *PGStore) HoldDays(ctx context.Context) (int, error) {
 	return days, err
 }
 
-const referralColumns = `id, referrer, referee, state, claimed_at, coalesce(offer_code, ''), redeemed_at`
+const referralColumns = `id, referrer, referee, state, claimed_at, coalesce(offer_code, ''), redeemed_at, reviewed_at is not null`
 
 func scanReferrals(rows pgx.Rows) ([]Referral, error) {
 	defer rows.Close()
@@ -226,7 +272,7 @@ func scanReferrals(rows pgx.Rows) ([]Referral, error) {
 	for rows.Next() {
 		var r Referral
 		var redeemed *time.Time
-		if err := rows.Scan(&r.ID, &r.Referrer, &r.Referee, &r.State, &r.ClaimedAt, &r.OfferCode, &redeemed); err != nil {
+		if err := rows.Scan(&r.ID, &r.Referrer, &r.Referee, &r.State, &r.ClaimedAt, &r.OfferCode, &redeemed, &r.Reviewed); err != nil {
 			return nil, err
 		}
 		if redeemed != nil {
@@ -243,15 +289,30 @@ func (p *PGStore) ListClaimed(ctx context.Context, limit int) ([]Referral, error
 	// re-claim that swapped the code restarts the window (reissued_at, 014);
 	// claimed_at itself stays the first claim, which is what StartedAfter
 	// compares against.
+	//
+	// Rotation (017): a fixed order used to hand back the same `limit` rows
+	// every pass once more than a batch of never-redeemed claims had piled
+	// up, and nothing behind them was ever looked at. Now: reported /redeemed
+	// since the last look first, then never looked at, then looked at longest
+	// ago (MarkClaimedChecked stamps last_checked_at after each answer).
 	rows, err := p.pool.Query(ctx,
 		`select `+referralColumns+` from referrals
 		  where state = 'claimed' and coalesce(reissued_at, claimed_at) > now() - interval '200 days'
-		  order by redeem_reported_at desc nulls last, claimed_at
+		  order by (redeem_reported_at is not null
+		            and redeem_reported_at > coalesce(last_checked_at, '-infinity'::timestamptz)) desc,
+		           last_checked_at asc nulls first,
+		           claimed_at, id
 		  limit $1`, limit)
 	if err != nil {
 		return nil, err
 	}
 	return scanReferrals(rows)
+}
+
+func (p *PGStore) MarkClaimedChecked(ctx context.Context, id int64, at time.Time) error {
+	_, err := p.pool.Exec(ctx,
+		`update referrals set last_checked_at = $2 where id = $1 and state = 'claimed'`, id, at)
+	return err
 }
 
 // MarkRedeemed is referral_mark_redeemed (016): claimed → redeemed with the
@@ -284,8 +345,8 @@ func (p *PGStore) MarkVoid(ctx context.Context, id int64, reason string) error {
 	return err
 }
 
-// MarkQualified is referral_qualify (016): redeemed → qualified, or held by
-// the velocity gate.
+// MarkQualified is referral_qualify (017): redeemed → qualified, or held by
+// the velocity gate (counted on theoretical success time).
 func (p *PGStore) MarkQualified(ctx context.Context, id int64) (bool, error) {
 	var outcome string
 	if err := p.pool.QueryRow(ctx, `select referral_qualify($1::bigint)`, id).Scan(&outcome); err != nil {
@@ -296,7 +357,10 @@ func (p *PGStore) MarkQualified(ctx context.Context, id int64) (bool, error) {
 
 // HeldDigests: referrers with held referrals not yet mailed, none of whose
 // referrals was mailed in the last 24 hours; per referrer every held referral
-// plus the successes inside the velocity window.
+// plus the successes that counted against one of them — theoretical success
+// time (redeemed_at + hold_days; with one hold_days for all, redeemed_at
+// itself) inside the window before that held one's, as referral_qualify (017)
+// counts.
 func (p *PGStore) HeldDigests(ctx context.Context, limit int) ([]HeldDigest, error) {
 	rows, err := p.pool.Query(ctx,
 		`select r.referrer from referrals r
@@ -325,29 +389,35 @@ func (p *PGStore) HeldDigests(ctx context.Context, limit int) ([]HeldDigest, err
 	if len(referrers) == 0 {
 		return nil, nil
 	}
-	var lim, window int
+	var lim, window, hold int
 	if err := p.pool.QueryRow(ctx,
-		`select velocity_limit, velocity_window_hours from referral_settings where id = 1`).Scan(&lim, &window); err != nil {
+		`select velocity_limit, velocity_window_hours, hold_days from referral_settings where id = 1`).Scan(&lim, &window, &hold); err != nil {
 		return nil, fmt.Errorf("velocity settings: %w", err)
 	}
 	out := make([]HeldDigest, 0, len(referrers))
 	for _, u := range referrers {
 		d := HeldDigest{Referrer: u, Limit: lim, WindowHours: window}
 		rows, err := p.pool.Query(ctx,
-			`select id, referee, state, claimed_at, coalesce(qualified_at, claimed_at),
-			        coalesce(claim_install_id, ''), held_notified_at is not null
-			   from referrals
-			  where referrer = $1
-			    and (state = 'held'
-			         or (state in ('qualified','saved','rewarded')
-			             and qualified_at > now() - make_interval(hours => $2::int)))
-			  order by qualified_at, id`, u, window)
+			`select r.id, r.referee, r.state, r.claimed_at, coalesce(r.qualified_at, r.claimed_at),
+			        coalesce(r.redeemed_at, r.qualified_at, r.claimed_at) + make_interval(days => $3::int) as due_at,
+			        coalesce(r.claim_install_id, ''), r.held_notified_at is not null
+			   from referrals r
+			  where r.referrer = $1
+			    and (r.state = 'held'
+			         or (r.state in ('qualified','saved','rewarded')
+			             and exists (select 1 from referrals h
+			                          where h.referrer = r.referrer and h.state = 'held'
+			                            and coalesce(r.redeemed_at, r.qualified_at)
+			                                  > coalesce(h.redeemed_at, h.qualified_at) - make_interval(hours => $2::int)
+			                            and coalesce(r.redeemed_at, r.qualified_at)
+			                                  <= coalesce(h.redeemed_at, h.qualified_at))))
+			  order by due_at, r.id`, u, window, hold)
 		if err != nil {
 			return nil, err
 		}
 		for rows.Next() {
 			var h HeldReferral
-			if err := rows.Scan(&h.ID, &h.Referee, &h.State, &h.ClaimedAt, &h.QualifiedAt, &h.InstallID, &h.Notified); err != nil {
+			if err := rows.Scan(&h.ID, &h.Referee, &h.State, &h.ClaimedAt, &h.QualifiedAt, &h.DueAt, &h.InstallID, &h.Notified); err != nil {
 				rows.Close()
 				return nil, err
 			}
@@ -379,9 +449,12 @@ func (p *PGStore) ListQualified(ctx context.Context, limit int) ([]Referral, err
 	return scanReferrals(rows)
 }
 
+// MarkSaved clears last_checked_at: whatever ① stamped there while it was
+// claimed is not a look at the referrer, and a fresh saver should be taken
+// early by ListSavers.
 func (p *PGStore) MarkSaved(ctx context.Context, id int64) error {
 	_, err := p.pool.Exec(ctx,
-		`update referrals set state = 'saved' where id = $1 and state = 'qualified'`, id)
+		`update referrals set state = 'saved', last_checked_at = null where id = $1 and state = 'qualified'`, id)
 	return err
 }
 
@@ -403,10 +476,15 @@ func (p *PGStore) Ledger(ctx context.Context, userID string) (Ledger, error) {
 	return led, nil
 }
 
+// ListSavers rotates like ListClaimed (017): a referrer with any saved
+// referral not looked at yet first, then the least recently looked at — a
+// fixed order kept handing back the same `limit` still-paying referrers.
 func (p *PGStore) ListSavers(ctx context.Context, limit int) ([]string, error) {
 	rows, err := p.pool.Query(ctx,
 		`select referrer from referrals where state = 'saved'
-		  group by referrer order by min(qualified_at) limit $1`, limit)
+		  group by referrer
+		  order by min(coalesce(last_checked_at, '-infinity'::timestamptz)), min(qualified_at), referrer
+		  limit $1`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -420,6 +498,12 @@ func (p *PGStore) ListSavers(ctx context.Context, limit int) ([]string, error) {
 		out = append(out, u)
 	}
 	return out, rows.Err()
+}
+
+func (p *PGStore) MarkSaverChecked(ctx context.Context, userID string, at time.Time) error {
+	_, err := p.pool.Exec(ctx,
+		`update referrals set last_checked_at = $2 where referrer = $1 and state = 'saved'`, userID, at)
+	return err
 }
 
 func (p *PGStore) SavedIDs(ctx context.Context, userID string) ([]int64, error) {

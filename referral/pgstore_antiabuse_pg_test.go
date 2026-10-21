@@ -127,7 +127,11 @@ func TestPGClaimJudgementOrderAndDevices(t *testing.T) {
 		t.Errorf("B's own device: %v %q, want new", k, c)
 	}
 	var gotFresh []bool
-	hook := func(fresh bool) error { gotFresh = append(gotFresh, fresh); return nil }
+	var checks int
+	hook := &ClaimGate{
+		Check: func() error { checks++; return nil },
+		Set:   func(fresh bool) error { gotFresh = append(gotFresh, fresh); return nil },
+	}
 	offer, err := st.Claim(ctx, userB, codeA, pgDevB, hook)
 	if err != nil || offer == "" {
 		t.Fatalf("claim = %q, %v", offer, err)
@@ -145,6 +149,10 @@ func TestPGClaimJudgementOrderAndDevices(t *testing.T) {
 	}
 	if len(gotFresh) != 2 || !gotFresh[0] || gotFresh[1] {
 		t.Errorf("hook fresh = %v, want [true false]", gotFresh)
+	}
+	// Under the device lock the re-check says "again": Apple is not asked.
+	if checks != 1 {
+		t.Errorf("gate checks = %d, want 1 (the first claim only)", checks)
 	}
 	if _, c := check(userB, codeC, ""); c != ErrAlreadyClaimed {
 		t.Errorf("another code: %q, want already_claimed", c)
@@ -164,8 +172,13 @@ func TestPGClaimHookFailureRollsBack(t *testing.T) {
 	codeA := pgInviteCode(t, st, ctx, userA)
 	pgSeed(t, pool, ctx, "b90", 90*day, "P1")
 	boom := errors.New("set bit0 failed")
-	if _, err := st.Claim(ctx, userB, codeA, pgDevB, func(bool) error { return boom }); !errors.Is(err, boom) {
-		t.Fatalf("claim = %v, want the hook's error", err)
+	if _, err := st.Claim(ctx, userB, codeA, pgDevB, &ClaimGate{Set: func(bool) error { return boom }}); !errors.Is(err, boom) {
+		t.Fatalf("claim = %v, want the gate's error", err)
+	}
+	// A refusing check rolls back the same way, before any code is taken.
+	used := Failure{Code: ErrDeviceUsed}
+	if _, err := st.Claim(ctx, userB, codeA, pgDevB, &ClaimGate{Check: func() error { return used }}); !errors.Is(err, used) {
+		t.Fatalf("claim = %v, want the check's refusal", err)
 	}
 	var n int
 	if err := pool.QueryRow(ctx, `select count(*) from referrals where referee = $1`, userB).Scan(&n); err != nil || n != 0 {
@@ -378,8 +391,10 @@ func TestPGVelocityWindowAndOff(t *testing.T) {
 	if h, err := st.MarkQualified(ctx, ids[0]); err != nil || h {
 		t.Fatalf("first: %v %v", h, err)
 	}
-	// The first success is 25 hours old: outside the window.
-	if _, err := pool.Exec(ctx, `update referrals set qualified_at = now() - interval '25 hours' where id = $1`, ids[0]); err != nil {
+	// The first success's theoretical time (redeemed_at + hold_days, 017) is
+	// 25 hours before the second's: outside the window — however close
+	// together the two are actually judged.
+	if _, err := pool.Exec(ctx, `update referrals set redeemed_at = redeemed_at - interval '25 hours' where id = $1`, ids[0]); err != nil {
 		t.Fatal(err)
 	}
 	if h, err := st.MarkQualified(ctx, ids[1]); err != nil || h {

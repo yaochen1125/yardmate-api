@@ -173,10 +173,12 @@ func TestSettleVelocityFiveIsFine(t *testing.T) {
 }
 
 func TestSettleVelocityWindowAndSwitch(t *testing.T) {
-	// Five successes 25 hours ago are outside the 24-hour window.
+	// Five successes whose theoretical time (redeemed + hold) is 25 hours
+	// before the new one's are outside the 24-hour window.
 	svc, store, rc, _ := gateSvc()
 	for _, id := range dueFriends(store, rc, base, 0, 5) {
 		store.refs[id].State, store.refs[id].qualifiedAt = StateRewarded, base.Add(-25*time.Hour)
+		store.refs[id].RedeemedAt = store.refs[id].RedeemedAt.Add(-25 * time.Hour)
 	}
 	dueFriends(store, rc, base, 10, 1)
 	if rep := settleAt(svc, store, base); rep.Held != 0 || rep.Qualified != 1 {

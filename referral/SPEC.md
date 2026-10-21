@@ -12,7 +12,7 @@
 
 - `GET /v1/referral/me`：给调用者造邀请码（第一次调才造）+ 回战绩 + 记下这次用的设备（防刷第 2 道）。
 - `POST /v1/referral/claim`：B 填 A 的码 → 按文档判定顺序过防刷第 1、2 道 → 记 A→B → 从码池发一张 App Store 一次性兑换码，
-  同一事务里给这台设备置 DeviceCheck `bit0`（`devicecheck.go`）。
+  同一事务里、一把全局设备锁下「查 `bit0` → 取码 → 置 `bit0`」（`devicecheck.go`、`ClaimGate`）。
 - 防刷五道里后端的四道（§2.4）：DeviceCheck、推荐人设备、同一订阅只算一次（结算 ①）、速度闸 → `held` + 运营邮件（结算 ②、`review.go`）。
 - `POST /v1/referral/redeemed`：App 回报「兑了」→ 只是让结算早点去查，不作凭据。
 - 结算定时器（每 10 分钟）：查 RevenueCat 推进状态，给推荐人赠会员（`settle.go`）。
@@ -37,10 +37,10 @@
 | 来源 | 内容 |
 |---|---|
 | 请求头 | `Authorization: Bearer <Supabase access token>`、`X-Device-Install-Id`（UUID）、`X-App-Version` |
-| `claim` body（≤ 16 KB）| `{"code": "ym 7kq2", "subscribed_before": false, "device_token": "<DCDevice base64>", "device_check_env": "production"}`；`device_token` 可缺（模拟器 / 拿不到）。`device_check_env`：**`enforce` 只认 `production`**（大小写、首尾空格不计），`development` / 缺 / 其他值一律当没带 token；`log` 按请求的环境查（`development` → 开发环境地址，其余含缺省 → 生产）|
+| `claim` body（≤ 16 KB）| `{"code": "ym 7kq2", "subscribed_before": false, "device_token": "<DCDevice base64>", "device_check_env": "production"}`；`device_token` 可缺（模拟器 / 拿不到）。`device_check_env`：**`enforce` 只认 `production`**（大小写、首尾空格不计），`development` / 缺 / 其他值一律当没带 token；例外：`DEVICECHECK_ALLOW_DEVELOPMENT=true`（**只给 staging**）时 `enforce` 也认 `development`、走开发环境地址；`log` 按请求的环境查（`development` → 开发环境地址，其余含缺省 → 生产）|
 | `redeemed` body | `{"offer_code": "XK7P2M9Q"}` |
-| vault | `REVENUECAT_SECRET_KEY`（v1 secret）、`REVENUECAT_ENTITLEMENT_ID`、`REFERRAL_SETTLE_INTERVAL`（可选，默认 10m）；DeviceCheck：`DEVICECHECK_KEY_ID`、`DEVICECHECK_PRIVATE_KEY`（.p8 压一行、`\n` 转义，同 `APPLE_PRIVATE_KEY`；或 `DEVICECHECK_PRIVATE_KEY_PATH`）、`APPLE_TEAM_ID`、`DEVICECHECK_MODE`（`enforce` / `log`，缺 = `enforce`）|
-| 库 | migration `013_referral.sql` 的五张表 + 两个函数，`014_referral_pool_margin.sql` 的四列设置 + 改过的 `referral_claim`，`016_referral_antiabuse.sql` 的防刷列 / 两张表 / 九个函数（经共享 pgx 池 `enrichment.DB.Pool()`）|
+| vault | `REVENUECAT_SECRET_KEY`（v1 secret）、`REVENUECAT_ENTITLEMENT_ID`、`REFERRAL_SETTLE_INTERVAL`（可选，默认 10m）；DeviceCheck：`DEVICECHECK_KEY_ID`、`DEVICECHECK_PRIVATE_KEY`（.p8 压一行、`\n` 转义，同 `APPLE_PRIVATE_KEY`；或 `DEVICECHECK_PRIVATE_KEY_PATH`）、`APPLE_TEAM_ID`、`DEVICECHECK_MODE`（`enforce` / `log`，缺 = `enforce`）、`DEVICECHECK_ALLOW_DEVELOPMENT`（`true` / `false`，缺 = `false`；staging 设 `true`，**prod 不设**；开着时启动打一条 WARN）|
+| 库 | migration `013_referral.sql` 的五张表 + 两个函数，`014_referral_pool_margin.sql` 的四列设置 + 改过的 `referral_claim`，`016_referral_antiabuse.sql` 的防刷列 / 两张表 / 九个函数，`017_referral_review_fixes.sql` 的 `last_checked_at` + 替换的 `referral_claim`（三参数）/ `referral_qualify`（经共享 pgx 池 `enrichment.DB.Pool()`）|
 | Apple DeviceCheck | `POST {api,api.development}.devicecheck.apple.com/v1/query_two_bits`、`/v1/update_two_bits`（ES256 JWT：`kid` = Key ID、`iss` = Team ID、`iat` = now；每次调用 3 s 超时）|
 | 告警邮件 | `FEEDBACK_SMTP_FROM/PASS` + `FEEDBACK_EMAIL_TO`（与意见反馈同一个账号、同一个收件箱）；缺任一 → 只打 WARN 日志 |
 | RevenueCat | `GET /v1/subscribers/{id}`（**不存在会创建**，只对验过签的 user id 调）、`POST .../entitlements/{ent}/promotional {"end_time_ms"}` |
@@ -62,7 +62,7 @@
 | 429 | `rate_limit_device` / `rate_limit_ip` | 本包的桶 / `/v1` 的 IP 桶 |
 | 502 | `store_failed` | 库或 RevenueCat 不可达 |
 | 503 | `pool_empty` | 码池没有**留够余量**的 free 码（`expires_at > now() + issue_margin_days`；补货后自愈）；不置 `bit0` |
-| 503 | `device_check_unavailable` | 苹果超时（3 s）/ 非 200、400 的回答 / 没配 DeviceCheck，或置 `bit0` 失败（这次领码整体回滚，码仍 free）（只 `enforce`）|
+| 503 | `device_check_unavailable` | 苹果超时（3 s）/ 非 200、400 的回答 / 没配 DeviceCheck，或置 `bit0` 失败且回读也不是已置（这次领码整体回滚，码仍 free）（只 `enforce`）；3 s 内等不到设备锁（两档都是，码没动）|
 | 503 | `not_configured` | 四个依赖缺任一个 |
 
 ### 1.5 外部依赖
@@ -74,18 +74,24 @@
 
 ```
 A /me ──造码 YM-XXXX──▶ A 分享
-B /claim ──判定顺序 2–4（referral_claim_check）→ 5 RC 查 B 无订阅史 → 6 DeviceCheck 查 bit0──▶
-        事务 { referral_claim(): referrals(A→B, claimed, claim_install_id) + code_pool 一张 issued
-               → update_two_bits(bit0) 失败就回滚 } commit
+B /claim ──判定顺序 2–4（referral_claim_check）→ 5 RC 查 B 无订阅史 → 6 本地能判的（没配 / 没 token）──▶
+        事务 { 全局设备锁（pg_advisory_xact_lock，lock_timeout 3 s）→ 2–4 再判（同账号刚提交 → 重领，不问苹果）
+               → 6 query_two_bits(bit0)
+               → referral_claim(): referrals(A→B, claimed, claim_install_id) + code_pool 一张 issued
+               → update_two_bits(bit0)；报错先回读，已置当成功，否则回滚 } commit
                                 （只发 expires_at > now + issue_margin_days 的，先到期的先发）
-B 在苹果兑换 ──▶ B /redeemed（只记 redeem_reported_at，并 nudge 结算）
-结算 ①：RC 上 B 有 store 订阅且 original_purchase_date > claimed_at → redeemed（redeemed_at = 那个时间，记 subscription_key）；
+B 在苹果兑换 ──▶ B /redeemed（记 redeem_reported_at（每次报都刷新），并 nudge 结算）
+结算 ①：每轮 200 条按轮转顺序取（上次查之后又报过 /redeemed 的 → 没查过的 → 最久没查的），查完一条记 last_checked_at；
+        RC 上 B 有 store 订阅且 original_purchase_date > claimed_at → redeemed（redeemed_at = 那个时间，记 subscription_key）；
         同一 subscription_key 已被另一条没作废的推荐 / 删号留存表占用 → void（duplicate_apple_id，名下的钱一起作废）
-结算 ②：redeemed_at + hold_days ≤ now，且该订阅 refunded_at 为空 → qualified；退款 → void；
-        推荐人 velocity_window_hours 内已成功（含 held）≥ velocity_limit 条 → held（等运营），新 held 给运营发信
-结算 ③：A 的 RC 没有生效中的 store 订阅 → 赠：end = max(now, 账本 promo_until, RC 现有赠送到期) + 30d
-        A 有（付费 / 试用 / intro / 朋友的免费月 / 家人共享）→ saved
-结算 ④：有 saved 的 A 不再被 store 订阅覆盖 → 一次赠 n × 30d，全部 saved → rewarded
+结算 ②：redeemed_at + hold_days ≤ now，且该订阅 refunded_at 为空 → qualified；退款 / 订阅没了 → void；
+        推荐人在这一条理论成功时间（redeemed_at + hold_days）之前 velocity_window_hours 内已成功（含 held）≥ velocity_limit 条
+        → held（等运营），新 held 给运营发信
+结算 ③：运营 approve 出来的（reviewed_at 有值）先按 ② 再查一次朋友的退款 / 订阅，不过就 void；
+        A 的 RC 没有生效中的 store 订阅 → 赠：end = max(now, 账本 promo_until, RC 现有赠送到期) + 30d
+        A 有（付费 / 试用 / intro / 朋友的免费月 / 家人共享）→ saved（清空 last_checked_at）
+结算 ④：有 saved 的 A 按轮转顺序取（有没查过的 saved → 最久没查的）；不再被 store 订阅覆盖 → 一次赠 n × 30d，
+        全部 saved → rewarded；仍被覆盖 → 记 last_checked_at
 ```
 
 RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidString`，RC id 区分大小写），
@@ -95,15 +101,17 @@ RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidStr
 
 `claimed → redeemed → qualified → (held →) (rewarded | saved → rewarded)`，任一步可 `void`。
 `void_reason`：`refunded` / `no_subscription`（②）、`duplicate_apple_id`（① 第 3 道）、`rejected`（运营 reject）。
-`held → qualified` 只能是运营 `approve`；③ 不再过闸。
+`held → qualified` 只能是运营 `approve`；③ 不再过闸，但先按 ② 再查一次朋友的退款 / 订阅（审核期间退了款 → `void`（`refunded`），不发）。
 `/me` 的数字：`invited` = 非 void 条数；`months_earned` = rewarded + saved；
 `months_pending` = redeemed + qualified + **held**（推荐人看不出审核）；`months_saved` = saved；`can_claim` = 没填过 **且** RC 无订阅史。
 
 ### 2.2 幂等 / 并发
 
 - 造码、领码是 plpgsql 函数（`raise exception` 整体回滚；`for update skip locked` 取库存）。
-- 同一人同一码再 claim → 拿回同一张；已 redeemed 永远原样回；issued 且 `expires_at > now + swap_grace_days`
-  （默认 3 天）也原样回。换码阈值故意**小于**发码余量：等于的话每张快到余量线的码都会被再 claim 换掉、白烧第二张。
+- 同一人同一码再 claim → 拿回同一张；**推荐已不在 `claimed`**（redeemed / qualified / held / saved / rewarded / void）**永远原样回**、不换码不扣库存
+  （017：码在到期前兑了、`ExpireCodes` 先划了 expired、结算 ① 之后才认定 —— 以前会走到换码再发一张）；码池那张 redeemed 也原样回；
+  issued 且 `expires_at > now + swap_grace_days`（默认 3 天）也原样回。换码阈值故意**小于**发码余量：等于的话每张快到余量线的码都会被再 claim 换掉、白烧第二张。
+  读推荐行 `for update`（017），和结算 ① 的 `referral_mark_redeemed` 串行。
 - 要换（老码过期 / 不足宽限 / 状态不对 / 行没了）时**先选替换码再动老码**（老码行 `for update` 锁住）：
   选到 → 老码划 expired、`referrals.offer_code` 换新、`reissued_at = now()`（`ListClaimed` 的 200 天窗口按
   `coalesce(reissued_at, claimed_at)` 算，不然很晚才兑的会掉出去）；`claimed_at` 不动——结算 ① 认「订阅起始晚于第一次填码」，
@@ -112,7 +120,12 @@ RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidStr
 - 发码余量：`referral_claim` 只在 `state = 'free' and expires_at > now + issue_margin_days` 里按 `expires_at`
   升序取（先用快过期的，但保证 B 有 ≥ 余量天数去兑）。余量期内 / 已过期的 free 码不发也不改状态
   （claim 不再全表划 expired，那是并发争用点），等结算的 `ExpireCodes` 到期划；巡检把余量期内的单独计作「余量不足」。
-- `/redeemed` 重复调无副作用；`ListClaimed` 只看最近一次发码（`coalesce(reissued_at, claimed_at)`）200 天内的（码最长 6 个月）。
+- `/redeemed` 重复调只刷新 `redeem_reported_at`（推荐还在 claimed 时）；`ListClaimed` 只看最近一次发码（`coalesce(reissued_at, claimed_at)`）200 天内的（码最长 6 个月）。
+- **结算批次轮转**（017，`last_checked_at`）：① / ④ 每轮各取 200（`settleBatch`）。原来固定顺序，积压超过 200 条「填了码一直没兑」的 claimed
+  （或一直在付费的 saver）之后每轮拿同一批，新来的永远查不到。现在 `ListClaimed` 按「上次查之后又报过 /redeemed → 没查过 → 最久没查」，
+  ① 每条 RC 答了就逐条 `MarkClaimedChecked`（时间用这一轮的开始时刻，这一轮里来的报告下一轮仍算「之后」；逐条写，一轮超时也往前转）；
+  RC 查失败的不记，留在前面。`ListSavers` 按推荐人 `min(coalesce(last_checked_at, -infinity))`，④ 仍被覆盖的 `MarkSaverChecked`；
+  `MarkSaved` 清空 `last_checked_at`（那是 claimed 时 ① 记的）。
 - 赠送先 RC 后账本；账本写失败会大声记日志，下一轮**再赠一次**（宁多发不少发）。
 - `end_time_ms` 与现有赠送到期相差 < 2h 会被 RC 当重复忽略；我们每次至少 +30d。
 
@@ -123,32 +136,40 @@ RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidStr
 3. 这个账号填过：同一个码 → 回手上那张（快过期换新，014 规则；**不查 RevenueCat、不查 DeviceCheck**，换台设备也拿得回）；别的码 → `already_claimed`
 4. `own_code`：码是自己的，或当前 `X-Device-Install-Id` 在码主人 `referral_devices` 里
 5. `not_new_user`：`subscribed_before` 或 RevenueCat 有 store 订阅史
-6. DeviceCheck（§2.4 第 1 道）
-7. 码池取码：没码 `pool_empty`（不置位）；取到 → 同一事务置 `bit0`，失败回滚 → `device_check_unavailable`
+6. DeviceCheck（§2.4 第 1 道）：没配 / 没 token 在事务外判；问苹果在事务里、设备锁下
+7. 码池取码：没码 `pool_empty`（不置位）；取到 → 同一事务置 `bit0`，失败（且回读不是已置）回滚 → `device_check_unavailable`
 
 2–4 先用只读的 `referral_claim_check` 判（这样 5、6 的外部调用只对「第一次填」发生、`pool_empty` 才排得到 5、6 后面），
-真领时三参数 `referral_claim` 在事务里原子地再判一遍（并发两台设备同一账号时，晚的那个拿到 `fresh = false`，不再置位）。
+新填码的事务拿到设备锁后再 `referral_claim_check` 一遍（同账号另一台设备刚提交 → 当重领，不问苹果），
+真领时三参数 `referral_claim` 在事务里原子地再判一遍（晚的那个拿到 `fresh = false`，不再置位）。
 和 #123/#124 的区别：`subscribed_before` 从「限流之前」挪到第 5 步（会扣一次当天次数——App 本来就不会让订阅过的人看到填码入口）；
 重领不再先问 RevenueCat（以前兑换过的人重领会被 RC 答成 `not_new_user`）。作废了的推荐重领只回老码、**不换码**（免得被拒的人天天重领烧库存）。
 
 ### 2.4 防刷（文档 `### 防刷` 五道，后端管前四道 + 第 5 道的数据）
 
-**第 1 道 DeviceCheck**（`devicecheck.go`，`handlers.go` `checkDevice` / `bitHook`）
+**第 1 道 DeviceCheck**（`devicecheck.go`，`handlers.go` `deviceGate` / `deviceRun`，`store.go` `ClaimGate`）
 
 | 情况 | `enforce`（prod）| `log`（staging）|
 |---|---|---|
 | 没配 DeviceCheck（缺 Key ID / Team ID / .p8，或 .p8 解析不了）| 新填码一律 503 `device_check_unavailable` | 不查不置，记日志放行 |
 | 没带 `device_token`（或 > 12 KB / 有控制字符）| 400 `device_unverified` | 记日志放行，不置位 |
-| `device_check_env` 不是 `production`（`development` / 缺 / 其他）| 当没带 token：400 `device_unverified`，不问苹果（开发环境的 bit 与生产分开存，认它等于每台设备两条命；Release 包一律带 `production`）| 照请求的环境查 / 置（`development` → `api.development.devicecheck.apple.com`），结果只记日志 |
+| `device_check_env` 不是 `production`（`development` / 缺 / 其他）| 当没带 token：400 `device_unverified`，不问苹果（开发环境的 bit 与生产分开存，认它等于每台设备两条命；Release 包一律带 `production`）。例外：`DEVICECHECK_ALLOW_DEVELOPMENT=true`（只 staging）时 `development` 也认，查 / 置走开发环境地址，照常拒 | 照请求的环境查 / 置（`development` → `api.development.devicecheck.apple.com`），结果只记日志 |
 | 苹果答 400（token 无效）| 400 `device_unverified` | 记日志放行，不置位 |
 | 苹果超时 / 其他错误 | 503 `device_check_unavailable` | 记日志放行，照样尝试置位 |
 | `bit0` 已置 | 400 `device_used` | 记日志放行，照样置位 |
-| 取到码后置位失败 | 回滚领码（码仍 free）→ 503 `device_check_unavailable` | 记日志，领码照常提交 |
+| 取到码后置位报错（超时 / 5xx）| 先回读一次 `bit0`：已置（苹果置上了、只是回答丢了）→ 当成功提交；未置 / 回读也失败 → 回滚领码（码仍 free）→ 503 `device_check_unavailable` | 记日志，领码照常提交，不回读 |
+| 设备锁 3 s 内等不到（`lock_timeout`，55P03）| 503 `device_check_unavailable`（码没动）| 同左 |
 
 - 苹果「没有 bit 记录」是 200 + 纯文本（实测 `Failed to find bit state`，文档写 `Bit State Not Found`），都当 `bit0 = false`。
 - `update_two_bits` 只发 `bit0: true`，不发 `bit1`（同一 Team 下别的 App 若也用 DeviceCheck，会共用这两个 bit）。
-- 置位在领码事务里、commit 之前：置位失败 → 回滚；置位成功但 commit 失败（极少）→ 这台设备 `bit0` 已置但没领到码，大声记日志。
-- 每次苹果调用 3 s（`DefaultDeviceCheckTimeout`，HTTP 客户端和 context 双重），一次新填码最多两次。
+- **查和置是原子的**（`ClaimGate`，评审 P2）：苹果的 bit 不在我们的事务里，同一台设备可以同时以多个账号、各自伪造的 `X-Device-Install-Id` 来填码；
+  事务外「先查后置」会让它们都查到 `false`、都拿到码。所以新填码的事务先拿一把**全局**事务级 advisory lock
+  （`pg_advisory_xact_lock(hashtextextended('referral_devicecheck', 0))`，填码量很小，一把就够；事务级 → 不怕 Supabase 的事务模式连接池，也不会比事务活得久），
+  `set local lock_timeout = '3000ms'`（也管这一事务里的行锁），锁到 commit / rollback：锁内再判 2–4 → 查 → 取码 → 置。重领不拿锁、不问苹果。
+  领码事务的 context 预算 = 10 s + 3 s 锁 + 3 × 苹果超时（查、置、回读），苹果调用自己各 3 s。
+- 置位在领码事务里、commit 之前：置位报错 → 回读（见上表）；置位成功但 commit 失败（极少）→ 这台设备 `bit0` 已置但没领到码，大声记日志。
+  回读也失败时仍回滚：苹果其实可能已置上，这台设备之后会是 `device_used`（剩余风险，只在「置位和回读都失败」时）。
+- 每次苹果调用 3 s（`DefaultDeviceCheckTimeout`，HTTP 客户端和 context 双重），一次新填码最多三次（查、置、置位报错时的回读）。
 
 **第 2 道 推荐人用过的设备**：`/me` 每次成功 `referral_me(user, install)` upsert `referral_devices(user_id, install_id 小写, first/last_seen_at)`；
 判定第 4 步只看**码主人自己**的设备。删账号随 `referral_users` 级联删。
@@ -162,14 +183,17 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
 所以用订阅记录里同一条订阅链换账号 / 转移 / 续费 / 组内升降级都不变的 `original_purchase_date`：`<store>:<original_purchase_date RFC3339>`
 （`Subscriber.SubscriptionKey`，不含 product id）。代价：两个不同的人同一秒开始订阅会撞，被误作废一条（运营可见）。
 
-**第 4 道 速度闸**（结算 ②，`referral_qualify`）：判成功时数这个推荐人 `velocity_window_hours` 小时内 `qualified_at` 的成功条数
-（qualified / held / saved / rewarded，**含 held**），≥ `velocity_limit` → 这条 `held`（也记 `qualified_at`，所以 held 自己也算进后面的计数）。
-即 24 小时内第 6 个起待审核。`velocity_limit = 0` = 闸关。锁推荐人 `referral_users` 行（`for no key update`）让同一推荐人的判定排队。
+**第 4 道 速度闸**（结算 ②，`referral_qualify`，017）：按**理论成功时间** = `redeemed_at + hold_days` 数，不按结算跑到的时刻：
+这一条的理论成功时间之前 `velocity_window_hours` 小时内（含那一刻）这个推荐人已成功的条数（qualified / held / saved / rewarded，**含 held**），
+≥ `velocity_limit` → 这条 `held`（也记 `qualified_at`，held 自己也算进后面的计数）。所有推荐同一个 `hold_days`，比较时消掉，SQL 里直接比 `redeemed_at`。
+即 24 小时内第 6 个起待审核。原来按 `qualified_at` 数：结算停摆后恢复，积压的成功在同一轮一起认定，第 6 个起全进 held（误拦，评审 P3）。
+只往前看：比这一条晚兑换的理论上在它之后才成功（`ListDue` 按 `redeemed_at` 升序给，正常时它们还没判）。
+`velocity_limit = 0` = 闸关。锁推荐人 `referral_users` 行（`for no key update`）让同一推荐人的判定排队。
 - 运营邮件（`review.go`）：每轮 ② 之后查「有没发过信的 held、且这个推荐人 24 小时内没收过信」的推荐人（`held_notified_at` 记在库里，重启不重发、发失败下轮重试）；
-  每人一封：推荐人 ID、规则、待审核条数（本封新增几条）、这批朋友填码设备数了几台不同（`claim_install_id`，016 之前的没记）、待审核 + 窗口内成功的列表、
-  approve / reject 命令。主题 ASCII（`[YardMate] Referral review: N held for one referrer`），正文中文。没配邮件 → 只打 WARN 并照样标记。
+  每人一封：推荐人 ID、规则、待审核条数（本封新增几条）、这批朋友填码设备数了几台不同（`claim_install_id`，016 之前的没记）、
+  待审核 + 算进某条 held 窗口的成功（同上口径）的列表（按理论成功时间排，列出理论成功 / 结算认定两个时间）、approve / reject 命令。主题 ASCII（`[YardMate] Referral review: N held for one referrer`），正文中文。没配邮件 → 只打 WARN 并照样标记。
 - 运营 `deploy/referral-review.sh list | approve <id> | reject <id>`（PostgREST + service role，rpc `referral_approve` / `referral_reject`）：
-  `approve` = held → qualified + `reviewed_at`，下一轮 ③ 照常发 / 攒（推荐人的 `months_earned` 变了，App 照常发到账通知）；
+  `approve` = held → qualified + `reviewed_at`，下一轮 ③ 先按 ② 再查一次朋友的退款 / 订阅（审核期间退了 → `void`），过了照常发 / 攒（推荐人的 `months_earned` 变了，App 照常发到账通知）；
   `reject` = 任何没作废的状态 → void（`rejected`）+ `reviewed_at`，名下的钱一起作废；已 rewarded 的 RevenueCat 赠送不收回（脚本提示）。
 
 **第 5 道 礼品卡人工审核**：数据由 `rewards/` 在申请邮件里出（见 `rewards/SPEC.md`），本包只提供 `claim_install_id` / `void_reason` / `held`。
@@ -192,6 +216,9 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
 - 迁移：`proxy/enrichment/migrations/013_referral.sql`，可重复跑；**先 staging 后 prod，且先于二进制**。
   `016_referral_antiabuse.sql`（依赖 013 / 014 / 015）同样先于二进制：新二进制调三参数 `referral_claim`、两参数 `referral_me` 等 016 的函数，
   没跑 016 时 `/me`、`/claim` 会 502、结算 ① ② 每行报错。旧二进制用的 013/014 函数签名都保留，回滚二进制不用回滚库。
+  `017_referral_review_fixes.sql`（依赖 013–016，可重复跑）**先于二进制、先 staging 后 prod**：新二进制读写 `referrals.last_checked_at`、
+  `reviewed_at`；没跑 017 时结算 ① ③ ④ 的列表每轮报错（`/me`、`/claim` 照常）。017 只同名同签名替换 `referral_claim(text,text,text)` 和
+  `referral_qualify(bigint)`，016 那版二进制照常调，回滚二进制不用回滚库。⚠️ 017 之后若重跑 016，会把这两个函数换回 016 版——重跑 016 后再跑一遍 017。
   删账号路径把「表不存在」当无事可删（42P01 → nil），所以顺序反了也不会把删账号打成 500。
 - `referral_settings` 改库即生效，不用发版：
 
@@ -203,7 +230,7 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
   | `low_stock_threshold` | 100 | 可发码少于这个数 → 告警；0 = 两种告警都关（临期是投影的低库存） |
   | `expiry_warn_days` | 30 | 最早一批可发码在这么多天内到期、**且它到期那天仍可发的会低于阈值**（只算比它晚到期超过 `issue_margin_days` 的批）→ 告警；0 = 关；必须 > `issue_margin_days` 才可达 |
   | `velocity_limit` | 5 | 速度闸（016）：推荐人窗口内已成功这么多条后，后面的进 held；0 = 闸关 |
-  | `velocity_window_hours` | 24 | 速度闸窗口，按 `qualified_at` 数 |
+  | `velocity_window_hours` | 24 | 速度闸窗口，按理论成功时间（`redeemed_at + hold_days`）数（017）|
 
   `014_referral_pool_margin.sql` 加的四列 + 替换 `referral_claim`；**先于二进制**（新二进制每轮读这四列，
   列不存在只是每轮记一条 `pool status` 错误 + `rep.Errors`，结算其它步照跑；旧 `referral_claim` 也能用，只是没余量）。
@@ -230,11 +257,27 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
 - nginx：`location /v1/` 前缀转发已覆盖 `/v1/referral/*`，**不需要改 api vhost**。官网 vhost `deploy/nginx/yardmate.ai` 加了
   邀请链接两段（`/i/*` → `/i/index.html`、AASA `default_type application/json` 不重定向），见 invite-links.md。
 - DeviceCheck：`DEVICECHECK_MODE` prod `enforce`、staging `log`；启动日志一行 `referral devicecheck ready: mode=…`，缺东西是 WARN（说缺哪个，不打 key）。
+  `DEVICECHECK_ALLOW_DEVELOPMENT`：staging 设 `true`（切 `enforce` 测第 1 道时 DEBUG 包的 `development` token 也认、走开发环境地址），
+  **prod 不设**（开发环境的 bit 与生产分开存，prod 认它等于每台设备两条命）；开着时启动打 `WARN: DEVICECHECK_ALLOW_DEVELOPMENT=true …`。
   上线顺序见 `deploy/README.md` §9。
 - 冒烟脚本不带 DeviceCheck token，只在 `log` 档能领到码。
-- 日志只有计数和错误文本，没有 user id、token、码。
+- 日志只有计数和错误文本，没有 user id、token、码。RevenueCat 客户端的错误只带操作名（`get subscriber` / `grant promotional`）+ 状态码 / 底层错误：
+  net/http 的 `*url.Error` 会打出整条 URL（`/subscribers/<APP_USER_ID>`），拆掉只留原因（仍 `%w`，超时照样认得出）。
 
 ## 4. 测试
+
+评审修补（017，api#126 之后）：`claim_review_test.go`：8 个 goroutine 同一设备 token、各自账号 + 伪造 install id 并发 /claim 只成一个
+（假实现用 `deviceMu` 模拟全局锁，去掉锁这条即失败）/ 同账号连点两下只问一次苹果、同一张码 / 置位报错但苹果已置 → 保留 / 置位报错回读未置 → 回滚、可重试 /
+置位和回读都失败 → 回滚 / log 档置位失败不回读 / `DEVICECHECK_ALLOW_DEVELOPMENT`：development 走开发地址查置、照样 `device_used`、production 照常、其他 env 仍 `device_unverified`、缺省关。
+`settle_review_test.go`：claimed 超过一批（250 条）第二轮拿到没查过的 + 新来的被认定 / 查过之后又报 /redeemed 的插到没查过的前面 / RC 查失败不记 /
+saver 超过一批第二轮轮到新 saver、`MarkSaved` 清空 / held 期间退款或订阅没了 → approve 后 void 不发、没退款照常发 /
+相隔 26 小时兑换的积压同一轮认定不 held / 同一小时兑换、晚 3 天认定照样 held、邮件按理论时间 / 窗口外的老成功不进邮件。
+`revenuecat_test.go`：连不上 / 超时的错误里没有 app user id 和路径、操作名在、`errors.Is(DeadlineExceeded)`；主包 `account_delete_logs_test.go` 删账号同理；
+`referral_wiring_test.go`：`DEVICECHECK_ALLOW_DEVELOPMENT` 五种写法。
+017 的 SQL（`pgstore_review_pg_test.go`，同一个 `REFERRAL_PG_TEST_URL` 门控）：017 可重跑 + 各代函数签名都在 / `ListClaimed` 轮转 + 报告插队 + 非 claimed 不记 /
+`ListSavers` 轮转 + `MarkSaved` 清空 / 6 路并发同设备只成一个 / 设备锁被占 3 s 后 `device_check_unavailable` / 只有 approve 过的 `Reviewed` /
+已兑换（码池那行已 expired）五个状态重领都回原码、不烧新码 / 速度闸按理论成功时间（积压不 held、晚认定的爆发照样 held、摘要只列爆发 + `DueAt`）；
+`pgstore_antiabuse_pg_test.go` 里 gate 的 Check 拒绝回滚、锁内重领不问苹果。**这些 PG 测试本机没有 Postgres，都只写了没跑过**（`go test` 里 SKIP）。
 
 防刷（016）：`claim_gates_test.go`（memStore 复刻 016 的判定规则 + fake DeviceCheck）：判定顺序每一步的先后（unknown 先于一切、already_claimed 先于 own_code、
 重领不问 RC 也不问 DeviceCheck、own_code 先于 not_new_user、not_new_user 先于 DeviceCheck、DeviceCheck 先于码池）/ 推荐人设备 own_code（大小写无关、别人的码不拦）/
@@ -276,7 +319,11 @@ SQL 函数（013 + 014）：`pgstore_pg_test.go` 要一个空库（`REFERRAL_PG_
   （另一种 In-App Purchase 密钥 + Issuer ID，用 `store_transaction_id` 查 `originalTransactionId`）换成真的原始交易号。
 - `log` 档里「苹果超时 / 5xx」也只记日志放行（文档「503 不放行」那句没分档；按「log = 只记日志不拦」理解，api#126 已定保留）。
 - `enforce` 下 `device_check_env` 缺省也当没带 token（文档原写「缺了当 production」；api#126 定为只认显式 `production`，Release 包本来就一律带）。
-- 速度闸的「24 小时内成功超过 5 个」按 `qualified_at` 数，朋友是 7 天前批量兑换的，会在同一轮结算里一起到期——第 6 个起全进 held。
+- 速度闸按理论成功时间、**只往前看**（017）：正常结算按 `redeemed_at` 升序判，口径就是「第 6 个」。若一批里较早兑换的那条这一轮 RC 查失败、
+  下一轮才判，它的窗口里只有比它早的——比它晚、已经判过的 5 条不算，这一批可能 6 条都放行。要关这个口子就改成「前后 24 小时」双向数
+  （代价是极少数排列下多拦一条进 held）；本 PR 照评审原话「过去 24 小时」做。
+- 旧二进制（016 之前）用的两参数 `referral_claim` 没改：回滚到那么老的二进制时，「已兑换后重领」仍会换码（017 只换了三参数版）。
+- 第 1 道「置位和回读都失败」时仍回滚（苹果可能其实已置上 → 这台设备之后 `device_used`）；要再保守就得在库里记一笔「待核实」下次 claim 前再查，本 PR 不做。
 
 - 推荐人正在付费时的「覆盖」把家人共享也算进去（赠了也用不上）；要不要反过来算「没付费」直接发。
 - `ListClaimed` 200 天截止之后那条 referral 永远停在 claimed；要不要定期 void。

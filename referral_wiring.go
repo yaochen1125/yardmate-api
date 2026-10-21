@@ -45,7 +45,7 @@ func newSupabaseAuthenticator(vault *secrets.Vault) referral.Authenticator {
 // Anti-abuse gate 1 (DeviceCheck) reads DEVICECHECK_KEY_ID +
 // DEVICECHECK_PRIVATE_KEY (or DEVICECHECK_PRIVATE_KEY_PATH) + APPLE_TEAM_ID
 // and DEVICECHECK_MODE (enforce | log; unset = enforce) — see
-// buildDeviceCheck.
+// buildDeviceCheck — plus DEVICECHECK_ALLOW_DEVELOPMENT (staging only).
 func buildReferralService(vault *secrets.Vault, db *enrichment.DB, mailer *enrichment.FeedbackMailer) *referral.Service {
 	var store referral.Store
 	if db != nil {
@@ -66,10 +66,11 @@ func buildReferralService(vault *secrets.Vault, db *enrichment.DB, mailer *enric
 	}
 	dc, mode := buildDeviceCheck(vault)
 	svc := referral.New(store, rc, vault.Get("REVENUECAT_ENTITLEMENT_ID"), newSupabaseAuthenticator(vault), referral.Options{
-		Interval:        vaultDurationOr(vault, "REFERRAL_SETTLE_INTERVAL", 0),
-		Alerter:         alerter,
-		DeviceCheck:     dc,
-		DeviceCheckMode: mode,
+		Interval:                    vaultDurationOr(vault, "REFERRAL_SETTLE_INTERVAL", 0),
+		Alerter:                     alerter,
+		DeviceCheck:                 dc,
+		DeviceCheckMode:             mode,
+		DeviceCheckAllowDevelopment: deviceCheckAllowDevelopment(vault, mode),
 	})
 	if !svc.Configured() {
 		log.Printf("WARN: referral not configured (missing %v); /v1/referral/* answers 503 not_configured", svc.Missing())
@@ -114,6 +115,20 @@ func buildDeviceCheck(vault *secrets.Vault) (referral.DeviceChecker, referral.De
 	}
 	log.Printf("referral devicecheck ready: mode=%s", mode)
 	return c, mode
+}
+
+// deviceCheckAllowDevelopment reads DEVICECHECK_ALLOW_DEVELOPMENT (default
+// false; ParseBool spellings, anything else = false). STAGING ONLY: with it,
+// enforce also takes device_check_env = "development" tokens (DEBUG builds)
+// and asks Apple's development host, whose bits are separate from
+// production's — on prod that would give every device a second life. Logged
+// loudly when on.
+func deviceCheckAllowDevelopment(vault *secrets.Vault, mode referral.DeviceCheckMode) bool {
+	on := vault.GetBool("DEVICECHECK_ALLOW_DEVELOPMENT", false)
+	if on {
+		log.Printf("WARN: DEVICECHECK_ALLOW_DEVELOPMENT=true (mode=%s): enforce also accepts development DeviceCheck tokens — staging only, never set it on prod", mode)
+	}
+	return on
 }
 
 func deviceCheckOffNote(mode referral.DeviceCheckMode) string {

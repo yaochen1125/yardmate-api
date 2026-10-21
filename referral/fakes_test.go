@@ -14,6 +14,11 @@ import (
 // exercise real transitions, and exposes a few knobs for the handler tests.
 type memStore struct {
 	mu sync.Mutex
+	// deviceMu is the PG store's global device lock (pg_advisory_xact_lock,
+	// ClaimGate): held by a gated Claim from before its gate's Check to the
+	// end. mu alone is released around the gate's Apple calls, so without
+	// deviceMu two gated claims could both check before either sets.
+	deviceMu sync.Mutex
 
 	// handler knobs
 	meStanding Standing
@@ -73,6 +78,15 @@ type memRef struct {
 	subKey         string
 	heldNotifiedAt time.Time
 	installID      string
+	// rotation (017): the last RevenueCat look (zero = never) and the last
+	// /redeemed report, both on the "database clock".
+	lastChecked time.Time
+	reportedAt  time.Time
+}
+
+// reportedSinceCheck is ListClaimed's first sort key.
+func (r *memRef) reportedSinceCheck() bool {
+	return !r.reportedAt.IsZero() && r.reportedAt.After(r.lastChecked)
 }
 
 func newMemStore() *memStore {
@@ -174,32 +188,63 @@ func (m *memStore) judgeLocked(userID, code, installID string) (ClaimKind, error
 	return ClaimNew, nil
 }
 
-func (m *memStore) Claim(_ context.Context, userID, code, installID string, hook ClaimHook) (string, error) {
+func (m *memStore) Claim(_ context.Context, userID, code, installID string, gate *ClaimGate) (string, error) {
+	if gate != nil {
+		m.deviceMu.Lock()
+		defer m.deviceMu.Unlock()
+	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.claimCalls++
 	m.gotUser, m.gotCode, m.gotInstall = userID, code, installID
 	if m.claimErr != nil {
-		return "", m.claimErr
+		err := m.claimErr
+		m.mu.Unlock()
+		return "", err
 	}
-	if m.codes == nil {
-		if hook != nil {
-			if err := hook(true); err != nil {
-				return "", err
-			}
+	emulate := m.codes != nil
+	kind := ClaimNew
+	if emulate {
+		// Steps 2–4 again under the device lock (PG: referral_claim_check).
+		k, err := m.judgeLocked(userID, code, installID)
+		if err != nil {
+			m.mu.Unlock()
+			return "", err
+		}
+		kind = k
+	}
+	m.mu.Unlock()
+
+	// Apple is asked without mu, like the PG store asks it without holding
+	// any row: only deviceMu keeps two gated claims apart here.
+	if gate != nil && gate.Check != nil && kind == ClaimNew {
+		if err := gate.Check(); err != nil {
+			return "", err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	set := func(fresh bool) error {
+		if gate == nil || gate.Set == nil {
+			return nil
+		}
+		return gate.Set(fresh)
+	}
+	if !emulate {
+		if err := set(true); err != nil {
+			return "", err
 		}
 		return m.claimOffer, nil
 	}
+	// referral_claim's own atomic re-check.
 	kind, err := m.judgeLocked(userID, code, installID)
 	if err != nil {
 		return "", err
 	}
 	if kind == ClaimAgain {
 		offer := m.claims[userID].offer
-		if hook != nil {
-			if err := hook(false); err != nil {
-				return "", err
-			}
+		if err := set(false); err != nil {
+			return "", err
 		}
 		return offer, nil
 	}
@@ -207,10 +252,8 @@ func (m *memStore) Claim(_ context.Context, userID, code, installID string, hook
 		return "", Failure{ErrPoolEmpty}
 	}
 	offer := m.shelf[0]
-	if hook != nil {
-		if err := hook(true); err != nil {
-			return "", err // rolled back: the code stays on the shelf, no claim
-		}
+	if err := set(true); err != nil {
+		return "", err // rolled back: the code stays on the shelf, no claim
 	}
 	m.shelf = m.shelf[1:]
 	m.claims[userID] = &memClaim{referrer: m.codes[code], offer: offer, install: strings.ToLower(installID)}
@@ -218,8 +261,18 @@ func (m *memStore) Claim(_ context.Context, userID, code, installID string, hook
 }
 
 func (m *memStore) ReportRedeemed(_ context.Context, userID, offer string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.gotUser, m.gotOffer = userID, offer
-	return m.redeemErr
+	if m.redeemErr != nil {
+		return m.redeemErr
+	}
+	for _, r := range m.refs {
+		if r.Referee == userID && r.OfferCode == offer && r.State == StateClaimed {
+			r.reportedAt = m.dueNow
+		}
+	}
+	return nil
 }
 
 func (m *memStore) DeleteUser(_ context.Context, userID string) error {
@@ -254,8 +307,43 @@ func (f *fakeAlerter) Alert(subject, body string) error {
 
 func (m *memStore) HoldDays(context.Context) (int, error) { return m.holdDays, m.holdErr }
 
+// ListClaimed replays pgstore.go's rotation order (017).
 func (m *memStore) ListClaimed(_ context.Context, limit int) ([]Referral, error) {
-	return capped(m.byState(StateClaimed), limit), nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var rows []*memRef
+	for _, r := range m.sortedLocked() {
+		if r.State == StateClaimed {
+			rows = append(rows, r)
+		}
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
+		if pa, pb := a.reportedSinceCheck(), b.reportedSinceCheck(); pa != pb {
+			return pa
+		}
+		if !a.lastChecked.Equal(b.lastChecked) {
+			return a.lastChecked.Before(b.lastChecked) // zero (never) first
+		}
+		if !a.ClaimedAt.Equal(b.ClaimedAt) {
+			return a.ClaimedAt.Before(b.ClaimedAt)
+		}
+		return a.ID < b.ID
+	})
+	out := make([]Referral, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Referral)
+	}
+	return capped(out, limit), nil
+}
+
+func (m *memStore) MarkClaimedChecked(_ context.Context, id int64, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r := m.refs[id]; r != nil && r.State == StateClaimed {
+		r.lastChecked = at
+	}
+	return nil
 }
 
 // MarkRedeemed replays 016's referral_mark_redeemed.
@@ -306,22 +394,35 @@ func (m *memStore) MarkVoid(_ context.Context, id int64, reason string) error {
 
 // fakeDC is an in-memory DeviceChecker: bits by (env, token). invalid tokens
 // get ErrDeviceTokenInvalid; queryErr / setErr fail every call; block makes
-// each call wait for its context (a hung Apple).
+// each call wait for its context (a hung Apple); delay makes each call take
+// that long (widens race windows). setApplies: a failing set still sets the
+// bit (Apple did it, the answer got lost). queryFails, when set, may fail
+// query number n (1-based).
 type fakeDC struct {
-	mu       sync.Mutex
-	bits     map[string]bool // env + "|" + token → bit0
-	invalid  map[string]bool
-	queryErr error
-	setErr   error
-	block    bool
-	queries  int
-	sets     int
-	envs     []string
+	mu         sync.Mutex
+	bits       map[string]bool // env + "|" + token → bit0
+	invalid    map[string]bool
+	queryErr   error
+	setErr     error
+	setApplies bool
+	queryFails func(n int) error
+	block      bool
+	delay      time.Duration
+	queries    int
+	sets       int
+	envs       []string
 }
 
 func newFakeDC() *fakeDC { return &fakeDC{bits: map[string]bool{}, invalid: map[string]bool{}} }
 
 func (f *fakeDC) wait(ctx context.Context) error {
+	if f.delay > 0 {
+		select {
+		case <-time.After(f.delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	if !f.block {
 		return nil
 	}
@@ -340,6 +441,11 @@ func (f *fakeDC) QueryBit0(ctx context.Context, env, token string) (bool, error)
 	if f.queryErr != nil {
 		return false, f.queryErr
 	}
+	if f.queryFails != nil {
+		if err := f.queryFails(f.queries); err != nil {
+			return false, err
+		}
+	}
 	if f.invalid[token] {
 		return false, ErrDeviceTokenInvalid
 	}
@@ -354,6 +460,9 @@ func (f *fakeDC) SetBit0(ctx context.Context, env, token string) error {
 	defer f.mu.Unlock()
 	f.sets++
 	if f.setErr != nil {
+		if f.setApplies {
+			f.bits[env+"|"+token] = true
+		}
 		return f.setErr
 	}
 	f.bits[env+"|"+token] = true
@@ -366,8 +475,25 @@ func (f *fakeDC) bit(env, token string) bool {
 	return f.bits[env+"|"+token]
 }
 
-// MarkQualified replays 016's referral_qualify (velocity gate on the
-// "database clock" dueNow).
+// successAt is the gate's clock for a referral: redeemed_at (its theoretical
+// success time minus the shared hold_days), qualified_at for a row without
+// one — as 017's referral_qualify coalesces.
+func (r *memRef) successAt() time.Time {
+	if r.RedeemedAt.IsZero() {
+		return r.qualifiedAt
+	}
+	return r.RedeemedAt
+}
+
+// inWindowBefore: o's success time is inside the window before at's (at
+// included), as referral_qualify / HeldDigests count.
+func (m *memStore) inWindowBefore(o *memRef, at time.Time) bool {
+	t := o.successAt()
+	return t.After(at.Add(-time.Duration(m.velocityWindow)*time.Hour)) && !t.After(at)
+}
+
+// MarkQualified replays 017's referral_qualify: the velocity gate on
+// theoretical success time (redeemed_at), not on the pass's clock.
 func (m *memStore) MarkQualified(_ context.Context, id int64) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -377,7 +503,6 @@ func (m *memStore) MarkQualified(_ context.Context, id int64) (bool, error) {
 	}
 	to := StateQualified
 	if m.velocityLimit > 0 {
-		since := m.dueNow.Add(-time.Duration(m.velocityWindow) * time.Hour)
 		recent := 0
 		for _, o := range m.refs {
 			if o.ID == id || o.Referrer != r.Referrer {
@@ -385,7 +510,7 @@ func (m *memStore) MarkQualified(_ context.Context, id int64) (bool, error) {
 			}
 			switch o.State {
 			case StateQualified, StateHeld, StateSaved, StateRewarded:
-				if o.qualifiedAt.After(since) {
+				if m.inWindowBefore(o, r.successAt()) {
 					recent++
 				}
 			}
@@ -407,7 +532,7 @@ func (m *memStore) approve(id int64) bool {
 	if r.State != StateHeld {
 		return false
 	}
-	r.State = StateQualified
+	r.State, r.Reviewed = StateQualified, true
 	return true
 }
 
@@ -418,7 +543,7 @@ func (m *memStore) reject(id int64) bool {
 	if r.State == StateVoid {
 		return false
 	}
-	r.State, r.voidReason = StateVoid, VoidRejected
+	r.State, r.voidReason, r.Reviewed = StateVoid, VoidRejected, true
 	return true
 }
 
@@ -444,9 +569,15 @@ func (m *memStore) HeldDigests(_ context.Context, limit int) ([]HeldDigest, erro
 		}
 	}
 	var out []HeldDigest
+	hold := time.Duration(m.holdDays) * 24 * time.Hour
 	for _, u := range capped(referrers, limit) {
 		d := HeldDigest{Referrer: u, Limit: m.velocityLimit, WindowHours: m.velocityWindow}
-		since := now.Add(-time.Duration(m.velocityWindow) * time.Hour)
+		var held []*memRef
+		for _, r := range m.sortedLocked() {
+			if r.Referrer == u && r.State == StateHeld {
+				held = append(held, r)
+			}
+		}
 		for _, r := range m.sortedLocked() {
 			if r.Referrer != u {
 				continue
@@ -454,13 +585,19 @@ func (m *memStore) HeldDigests(_ context.Context, limit int) ([]HeldDigest, erro
 			in := r.State == StateHeld
 			switch r.State {
 			case StateQualified, StateSaved, StateRewarded:
-				in = r.qualifiedAt.After(since)
+				for _, h := range held {
+					if m.inWindowBefore(r, h.successAt()) {
+						in = true
+					}
+				}
 			}
 			if in {
 				d.Referrals = append(d.Referrals, HeldReferral{ID: r.ID, Referee: r.Referee, State: r.State,
-					ClaimedAt: r.ClaimedAt, QualifiedAt: r.qualifiedAt, InstallID: r.installID, Notified: !r.heldNotifiedAt.IsZero()})
+					ClaimedAt: r.ClaimedAt, QualifiedAt: r.qualifiedAt, DueAt: r.successAt().Add(hold),
+					InstallID: r.installID, Notified: !r.heldNotifiedAt.IsZero()})
 			}
 		}
+		sort.SliceStable(d.Referrals, func(i, j int) bool { return d.Referrals[i].DueAt.Before(d.Referrals[j].DueAt) })
 		out = append(out, d)
 	}
 	return out, nil
@@ -501,7 +638,7 @@ func (m *memStore) MarkSaved(_ context.Context, id int64) error {
 	if r.State != StateQualified {
 		return errors.New("not qualified")
 	}
-	r.State = StateSaved
+	r.State, r.lastChecked = StateSaved, time.Time{}
 	return nil
 }
 
@@ -513,16 +650,61 @@ func (m *memStore) Ledger(_ context.Context, userID string) (Ledger, error) {
 	return led, nil
 }
 
+// ListSavers replays pgstore.go's rotation order (017): per referrer the
+// earliest last look (never = zero = first), then the earliest qualified_at.
 func (m *memStore) ListSavers(_ context.Context, limit int) ([]string, error) {
-	seen := map[string]bool{}
-	var out []string
-	for _, r := range m.byState(StateSaved) {
-		if !seen[r.Referrer] {
-			seen[r.Referrer] = true
-			out = append(out, r.Referrer)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	type saver struct {
+		user               string
+		checked, qualified time.Time
+	}
+	byUser := map[string]*saver{}
+	var all []*saver
+	for _, r := range m.sortedLocked() {
+		if r.State != StateSaved {
+			continue
+		}
+		sv := byUser[r.Referrer]
+		if sv == nil {
+			sv = &saver{user: r.Referrer, checked: r.lastChecked, qualified: r.qualifiedAt}
+			byUser[r.Referrer] = sv
+			all = append(all, sv)
+			continue
+		}
+		if r.lastChecked.Before(sv.checked) {
+			sv.checked = r.lastChecked
+		}
+		if r.qualifiedAt.Before(sv.qualified) {
+			sv.qualified = r.qualifiedAt
 		}
 	}
+	sort.SliceStable(all, func(i, j int) bool {
+		a, b := all[i], all[j]
+		if !a.checked.Equal(b.checked) {
+			return a.checked.Before(b.checked)
+		}
+		if !a.qualified.Equal(b.qualified) {
+			return a.qualified.Before(b.qualified)
+		}
+		return a.user < b.user
+	})
+	out := make([]string, 0, len(all))
+	for _, sv := range all {
+		out = append(out, sv.user)
+	}
 	return capped(out, limit), nil
+}
+
+func (m *memStore) MarkSaverChecked(_ context.Context, userID string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.refs {
+		if r.Referrer == userID && r.State == StateSaved {
+			r.lastChecked = at
+		}
+	}
+	return nil
 }
 
 func (m *memStore) SavedIDs(_ context.Context, userID string) ([]int64, error) {
@@ -570,6 +752,7 @@ type fakeRC struct {
 	err    error
 	grants []grantCall
 	gets   int
+	asked  map[string]int // gets per app user id
 	gerr   error
 }
 
@@ -578,7 +761,7 @@ type grantCall struct {
 	until     time.Time
 }
 
-func newFakeRC() *fakeRC { return &fakeRC{subs: map[string]*Subscriber{}} }
+func newFakeRC() *fakeRC { return &fakeRC{subs: map[string]*Subscriber{}, asked: map[string]int{}} }
 
 func (f *fakeRC) set(userID string, sub *Subscriber) {
 	f.mu.Lock()
@@ -590,6 +773,7 @@ func (f *fakeRC) Subscriber(_ context.Context, appUserID string) (*Subscriber, e
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gets++
+	f.asked[appUserID]++
 	if f.err != nil {
 		return nil, f.err
 	}
