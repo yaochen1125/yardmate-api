@@ -56,10 +56,75 @@ const (
 	StateClaimed   = "claimed"
 	StateRedeemed  = "redeemed"
 	StateQualified = "qualified"
-	StateSaved     = "saved"
-	StateRewarded  = "rewarded"
-	StateVoid      = "void"
+	// StateHeld is anti-abuse gate 4 (migration 016): the referrer already
+	// had velocity_limit successes inside velocity_window_hours, so this one
+	// waits for an operator (deploy/referral-review.sh approve / reject).
+	// Counted in /me's months_pending; never granted while held.
+	StateHeld     = "held"
+	StateSaved    = "saved"
+	StateRewarded = "rewarded"
+	StateVoid     = "void"
 )
+
+// void_reason values (referrals.void_reason).
+const (
+	VoidRefunded       = "refunded"           // ② the friend's subscription was refunded
+	VoidNoSubscription = "no_subscription"    // ② the subscription is gone by the end of the hold
+	VoidDuplicate      = "duplicate_apple_id" // ① gate 3: another live referral has the same subscription
+	VoidRejected       = "rejected"           // gate 4 / gift-card review: an operator said no
+)
+
+// ClaimKind is the /claim pre-check's verdict on judgement steps 2–4
+// (docs: /claim 判定顺序), before RevenueCat and DeviceCheck are asked.
+type ClaimKind int
+
+const (
+	// ClaimNew: a first claim — steps 5 (new user) and 6 (DeviceCheck) apply.
+	ClaimNew ClaimKind = iota
+	// ClaimAgain: this account already put this very code in. The answer is
+	// the code it was given (swapped if it is about to expire), with no
+	// RevenueCat or DeviceCheck look — "换台设备也能拿回".
+	ClaimAgain
+)
+
+// ClaimHook runs inside the claim's database transaction after a pool code
+// has been taken, with fresh = this call created the referral. An error
+// rolls the whole claim back (the code goes back to free) and comes out of
+// Claim unchanged. /claim uses it to set DeviceCheck bit0 "同进退" with the
+// code.
+type ClaimHook func(fresh bool) error
+
+// HeldReferral is one line of a gate-4 review digest.
+type HeldReferral struct {
+	ID          int64
+	Referee     string
+	State       string // held, or qualified / saved / rewarded inside the window
+	ClaimedAt   time.Time
+	QualifiedAt time.Time
+	InstallID   string // the claim's X-Device-Install-Id; "" for claims before migration 016
+	Notified    bool   // a held one already mailed before
+}
+
+// HeldDigest is what the operator mail about one referrer's new held
+// referrals is drawn from: every held referral of theirs plus every success
+// inside the velocity window, oldest first.
+type HeldDigest struct {
+	Referrer    string
+	Limit       int // velocity_limit
+	WindowHours int // velocity_window_hours
+	Referrals   []HeldReferral
+}
+
+// NewHeld lists the ids of held referrals not mailed yet.
+func (d HeldDigest) NewHeld() []int64 {
+	var ids []int64
+	for _, r := range d.Referrals {
+		if r.State == StateHeld && !r.Notified {
+			ids = append(ids, r.ID)
+		}
+	}
+	return ids
+}
 
 // Failure is a refusal the store named. The handler turns it into an HTTP
 // status; the app turns that into a sentence.
@@ -74,6 +139,13 @@ const (
 	ErrAlreadyClaimed = "already_claimed" // this account has already used someone's code
 	ErrNotNewUser     = "not_new_user"    // this account has had Premium before
 	ErrPoolEmpty      = "pool_empty"      // no free code with the issue margin left
+)
+
+// The DeviceCheck refusals (gate 1). Decided in Go, not SQL.
+const (
+	ErrDeviceUsed        = "device_used"              // 400: bit0 already set — this device has been a friend
+	ErrDeviceUnverified  = "device_unverified"        // 400 (enforce): no token, or Apple rejected it
+	ErrDeviceUnavailable = "device_check_unavailable" // 503: Apple timed out / failed, or setting bit0 failed
 )
 
 // PoolSettings is the tunable part of referral_settings the code pool reads
@@ -128,12 +200,20 @@ func named(err error) (Failure, bool) {
 // only implementation is PGStore (pgstore.go) over the shared Supabase pool.
 type Store interface {
 	// Me is the user's own standing, making their code on the spot the first
-	// time they ask. CanClaim here reflects the database only (never claimed);
+	// time they ask, and notes installID among the devices this user has
+	// used (gate 2: a friend claiming this user's code on one of them gets
+	// own_code). CanClaim here reflects the database only (never claimed);
 	// the RevenueCat half is applied by the handler.
-	Me(ctx context.Context, userID string) (Standing, error)
-	// Claim records referrer→referee and hands back an Apple one-time code
-	// from the pool, atomically. code is already normalised.
-	Claim(ctx context.Context, userID, code string) (offerCode string, err error)
+	Me(ctx context.Context, userID, installID string) (Standing, error)
+	// ClaimCheck runs judgement steps 2–4 without writing: unknown_code /
+	// already_claimed / own_code (their own code, or installID is a device
+	// the code's owner has used) as a Failure, else ClaimNew or ClaimAgain.
+	ClaimCheck(ctx context.Context, userID, code, installID string) (ClaimKind, error)
+	// Claim re-checks 2–4 atomically, records referrer→referee (with the
+	// claiming device) and hands back an Apple one-time code from the pool;
+	// a re-claim gets the code it already has (or a swap). hook, when not
+	// nil, runs before commit (see ClaimHook). code is already normalised.
+	Claim(ctx context.Context, userID, code, installID string, hook ClaimHook) (offerCode string, err error)
 	// ReportRedeemed notes that the app says offerCode was redeemed by userID.
 	// A hint for the settlement loop, never a proof. Idempotent.
 	ReportRedeemed(ctx context.Context, userID, offerCode string) error
@@ -154,14 +234,25 @@ type Store interface {
 	// most recently reported first.
 	ListClaimed(ctx context.Context, limit int) ([]Referral, error)
 	// MarkRedeemed moves a claimed referral to redeemed at the subscription's
-	// real start time (from RevenueCat).
-	MarkRedeemed(ctx context.Context, id int64, at time.Time) error
+	// real start time (from RevenueCat) and records subscriptionKey (gate 3,
+	// Subscriber.SubscriptionKey). When another live referral — or a deleted
+	// account's — already has that key, the referral is voided instead
+	// (duplicate_apple_id, its rewards money with it) and voided is true.
+	MarkRedeemed(ctx context.Context, id int64, at time.Time, subscriptionKey string) (voided bool, err error)
 	// ListDue returns redeemed referrals whose hold has elapsed.
 	ListDue(ctx context.Context, hold time.Duration, limit int) ([]Referral, error)
-	// MarkVoid retires a referral (refund).
+	// MarkVoid retires a referral (refund / no subscription).
 	MarkVoid(ctx context.Context, id int64, reason string) error
-	// MarkQualified moves a redeemed referral to qualified.
-	MarkQualified(ctx context.Context, id int64) error
+	// MarkQualified moves a redeemed referral to qualified — or to held when
+	// the referrer already has velocity_limit successes (held included)
+	// inside velocity_window_hours (gate 4); held is true then.
+	MarkQualified(ctx context.Context, id int64) (held bool, err error)
+	// HeldDigests returns, per referrer with held referrals not yet mailed
+	// and no review mail in the last 24 hours, what the operator mail needs.
+	HeldDigests(ctx context.Context, limit int) ([]HeldDigest, error)
+	// MarkHeldNotified records that the review mail for these held
+	// referrals went out.
+	MarkHeldNotified(ctx context.Context, ids []int64) error
 	// ListQualified returns qualified referrals not yet rewarded or saved.
 	ListQualified(ctx context.Context, limit int) ([]Referral, error)
 	// MarkSaved parks a qualified referral until the referrer's paid plan ends.

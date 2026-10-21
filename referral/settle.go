@@ -11,7 +11,13 @@ import (
 //
 //	① claimed   → redeemed   RevenueCat shows the referee's own store subscription
 //	                         starting after the claim (offer code, or just paying).
+//	            → void       gate 3: that subscription (SubscriptionKey) is already
+//	                         another live referral's — one Apple ID counts once.
 //	② redeemed  → qualified  hold_days served and not refunded; else void.
+//	            → held       gate 4: the referrer already has velocity_limit
+//	                         successes inside velocity_window_hours; an operator
+//	                         approves (→ qualified) or rejects (→ void). New held
+//	                         ones are mailed to the operator (review.go).
 //	③ qualified → rewarded   referrer not covered by a store subscription: grant
 //	                         30 days on top of max(now, ledger, RC promo expiry).
 //	            → saved      referrer covered (paid / trial / intro / their own
@@ -36,7 +42,10 @@ type Report struct {
 	Expired   int64
 	Redeemed  int
 	Voided    int
+	Duplicate int // ① voided as duplicate_apple_id (gate 3); also counted in Voided
 	Qualified int
+	Held      int // ② parked for review (gate 4)
+	Reviewed  int // review mails sent (or logged, without a mailer) this pass
 	Granted   int // referrals rewarded straight away (③)
 	Saved     int // referrals parked (③)
 	Flushed   int // saved referrals paid out (④)
@@ -95,9 +104,9 @@ func (s *Service) runPass(ctx context.Context) {
 	pctx, cancel := context.WithTimeout(ctx, settlePassTimeout)
 	defer cancel()
 	rep := s.Settle(pctx)
-	if rep.Errors > 0 || rep.Redeemed+rep.Voided+rep.Qualified+rep.Granted+rep.Saved+rep.Flushed > 0 || rep.Expired > 0 || rep.Alerted > 0 {
-		log.Printf("referral settle: expired=%d redeemed=%d voided=%d qualified=%d granted=%d saved=%d flushed=%d usable=%d alerted=%d errors=%d",
-			rep.Expired, rep.Redeemed, rep.Voided, rep.Qualified, rep.Granted, rep.Saved, rep.Flushed, rep.Usable, rep.Alerted, rep.Errors)
+	if rep.Errors > 0 || rep.Redeemed+rep.Voided+rep.Qualified+rep.Held+rep.Granted+rep.Saved+rep.Flushed > 0 || rep.Expired > 0 || rep.Alerted+rep.Reviewed > 0 {
+		log.Printf("referral settle: expired=%d redeemed=%d voided=%d duplicate=%d qualified=%d held=%d granted=%d saved=%d flushed=%d usable=%d alerted=%d reviewed=%d errors=%d",
+			rep.Expired, rep.Redeemed, rep.Voided, rep.Duplicate, rep.Qualified, rep.Held, rep.Granted, rep.Saved, rep.Flushed, rep.Usable, rep.Alerted, rep.Reviewed, rep.Errors)
 	}
 	// The per-device buckets are this package's own; sweep them here rather
 	// than threading them through ratelimit.Limiter.
@@ -155,13 +164,19 @@ func (s *Service) Settle(ctx context.Context) Report {
 			if !ok {
 				continue
 			}
-			_, start, started := sub.StartedAfter(ref.ClaimedAt)
+			key, start, started := sub.StartedAfter(ref.ClaimedAt)
 			if !started {
 				continue
 			}
-			if err := s.store.MarkRedeemed(ctx, ref.ID, start); err != nil {
+			voided, err := s.store.MarkRedeemed(ctx, ref.ID, start, sub.SubscriptionKey(key))
+			if err != nil {
 				log.Printf("referral settle: mark redeemed: %v", err)
 				rep.Errors++
+				continue
+			}
+			if voided {
+				rep.Voided++
+				rep.Duplicate++
 				continue
 			}
 			rep.Redeemed++
@@ -195,14 +210,22 @@ func (s *Service) Settle(ctx context.Context) Report {
 				rep.Voided++
 				continue
 			}
-			if err := s.store.MarkQualified(ctx, ref.ID); err != nil {
+			held, err := s.store.MarkQualified(ctx, ref.ID)
+			if err != nil {
 				log.Printf("referral settle: mark qualified: %v", err)
 				rep.Errors++
+				continue
+			}
+			if held {
+				rep.Held++
 				continue
 			}
 			rep.Qualified++
 		}
 	}
+	// Gate 4's operator mail for whatever went held (this pass or earlier and
+	// not yet mailed).
+	s.notifyHeld(ctx, now, &rep)
 
 	// ③ qualified → rewarded / saved
 	if qualified, err := s.store.ListQualified(ctx, settleBatch); err != nil {
