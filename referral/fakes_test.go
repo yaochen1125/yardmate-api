@@ -73,6 +73,15 @@ type memRef struct {
 	subKey         string
 	heldNotifiedAt time.Time
 	installID      string
+	// rotation (017): the last RevenueCat look (zero = never) and the last
+	// /redeemed report, both on the "database clock".
+	lastChecked time.Time
+	reportedAt  time.Time
+}
+
+// reportedSinceCheck is ListClaimed's first sort key.
+func (r *memRef) reportedSinceCheck() bool {
+	return !r.reportedAt.IsZero() && r.reportedAt.After(r.lastChecked)
 }
 
 func newMemStore() *memStore {
@@ -218,8 +227,18 @@ func (m *memStore) Claim(_ context.Context, userID, code, installID string, hook
 }
 
 func (m *memStore) ReportRedeemed(_ context.Context, userID, offer string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.gotUser, m.gotOffer = userID, offer
-	return m.redeemErr
+	if m.redeemErr != nil {
+		return m.redeemErr
+	}
+	for _, r := range m.refs {
+		if r.Referee == userID && r.OfferCode == offer && r.State == StateClaimed {
+			r.reportedAt = m.dueNow
+		}
+	}
+	return nil
 }
 
 func (m *memStore) DeleteUser(_ context.Context, userID string) error {
@@ -254,8 +273,43 @@ func (f *fakeAlerter) Alert(subject, body string) error {
 
 func (m *memStore) HoldDays(context.Context) (int, error) { return m.holdDays, m.holdErr }
 
+// ListClaimed replays pgstore.go's rotation order (017).
 func (m *memStore) ListClaimed(_ context.Context, limit int) ([]Referral, error) {
-	return capped(m.byState(StateClaimed), limit), nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var rows []*memRef
+	for _, r := range m.sortedLocked() {
+		if r.State == StateClaimed {
+			rows = append(rows, r)
+		}
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
+		if pa, pb := a.reportedSinceCheck(), b.reportedSinceCheck(); pa != pb {
+			return pa
+		}
+		if !a.lastChecked.Equal(b.lastChecked) {
+			return a.lastChecked.Before(b.lastChecked) // zero (never) first
+		}
+		if !a.ClaimedAt.Equal(b.ClaimedAt) {
+			return a.ClaimedAt.Before(b.ClaimedAt)
+		}
+		return a.ID < b.ID
+	})
+	out := make([]Referral, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Referral)
+	}
+	return capped(out, limit), nil
+}
+
+func (m *memStore) MarkClaimedChecked(_ context.Context, id int64, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r := m.refs[id]; r != nil && r.State == StateClaimed {
+		r.lastChecked = at
+	}
+	return nil
 }
 
 // MarkRedeemed replays 016's referral_mark_redeemed.
@@ -501,7 +555,7 @@ func (m *memStore) MarkSaved(_ context.Context, id int64) error {
 	if r.State != StateQualified {
 		return errors.New("not qualified")
 	}
-	r.State = StateSaved
+	r.State, r.lastChecked = StateSaved, time.Time{}
 	return nil
 }
 
@@ -513,16 +567,61 @@ func (m *memStore) Ledger(_ context.Context, userID string) (Ledger, error) {
 	return led, nil
 }
 
+// ListSavers replays pgstore.go's rotation order (017): per referrer the
+// earliest last look (never = zero = first), then the earliest qualified_at.
 func (m *memStore) ListSavers(_ context.Context, limit int) ([]string, error) {
-	seen := map[string]bool{}
-	var out []string
-	for _, r := range m.byState(StateSaved) {
-		if !seen[r.Referrer] {
-			seen[r.Referrer] = true
-			out = append(out, r.Referrer)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	type saver struct {
+		user               string
+		checked, qualified time.Time
+	}
+	byUser := map[string]*saver{}
+	var all []*saver
+	for _, r := range m.sortedLocked() {
+		if r.State != StateSaved {
+			continue
+		}
+		sv := byUser[r.Referrer]
+		if sv == nil {
+			sv = &saver{user: r.Referrer, checked: r.lastChecked, qualified: r.qualifiedAt}
+			byUser[r.Referrer] = sv
+			all = append(all, sv)
+			continue
+		}
+		if r.lastChecked.Before(sv.checked) {
+			sv.checked = r.lastChecked
+		}
+		if r.qualifiedAt.Before(sv.qualified) {
+			sv.qualified = r.qualifiedAt
 		}
 	}
+	sort.SliceStable(all, func(i, j int) bool {
+		a, b := all[i], all[j]
+		if !a.checked.Equal(b.checked) {
+			return a.checked.Before(b.checked)
+		}
+		if !a.qualified.Equal(b.qualified) {
+			return a.qualified.Before(b.qualified)
+		}
+		return a.user < b.user
+	})
+	out := make([]string, 0, len(all))
+	for _, sv := range all {
+		out = append(out, sv.user)
+	}
 	return capped(out, limit), nil
+}
+
+func (m *memStore) MarkSaverChecked(_ context.Context, userID string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.refs {
+		if r.Referrer == userID && r.State == StateSaved {
+			r.lastChecked = at
+		}
+	}
+	return nil
 }
 
 func (m *memStore) SavedIDs(_ context.Context, userID string) ([]int64, error) {
@@ -570,6 +669,7 @@ type fakeRC struct {
 	err    error
 	grants []grantCall
 	gets   int
+	asked  map[string]int // gets per app user id
 	gerr   error
 }
 
@@ -578,7 +678,7 @@ type grantCall struct {
 	until     time.Time
 }
 
-func newFakeRC() *fakeRC { return &fakeRC{subs: map[string]*Subscriber{}} }
+func newFakeRC() *fakeRC { return &fakeRC{subs: map[string]*Subscriber{}, asked: map[string]int{}} }
 
 func (f *fakeRC) set(userID string, sub *Subscriber) {
 	f.mu.Lock()
@@ -590,6 +690,7 @@ func (f *fakeRC) Subscriber(_ context.Context, appUserID string) (*Subscriber, e
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gets++
+	f.asked[appUserID]++
 	if f.err != nil {
 		return nil, f.err
 	}

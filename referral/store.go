@@ -215,7 +215,9 @@ type Store interface {
 	// nil, runs before commit (see ClaimHook). code is already normalised.
 	Claim(ctx context.Context, userID, code, installID string, hook ClaimHook) (offerCode string, err error)
 	// ReportRedeemed notes that the app says offerCode was redeemed by userID.
-	// A hint for the settlement loop, never a proof. Idempotent.
+	// A hint for the settlement loop, never a proof. Each report restamps the
+	// time (while the referral is claimed), which puts the row at the front
+	// of the next ListClaimed if it has been looked at since.
 	ReportRedeemed(ctx context.Context, userID, offerCode string) error
 	// DeleteUser removes the user's invite code, every referral they are on
 	// either side of, and their reward ledger (account deletion).
@@ -231,8 +233,15 @@ type Store interface {
 	// HoldDays reads referral_settings.hold_days.
 	HoldDays(ctx context.Context) (int, error)
 	// ListClaimed returns referrals still waiting for the referee to redeem,
-	// most recently reported first.
+	// in rotation order: first those reported /redeemed since their last
+	// look, then never looked at, then looked at longest ago — so a backlog
+	// bigger than one batch rotates instead of the same rows coming back
+	// every pass.
 	ListClaimed(ctx context.Context, limit int) ([]Referral, error)
+	// MarkClaimedChecked records that RevenueCat answered for this claimed
+	// referral at `at` (last_checked_at, migration 017) — ListClaimed's
+	// rotation key. A referral no longer claimed is left alone.
+	MarkClaimedChecked(ctx context.Context, id int64, at time.Time) error
 	// MarkRedeemed moves a claimed referral to redeemed at the subscription's
 	// real start time (from RevenueCat) and records subscriptionKey (gate 3,
 	// Subscriber.SubscriptionKey). When another live referral — or a deleted
@@ -255,12 +264,19 @@ type Store interface {
 	MarkHeldNotified(ctx context.Context, ids []int64) error
 	// ListQualified returns qualified referrals not yet rewarded or saved.
 	ListQualified(ctx context.Context, limit int) ([]Referral, error)
-	// MarkSaved parks a qualified referral until the referrer's paid plan ends.
+	// MarkSaved parks a qualified referral until the referrer's paid plan
+	// ends, with no last look yet (so ListSavers takes its referrer early).
 	MarkSaved(ctx context.Context, id int64) error
 	// Ledger reads a referrer's reward account (zero value when none).
 	Ledger(ctx context.Context, userID string) (Ledger, error)
-	// ListSavers returns referrers who have at least one saved referral.
+	// ListSavers returns referrers who have at least one saved referral, in
+	// rotation order: a referrer with a saved referral never looked at
+	// first, then the one looked at longest ago.
 	ListSavers(ctx context.Context, limit int) ([]string, error)
+	// MarkSaverChecked records that RevenueCat answered for this referrer at
+	// `at` and they are still covered: every saved referral of theirs gets
+	// last_checked_at = at (ListSavers' rotation key).
+	MarkSaverChecked(ctx context.Context, userID string, at time.Time) error
 	// SavedIDs returns the saved referral ids of one referrer.
 	SavedIDs(ctx context.Context, userID string) ([]int64, error)
 	// RecordGranted marks ids rewarded and advances the ledger to until,

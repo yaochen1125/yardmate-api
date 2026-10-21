@@ -123,10 +123,13 @@ func (p *PGStore) Claim(ctx context.Context, userID, code, installID string, hoo
 	return out.OfferCode, nil
 }
 
+// ReportRedeemed restamps redeem_reported_at on every report while the
+// referral is still claimed: ListClaimed puts a row reported since its last
+// look first, so a report after a look that found nothing yet is not lost.
 func (p *PGStore) ReportRedeemed(ctx context.Context, userID, offerCode string) error {
 	_, err := p.pool.Exec(ctx,
 		`update referrals set redeem_reported_at = now()
-		  where referee = $1 and offer_code = $2 and redeem_reported_at is null`,
+		  where referee = $1 and offer_code = $2 and state = 'claimed'`,
 		userID, offerCode)
 	return err
 }
@@ -243,15 +246,30 @@ func (p *PGStore) ListClaimed(ctx context.Context, limit int) ([]Referral, error
 	// re-claim that swapped the code restarts the window (reissued_at, 014);
 	// claimed_at itself stays the first claim, which is what StartedAfter
 	// compares against.
+	//
+	// Rotation (017): a fixed order used to hand back the same `limit` rows
+	// every pass once more than a batch of never-redeemed claims had piled
+	// up, and nothing behind them was ever looked at. Now: reported /redeemed
+	// since the last look first, then never looked at, then looked at longest
+	// ago (MarkClaimedChecked stamps last_checked_at after each answer).
 	rows, err := p.pool.Query(ctx,
 		`select `+referralColumns+` from referrals
 		  where state = 'claimed' and coalesce(reissued_at, claimed_at) > now() - interval '200 days'
-		  order by redeem_reported_at desc nulls last, claimed_at
+		  order by (redeem_reported_at is not null
+		            and redeem_reported_at > coalesce(last_checked_at, '-infinity'::timestamptz)) desc,
+		           last_checked_at asc nulls first,
+		           claimed_at, id
 		  limit $1`, limit)
 	if err != nil {
 		return nil, err
 	}
 	return scanReferrals(rows)
+}
+
+func (p *PGStore) MarkClaimedChecked(ctx context.Context, id int64, at time.Time) error {
+	_, err := p.pool.Exec(ctx,
+		`update referrals set last_checked_at = $2 where id = $1 and state = 'claimed'`, id, at)
+	return err
 }
 
 // MarkRedeemed is referral_mark_redeemed (016): claimed → redeemed with the
@@ -379,9 +397,12 @@ func (p *PGStore) ListQualified(ctx context.Context, limit int) ([]Referral, err
 	return scanReferrals(rows)
 }
 
+// MarkSaved clears last_checked_at: whatever ① stamped there while it was
+// claimed is not a look at the referrer, and a fresh saver should be taken
+// early by ListSavers.
 func (p *PGStore) MarkSaved(ctx context.Context, id int64) error {
 	_, err := p.pool.Exec(ctx,
-		`update referrals set state = 'saved' where id = $1 and state = 'qualified'`, id)
+		`update referrals set state = 'saved', last_checked_at = null where id = $1 and state = 'qualified'`, id)
 	return err
 }
 
@@ -403,10 +424,15 @@ func (p *PGStore) Ledger(ctx context.Context, userID string) (Ledger, error) {
 	return led, nil
 }
 
+// ListSavers rotates like ListClaimed (017): a referrer with any saved
+// referral not looked at yet first, then the least recently looked at — a
+// fixed order kept handing back the same `limit` still-paying referrers.
 func (p *PGStore) ListSavers(ctx context.Context, limit int) ([]string, error) {
 	rows, err := p.pool.Query(ctx,
 		`select referrer from referrals where state = 'saved'
-		  group by referrer order by min(qualified_at) limit $1`, limit)
+		  group by referrer
+		  order by min(coalesce(last_checked_at, '-infinity'::timestamptz)), min(qualified_at), referrer
+		  limit $1`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -420,6 +446,12 @@ func (p *PGStore) ListSavers(ctx context.Context, limit int) ([]string, error) {
 		out = append(out, u)
 	}
 	return out, rows.Err()
+}
+
+func (p *PGStore) MarkSaverChecked(ctx context.Context, userID string, at time.Time) error {
+	_, err := p.pool.Exec(ctx,
+		`update referrals set last_checked_at = $2 where referrer = $1 and state = 'saved'`, userID, at)
+	return err
 }
 
 func (p *PGStore) SavedIDs(ctx context.Context, userID string) ([]int64, error) {

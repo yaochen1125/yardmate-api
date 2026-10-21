@@ -154,7 +154,11 @@ func (s *Service) Settle(ctx context.Context) Report {
 		return sub, true
 	}
 
-	// ① claimed → redeemed
+	// ① claimed → redeemed. Every row RevenueCat answered for is stamped
+	// (MarkClaimedChecked) right away, one by one — a pass cut short by its
+	// timeout still moves the rotation on — so the next batch starts with the
+	// rows not looked at yet instead of the same settleBatch coming back
+	// (ListClaimed's order). A failed lookup is not stamped: it stays early.
 	if claimed, err := s.store.ListClaimed(ctx, settleBatch); err != nil {
 		log.Printf("referral settle: list claimed: %v", err)
 		rep.Errors++
@@ -163,6 +167,12 @@ func (s *Service) Settle(ctx context.Context) Report {
 			sub, ok := lookup(ref.Referee)
 			if !ok {
 				continue
+			}
+			// The pass's start time, not now: a /redeemed report that lands
+			// while this pass runs is still "since the last look" next pass.
+			if err := s.store.MarkClaimedChecked(ctx, ref.ID, now); err != nil {
+				log.Printf("referral settle: mark claimed checked: %v", err)
+				rep.Errors++
 			}
 			key, start, started := sub.StartedAfter(ref.ClaimedAt)
 			if !started {
@@ -254,14 +264,23 @@ func (s *Service) Settle(ctx context.Context) Report {
 		}
 	}
 
-	// ④ saved → rewarded once the referrer's store coverage has ended
+	// ④ saved → rewarded once the referrer's store coverage has ended. A
+	// referrer still covered is stamped (MarkSaverChecked) so ListSavers
+	// rotates past them, like ①.
 	if savers, err := s.store.ListSavers(ctx, settleBatch); err != nil {
 		log.Printf("referral settle: list savers: %v", err)
 		rep.Errors++
 	} else {
 		for _, userID := range savers {
 			sub, ok := lookup(userID)
-			if !ok || sub.Covered(now) {
+			if !ok {
+				continue
+			}
+			if sub.Covered(now) {
+				if err := s.store.MarkSaverChecked(ctx, userID, now); err != nil {
+					log.Printf("referral settle: mark saver checked: %v", err)
+					rep.Errors++
+				}
 				continue
 			}
 			ids, err := s.store.SavedIDs(ctx, userID)
