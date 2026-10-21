@@ -1,7 +1,6 @@
 package rewards
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -121,11 +120,34 @@ func TestProgressMaturedRowLeavesTheList(t *testing.T) {
 	}
 }
 
+func TestFreeMonthEndClampsToMonthEnd(t *testing.T) {
+	at := func(y int, m time.Month, d int) time.Time { return time.Date(y, m, d, 10, 30, 15, 0, time.UTC) }
+	for _, c := range []struct{ from, want time.Time }{
+		{at(2026, 10, 6), at(2026, 11, 6)},
+		{at(2026, 1, 31), at(2026, 2, 28)},
+		{at(2028, 1, 31), at(2028, 2, 29)}, // leap year
+		{at(2026, 1, 29), at(2026, 2, 28)},
+		{at(2026, 3, 31), at(2026, 4, 30)},
+		{at(2026, 8, 31), at(2026, 9, 30)},
+		{at(2026, 12, 31), at(2027, 1, 31)},
+		{at(2026, 2, 28), at(2026, 3, 28)},
+	} {
+		if got := FreeMonthEnd(c.from); !got.Equal(c.want) {
+			t.Errorf("FreeMonthEnd(%s) = %s, want %s", c.from.Format(time.DateOnly), got, c.want)
+		}
+	}
+	// Taken in UTC whatever zone it comes in.
+	pdt := time.FixedZone("PDT", -7*3600)
+	if got := FreeMonthEnd(time.Date(2026, 1, 30, 20, 0, 0, 0, pdt)); !got.Equal(time.Date(2026, 2, 28, 3, 0, 0, 0, time.UTC)) {
+		t.Errorf("zoned = %s", got)
+	}
+}
+
 func TestProgressFreeMonthBoundary(t *testing.T) {
 	redeemed := time.Date(2026, 1, 31, 10, 0, 0, 0, time.UTC)
 	refs := []TrackReferral{{ID: 1, State: "redeemed", ClaimedAt: redeemed.Add(-time.Hour), RedeemedAt: redeemed}}
 	end := FreeMonthEnd(redeemed)
-	if !end.Equal(redeemed.AddDate(0, 1, 0)) {
+	if !end.Equal(time.Date(2026, 2, 28, 10, 0, 0, 0, time.UTC)) {
 		t.Fatalf("end = %s", end)
 	}
 	counts, list := Progress(refs, nil, end.Add(-time.Second))
@@ -293,7 +315,29 @@ func TestRewardsCarriesProgress(t *testing.T) {
 		t.Fatalf("progress error wire = %s", raw)
 	}
 	// Someone with nothing: counts of zero, no list.
-	if _, err := svc.Rewards(context.Background(), stranger); err != nil {
-		t.Fatal(err)
+	store.progressErr = nil
+	empty := summaryOf(t, svc, stranger)
+	if empty.Counts == nil || *empty.Counts != (Counts{}) || len(empty.Referrals) != 0 {
+		t.Fatalf("stranger: %+v counts=%+v", empty, empty.Counts)
+	}
+}
+
+// Claimed but never redeemed: listed for 200 days after the (last) code, then
+// Joined only — settlement stops looking at it and the code has expired.
+func TestProgressUnredeemedWindow(t *testing.T) {
+	now := t0
+	refs := []TrackReferral{
+		{ID: 1, State: "claimed", ClaimedAt: now.Add(-day(199)), IssuedAt: now.Add(-day(199))},
+		{ID: 2, State: "claimed", ClaimedAt: now.Add(-day(201)), IssuedAt: now.Add(-day(201))},
+		{ID: 3, State: "claimed", ClaimedAt: now.Add(-day(300)), IssuedAt: now.Add(-day(20))}, // code reissued
+	}
+	counts, list := Progress(refs, nil, now)
+	if counts != (Counts{Joined: 3}) || len(list) != 2 {
+		t.Fatalf("%+v %+v", counts, list)
+	}
+	for _, r := range list {
+		if str(r.JoinedAt) == rfc3339(refs[1].ClaimedAt) {
+			t.Errorf("201-day-old unredeemed listed: %+v", r)
+		}
 	}
 }

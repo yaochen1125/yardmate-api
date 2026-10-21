@@ -362,6 +362,7 @@ func TestPGProgress(t *testing.T) {
 	}
 	credit(paid, "t1", "pending", "com.chenyao.plantapp.premium.month", now.Add(-day(10)))
 	credit(paid, "t2", "available", "com.chenyao.plantapp.premium.month", now.Add(-day(100)))
+	credit(paid, "t2b", "available", "com.chenyao.plantapp.premium.month", now.Add(-day(130))) // only the latest available comes back
 	credit(paid, "t3", "voided", "com.chenyao.plantapp.premium.month", now.Add(-day(5)))
 	credit(void, "t4", "pending", "com.chenyao.plantapp.premium.month", now.Add(-day(5)))
 	credit(gone, "t5", "pending", "com.chenyao.plantapp.premium.yearly.3d", now.Add(-day(20)))

@@ -205,7 +205,8 @@ func (m *memStore) Progress(_ context.Context, userID string) ([]TrackReferral, 
 	var refs []TrackReferral
 	for _, r := range m.refs {
 		if r.Referrer == userID && r.State != "void" {
-			refs = append(refs, TrackReferral{ID: r.ID, State: r.State, ClaimedAt: r.ClaimedAt, RedeemedAt: m.redeemed[r.ID]})
+			refs = append(refs, TrackReferral{ID: r.ID, State: r.State, ClaimedAt: r.ClaimedAt, RedeemedAt: m.redeemed[r.ID],
+				IssuedAt: r.ClaimedAt})
 		}
 	}
 	sort.Slice(refs, func(i, j int) bool { return refs[i].ID < refs[j].ID })
