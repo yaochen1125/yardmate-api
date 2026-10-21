@@ -40,6 +40,11 @@ type Referral struct {
 	ClaimedAt  time.Time
 	OfferCode  string
 	RedeemedAt time.Time // zero until state >= redeemed
+	// Reviewed: an operator approved / rejected it (reviewed_at, 016). A
+	// qualified referral that is Reviewed came out of held, so ③ checks the
+	// friend's refund again before paying (the ② check ran before the
+	// review, however long that took).
+	Reviewed bool
 }
 
 // Ledger is a referrer's reward account.

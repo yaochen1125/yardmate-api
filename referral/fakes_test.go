@@ -516,7 +516,7 @@ func (m *memStore) approve(id int64) bool {
 	if r.State != StateHeld {
 		return false
 	}
-	r.State = StateQualified
+	r.State, r.Reviewed = StateQualified, true
 	return true
 }
 
@@ -527,7 +527,7 @@ func (m *memStore) reject(id int64) bool {
 	if r.State == StateVoid {
 		return false
 	}
-	r.State, r.voidReason = StateVoid, VoidRejected
+	r.State, r.voidReason, r.Reviewed = StateVoid, VoidRejected, true
 	return true
 }
 

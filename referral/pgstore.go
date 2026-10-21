@@ -264,7 +264,7 @@ func (p *PGStore) HoldDays(ctx context.Context) (int, error) {
 	return days, err
 }
 
-const referralColumns = `id, referrer, referee, state, claimed_at, coalesce(offer_code, ''), redeemed_at`
+const referralColumns = `id, referrer, referee, state, claimed_at, coalesce(offer_code, ''), redeemed_at, reviewed_at is not null`
 
 func scanReferrals(rows pgx.Rows) ([]Referral, error) {
 	defer rows.Close()
@@ -272,7 +272,7 @@ func scanReferrals(rows pgx.Rows) ([]Referral, error) {
 	for rows.Next() {
 		var r Referral
 		var redeemed *time.Time
-		if err := rows.Scan(&r.ID, &r.Referrer, &r.Referee, &r.State, &r.ClaimedAt, &r.OfferCode, &redeemed); err != nil {
+		if err := rows.Scan(&r.ID, &r.Referrer, &r.Referee, &r.State, &r.ClaimedAt, &r.OfferCode, &redeemed, &r.Reviewed); err != nil {
 			return nil, err
 		}
 		if redeemed != nil {

@@ -271,3 +271,50 @@ func TestPGGatedClaimGivesUpOnABusyDeviceLock(t *testing.T) {
 		t.Errorf("P1 = %s, want free", s)
 	}
 }
+
+// MARK: approved out of held → ③ re-checks the refund
+
+func TestPGListQualifiedSaysWhichWereReviewed(t *testing.T) {
+	st, pool, ctx := pgTest(t)
+	codeA := pgInviteCode(t, st, ctx, userA)
+	pgSeed(t, pool, ctx, "b90", 90*day, "P1", "P2")
+	if _, err := pool.Exec(ctx, `update referral_settings set velocity_limit = 1 where id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	var ids []int64
+	for _, u := range []string{userB, userC} {
+		if _, err := st.Claim(ctx, u, codeA, "", nil); err != nil {
+			t.Fatal(err)
+		}
+		id := pgReferralID(t, pool, ctx, u)
+		if _, err := st.MarkRedeemed(ctx, id, time.Now().Add(-8*day), "app_store:"+u); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if h, err := st.MarkQualified(ctx, ids[0]); err != nil || h {
+		t.Fatalf("first: held=%v %v", h, err)
+	}
+	if h, err := st.MarkQualified(ctx, ids[1]); err != nil || !h {
+		t.Fatalf("second: held=%v %v, want held (limit 1)", h, err)
+	}
+	if _, err := pool.Exec(ctx, `select referral_approve($1)`, ids[1]); err != nil {
+		t.Fatal(err)
+	}
+	q, err := st.ListQualified(ctx, 10)
+	if err != nil || len(q) != 2 {
+		t.Fatalf("qualified = %+v, %v", q, err)
+	}
+	for _, r := range q {
+		if want := r.ID == ids[1]; r.Reviewed != want {
+			t.Errorf("referral %d Reviewed = %v, want %v (only the approved one)", r.ID, r.Reviewed, want)
+		}
+	}
+	// The re-check voids it like ② would: refunded touches only the referral.
+	if err := st.MarkVoid(ctx, ids[1], VoidRefunded); err != nil {
+		t.Fatal(err)
+	}
+	if s, r, _, _ := pgRefRow(t, pool, ctx, ids[1]); s != StateVoid || r != VoidRefunded {
+		t.Errorf("approved then refunded = %s %q, want void refunded", s, r)
+	}
+}

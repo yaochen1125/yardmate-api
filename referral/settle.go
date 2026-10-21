@@ -203,15 +203,7 @@ func (s *Service) Settle(ctx context.Context) Report {
 			if !ok {
 				continue
 			}
-			key, _, started := sub.StartedAfter(ref.ClaimedAt)
-			reason := ""
-			switch {
-			case !started:
-				reason = "no_subscription"
-			case sub.Refunded(key):
-				reason = "refunded"
-			}
-			if reason != "" {
+			if reason := holdVerdict(sub, ref.ClaimedAt); reason != "" {
 				if err := s.store.MarkVoid(ctx, ref.ID, reason); err != nil {
 					log.Printf("referral settle: mark void: %v", err)
 					rep.Errors++
@@ -237,12 +229,29 @@ func (s *Service) Settle(ctx context.Context) Report {
 	// not yet mailed).
 	s.notifyHeld(ctx, now, &rep)
 
-	// ③ qualified → rewarded / saved
+	// ③ qualified → rewarded / saved. One that an operator approved out of
+	// held has ②'s test run again first: ② ran before the review, and a
+	// friend refunding while it sat in held must not still earn the month.
 	if qualified, err := s.store.ListQualified(ctx, settleBatch); err != nil {
 		log.Printf("referral settle: list qualified: %v", err)
 		rep.Errors++
 	} else {
 		for _, ref := range qualified {
+			if ref.Reviewed {
+				friend, ok := lookup(ref.Referee)
+				if !ok {
+					continue
+				}
+				if reason := holdVerdict(friend, ref.ClaimedAt); reason != "" {
+					if err := s.store.MarkVoid(ctx, ref.ID, reason); err != nil {
+						log.Printf("referral settle: mark void (after review): %v", err)
+						rep.Errors++
+						continue
+					}
+					rep.Voided++
+					continue
+				}
+			}
 			sub, ok := lookup(ref.Referrer)
 			if !ok {
 				continue
@@ -300,6 +309,21 @@ func (s *Service) Settle(ctx context.Context) Report {
 		}
 	}
 	return rep
+}
+
+// holdVerdict is ②'s test of the friend's subscription at the end of the
+// hold (and ③'s again for a referral approved out of held): "" = it stands,
+// else the void reason — no store subscription of theirs that began after
+// the claim (gone, or transferred away), or that subscription refunded.
+func holdVerdict(friend *Subscriber, claimedAt time.Time) string {
+	key, _, started := friend.StartedAfter(claimedAt)
+	switch {
+	case !started:
+		return VoidNoSubscription
+	case friend.Refunded(key):
+		return VoidRefunded
+	}
+	return ""
 }
 
 // grant pays len(ids) months to userID: RevenueCat first, then the ledger.

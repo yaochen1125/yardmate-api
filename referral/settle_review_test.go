@@ -109,3 +109,50 @@ func TestSettleSaversBacklogRotates(t *testing.T) {
 		t.Errorf("%+v state %s, want the new saver reached and paid", rep, store.get(id).State)
 	}
 }
+
+// MARK: a refund while held
+
+func TestSettleApprovedHeldIsCheckedForARefundAgain(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		change func(sub *Subscriber)
+		reason string
+	}{
+		{"refunded while held", func(sub *Subscriber) {
+			s := sub.Subscriptions[premiumMonth]
+			s.RefundedAt = tp(base.Add(time.Hour))
+			sub.Subscriptions[premiumMonth] = s
+		}, VoidRefunded},
+		{"subscription gone while held", func(sub *Subscriber) { delete(sub.Subscriptions, premiumMonth) }, VoidNoSubscription},
+	} {
+		svc, store, rc, _ := gateSvc()
+		ids := dueFriends(store, rc, base, 0, 6)
+		settleAt(svc, store, base)
+		sixth := ids[5]
+		if store.get(sixth).State != StateHeld {
+			t.Fatalf("%s: sixth = %s, want held", c.name, store.get(sixth).State)
+		}
+		// The friend refunds while the operator looks; then the operator
+		// approves.
+		c.change(rc.subs[AppUserID(store.get(sixth).Referee)])
+		if !store.approve(sixth) {
+			t.Fatal("approve")
+		}
+		rep := settleAt(svc, store, base.Add(2*time.Hour))
+		if r := store.refs[sixth]; r.State != StateVoid || r.voidReason != c.reason {
+			t.Errorf("%s: %s %q, want void %s", c.name, r.State, r.voidReason, c.reason)
+		}
+		if rep.Granted != 0 || rep.Voided != 1 || len(rc.grants) != 5 {
+			t.Errorf("%s: %+v grants=%d, want no sixth month", c.name, rep, len(rc.grants))
+		}
+	}
+
+	// Approved and still paying: paid as usual.
+	svc, store, rc, _ := gateSvc()
+	ids := dueFriends(store, rc, base, 0, 6)
+	settleAt(svc, store, base)
+	store.approve(ids[5])
+	if rep := settleAt(svc, store, base.Add(2*time.Hour)); rep.Granted != 1 || store.get(ids[5]).State != StateRewarded {
+		t.Errorf("approved, no refund: %+v state %s, want granted", rep, store.get(ids[5]).State)
+	}
+}
