@@ -283,7 +283,7 @@ func (s *Service) refund(ctx context.Context, ev rcEvent) (string, error) {
 // referrer for every renewal of a code that was never redeemed.
 func eligible(ref Referral, evType string, purchased time.Time) bool {
 	switch ref.State {
-	case refRedeemed, refQualified, refSaved, refRewarded:
+	case refRedeemed, refQualified, refHeld, refSaved, refRewarded:
 		return true
 	case refClaimed:
 		return evType == "INITIAL_PURCHASE" && purchased.After(ref.ClaimedAt)

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/mail"
+	"sort"
 	"strings"
 	"time"
 
@@ -121,19 +122,33 @@ func validEmail(raw string) (string, bool) {
 // /v1/feedback). Fire-and-forget: the row is already committed and
 // deploy/referral-payout.sh list shows it either way, so a mail outage must
 // not fail or slow the 201.
+//
+// The mail is also the gift-card review (anti-abuse gate 5): the referrer's
+// friend count, distinct claim devices, refunds and void / held referrals are
+// read here, off the request path too. If that read fails the mail still goes,
+// saying the numbers are missing.
 func (s *Service) notifyOperator(po Payout, year YearTotals, calendarYear int) {
-	subject, body := composePayoutMail(po, year, calendarYear)
 	if s.mailer == nil {
 		log.Printf("referral payout #%d requested; operator mail disabled (FEEDBACK_SMTP_* unset) — deploy/referral-payout.sh list", po.ID)
 		return
 	}
-	m := s.mailer
+	m, store := s.mailer, s.store
 	s.async(func() {
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("referral payout #%d: operator mail panic recovered: %v", po.ID, r)
 			}
 		}()
+		ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+		review, err := store.ReviewStats(ctx, po.UserID)
+		cancel()
+		var rv *Review
+		if err != nil {
+			log.Printf("referral payout #%d: review numbers unavailable (mail says so): %v", po.ID, err)
+		} else {
+			rv = &review
+		}
+		subject, body := composePayoutMail(po, year, rv, calendarYear)
 		if err := m.Alert(subject, body); err != nil {
 			log.Printf("referral payout #%d: operator mail failed (request stored; deploy/referral-payout.sh list): %v", po.ID, err)
 		}
@@ -143,7 +158,7 @@ func (s *Service) notifyOperator(po Payout, year YearTotals, calendarYear int) {
 // composePayoutMail renders the operator notice. Subject is plain ASCII
 // (Alert does no RFC 2047 encoding); the user's email address only ever goes
 // in the body.
-func composePayoutMail(po Payout, year YearTotals, calendarYear int) (subject, body string) {
+func composePayoutMail(po Payout, year YearTotals, rv *Review, calendarYear int) (subject, body string) {
 	subject = fmt.Sprintf("[YardMate] Referral gift card request #%d", po.ID)
 	var b strings.Builder
 	b.WriteString("A referrer asked for a gift card.\n\n")
@@ -160,11 +175,62 @@ func composePayoutMail(po Payout, year YearTotals, calendarYear int) (subject, b
 		fmt.Fprintf(&b, "W-9 FIRST (先收 W-9 再发): this user is at %s or more in gift cards this year,\n", usd(W9WarnCents))
 		b.WriteString("and 1099-NEC is required from $600. Collect a W-9 before sending this card.\n\n")
 	}
+	writeReview(&b, rv)
 	b.WriteString("Within 3 business days: buy the card, email the code to the address above, then\n")
 	fmt.Fprintf(&b, "  deploy/referral-payout.sh mark-sent %d\n", po.ID)
 	b.WriteString("To cancel instead (the amount goes back to their balance):\n")
 	fmt.Fprintf(&b, "  deploy/referral-payout.sh cancel %d\n", po.ID)
 	return subject, b.String()
+}
+
+// writeReview is the gate-5 block of the payout mail (rewards.md ### 入账与兑换:
+// 朋友数 / 朋友设备是否都不同 / 退款笔数 / 作废与待审核的推荐数).
+func writeReview(b *strings.Builder, rv *Review) {
+	b.WriteString("Review before buying (防刷第 5 道):\n")
+	if rv == nil {
+		b.WriteString("  (numbers unavailable — the database read failed; check the referrer by hand:\n")
+		b.WriteString("   deploy/referral-review.sh list, and their referrals / reward_ledger rows)\n\n")
+		return
+	}
+	fmt.Fprintf(b, "  Friends (not void):          %d, of whom %d brought in money\n", rv.Friends, rv.FriendsPaid)
+	recorded := rv.Friends - rv.NoDevice
+	verdict := "all different"
+	if rv.ClaimDevices < recorded {
+		verdict = fmt.Sprintf("NOT all different — %d friends on %d devices", recorded, rv.ClaimDevices)
+	}
+	fmt.Fprintf(b, "  Friend devices (distinct):   %d of %d with a recorded device → %s", rv.ClaimDevices, recorded, verdict)
+	if rv.NoDevice > 0 {
+		fmt.Fprintf(b, " (+%d claimed before devices were recorded)", rv.NoDevice)
+	}
+	b.WriteString("\n")
+	fmt.Fprintf(b, "  Refunded charges:            %d\n", rv.Refunds)
+	fmt.Fprintf(b, "  Void referrals:              %s\n", voidLine(rv.VoidByReason))
+	fmt.Fprintf(b, "  Held (awaiting review):      %d\n", rv.Held)
+	b.WriteString("If anything looks off: cancel this request (below), then void the bad referrals with\n")
+	b.WriteString("  deploy/referral-review.sh reject <referral id>   (their money is voided with them)\n\n")
+}
+
+// voidLine lists void referrals by reason: the three the review cares about
+// always (0 included), then any other reason present.
+func voidLine(by map[string]int) string {
+	known := []string{"duplicate_apple_id", "rejected", "refunded"}
+	parts := make([]string, 0, len(by)+len(known))
+	seen := map[string]bool{}
+	for _, k := range known {
+		parts = append(parts, fmt.Sprintf("%s %d", k, by[k]))
+		seen[k] = true
+	}
+	var other []string
+	for k := range by {
+		if !seen[k] {
+			other = append(other, k)
+		}
+	}
+	sort.Strings(other)
+	for _, k := range other {
+		parts = append(parts, fmt.Sprintf("%s %d", k, by[k]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // usd renders cents as "$1234.56" (no thousands grouping; operator text only).

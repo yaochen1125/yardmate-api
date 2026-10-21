@@ -26,9 +26,41 @@ const (
 	refClaimed   = "claimed"
 	refRedeemed  = "redeemed"
 	refQualified = "qualified"
-	refSaved     = "saved"
-	refRewarded  = "rewarded"
+	// refHeld is the referral package's anti-abuse gate 4 (migration 016):
+	// waiting for an operator. The friend has redeemed, so money is still
+	// recorded and matures as usual (rewards.md ### 防刷); a reject voids it.
+	refHeld     = "held"
+	refSaved    = "saved"
+	refRewarded = "rewarded"
 )
+
+// VoidRefunded is reward_ledger.void_reason (migration 016) for a charge
+// Apple refunded (webhook). The other reasons there are the referral's own
+// (duplicate_apple_id / rejected), written by referral_void in SQL when the
+// whole referral is voided.
+const VoidRefunded = "refunded"
+
+// Review is what the gift-card request mail adds for the operator's review
+// (anti-abuse gate 5, rewards.md ### 入账与兑换): the referrer's friends and
+// how believable they look.
+type Review struct {
+	// Friends is the referrer's referrals that are not void; FriendsPaid is
+	// how many of them have brought in money (a ledger row not voided).
+	Friends     int
+	FriendsPaid int
+	// ClaimDevices is the distinct claim_install_id among those friends;
+	// NoDevice is how many of them have none recorded (claimed before
+	// migration 016). All different ⇔ ClaimDevices == Friends - NoDevice.
+	ClaimDevices int
+	NoDevice     int
+	// Refunds is the referrer's ledger rows voided by an Apple refund.
+	Refunds int
+	// VoidByReason counts void referrals by void_reason
+	// (duplicate_apple_id / rejected / refunded / no_subscription …).
+	VoidByReason map[string]int
+	// Held is the referrals waiting for gate-4 review right now.
+	Held int
+}
 
 // Referral is the referee's referral row as the webhook needs it.
 type Referral struct {
@@ -130,4 +162,6 @@ type Store interface {
 	// of amount and returns it with the user's totals for the calendar year
 	// starting at yearStart.
 	RequestPayout(ctx context.Context, userID, email string, amount, threshold int64, yearStart time.Time) (Payout, YearTotals, error)
+	// ReviewStats reads the referrer's review numbers for the payout mail.
+	ReviewStats(ctx context.Context, userID string) (Review, error)
 }

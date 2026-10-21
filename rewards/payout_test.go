@@ -358,7 +358,7 @@ func TestPayoutConcurrentRequestsMakeOne(t *testing.T) {
 
 func TestPayoutMailSubjectIsASCII(t *testing.T) {
 	subject, _ := composePayoutMail(Payout{ID: 17, UserID: referrer, AmountCents: 10000, Email: "é@example.com", RequestedAt: t0},
-		YearTotals{RequestedCents: 10000}, 2026)
+		YearTotals{RequestedCents: 10000}, nil, 2026)
 	if subject != "[YardMate] Referral gift card request #17" {
 		t.Fatalf("subject = %q", subject)
 	}
@@ -366,5 +366,69 @@ func TestPayoutMailSubjectIsASCII(t *testing.T) {
 		if c > 0x7e {
 			t.Fatalf("non-ASCII subject %q", subject)
 		}
+	}
+}
+
+// MARK: gate 5 — the review numbers in the request mail
+
+func TestPayoutMailCarriesTheReview(t *testing.T) {
+	svc, store, mailer := richSvc(t)
+	ref := store.refs[referee]
+	store.reviewRefs = []reviewRef{
+		{ref.ID, referrer, "rewarded", "", "DEV-1"},
+		{90, referrer, "rewarded", "", "DEV-1"}, // same phone as the first
+		{91, referrer, "held", "", "DEV-2"},
+		{92, referrer, "qualified", "", ""}, // claimed before devices were recorded
+		{93, referrer, "void", "duplicate_apple_id", "DEV-3"},
+		{94, referrer, "void", "rejected", "DEV-4"},
+		{95, referrer, "void", "refunded", "DEV-5"},
+		{96, referrer, "void", "no_subscription", "DEV-6"},
+		{97, stranger, "rewarded", "", "DEV-9"}, // someone else's friend
+	}
+	for i := range store.ledger {
+		store.ledger[i].ReferralID = ref.ID
+	}
+	store.ledger = append(store.ledger,
+		&ledgerRow{Credit: Credit{Referrer: referrer, ReferralID: 90, EventID: "r1", TransactionID: "tr1", CreditCents: 178}, State: LedgerVoided, VoidReason: VoidRefunded},
+		&ledgerRow{Credit: Credit{Referrer: referrer, ReferralID: 93, EventID: "r2", TransactionID: "tr2", CreditCents: 178}, State: LedgerVoided, VoidReason: "duplicate_apple_id"},
+	)
+	if w := callPayout(t, svc, okBody, nil); w.Code != http.StatusCreated {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	body := mailer.bodies[0]
+	for _, want := range []string{
+		"Review before buying (防刷第 5 道):",
+		"Friends (not void):          4, of whom 1 brought in money",
+		"Friend devices (distinct):   2 of 3 with a recorded device → NOT all different — 3 friends on 2 devices (+1 claimed before devices were recorded)",
+		"Refunded charges:            1",
+		"Void referrals:              duplicate_apple_id 1, rejected 1, refunded 1, no_subscription 1",
+		"Held (awaiting review):      1",
+		"deploy/referral-review.sh reject <referral id>",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("mail missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestPayoutMailReviewAllDifferentAndUnavailable(t *testing.T) {
+	svc, store, mailer := richSvc(t)
+	store.reviewRefs = []reviewRef{{1, referrer, "rewarded", "", "A"}, {2, referrer, "saved", "", "B"}}
+	if w := callPayout(t, svc, okBody, nil); w.Code != http.StatusCreated {
+		t.Fatalf("%d", w.Code)
+	}
+	if !strings.Contains(mailer.bodies[0], "2 of 2 with a recorded device → all different") ||
+		!strings.Contains(mailer.bodies[0], "Void referrals:              duplicate_apple_id 0, rejected 0, refunded 0") {
+		t.Errorf("all-different mail:\n%s", mailer.bodies[0])
+	}
+
+	// The review read failing still sends the mail (and still 201s).
+	svc, store, mailer = richSvc(t)
+	store.reviewErr = errBoom
+	if w := callPayout(t, svc, okBody, nil); w.Code != http.StatusCreated {
+		t.Fatalf("%d", w.Code)
+	}
+	if len(mailer.bodies) != 1 || !strings.Contains(mailer.bodies[0], "numbers unavailable") {
+		t.Errorf("review error: %d mails\n%v", len(mailer.bodies), mailer.bodies)
 	}
 }
