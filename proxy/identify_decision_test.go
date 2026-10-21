@@ -34,7 +34,11 @@ func TestIdentifyDecisionLine(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := identifyDecisionLine("dev", "plantnet-catalog", c.engTop, c.gpt, c.gptErr, c.final, c.sentinel, nil)
+			var cands []string
+			if c.engTop != nil {
+				cands = []string{c.engTop.ScientificName}
+			}
+			got := identifyDecisionLine("dev", "plantnet-catalog", c.engTop, cands, c.gpt, c.gptErr, c.final, c.sentinel, nil)
 			for _, w := range c.want {
 				if !strings.Contains(got, w) {
 					t.Errorf("line %q missing %q", got, w)
@@ -68,5 +72,25 @@ func TestHandleIdentify_LogsDecision(t *testing.T) {
 		if !strings.Contains(line, w) {
 			t.Errorf("decision line %q missing %q", line, w)
 		}
+	}
+}
+
+// 评审补的两处归因：库内优先选中引擎第 3 名（GPT 恰好同意）→ both 而非 gpt；
+// 属级保留 "Begonia spp." → "Begonia" → gpt 而非 other。
+func TestIdentifyDecisionLine_Attribution(t *testing.T) {
+	adansonii := &Suggestion{ScientificName: "Monstera adansonii", Confidence: 0.5}
+	deliciosa := &Suggestion{ScientificName: "Monstera deliciosa", Confidence: 0.3}
+	got := identifyDecisionLine("dev", "plantnet-catalog", adansonii,
+		[]string{"Monstera adansonii", "Philodendron hederaceum", "Monstera deliciosa"},
+		&Suggestion{ScientificName: "Monstera deliciosa", Confidence: 0.9}, nil,
+		&IdentifyResult{Suggestions: []Suggestion{*deliciosa}}, false, nil)
+	if !strings.Contains(got, "from=both") {
+		t.Errorf("catalog-preferred 3rd engine candidate that GPT agrees with: %q, want from=both", got)
+	}
+	got = identifyDecisionLine("dev", "ai-raw-oob-genus", nil, nil,
+		&Suggestion{ScientificName: "Begonia spp.", Confidence: 0.6}, nil,
+		&IdentifyResult{Suggestions: []Suggestion{{ScientificName: "Begonia"}}}, false, nil)
+	if !strings.Contains(got, "from=gpt") {
+		t.Errorf("genus-keep of GPT's Begonia spp.: %q, want from=gpt", got)
 	}
 }

@@ -551,6 +551,7 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 		// engTop — 引擎（Pl@ntNet / Plant.id）原始第一名的副本（cascade 重排 / 改写之前），
 		// 只供 `identify decision:` 日志对比 GPT（identify_decision.go）。
 		var engTop *Suggestion
+		var engCands []string
 		// on-demand 双信号印证会把并行 KNN 结果提前读到这里（switch 前需要它做跳过判据），
 		// 供下方 7a-4 复用，避免二次读已空的 knnCh。always 模式两者不动，7a-4 照旧读 knnCh。
 		var knnPreRead visionKNNResult
@@ -663,6 +664,9 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			if len(cands) > 0 && !strings.HasPrefix(engine, "ai-") {
 				top := cands[0]
 				engTop = &top
+				for _, c := range cands {
+					engCands = append(engCands, c.ScientificName)
+				}
 			}
 
 			// Find the highest-engine-confidence candidate that resolves to
@@ -1350,7 +1354,7 @@ func HandleIdentify(plantNet *PlantNetClient, plantID *PlantIDClient, content *C
 			}
 		}
 		catalogHit := len(result.Suggestions) > 0 && result.Suggestions[0].PlantID != nil
-		logIdentifyDecision(deviceID, engine, engTop, gptSug, gptErr, result, unknownSentinel, content)
+		logIdentifyDecision(deviceID, engine, engTop, engCands, gptSug, gptErr, result, unknownSentinel, content)
 		log.Printf("identify ok: deviceID=%s appVer=%s attKeyID=%q assertPresent=%v engine=%s mime=%s isPlant=%v suggestions=%d plantIdsResolved=%d catalogHit=%v suggestionsWithImage=%d aiEnhanced=%v",
 			deviceID, appVer, attKeyID, attAssertPresent, engine, mime, result.IsPlant, len(result.Suggestions), plantIDsResolved, catalogHit, suggestionsWithImage, result.AIEnhancedAt != nil)
 		// Plantdex rarity counter (proxy/rarity/SPEC.md): best-effort in-memory

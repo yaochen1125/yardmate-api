@@ -45,8 +45,13 @@ func decisionCat(s *Suggestion, content *ContentIndex) string {
 	return "-"
 }
 
-// sameTaxon — 种级比较（speciesKey）；任一方只到属等折不出种级键时退回整名比较。
+// sameTaxon — 两边都是属级（"Begonia" / "Begonia spp."）按裸属名比；否则种级比较
+// （speciesKey）；折不出种级键时退回整名比较。
 func sameTaxon(a, b string) bool {
+	// 属级先比（speciesKey 会把 "Begonia spp." 折成非空的 "begonia spp."，与 "begonia" 不等）。
+	if ga, gb := genusOnlyName(a), genusOnlyName(b); ga != "" && gb != "" {
+		return ga == gb
+	}
 	ka, kb := speciesKey(a), speciesKey(b)
 	if ka != "" && kb != "" {
 		return ka == kb
@@ -55,7 +60,9 @@ func sameTaxon(a, b string) bool {
 }
 
 // identifyDecisionLine 生成 `identify decision:` 日志内容（拆出来便于单测）。
-func identifyDecisionLine(deviceID, engine string, engTop, gpt *Suggestion, gptErr error, res *IdentifyResult, sentinel bool, content *ContentIndex) string {
+// engCands — 引擎原始候选的学名（含 engTop）。库内优先可能选中第 2/3 名，只要最终结果
+// 在引擎候选里就算来自引擎。
+func identifyDecisionLine(deviceID, engine string, engTop *Suggestion, engCands []string, gpt *Suggestion, gptErr error, res *IdentifyResult, sentinel bool, content *ContentIndex) string {
 	gptState := "ok"
 	switch {
 	case gpt != nil:
@@ -81,7 +88,13 @@ func identifyDecisionLine(deviceID, engine string, engTop, gpt *Suggestion, gptE
 	case final == nil:
 		from = "none"
 	default:
-		fromEng := engTop != nil && sameTaxon(final.ScientificName, engTop.ScientificName)
+		fromEng := false
+		for _, c := range engCands {
+			if sameTaxon(final.ScientificName, c) {
+				fromEng = true
+				break
+			}
+		}
 		fromGPT := gpt != nil && sameTaxon(final.ScientificName, gpt.ScientificName)
 		switch {
 		case fromEng && fromGPT:
@@ -100,6 +113,6 @@ func identifyDecisionLine(deviceID, engine string, engTop, gpt *Suggestion, gptE
 		decisionName(final), decisionCat(final, content), from)
 }
 
-func logIdentifyDecision(deviceID, engine string, engTop, gpt *Suggestion, gptErr error, res *IdentifyResult, sentinel bool, content *ContentIndex) {
-	log.Print(identifyDecisionLine(deviceID, engine, engTop, gpt, gptErr, res, sentinel, content))
+func logIdentifyDecision(deviceID, engine string, engTop *Suggestion, engCands []string, gpt *Suggestion, gptErr error, res *IdentifyResult, sentinel bool, content *ContentIndex) {
+	log.Print(identifyDecisionLine(deviceID, engine, engTop, engCands, gpt, gptErr, res, sentinel, content))
 }
