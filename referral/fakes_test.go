@@ -475,8 +475,25 @@ func (f *fakeDC) bit(env, token string) bool {
 	return f.bits[env+"|"+token]
 }
 
-// MarkQualified replays 016's referral_qualify (velocity gate on the
-// "database clock" dueNow).
+// successAt is the gate's clock for a referral: redeemed_at (its theoretical
+// success time minus the shared hold_days), qualified_at for a row without
+// one — as 017's referral_qualify coalesces.
+func (r *memRef) successAt() time.Time {
+	if r.RedeemedAt.IsZero() {
+		return r.qualifiedAt
+	}
+	return r.RedeemedAt
+}
+
+// inWindowBefore: o's success time is inside the window before at's (at
+// included), as referral_qualify / HeldDigests count.
+func (m *memStore) inWindowBefore(o *memRef, at time.Time) bool {
+	t := o.successAt()
+	return t.After(at.Add(-time.Duration(m.velocityWindow)*time.Hour)) && !t.After(at)
+}
+
+// MarkQualified replays 017's referral_qualify: the velocity gate on
+// theoretical success time (redeemed_at), not on the pass's clock.
 func (m *memStore) MarkQualified(_ context.Context, id int64) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -486,7 +503,6 @@ func (m *memStore) MarkQualified(_ context.Context, id int64) (bool, error) {
 	}
 	to := StateQualified
 	if m.velocityLimit > 0 {
-		since := m.dueNow.Add(-time.Duration(m.velocityWindow) * time.Hour)
 		recent := 0
 		for _, o := range m.refs {
 			if o.ID == id || o.Referrer != r.Referrer {
@@ -494,7 +510,7 @@ func (m *memStore) MarkQualified(_ context.Context, id int64) (bool, error) {
 			}
 			switch o.State {
 			case StateQualified, StateHeld, StateSaved, StateRewarded:
-				if o.qualifiedAt.After(since) {
+				if m.inWindowBefore(o, r.successAt()) {
 					recent++
 				}
 			}
@@ -553,9 +569,15 @@ func (m *memStore) HeldDigests(_ context.Context, limit int) ([]HeldDigest, erro
 		}
 	}
 	var out []HeldDigest
+	hold := time.Duration(m.holdDays) * 24 * time.Hour
 	for _, u := range capped(referrers, limit) {
 		d := HeldDigest{Referrer: u, Limit: m.velocityLimit, WindowHours: m.velocityWindow}
-		since := now.Add(-time.Duration(m.velocityWindow) * time.Hour)
+		var held []*memRef
+		for _, r := range m.sortedLocked() {
+			if r.Referrer == u && r.State == StateHeld {
+				held = append(held, r)
+			}
+		}
 		for _, r := range m.sortedLocked() {
 			if r.Referrer != u {
 				continue
@@ -563,13 +585,19 @@ func (m *memStore) HeldDigests(_ context.Context, limit int) ([]HeldDigest, erro
 			in := r.State == StateHeld
 			switch r.State {
 			case StateQualified, StateSaved, StateRewarded:
-				in = r.qualifiedAt.After(since)
+				for _, h := range held {
+					if m.inWindowBefore(r, h.successAt()) {
+						in = true
+					}
+				}
 			}
 			if in {
 				d.Referrals = append(d.Referrals, HeldReferral{ID: r.ID, Referee: r.Referee, State: r.State,
-					ClaimedAt: r.ClaimedAt, QualifiedAt: r.qualifiedAt, InstallID: r.installID, Notified: !r.heldNotifiedAt.IsZero()})
+					ClaimedAt: r.ClaimedAt, QualifiedAt: r.qualifiedAt, DueAt: r.successAt().Add(hold),
+					InstallID: r.installID, Notified: !r.heldNotifiedAt.IsZero()})
 			}
 		}
+		sort.SliceStable(d.Referrals, func(i, j int) bool { return d.Referrals[i].DueAt.Before(d.Referrals[j].DueAt) })
 		out = append(out, d)
 	}
 	return out, nil

@@ -345,8 +345,8 @@ func (p *PGStore) MarkVoid(ctx context.Context, id int64, reason string) error {
 	return err
 }
 
-// MarkQualified is referral_qualify (016): redeemed → qualified, or held by
-// the velocity gate.
+// MarkQualified is referral_qualify (017): redeemed → qualified, or held by
+// the velocity gate (counted on theoretical success time).
 func (p *PGStore) MarkQualified(ctx context.Context, id int64) (bool, error) {
 	var outcome string
 	if err := p.pool.QueryRow(ctx, `select referral_qualify($1::bigint)`, id).Scan(&outcome); err != nil {
@@ -357,7 +357,10 @@ func (p *PGStore) MarkQualified(ctx context.Context, id int64) (bool, error) {
 
 // HeldDigests: referrers with held referrals not yet mailed, none of whose
 // referrals was mailed in the last 24 hours; per referrer every held referral
-// plus the successes inside the velocity window.
+// plus the successes that counted against one of them — theoretical success
+// time (redeemed_at + hold_days; with one hold_days for all, redeemed_at
+// itself) inside the window before that held one's, as referral_qualify (017)
+// counts.
 func (p *PGStore) HeldDigests(ctx context.Context, limit int) ([]HeldDigest, error) {
 	rows, err := p.pool.Query(ctx,
 		`select r.referrer from referrals r
@@ -386,29 +389,35 @@ func (p *PGStore) HeldDigests(ctx context.Context, limit int) ([]HeldDigest, err
 	if len(referrers) == 0 {
 		return nil, nil
 	}
-	var lim, window int
+	var lim, window, hold int
 	if err := p.pool.QueryRow(ctx,
-		`select velocity_limit, velocity_window_hours from referral_settings where id = 1`).Scan(&lim, &window); err != nil {
+		`select velocity_limit, velocity_window_hours, hold_days from referral_settings where id = 1`).Scan(&lim, &window, &hold); err != nil {
 		return nil, fmt.Errorf("velocity settings: %w", err)
 	}
 	out := make([]HeldDigest, 0, len(referrers))
 	for _, u := range referrers {
 		d := HeldDigest{Referrer: u, Limit: lim, WindowHours: window}
 		rows, err := p.pool.Query(ctx,
-			`select id, referee, state, claimed_at, coalesce(qualified_at, claimed_at),
-			        coalesce(claim_install_id, ''), held_notified_at is not null
-			   from referrals
-			  where referrer = $1
-			    and (state = 'held'
-			         or (state in ('qualified','saved','rewarded')
-			             and qualified_at > now() - make_interval(hours => $2::int)))
-			  order by qualified_at, id`, u, window)
+			`select r.id, r.referee, r.state, r.claimed_at, coalesce(r.qualified_at, r.claimed_at),
+			        coalesce(r.redeemed_at, r.qualified_at, r.claimed_at) + make_interval(days => $3::int) as due_at,
+			        coalesce(r.claim_install_id, ''), r.held_notified_at is not null
+			   from referrals r
+			  where r.referrer = $1
+			    and (r.state = 'held'
+			         or (r.state in ('qualified','saved','rewarded')
+			             and exists (select 1 from referrals h
+			                          where h.referrer = r.referrer and h.state = 'held'
+			                            and coalesce(r.redeemed_at, r.qualified_at)
+			                                  > coalesce(h.redeemed_at, h.qualified_at) - make_interval(hours => $2::int)
+			                            and coalesce(r.redeemed_at, r.qualified_at)
+			                                  <= coalesce(h.redeemed_at, h.qualified_at))))
+			  order by due_at, r.id`, u, window, hold)
 		if err != nil {
 			return nil, err
 		}
 		for rows.Next() {
 			var h HeldReferral
-			if err := rows.Scan(&h.ID, &h.Referee, &h.State, &h.ClaimedAt, &h.QualifiedAt, &h.InstallID, &h.Notified); err != nil {
+			if err := rows.Scan(&h.ID, &h.Referee, &h.State, &h.ClaimedAt, &h.QualifiedAt, &h.DueAt, &h.InstallID, &h.Notified); err != nil {
 				rows.Close()
 				return nil, err
 			}

@@ -11,7 +11,8 @@ import (
 
 // Gate 4's operator mail (invite-friends.md ### 防刷 第 4 道). Settlement ②
 // parks a referral as held when its referrer already had velocity_limit
-// successes inside velocity_window_hours; each pass then mails the operator
+// successes inside velocity_window_hours of its theoretical success time
+// (redeemed_at + hold_days, 017); each pass then mails the operator
 // about new held ones — at most one mail per referrer per 24 hours, kept in
 // the database (referrals.held_notified_at), so a restart does not repeat it
 // and a failed send is retried on the next pass. The operator answers with
@@ -87,7 +88,7 @@ func reviewMail(d HeldDigest, now time.Time) (subject, body string) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "推荐好友速度闸：有推荐进了「待审核」（%s）\n\n", now.UTC().Format("2006-01-02 15:04 UTC"))
 	fmt.Fprintf(&b, "推荐人：%s\n", d.Referrer)
-	fmt.Fprintf(&b, "规则：%d 小时内成功超过 %d 个，第 %d 个起待审核（referral_settings.velocity_limit / velocity_window_hours）\n",
+	fmt.Fprintf(&b, "规则：%d 小时内成功超过 %d 个，第 %d 个起待审核（按理论成功时间 = 兑换时间 + hold_days 数，不按结算跑到的时刻；referral_settings.velocity_limit / velocity_window_hours）\n",
 		d.WindowHours, d.Limit, d.Limit+1)
 	fmt.Fprintf(&b, "待审核：%d 条（这封新增 %d 条）\n", held, len(newIDs))
 	distinct, recorded, missing := deviceSpread(d.Referrals)
@@ -101,9 +102,9 @@ func reviewMail(d HeldDigest, now time.Time) (subject, body string) {
 	}
 	b.WriteString("\n")
 
-	fmt.Fprintf(&b, "\n待审核 + 最近 %d 小时成功的（按认定时间）：\n", d.WindowHours)
+	fmt.Fprintf(&b, "\n待审核 + 算进它们那 %d 小时窗口的成功（按理论成功时间）：\n", d.WindowHours)
 	tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "  推荐 id\t状态\t填码（UTC）\t认定（UTC）\t填码设备\t朋友")
+	fmt.Fprintln(tw, "  推荐 id\t状态\t填码（UTC）\t理论成功（UTC）\t结算认定（UTC）\t填码设备\t朋友")
 	for _, r := range d.Referrals {
 		state := r.State
 		if r.State == StateHeld && !r.Notified {
@@ -113,8 +114,9 @@ func reviewMail(d HeldDigest, now time.Time) (subject, body string) {
 		if dev == "" {
 			dev = "-"
 		}
-		fmt.Fprintf(tw, "  #%d\t%s\t%s\t%s\t%s\t%s\n", r.ID, state,
-			r.ClaimedAt.UTC().Format("2006-01-02 15:04"), r.QualifiedAt.UTC().Format("2006-01-02 15:04"), dev, r.Referee)
+		fmt.Fprintf(tw, "  #%d\t%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, state,
+			r.ClaimedAt.UTC().Format("2006-01-02 15:04"), r.DueAt.UTC().Format("2006-01-02 15:04"),
+			r.QualifiedAt.UTC().Format("2006-01-02 15:04"), dev, r.Referee)
 	}
 	_ = tw.Flush()
 

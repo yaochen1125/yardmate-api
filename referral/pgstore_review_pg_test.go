@@ -376,3 +376,76 @@ func TestPGReclaimAfterRedeemingNeverBurnsAnotherCode(t *testing.T) {
 		t.Errorf("claimed + dying code: re-claim = %q, %v; want a swap", again, err)
 	}
 }
+
+// MARK: velocity gate on theoretical success time
+
+func TestPGVelocityCountsTheoreticalSuccessTime(t *testing.T) {
+	st, pool, ctx := pgTest(t)
+	codeA := pgInviteCode(t, st, ctx, userA)
+	if _, err := pool.Exec(ctx, `update referral_settings set velocity_limit = 2 where id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	pgSeed(t, pool, ctx, "b90", 90*day, "P1", "P2", "P3", "P4", "P5", "P6", "P7")
+	claimRedeemed := func(user string, redeemedAgo time.Duration) int64 {
+		t.Helper()
+		if _, err := st.Claim(ctx, user, codeA, "", nil); err != nil {
+			t.Fatal(err)
+		}
+		id := pgReferralID(t, pool, ctx, user)
+		if _, err := st.MarkRedeemed(ctx, id, time.Now().Add(-redeemedAgo), "app_store:"+user); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	// A backlog after an outage: four friends who redeemed 26 hours apart
+	// (oldest first, as ListDue hands them over), all judged right now.
+	var backlog []int64
+	for i, u := range []string{"bk-0", "bk-1", "bk-2", "bk-3"} {
+		backlog = append(backlog, claimRedeemed(u, 8*day+time.Duration(3-i)*26*time.Hour))
+	}
+	for _, id := range backlog {
+		if h, err := st.MarkQualified(ctx, id); err != nil || h {
+			t.Errorf("backlog %d: held=%v %v, want qualified (26 h apart in theory)", id, h, err)
+		}
+	}
+	// A burst judged late: three friends within the same hour, fifteen days
+	// ago (a week after their hold ended; clear of the backlog's 8–11¼ days).
+	// The third is held.
+	var burst []int64
+	for i, u := range []string{"bu-0", "bu-1", "bu-2"} {
+		burst = append(burst, claimRedeemed(u, 15*day-time.Duration(i)*10*time.Minute))
+	}
+	var held []bool
+	for _, id := range burst {
+		h, err := st.MarkQualified(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, h)
+	}
+	if held[0] || held[1] || !held[2] {
+		t.Errorf("burst held = %v, want the third held", held)
+	}
+	// The digest lists the held one and the two that counted against it —
+	// not the backlog, judged at the same moment but days apart in theory.
+	ds, err := st.HeldDigests(ctx, 10)
+	if err != nil || len(ds) != 1 {
+		t.Fatalf("digests = %+v, %v", ds, err)
+	}
+	var got []int64
+	for _, r := range ds[0].Referrals {
+		got = append(got, r.ID)
+		if r.DueAt.IsZero() {
+			t.Errorf("referral %d: no theoretical success time", r.ID)
+		}
+	}
+	if len(got) != 3 || got[0] != burst[0] || got[1] != burst[1] || got[2] != burst[2] {
+		t.Errorf("digest = %v, want the burst %v in theoretical order", got, burst)
+	}
+	// hold_days moves the theoretical time, not who counts.
+	var due time.Time
+	_ = pool.QueryRow(ctx, `select redeemed_at + interval '7 days' from referrals where id = $1`, burst[0]).Scan(&due)
+	if !ds[0].Referrals[0].DueAt.Equal(due) {
+		t.Errorf("DueAt = %v, want redeemed_at + hold_days = %v", ds[0].Referrals[0].DueAt, due)
+	}
+}

@@ -111,16 +111,20 @@ type ClaimGate struct {
 type HeldReferral struct {
 	ID          int64
 	Referee     string
-	State       string // held, or qualified / saved / rewarded inside the window
+	State       string // held, or qualified / saved / rewarded inside a held one's window
 	ClaimedAt   time.Time
-	QualifiedAt time.Time
-	InstallID   string // the claim's X-Device-Install-Id; "" for claims before migration 016
-	Notified    bool   // a held one already mailed before
+	QualifiedAt time.Time // when settlement judged it
+	// DueAt is the theoretical success time the gate counts by (017):
+	// redeemed_at + hold_days.
+	DueAt     time.Time
+	InstallID string // the claim's X-Device-Install-Id; "" for claims before migration 016
+	Notified  bool   // a held one already mailed before
 }
 
 // HeldDigest is what the operator mail about one referrer's new held
 // referrals is drawn from: every held referral of theirs plus every success
-// inside the velocity window, oldest first.
+// that counted against one of them (theoretical success time inside the
+// velocity window before that held one's), by theoretical success time.
 type HeldDigest struct {
 	Referrer    string
 	Limit       int // velocity_limit
@@ -269,7 +273,10 @@ type Store interface {
 	MarkVoid(ctx context.Context, id int64, reason string) error
 	// MarkQualified moves a redeemed referral to qualified — or to held when
 	// the referrer already has velocity_limit successes (held included)
-	// inside velocity_window_hours (gate 4); held is true then.
+	// inside velocity_window_hours (gate 4); held is true then. The window is
+	// on theoretical success time (redeemed_at + hold_days, 017), not on when
+	// settlement gets round to it, so a backlog judged in one pass after an
+	// outage is not held wholesale.
 	MarkQualified(ctx context.Context, id int64) (held bool, err error)
 	// HeldDigests returns, per referrer with held referrals not yet mailed
 	// and no review mail in the last 24 hours, what the operator mail needs.

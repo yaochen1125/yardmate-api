@@ -3,6 +3,8 @@ package referral
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -154,5 +156,65 @@ func TestSettleApprovedHeldIsCheckedForARefundAgain(t *testing.T) {
 	store.approve(ids[5])
 	if rep := settleAt(svc, store, base.Add(2*time.Hour)); rep.Granted != 1 || store.get(ids[5]).State != StateRewarded {
 		t.Errorf("approved, no refund: %+v state %s, want granted", rep, store.get(ids[5]).State)
+	}
+}
+
+// MARK: velocity gate on theoretical success time
+
+func TestSettleVelocityBacklogAfterAnOutageIsNotHeld(t *testing.T) {
+	// Settlement was down for days. Eight friends redeemed 26 hours apart,
+	// so by the time each served the hold no 24 hours ever held more than
+	// one success — but they all come due in the same pass now.
+	svc, store, rc, alert := gateSvc()
+	var ids []int64
+	for i := 0; i < 8; i++ {
+		id := dueFriends(store, rc, base, i, 1)[0]
+		store.refs[id].RedeemedAt = base.Add(-8*day - time.Duration(i)*26*time.Hour)
+		ids = append(ids, id)
+	}
+	rep := settleAt(svc, store, base)
+	if rep.Qualified != 8 || rep.Held != 0 || len(alert.sent) != 0 {
+		t.Errorf("%+v mails=%d, want all eight qualified, none held (judged together ≠ succeeded together)", rep, len(alert.sent))
+	}
+}
+
+func TestSettleVelocityBurstJudgedLateIsStillHeld(t *testing.T) {
+	// Six friends redeemed within the same hour; settlement only gets to
+	// them three days after their hold ended. Still a burst: the sixth waits.
+	svc, store, rc, alert := gateSvc()
+	ids := dueFriends(store, rc, base, 0, 6)
+	for i, id := range ids {
+		store.refs[id].RedeemedAt = base.Add(-11*day + time.Duration(i)*10*time.Minute)
+	}
+	rep := settleAt(svc, store, base)
+	if rep.Qualified != 5 || rep.Held != 1 || store.get(ids[5]).State != StateHeld {
+		t.Fatalf("%+v sixth=%s, want 5 qualified + the sixth held", rep, store.get(ids[5]).State)
+	}
+	// The mail lists the held one and the five that counted against it, by
+	// theoretical success time (redeemed + 7 days).
+	if len(alert.sent) != 1 {
+		t.Fatalf("mails = %d, want 1", len(alert.sent))
+	}
+	body := alert.sent[0].body
+	for _, want := range []string{"6 台不同设备", "理论成功（UTC）", base.Add(-11 * day).Add(7 * day).Format("2006-01-02 15:04"), "按理论成功时间 = 兑换时间 + hold_days"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("mail missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestReviewDigestOnlyListsSuccessesThatCounted(t *testing.T) {
+	svc, store, rc, alert := gateSvc()
+	// An old success two days before the burst does not belong in the mail.
+	old := dueFriends(store, rc, base, 50, 1)[0]
+	store.refs[old].State, store.refs[old].qualifiedAt = StateRewarded, base.Add(-2*day)
+	store.refs[old].RedeemedAt = base.Add(-10 * day)
+	dueFriends(store, rc, base, 0, 6)
+	settleAt(svc, store, base)
+	if len(alert.sent) != 1 {
+		t.Fatalf("mails = %d", len(alert.sent))
+	}
+	if body := alert.sent[0].body; strings.Contains(body, fmt.Sprintf("#%d\t", old)) || strings.Contains(body, fmt.Sprintf("#%d ", old)) {
+		t.Errorf("mail lists #%d, a success outside the held one's window:\n%s", old, body)
 	}
 }
