@@ -29,10 +29,16 @@ const (
 	inatFungiTaxonID   = "47170" // Kingdom Fungi (incl. lichens)
 )
 
-// INatTaxon is the slice of an iNat taxon record LookupTaxon returns.
+// INatTaxon is the slice of an iNat taxon record LookupTaxon /
+// LocalizedCommonNames return.
 type INatTaxon struct {
-	// CommonName is iNat's preferred_common_name ("" when iNat has none).
+	// CommonName is iNat's preferred_common_name ("" when iNat has none) — in the
+	// query locale for LocalizedCommonNames (iNat does NOT fall back to English
+	// there), iNat's default (English) otherwise.
 	CommonName string
+	// EnglishCommonName is iNat's english_common_name ("" when none). Only
+	// LocalizedCommonNames fills it.
+	EnglishCommonName string
 	// Kingdom is iNat's iconic_taxon_name for the match — "Plantae" or "Fungi"
 	// given the query scope (normalize via NormalizeKingdom before use).
 	Kingdom string
@@ -91,16 +97,27 @@ func (c *INatClient) LookupTaxonErr(ctx context.Context, sciName string) (INatTa
 	if len(matches) == 0 {
 		return INatTaxon{}, false, nil
 	}
+	return mergeTaxa(matches), true, nil
+}
+
+// mergeTaxa folds the exact-name matches of one query (most observed first) into
+// one INatTaxon: each name comes from the most-observed match that has one, and
+// Kingdom is Fungi if ANY match is a fungus (a cross-kingdom homonym — safety
+// bias, see MergeKingdom), else the first match's.
+func mergeTaxa(matches []inatTaxonResult) INatTaxon {
 	var out INatTaxon
 	for _, r := range matches {
 		if out.CommonName == "" {
-			out.CommonName = r.PreferredCommonName
+			out.CommonName = strings.TrimSpace(r.PreferredCommonName)
+		}
+		if out.EnglishCommonName == "" {
+			out.EnglishCommonName = strings.TrimSpace(r.EnglishCommonName)
 		}
 		if out.Kingdom == "" || strings.EqualFold(r.IconicTaxonName, KingdomFungi) {
 			out.Kingdom = r.IconicTaxonName
 		}
 	}
-	return out, true, nil
+	return out
 }
 
 // INatStatusError is a non-2xx iNat response (429 = rate limited, 5xx = iNat down).
@@ -112,6 +129,7 @@ func (e *INatStatusError) Error() string { return fmt.Sprintf("inat: status %d",
 type inatTaxonResult struct {
 	Name                string `json:"name"`
 	PreferredCommonName string `json:"preferred_common_name"`
+	EnglishCommonName   string `json:"english_common_name"`
 	IconicTaxonName     string `json:"iconic_taxon_name"`
 }
 
@@ -121,6 +139,32 @@ type inatTaxonResult struct {
 // the lookup did not complete (nil client, transport, non-2xx, decode); (nil, nil)
 // means iNat answered and nothing matched exactly.
 func (c *INatClient) searchTaxa(ctx context.Context, sciName, taxonScope string) ([]inatTaxonResult, error) {
+	results, err := c.queryTaxa(ctx, sciName, taxonScope, "")
+	if err != nil {
+		return nil, err
+	}
+	return exactTaxa(results, sciName), nil
+}
+
+// exactTaxa keeps the results whose name equals want (case-insensitive), in
+// order. q is a fuzzy search — only an exact name match is trusted, so iNat
+// returning a different taxon first can't poison the common name / kingdom.
+func exactTaxa(results []inatTaxonResult, want string) []inatTaxonResult {
+	want = strings.ToLower(strings.TrimSpace(want))
+	var out []inatTaxonResult
+	for _, r := range results {
+		if strings.ToLower(strings.TrimSpace(r.Name)) == want {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// queryTaxa is the raw iNat taxa search behind searchTaxa / LocalizedCommonNames:
+// every result (exact or not) in observations-count order. locale "" = iNat's
+// default (English) common names. Errors as searchTaxa; an empty sciName is
+// (nil, nil) without a request.
+func (c *INatClient) queryTaxa(ctx context.Context, sciName, taxonScope, locale string) ([]inatTaxonResult, error) {
 	if c == nil || c.HTTP == nil {
 		return nil, errors.New("inat: nil client")
 	}
@@ -139,7 +183,10 @@ func (c *INatClient) searchTaxa(ctx context.Context, sciName, taxonScope string)
 	q.Set("order_by", "observations_count")
 	q.Set("order", "desc")
 	q.Set("is_active", "true")
-	q.Set("fields", "name,rank,preferred_common_name,iconic_taxon_name")
+	q.Set("fields", "name,rank,preferred_common_name,english_common_name,iconic_taxon_name")
+	if locale != "" {
+		q.Set("locale", locale)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"?"+q.Encode(), nil)
 	if err != nil {
@@ -164,14 +211,63 @@ func (c *INatClient) searchTaxa(ctx context.Context, sciName, taxonScope string)
 		return nil, err
 	}
 
-	want := strings.ToLower(strings.TrimSpace(sciName))
-	var out []inatTaxonResult
-	for _, r := range body.Results {
-		// q is a fuzzy search — only trust an exact species-name match so iNat
-		// returning a different taxon first can't poison the common name / kingdom.
-		if strings.ToLower(strings.TrimSpace(r.Name)) == want {
-			out = append(out, r)
+	return body.Results, nil
+}
+
+// ErrINatNoMatch is returned by LocalizedCommonNames when iNat answered but has
+// no taxon whose name matches the query — a DEFINITIVE "iNat does not know this
+// plant", as opposed to a transport / decode failure (any other error), which
+// callers must treat as "unknown" and not cache.
+var ErrINatNoMatch = errors.New("inat: no matching taxon")
+
+// LocalizedCommonNames returns, from one taxa query scoped to Plantae + Fungi,
+// iNat's preferred common name in the given iNat locale (e.g. "zh-CN", "ja",
+// "de"; "" = iNat's default) as CommonName, its EnglishCommonName, AND the
+// Kingdom — enrichment's authoritative display name and mushroom-safety kingdom
+// ride on the same round-trip. CommonName is "" when iNat has no name in that
+// locale (iNat does NOT fall back to English in preferred_common_name —
+// english_common_name carries that separately). Several exact matches merge as
+// in LookupTaxon (mergeTaxa).
+//
+// The query uses iNat's name form (inatQueryName: rank markers dropped — a
+// "var." / "subsp." query finds nothing). Only when that has no exact match
+// and the input is infraspecific does a SECOND query ask for the species
+// binomial (iNat may not know the variety but does know the species).
+//
+// err == nil means iNat answered and a taxon matched (any field may still be
+// ""); ErrINatNoMatch means iNat answered with no matching taxon; any other
+// error means iNat could not be asked (timeout, non-2xx *INatStatusError, bad
+// JSON).
+func (c *INatClient) LocalizedCommonNames(ctx context.Context, sciName, locale string) (INatTaxon, error) {
+	queries := []string{inatQueryName(sciName)}
+	if b := speciesBinomial(sciName); !strings.EqualFold(b, queries[0]) {
+		queries = append(queries, b)
+	}
+	for _, q := range queries {
+		results, err := c.queryTaxa(ctx, q, inatPlantaeTaxonID+","+inatFungiTaxonID, locale)
+		if err != nil {
+			return INatTaxon{}, err
+		}
+		if matches := exactTaxa(results, q); len(matches) > 0 {
+			return mergeTaxa(matches), nil
 		}
 	}
-	return out, nil
+	return INatTaxon{}, ErrINatNoMatch
+}
+
+// inatQueryName rewrites a scientific name into iNat's taxon-name form. iNat
+// stores infraspecific taxa WITHOUT rank markers ("Brassica oleracea
+// capitata", "Acer palmatum amoenum"), and a query that still carries "var." /
+// "subsp." returns no results at all. Everything else (cultivar quotes, hybrid
+// ×, "cv.") is left as is — speciesBinomial covers those via the fallback query.
+func inatQueryName(s string) string {
+	var out []string
+	for _, f := range strings.Fields(s) {
+		switch strings.ToLower(f) {
+		case "var.", "subsp.", "ssp.", "f.", "forma":
+			continue
+		}
+		out = append(out, f)
+	}
+	return strings.Join(out, " ")
 }

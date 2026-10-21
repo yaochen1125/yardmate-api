@@ -228,14 +228,16 @@ func TestGetOrGenerate_INatFailureDoesNotAffectMainFlow(t *testing.T) {
 	}
 }
 
-// Non-English requests never asked iNat before (its common name is English). The
-// kingdom lookup now runs alongside generation: the master gets the authoritative
-// kingdom, but the localized common name is NOT replaced by the English iNat one.
+// A non-English request asks iNat once, in its locale (SPEC §7 common_name C):
+// that single query yields both the localized name and the kingdom, so the
+// master gets the authoritative kingdom with no separate kingdom lookup.
 func TestGetOrGenerate_NonEnglishMasterGetsINatKingdom(t *testing.T) {
-	inat, calls, done := inatCountingStub(t, inatBodyFlyAgaric)
+	inat, calls, done := inatCountingStub(t, `{"results":[
+		{"name":"Amanita muscaria","rank":"species","preferred_common_name":"Fliegenpilz","iconic_taxon_name":"Fungi"}
+	]}`)
 	defer done()
 	d := foodyDetail(nil) // model did not self-report
-	d.CommonName = "Fliegenpilz"
+	d.CommonName = "Roter Fliegen-Pilz"
 	db := &stubDB{}
 	svc := NewService(nil, db, &stubLLM{ret: d}, NewCache(10, time.Hour), inat)
 
@@ -245,11 +247,11 @@ func TestGetOrGenerate_NonEnglishMasterGetsINatKingdom(t *testing.T) {
 	}
 	assertFungiSanitized(t, "response", got)
 	assertFungiSanitized(t, "persisted row", db.insertCalls[0].Data)
-	if got.CommonName != "Fliegenpilz" || got.CommonNameSource != "llm" {
-		t.Errorf("common name = %q/%q, want the localized LLM name untouched", got.CommonName, got.CommonNameSource)
+	if got.CommonName != "Fliegenpilz" || got.CommonNameSource != NameSourceINat {
+		t.Errorf("common name = %q/%q, want iNat's German name", got.CommonName, got.CommonNameSource)
 	}
 	if n := atomic.LoadInt32(calls); n != 1 {
-		t.Errorf("iNat calls = %d, want exactly 1", n)
+		t.Errorf("iNat calls = %d, want exactly 1 (name + kingdom share one query)", n)
 	}
 }
 
@@ -280,10 +282,11 @@ func TestGetOrGenerate_LegacySupabaseRowFilteredOnRead(t *testing.T) {
 	}
 }
 
-// Non-English request served from the English fallback row: no iNat is consulted,
-// but a stored Fungi kingdom still triggers the filter.
+// Non-English request served from the English fallback row: a stored Fungi
+// kingdom triggers the filter even when iNat knows nothing about the taxon, and
+// the only iNat call is the name lookup (no extra kingdom round-trip).
 func TestGetOrGenerate_EnglishFallbackRowWithStoredFungiFiltered(t *testing.T) {
-	inat, calls, done := inatCountingStub(t, inatBodyFlyAgaric)
+	inat, calls, done := inatCountingStub(t, `{"results":[]}`)
 	defer done()
 	db := &stubDB{lookupQ: []dbLookupResult{{pd: nil}, {pd: foodyDetail(kPtr("Fungi"))}}}
 	svc := NewService(nil, db, &stubLLM{}, NewCache(10, time.Hour), inat)
@@ -296,8 +299,8 @@ func TestGetOrGenerate_EnglishFallbackRowWithStoredFungiFiltered(t *testing.T) {
 		t.Errorf("source = %q, want %q", src, SourceSupabaseFallbackEn)
 	}
 	assertFungiSanitized(t, "response", got)
-	if n := atomic.LoadInt32(calls); n != 0 {
-		t.Errorf("iNat calls = %d, want 0 (no extra round-trip on a non-English DB hit)", n)
+	if n := atomic.LoadInt32(calls); n != 1 {
+		t.Errorf("iNat calls = %d, want 1 (the name lookup only)", n)
 	}
 }
 

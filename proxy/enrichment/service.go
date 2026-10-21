@@ -79,7 +79,8 @@ type Service struct {
 	db         ServiceDB
 	llm        ServiceLLM
 	cache      *Cache
-	inat       *proxy.INatClient   // optional iNat client; nil → skip name override (PR #24 follow-up, library-internal stays curated)
+	names      *NameResolver       // optional; nil → no authoritative-name override (SPEC §7 common_name C; catalog rows stay curated)
+	inat       *proxy.INatClient   // optional; the kingdom retry when the name lookup's iNat query got no answer (SPEC §7 kingdom)
 	backfill   *Backfiller         // optional; nil → no async translation backfill (tests / DB-less mode)
 	diseaseIDs map[string]struct{} // for common_diseases_list whitelist
 
@@ -112,17 +113,30 @@ func (s *Service) Backfiller() *Backfiller {
 	return s.backfill
 }
 
+// SetNameResolver replaces the authoritative-name resolver (main wires one with
+// both iNat and Wikidata; NewService's default uses iNat only). nil disables
+// the override.
+func (s *Service) SetNameResolver(r *NameResolver) {
+	if s != nil {
+		s.names = r
+	}
+}
+
 // NewService builds a Service with the given dependencies. content may not
 // be nil in production (path-1 catalog hit relies on it); db + llm + cache +
-// inat may legitimately be nil during partial-degradation tests. inat is the
-// iNaturalist taxa client used to override out-of-catalog common names with
-// iNat preferred_common_name (PR #24 follow-up; library-internal catalog
-// results stay curated, matching identify-side priority library > iNat >
-// upstream).
+// inat may legitimately be nil during partial-degradation tests. inat backs the
+// default authoritative-name resolver that overrides out-of-catalog common
+// names and supplies the authoritative kingdom from the same query (SPEC §7
+// common_name C + kingdom; library-internal catalog results stay curated,
+// matching identify-side priority library > iNat > upstream).
 //
 // Computes the catalog disease ID set once for fast whitelisting of
 // LLM-generated common_diseases_list (SPEC §1.1 + §7 whitelist decision).
 func NewService(content *proxy.ContentIndex, db ServiceDB, llm ServiceLLM, cache *Cache, inat *proxy.INatClient) *Service {
+	var names *NameResolver
+	if inat != nil {
+		names = NewNameResolver(inat, nil)
+	}
 	diseaseIDs := make(map[string]struct{})
 	if content != nil {
 		for _, ref := range content.AllDiseaseNames() {
@@ -134,6 +148,7 @@ func NewService(content *proxy.ContentIndex, db ServiceDB, llm ServiceLLM, cache
 		db:         db,
 		llm:        llm,
 		cache:      cache,
+		names:      names,
 		inat:       inat,
 		diseaseIDs: diseaseIDs,
 	}
@@ -177,29 +192,56 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	preciseName := proxy.NormalizeScientificNamePrecise(name)
 	cacheKey := preciseName + "|" + lang
 
-	// iNat preferred_common_name override applies to ENGLISH rows only (SPEC §7
-	// common_name B): the iNat name is English, so injecting it into a localized
-	// row would force English back in. The lookup itself is deferred until AFTER
-	// the cache (Step 0) and catalog (Step 1) short-circuits so a hot-path hit
-	// pays no 8s iNat round-trip; iNatName stays "" (a no-op override) until then.
-	iNatName := ""
-	// iNatKingdom is the authoritative kingdom from that SAME deferred iNat taxon
-	// lookup (no extra round-trip). nil until/unless iNat resolves the name.
-	var iNatKingdom *string
-	iNatAsked := false // the taxon lookup already ran for this request
-	overrideINat := func(d *proxy.PlantDetail, source string) *proxy.PlantDetail {
-		if iNatName == "" || source == SourceCatalog || d == nil {
+	// Authoritative display name + kingdom (SPEC §7 common_name C, §7 kingdom):
+	// every NON-catalog response gets its common_name from iNat / Wikidata in the
+	// request language (→ English → scientific name), never the LLM's, and the
+	// SAME iNat taxa query (Plantae + Fungi scope) carries the authoritative
+	// kingdom — one iNat round-trip per request serves both. Resolution is started
+	// once (startName) and awaited lazily (awaitName) so it overlaps the DB
+	// lookups / LLM call; the resolver's own 24h cache makes repeat lookups free
+	// and its 1.5s cap bounds the first one. Catalog hits never start it. All
+	// closures run on this goroutine (singleflight runs fn on the leader's goroutine).
+	var nameCh chan Resolution
+	var nameResult *Resolution
+	startName := func() {
+		if nameCh != nil {
+			return
+		}
+		nameCh = make(chan Resolution, 1)
+		go func() {
+			nameCh <- s.names.Resolve(ctx, name, lang)
+		}()
+	}
+	awaitName := func() Resolution {
+		startName()
+		if nameResult == nil {
+			o := <-nameCh
+			nameResult = &o
+		}
+		return *nameResult
+	}
+	applyName := func(d *proxy.PlantDetail, source string) *proxy.PlantDetail {
+		if source == SourceCatalog || d == nil {
 			return d
 		}
-		out := *d // copy: do NOT mutate cached / catalog-shared pointer
-		out.CommonName = iNatName
-		out.CommonNameSource = "inaturalist"
+		o := awaitName()
+		// Fold the same lookup's kingdom into EVERY non-catalog response, LRU hits
+		// included: a cached row was finalized when it was cached — possibly while
+		// iNat was unreachable — so a legacy mushroom row would otherwise be served
+		// unfiltered for the whole cache TTL. Returns d itself when nothing changes.
+		d = s.applyKingdom(d, name, o.Kingdom)
+		if !o.OK {
+			return d // unresolved (source outage) → keep the row's own name
+		}
+		out := *d // copy: do NOT mutate cached / DB-shared pointer
+		out.CommonName = o.Name.Name
+		out.CommonNameSource = o.Name.Source
 		return &out
 	}
 
 	// Step 0: in-process LRU cache.
 	if cached, ok := s.cache.Get(cacheKey); ok {
-		return overrideINat(cached, SourceCache), SourceCache, nil
+		return applyName(cached, SourceCache), SourceCache, nil
 	}
 
 	// Step 1: embedded 1522 catalog. Lang-agnostic today — the curated catalog is
@@ -225,34 +267,22 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		return nil, "", ErrEnrichmentUnavailable
 	}
 
-	// Deferred iNat lookup (#1): only reached on a cache + catalog miss, i.e. a
-	// request that will actually serve/generate a Supabase row. English-only —
-	// the iNat preferred_common_name is English, so it must not touch localized
-	// rows. Populated here so overrideINat refreshes Supabase/generated rows below
-	// (cache + catalog hits already returned above and never pay this round-trip).
-	//
-	// The request is LookupTaxon (Plantae + Fungi scope), not the plants-only
-	// PreferredCommonName: one round-trip yields the common name AND the kingdom
-	// that drives the mushroom-safety notice (SPEC §7 kingdom).
-	if lang == "en" && s.inat != nil {
-		iNatAsked = true
-		if t, ok := s.inat.LookupTaxon(ctx, name); ok {
-			iNatName = t.CommonName
-			iNatKingdom = proxy.NormalizeKingdom(t.Kingdom)
-		}
-	}
+	// Kick off name + kingdom resolution now so it runs concurrently with the DB
+	// lookups and any LLM call below.
+	startName()
 
 	row, err := s.db.Lookup(ctx, normalized, lang)
 	if err != nil {
 		return nil, "", err
 	}
 	if row != nil {
-		// Rows written before v6 carry no kingdom; an iNat verdict fills it in on
-		// the fly, and a fungal row is hard-filtered on read (legacy v1 rows can
-		// hold culinary uses) — see applyKingdom.
-		row = s.applyKingdom(row, name, iNatKingdom)
+		// Rows written before v6 carry no kingdom; the iNat verdict (from the name
+		// lookup the title waits on anyway) fills it in on the fly, and a fungal row
+		// is hard-filtered on read (legacy v1 rows can hold culinary uses) — see
+		// applyKingdom.
+		row = s.applyKingdom(row, name, awaitName().Kingdom)
 		s.cache.Set(cacheKey, row)
-		return overrideINat(row, SourceSupabaseHit), SourceSupabaseHit, nil
+		return applyName(row, SourceSupabaseHit), SourceSupabaseHit, nil
 	}
 
 	// Step 3: display fallback — exact lang missing, serve the English row if it
@@ -263,16 +293,16 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		// (or English fallback) may already hold the master, so serve it without a
 		// second DB round-trip. Same source tag + no override as the DB path below.
 		if enCached, ok := s.cache.Get(preciseName + "|en"); ok {
-			return enCached, SourceSupabaseFallbackEn, nil
+			return applyName(enCached, SourceSupabaseFallbackEn), SourceSupabaseFallbackEn, nil
 		}
 		enRow, err := s.db.Lookup(ctx, normalized, "en")
 		if err != nil {
 			return nil, "", err
 		}
 		if enRow != nil {
-			enRow = s.applyKingdom(enRow, name, nil) // stored kingdom only (no iNat on non-en)
+			enRow = s.applyKingdom(enRow, name, awaitName().Kingdom) // kingdom is language-independent
 			s.cache.Set(preciseName+"|en", enRow)
-			return enRow, SourceSupabaseFallbackEn, nil
+			return applyName(enRow, SourceSupabaseFallbackEn), SourceSupabaseFallbackEn, nil
 		}
 		// English also missing → fall through and generate the master in `lang`.
 	}
@@ -287,8 +317,8 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 	// cache+DB misses pay ONE OpenAI round-trip; late followers reuse the leader's
 	// result. Key = cacheKey (preciseName|lang), matching the LRU key. On error
 	// every follower receives the leader's error. The result carries the raw
-	// detail + source; overrideINat is applied per-caller AFTER Do so each caller
-	// gets its own (copied) iNat-refreshed English name.
+	// detail + source; applyName is applied per-caller AFTER Do so each caller
+	// gets its own (copied) authoritative name.
 	v, err, _ := s.sf.Do(cacheKey, func() (any, error) {
 		// Detach the SHARED generation from any single caller's context. This
 		// flight is coalesced across all concurrent first-callers, so if the
@@ -308,9 +338,6 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		}
 
 		hint := req.CommonName
-		if iNatName != "" { // only non-empty for English (gated above)
-			hint = iNatName
-		}
 
 		// Step 4: before generating a fresh master, check whether a master already
 		// exists for this plant in ANOTHER language — i.e. we are racing this
@@ -323,9 +350,10 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 			return nil, lookErr
 		} else if existing != nil {
 			if translated, reqID, tErr := s.llm.Translate(ctx, existing, lang); tErr == nil && translated != nil {
-				// The copy inherits the master's kingdom; fold in iNat (en only)
-				// and hard-filter before it is persisted.
-				translated = s.applyKingdom(translated, name, iNatKingdom)
+				// The copy inherits the master's kingdom; fold in iNat (awaited only
+				// now — the translation call took longer than the lookup) and
+				// hard-filter before it is persisted.
+				translated = s.applyKingdom(translated, name, awaitName().Kingdom)
 				inserted, insErr := s.db.Insert(ctx, InsertParams{
 					Normalized:      normalized,
 					Lang:            lang,
@@ -342,7 +370,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 				if !inserted {
 					// Another caller wrote this lang first — return their row.
 					if row, _ := s.db.Lookup(ctx, normalized, lang); row != nil {
-						row = s.applyKingdom(row, name, iNatKingdom)
+						row = s.applyKingdom(row, name, awaitName().Kingdom)
 						s.cache.Set(cacheKey, row)
 						return genResult{row, SourceSupabaseHit}, nil
 					}
@@ -356,21 +384,30 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		}
 
 		// Step 5: true first-caller (or translation-failure fallback) — generate
-		// the master in `lang`.
-		//
-		// Non-English requests skipped the iNat lookup above (its common name is
-		// English-only), but the KINGDOM is language-independent and must be baked
-		// into the master. Fetch it CONCURRENTLY with the multi-second LLM call so
-		// it adds no latency; bounded by its own short timeout and best-effort — a
-		// slow / failed iNat just leaves the model's self-report as the only source.
+		// the master in `lang`. A localized authoritative name becomes the hint so
+		// the description prose uses the same name as the title (awaited only
+		// here: resolution has been running since before the DB lookups).
+		authName := awaitName()
+		if authName.OK && authName.Name.Localized() {
+			hint = authName.Name.Name
+		}
+
+		// The kingdom normally rode on that same iNat query. Only when iNat could
+		// not be asked there (timeout / error / no resolver) is it retried once —
+		// the master is what gets PERSISTED, and the name lookup's 1.5 s cap is
+		// tight. The retry runs CONCURRENTLY with the multi-second LLM call so it
+		// adds no latency; bounded by its own timeout and best-effort — a slow /
+		// failed iNat just leaves the model's Fungi self-report as the only source.
+		iNatKingdom := authName.Kingdom
 		var kingdomCh chan *string
-		if !iNatAsked && s.inat != nil {
+		if !authName.INatAnswered && s.inat != nil {
 			kingdomCh = make(chan *string, 1) // buffered: never blocks if we bail out
 			go func() {
 				kctx, kcancel := context.WithTimeout(ctx, inatKingdomTimeout)
 				defer kcancel()
 				var k *string
-				if t, ok := s.inat.LookupTaxon(kctx, name); ok {
+				// Same query + matching as the name lookup (locale is irrelevant here).
+				if t, err := s.inat.LocalizedCommonNames(kctx, name, ""); err == nil {
 					k = proxy.NormalizeKingdom(t.Kingdom)
 				}
 				kingdomCh <- k
@@ -401,11 +438,12 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		// Whitelist common_diseases_list against the catalog (SPEC §1.1 + §7).
 		generated.CommonDiseasesList = s.filterCatalogDiseaseIDs(generated.CommonDiseasesList)
 
-		// Patch the English master with the iNat name (the LLM may ignore the
-		// hint). Non-English masters keep their localized common_name (iNatName == "").
-		if iNatName != "" {
-			generated.CommonName = iNatName
-			generated.CommonNameSource = "inaturalist"
+		// Bake a localized authoritative name into the stored master (the LLM may
+		// ignore the hint). English / scientific-name fallbacks are NOT baked — they
+		// are applied at response time so a better source can win later.
+		if authName.OK && authName.Name.Localized() {
+			generated.CommonName = authName.Name.Name
+			generated.CommonNameSource = authName.Name.Source
 		}
 
 		// Step 6: INSERT ON CONFLICT (normalized, lang) DO NOTHING. On conflict,
@@ -415,7 +453,7 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 			Normalized:      normalized,
 			Lang:            lang,
 			ScientificName:  name,
-			CommonName:      hint, // iNat-resolved hint when iNat hit (en), else upstream
+			CommonName:      hint, // localized authoritative name when resolved, else upstream
 			Data:            generated,
 			Source:          SourceTag,
 			SourceVersion:   PromptVersion,
@@ -459,13 +497,14 @@ func (s *Service) GetOrGenerate(ctx context.Context, req Request) (*proxy.PlantD
 		return nil, "", err
 	}
 	res := v.(genResult)
-	return overrideINat(res.detail, res.source), res.source, nil
+	return applyName(res.detail, res.source), res.source, nil
 }
 
-// inatKingdomTimeout caps the kingdom-only iNat lookup that runs alongside a
-// non-English master generation (the client's own timeout is 8 s). It is waited
-// on only after the LLM call returns, so in practice it never extends the
-// request; the cap bounds the worst case when the LLM answers unusually fast.
+// inatKingdomTimeout caps the kingdom-only iNat retry that runs alongside a
+// master generation when the name lookup's iNat query got no answer (the
+// client's own timeout is 8 s). It is waited on only after the LLM call returns,
+// so in practice it never extends the request; the cap bounds the worst case
+// when the LLM answers unusually fast.
 const inatKingdomTimeout = 4 * time.Second
 
 // applyKingdom is finalizeKingdom bound to this Service's ContentIndex.
