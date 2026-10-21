@@ -8,7 +8,8 @@
 #   - identify 502 ≥ 1                       （用户已经看到失败）
 #   - identify 200 但耗时 > SLOW_SECS ≥ 1    （危险区：接近客户端 30s 计时器）
 #   - GPT 兜底失败/预算耗尽跳过 ≥ 1          （兜底链路自身出问题）
-#   - Pl@ntNet 失败（plantid-skip）≥ 2       （上游 outage 进行中，即使兜底救回）
+#   - Pl@ntNet 失败 ≥ 2                      （上游 outage 进行中，即使兜底救回）
+#     = plantid-skip（交 GPT）+ plantnet fallback（交 Plant.id）+ identify plantid-budget（上限挡下）
 # 30 分钟冷却：持续 outage 期间最多每半小时一封，不淹邮箱（healthz watchdog
 # 的 2026-07-28 教训是只发一封会被淹没；这里反向教训是别变成邮件炸弹）。
 set -uo pipefail
@@ -29,8 +30,11 @@ slow200=$(grep -E 'v1/identify HTTP/1\.[01]" from [0-9.]+ - 200 ' <<<"$LOG" \
     | awk -v t="$SLOW_SECS" '{d=$NF; sub(/s$/,"",d); if (d+0 > t) n++} END {print n+0}')
 rescue_err=$(count "gpt on-demand fallback err:")
 rescue_nobudget=$(count "fallback skipped (budget exhausted)")
-pnfail=$(count "identify plantid-skip:")
+pid_takeover=$(count "identify plantnet fallback:")
+pid_capped=$(count "plantid-budget:")
+pnfail=$(( $(count "identify plantid-skip:") + pid_takeover + $(count "identify plantid-budget:") ))
 rescued_ok=$(count "rescued=true")
+genus_kept=$(count "identify genus-keep:")
 
 fire=0
 [ "${c502:-0}" -ge 1 ] && fire=1
@@ -56,18 +60,23 @@ BODY="最近 11 分钟 /v1/identify 异常汇总：
   GPT 兜底失败       : ${rescue_err}
   兜底预算耗尽跳过   : ${rescue_nobudget}
   Pl@ntNet 失败      : ${pnfail}
+  Plant.id 接管      : ${pid_takeover}
+  Plant.id 上限挡下  : ${pid_capped}
   GPT 兜底救回       : ${rescued_ok}
+  只认到属（保留属）: ${genus_kept}
 
 解读：
   - Pl@ntNet失败多 + 救回多 = 上游 outage 但兜底在工作，观察即可
   - 502 / 兜底失败 > 0     = 用户正在看到错误，需要介入
   - slow200 > 0            = 响应逼近客户端 30s 计时器，用户可能已看不到结果
+  - Plant.id 上限挡下 > 0  = 当日 Plant.id 额度（全站 / 单 IP）已用满，后续只靠 GPT
 
-止血手段（上游持续挂时）：/etc/yardmate-api/secrets.env 置空 PLANTNET_API_KEY
-并 systemctl restart yardmate-api → Plant.id 接管（走 credit，恢复后翻回）。
+止血手段（上游持续挂时）：/etc/yardmate-api/secrets.env 设 PLANTID_IDENTIFY_FALLBACK=outage
+并 systemctl restart yardmate-api → Pl@ntNet 故障期由 Plant.id 接管（走 credit，受
+PLANTID_DAILY_CAP 全站 / PLANTID_PER_IP_DAILY_CAP 单 IP 每日上限约束）。
 
 最近相关日志（最多 20 条）：
-$(grep -E "identify (plantid-skip|gpt on-demand fallback|upstream err)|v1/identify.*- (502|200) " <<<"$LOG" | tail -20)
+$(grep -E "identify (plantid-skip|plantnet fallback|plantid-budget|genus-keep|gpt on-demand fallback|upstream err)|v1/identify.*- (502|200) " <<<"$LOG" | tail -20)
 
 排查: journalctl -u yardmate-api --since '30 min ago' | grep identify
 30 分钟冷却已启动，持续异常将再次提醒。"
