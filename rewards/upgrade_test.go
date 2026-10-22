@@ -53,6 +53,14 @@ func (m *memStore) setState(referee, state string) {
 	m.refs[referee] = r
 }
 
+func (m *memStore) setIssued(referee string, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r := m.refs[referee]
+	r.IssuedAt = at
+	m.refs[referee] = r
+}
+
 func (m *memStore) stateOf(referee string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -196,6 +204,21 @@ func TestWebhookRenewalBeforeSettlementEdges(t *testing.T) {
 	w = post(t, svc, secret, purchase("evt-first"))
 	if got := status(t, w); got != outRecorded || red.calls != 0 || store.stateOf(referee) != refClaimed {
 		t.Fatalf("first purchase: %q calls=%d state=%s", got, red.calls, store.stateOf(referee))
+	}
+
+	// Past settlement ①'s 200-day window (from the last code issue): ① gave
+	// up on it, a charge does not revive it.
+	svc, store, red = claimedSvc(t, ChargeRedeemed)
+	store.setIssued(referee, t0.Add(-201*24*time.Hour))
+	w = post(t, svc, secret, renewal)
+	if got := status(t, w); got != outNotRedeemed || red.calls != 0 {
+		t.Fatalf("past the window: %q calls=%d", got, red.calls)
+	}
+	// A code reissued inside the window keeps it open.
+	svc, store, red = claimedSvc(t, ChargeRedeemed)
+	store.setIssued(referee, t0.Add(-199*24*time.Hour))
+	if got := status(t, post(t, svc, secret, renewal)); got != outRecorded || red.calls != 1 {
+		t.Fatalf("inside the window: %q calls=%d", got, red.calls)
 	}
 
 	// A PRODUCT_CHANGE of someone who is nobody's friend is not counted.

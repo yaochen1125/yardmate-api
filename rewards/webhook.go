@@ -221,7 +221,7 @@ func (s *Service) credit(ctx context.Context, ev rcEvent) (string, error) {
 		purchased = time.UnixMilli(ev.PurchasedAtMs).UTC()
 	}
 	if !eligible(ref, ev.Type, purchased) {
-		if !chargeBeforeSettlement(ref, ev.Type, purchased) {
+		if !chargeBeforeSettlement(ref, ev.Type, purchased, s.now()) {
 			return outNotRedeemed, nil
 		}
 		if ev.ID == "" || ev.TransactionID == "" {
@@ -331,9 +331,16 @@ func eligible(ref Referral, evType string, purchased time.Time) bool {
 // chargeBeforeSettlement: a RENEWAL charged after the claim while the
 // referral is still claimed — the friend upgraded out of the free month
 // before settlement ① redeemed them. Whether its subscription began after
-// the claim is RevenueCat's to say (redeemCharge).
-func chargeBeforeSettlement(ref Referral, evType string, purchased time.Time) bool {
-	return ref.State == refClaimed && evType == "RENEWAL" && purchased.After(ref.ClaimedAt)
+// the claim is RevenueCat's to say (redeemCharge). Only inside settlement
+// ①'s window (unredeemedWindow from the last code issue): past it ① has given
+// up on the referral and a charge must not revive it.
+func chargeBeforeSettlement(ref Referral, evType string, purchased, now time.Time) bool {
+	issued := ref.IssuedAt
+	if issued.IsZero() {
+		issued = ref.ClaimedAt
+	}
+	return ref.State == refClaimed && evType == "RENEWAL" && purchased.After(ref.ClaimedAt) &&
+		now.Sub(issued) <= unredeemedWindow
 }
 
 // redeemCharge asks the referral package to run settlement ① for this

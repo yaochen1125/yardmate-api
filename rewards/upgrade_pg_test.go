@@ -64,6 +64,17 @@ func pgCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, q string, ar
 func TestPGRenewalBeforeSettlement(t *testing.T) {
 	store, pool, ctx := pgTest(t)
 	refID := seedReferral(t, ctx, pool, referrer, referee, "claimed")
+	// IssuedAt = coalesce(reissued_at, claimed_at): settlement ①'s window start.
+	ref, _, err := store.ReferralByReferee(ctx, referee)
+	if err != nil || !ref.IssuedAt.Equal(ref.ClaimedAt) {
+		t.Fatalf("issued %v claimed %v (%v), want equal before any reissue", ref.IssuedAt, ref.ClaimedAt, err)
+	}
+	if _, err := pool.Exec(ctx, `update referrals set reissued_at = claimed_at + interval '1 hour' where id = $1`, refID); err != nil {
+		t.Fatal(err)
+	}
+	if ref, _, err = store.ReferralByReferee(ctx, referee); err != nil || !ref.IssuedAt.Equal(ref.ClaimedAt.Add(time.Hour)) {
+		t.Fatalf("issued %v claimed %v (%v), want the reissue", ref.IssuedAt, ref.ClaimedAt, err)
+	}
 	start := time.Now().Add(30 * time.Second).UTC().Truncate(time.Microsecond)
 	red := &pgRedeemer{pool: pool, start: start, key: "app_store:" + start.Format(time.RFC3339Nano)}
 	svc := pgWebhookSvc(store, red)

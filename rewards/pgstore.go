@@ -31,8 +31,8 @@ const pgUniqueViolation = "23505"
 func (p *PGStore) ReferralByReferee(ctx context.Context, referee string) (Referral, bool, error) {
 	var r Referral
 	err := p.pool.QueryRow(ctx,
-		`select id, referrer, referee, state, claimed_at from referrals where referee = $1`, referee).
-		Scan(&r.ID, &r.Referrer, &r.Referee, &r.State, &r.ClaimedAt)
+		`select id, referrer, referee, state, claimed_at, coalesce(reissued_at, claimed_at) from referrals where referee = $1`, referee).
+		Scan(&r.ID, &r.Referrer, &r.Referee, &r.State, &r.ClaimedAt, &r.IssuedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Referral{}, false, nil
 	}

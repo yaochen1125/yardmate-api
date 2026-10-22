@@ -69,6 +69,10 @@ type Referral struct {
 	Referee   string
 	State     string
 	ClaimedAt time.Time
+	// IssuedAt is coalesce(reissued_at, claimed_at): when the friend last got
+	// an offer code — the start of settlement ①'s 200-day window, which the
+	// webhook's on-the-spot redeem keeps to as well (chargeBeforeSettlement).
+	IssuedAt time.Time
 }
 
 // Credit is one reward_ledger row to write: one real charge to the friend.

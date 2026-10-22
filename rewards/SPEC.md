@@ -81,7 +81,8 @@ environment != PRODUCTION（ALLOW_SANDBOX 时 SANDBOX 也算）    → 200 ignor
 type ∈ INITIAL_PURCHASE / RENEWAL:
     period_type ∉ {NORMAL, INTRO} / is_family_share / price ≤ 0 或缺 → 200 not_counted
     lower(app_user_id) 不是 uuid / 不是任何 referrals.referee   → 200 not_referee
-    推荐是 claimed、这笔是 RENEWAL 且 purchased_at > claimed_at（免费月里升级，扣费先于结算 ①）:
+    推荐是 claimed、这笔是 RENEWAL、purchased_at > claimed_at、且最近一次发码（coalesce(reissued_at, claimed_at)）在 200 天内
+    （同结算 ① 的窗口；免费月里升级，扣费先于结算 ①）:
         缺 event.id / transaction_id                          → 400 bad_event（不去认定）
         Redeemer.RedeemForCharge(推荐, product_id)：
             订阅开始早于填码 / 不是本人购买                   → 200 not_redeemed
@@ -245,8 +246,8 @@ webhook 鉴权十种头 / 未配置 / 坏 body / 64 KB；文档每条记与不�
 各推荐状态（含 claimed 下首购前后、claimed 下填码前的续费不记、void）；
 免费月里升级（`upgrade_test.go`，按 RevenueCat 的顺序：PRODUCT_CHANGE → RENEWAL）：PRODUCT_CHANGE 只计数不记、RENEWAL 当场认定并记 1020、重发 duplicate 且不再认定 /
 认定不了 503 not_settled、不留记录，结算认定后重发记一笔 / 三种不记（订阅早于填码、第 3 道作废、认定后被别处作废）/ 没接 Redeemer 503、坏事件 400 不去认定、
-填码前的续费不问、claimed 首购照记不问、陌生人的 PRODUCT_CHANGE 不计数 / 到期才换（降级）：试用 $0 不记、扣费记一次 / ALLOW_SANDBOX 开关（默认不记、开了 SANDBOX 记、缺环境不记）；
-PG（`upgrade_pg_test.go`，真 `referral_mark_redeemed`）：续费当场认定 → 推荐 redeemed（redeemed_at / subscription_key 写对）+ 记一笔、重发不再认定 /
+填码前的续费不问、claimed 首购照记不问、发码超过 200 天不问（199 天照问）、陌生人的 PRODUCT_CHANGE 不计数 / 到期才换（降级）：试用 $0 不记、扣费记一次 / ALLOW_SANDBOX 开关（默认不记、开了 SANDBOX 记、缺环境不记）；
+PG（`upgrade_pg_test.go`，真 `referral_mark_redeemed`）：`ReferralByReferee` 的 IssuedAt 先等于 claimed_at、换码后等于 reissued_at / 续费当场认定 → 推荐 redeemed（redeemed_at / subscription_key 写对）+ 记一笔、重发不再认定 /
 webhook 和结算 ① 同时认定同一条（8 次）→ 只生效一次、不被判成自己的重复、只记一笔 / 当场撞第 3 道 → void duplicate_apple_id、不记。
 实收比例（1 − 税 − 抽成：0.65 → 780、抽成 0.30 → 840；两项都缺 / 只有弃用的 takehome / 缺一项 / null / 超范围 / 负数 / 抽成 0 / 和 ≥ 1 → 0.70 = 840）；金额四舍五入表（含正好 .5）；90 天；按 event id 和 transaction id 去重；
 退款只 void pending；退款先到 → 留记录、晚到的扣费及其重发答 voided、别的交易不受影响；库错误 500；
