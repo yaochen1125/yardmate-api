@@ -154,28 +154,29 @@ func TestPGLedgerAndPayouts(t *testing.T) {
 	}
 
 	yearStart := time.Date(time.Now().UTC().Year(), 1, 1, 0, 0, 0, 0, time.UTC)
-	po, year, err := store.RequestPayout(ctx, referrer, "a@example.com", PayoutAmountCents, ThresholdCents, yearStart)
-	if err != nil || po.State != PayoutRequested || po.AmountCents != 10000 || po.Email != "a@example.com" {
+	// $180 redeemable → one $180 card (whole $10, under the $500 cap).
+	po, year, err := store.RequestPayout(ctx, referrer, "a@example.com", yearStart)
+	if err != nil || po.State != PayoutRequested || po.AmountCents != 18000 || po.Email != "a@example.com" {
 		t.Fatalf("payout = %+v %v", po, err)
 	}
-	if year.RequestedCents != 10000 || year.SentCents != 0 {
+	if year.RequestedCents != 18000 || year.SentCents != 0 {
 		t.Fatalf("year = %+v", year)
 	}
-	if _, _, err := store.RequestPayout(ctx, referrer, "a@example.com", PayoutAmountCents, ThresholdCents, yearStart); !errors.Is(err, ErrPayoutInProgress) {
+	if _, _, err := store.RequestPayout(ctx, referrer, "a@example.com", yearStart); !errors.Is(err, ErrPayoutInProgress) {
 		t.Fatalf("second request: %v", err)
 	}
-	if _, _, err := store.RequestPayout(ctx, stranger, "s@example.com", PayoutAmountCents, ThresholdCents, yearStart); !errors.Is(err, ErrBelowThreshold) {
+	if _, _, err := store.RequestPayout(ctx, stranger, "s@example.com", yearStart); !errors.Is(err, ErrBelowThreshold) {
 		t.Fatalf("stranger: %v", err)
 	}
-	// Mark it sent → balance 8 000 < 10 000 → below_threshold.
+	// Mark it sent → balance 0 < 2 000 → below_threshold.
 	if _, err := pool.Exec(ctx, `update reward_payouts set state = 'sent', sent_at = now() where id = $1`, po.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.RequestPayout(ctx, referrer, "a@example.com", PayoutAmountCents, ThresholdCents, yearStart); !errors.Is(err, ErrBelowThreshold) {
+	if _, _, err := store.RequestPayout(ctx, referrer, "a@example.com", yearStart); !errors.Is(err, ErrBelowThreshold) {
 		t.Fatalf("after sent: %v", err)
 	}
 	b, _ = store.Balance(ctx, referrer)
-	if b.SpentCents != 10000 || b.Latest == nil || b.Latest.State != PayoutSent || b.Latest.SentAt.IsZero() {
+	if b.SpentCents != 18000 || b.Latest == nil || b.Latest.State != PayoutSent || b.Latest.SentAt.IsZero() {
 		t.Fatalf("balance after sent = %+v latest=%+v", b, b.Latest)
 	}
 
@@ -215,7 +216,7 @@ func TestPGChangePayoutEmail(t *testing.T) {
 		t.Fatalf("no payout: %v", err)
 	}
 	yearStart := time.Date(time.Now().UTC().Year(), 1, 1, 0, 0, 0, 0, time.UTC)
-	po, _, err := store.RequestPayout(ctx, referrer, "old@example.com", PayoutAmountCents, ThresholdCents, yearStart)
+	po, _, err := store.RequestPayout(ctx, referrer, "old@example.com", yearStart)
 	if err != nil || !po.EmailEditable {
 		t.Fatalf("request: %+v %v", po, err)
 	}
@@ -281,7 +282,7 @@ func TestPGMarkSentBufferAndUndo(t *testing.T) {
 	for i, txn := range []string{"b1", "b2"} {
 		c := Credit{ReferralID: refID, Referrer: referrer, Referee: referee, EventID: "ev-" + txn, EventType: "RENEWAL",
 			TransactionID: txn, ProductID: "com.chenyao.plantapp.premium.year", PeriodType: "NORMAL",
-			PriceUSDCents: 3999, Takehome: "0.8500", CreditCents: 15000,
+			PriceUSDCents: 3999, Takehome: "0.8500", CreditCents: 40000,
 			PurchasedAt: past, AvailableAt: past.Add(RefundWindow)}
 		if res, err := store.RecordCredit(ctx, c); err != nil || res != CreditInserted {
 			t.Fatalf("record %d: %v %v", i, res, err)
@@ -291,9 +292,10 @@ func TestPGMarkSentBufferAndUndo(t *testing.T) {
 		t.Fatal(err)
 	}
 	yearStart := time.Date(time.Now().UTC().Year(), 1, 1, 0, 0, 0, 0, time.UTC)
-	po, _, err := store.RequestPayout(ctx, referrer, "a@example.com", PayoutAmountCents, ThresholdCents, yearStart)
-	if err != nil {
-		t.Fatalf("request: %v", err)
+	// $800 redeemable → capped at one $500 card; $300 stays.
+	po, _, err := store.RequestPayout(ctx, referrer, "a@example.com", yearStart)
+	if err != nil || po.AmountCents != MaxPayoutCents {
+		t.Fatalf("request: %+v %v", po, err)
 	}
 
 	markSent := func(email string) int {
@@ -344,10 +346,10 @@ func TestPGMarkSentBufferAndUndo(t *testing.T) {
 	if err != nil || b.Latest == nil || b.Latest.State != PayoutRequested || !b.Latest.SentAt.IsZero() {
 		t.Fatalf("balance in buffer = %+v latest=%+v err=%v", b, b.Latest, err)
 	}
-	if b.SpentCents != 10000 {
-		t.Fatalf("spent in buffer = %d, want 10000", b.SpentCents)
+	if b.SpentCents != 50000 {
+		t.Fatalf("spent in buffer = %d, want 50000", b.SpentCents)
 	}
-	if _, _, err := store.RequestPayout(ctx, referrer, "a@example.com", PayoutAmountCents, ThresholdCents, yearStart); !errors.Is(err, ErrPayoutInProgress) {
+	if _, _, err := store.RequestPayout(ctx, referrer, "a@example.com", yearStart); !errors.Is(err, ErrPayoutInProgress) {
 		t.Fatalf("request in buffer: %v", err)
 	}
 
@@ -373,9 +375,9 @@ func TestPGMarkSentBufferAndUndo(t *testing.T) {
 	if n := undo(); n != 0 {
 		t.Fatalf("undo after the hour changed %d rows", n)
 	}
-	// Balance 30 000 − 10 000 sent = 20 000: a new request is allowed again.
-	if _, _, err := store.RequestPayout(ctx, referrer, "a@example.com", PayoutAmountCents, ThresholdCents, yearStart); err != nil {
-		t.Fatalf("request after the hour: %v", err)
+	// Balance 80 000 − 50 000 sent = 30 000: the next card is $300.
+	if next, _, err := store.RequestPayout(ctx, referrer, "a@example.com", yearStart); err != nil || next.AmountCents != 30000 {
+		t.Fatalf("request after the hour: %+v %v", next, err)
 	}
 }
 

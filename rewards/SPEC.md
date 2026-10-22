@@ -12,7 +12,7 @@
   退款先于扣费到达时记下交易号，那笔扣费晚到也不入账（`webhook.go`）。
 - 入账定时器（每 10 分钟，自己的循环，与 referral 结算同一个 `REFERRAL_SETTLE_INTERVAL`）：`available_at <= now()` 的 pending → **available**（`rewards.go`）。
 - `GET /v1/referral/me` 的 `rewards` 字段：经 `referral.RewardsReader` 注入（`Rewards`）；本包不碰 `/me` 别的字段。
-- `POST /v1/referral/payout`：可兑余额 ≥ $100 → 建一条 `requested` 申请（固定 $100）→ 给运营发邮件（`payout.go`）；
+- `POST /v1/referral/payout`：可兑余额 ≥ $20 → 建一条 `requested` 申请，金额 = `PayoutAmountFor(可兑余额)`：⌊可兑 ÷ $10⌋ × $10、最多 $500，零头和超出的留在余额里（rewards.md `### 兑换金额`，2026-10-22 从固定 $100 改）→ 给运营发邮件（`payout.go`）；
   邮件就是防刷第 5 道的人工审核，附这个推荐人的朋友数 / 朋友设备去重数 / 退款笔数 / 作废与待审核推荐数（`ReviewStats`，§2.3）。
 - `POST /v1/referral/payout/email`：申请中（库里真 `requested`，缓冲中不算）的推荐人改收卡邮箱 → 给运营发「邮箱已改」邮件（§2.8）。
 - 运营侧：`deploy/referral-payout.sh list | mark-sent <id> | undo <id> | cancel <id>`（PostgREST + service role；`mark-sent` 两次确认、标记后 1 小时内可 `undo`，§2.7）。
@@ -34,7 +34,7 @@
 | `/payout` 头 | 同 `/claim`：`Authorization: Bearer <Supabase access token>`、`X-Device-Install-Id`、`X-App-Version` |
 | `/payout`、`/payout/email` body | `{"email": "you@example.com"}` |
 | vault | `REVENUECAT_WEBHOOK_SECRET`；`SUPABASE_URL` / `SUPABASE_DB_URL`（与 referral 共用）；`FEEDBACK_SMTP_*` / `FEEDBACK_EMAIL_TO`（运营邮件，main 经 `mail_wiring.go` 建一次、与 feedback / 码池告警共用，缺了只记日志）；`REFERRAL_SETTLE_INTERVAL`（可选）|
-| 库 | migration `015_referral_rewards.sql` 的 `reward_ledger` / `reward_voided_txns` / `reward_payouts`（依赖 013 的 `referral_users` / `referrals`）；`016_referral_antiabuse.sql` 的 `reward_ledger.void_reason`、`referrals.claim_install_id` |
+| 库 | migration `015_referral_rewards.sql` 的 `reward_ledger` / `reward_voided_txns` / `reward_payouts`（依赖 013 的 `referral_users` / `referrals`；015 文件里「满 $100 申请一张」「一行 = 一张 $100」的注释和 `amount_cents default 10000` 是 2026-10-22 之前的规则，现行规则见 §2.3，不改已上线的迁移）；`016_referral_antiabuse.sql` 的 `reward_ledger.void_reason`、`referrals.claim_install_id` |
 
 ### 1.4 输出
 
@@ -51,8 +51,8 @@ RevenueCat 后台的投递记录里看得到；`voided` 既指退款作废了 pe
 | payout | 400 | `missing_device_id` / `missing_app_version` / `bad_json` | 请求形状（同 referral）|
 | payout | 400 | `invalid_email` | `net/mail` 解析不成裸地址（不许显示名 / 尖括号）、无 `@`、> 254 字符、域名是 `privaterelay.appleid.com`（不分大小写；Apple 隐藏邮件地址收不到亚马逊的邮件）|
 | payout | 401 | `unauthorized` | token 验签失败 |
-| payout | 409 | `payout_in_progress` | 已有 `requested`（**先于**余额判断：$100 申请中、余额 0 时也答这个）|
-| payout | 409 | `below_threshold` | 可兑余额 < $100（没当过推荐人也是这个）|
+| payout | 409 | `payout_in_progress` | 已有 `requested`（**先于**余额判断：一张申请中、余额不够 $20 时也答这个）|
+| payout | 409 | `below_threshold` | 可兑余额 < $20（没当过推荐人也是这个）|
 | payout | 429 | `rate_limit_device` | `/claim` 的设备桶（共用次数）|
 | payout | 502 | `store_failed` | 库不可达 |
 | payout | 503 | `not_configured` | 缺库或缺 `SUPABASE_URL` |
@@ -119,17 +119,17 @@ available_cents = max(0, lifetime_cents − sum(requested + sent 申请))
 pending_cents   = sum(pending 账本)
 ```
 
-`cancelled` 不在扣减里，所以运营 `cancel` 之后 $100 自然回到余额，不用回写任何东西。voided 永远不算。
+`cancelled` 不在扣减里，所以运营 `cancel` 之后那张的金额自然回到余额，不用回写任何东西。voided 永远不算。
 
 ### 2.3 兑换（`RequestPayout`，一个事务）
 
 1. `select … from referral_users where user_id = $1 for no key update` —— 同一人的并发申请在这里排队（no key update 不挡别的表插 FK）。没这行 → `below_threshold`。
-2. 有 `requested`，或有还在 1 小时缓冲里的 `sent`（`undo_until > now()`，§2.7）→ `payout_in_progress`；可兑余额 < 10000 → `below_threshold`。
-3. `insert reward_payouts (user_id, amount_cents = 10000, email)`；partial unique index `(user_id) where state = 'requested'` 兜底，撞了也答 `payout_in_progress`。
+2. 有 `requested`，或有还在 1 小时缓冲里的 `sent`（`undo_until > now()`，§2.7）→ `payout_in_progress`；`PayoutAmountFor(可兑余额)` = 0（可兑 < 2000）→ `below_threshold`。
+3. `insert reward_payouts (user_id, amount_cents = PayoutAmountFor(第 2 步读到的可兑余额), email)`——金额在行锁下、用同一事务读到的余额算，App 上的金额只是预览；建表默认值 10000 不再用到（没加迁移）。常量 `MinPayoutCents` 2000 / `PayoutStepCents` 1000 / `MaxPayoutCents` 50000，App 有同样一份；partial unique index `(user_id) where state = 'requested'` 兜底，撞了也答 `payout_in_progress`。
 4. 同事务读该用户**本自然年（UTC）**的 `sent`（按 `sent_at`，含缓冲中的）+ `requested`（含这一张）合计 → 进运营邮件。
 
-邮件异步发（不拖 201，panic 也兜住）：主题 `[YardMate] Referral gift card request #<id>`（纯 ASCII），
-正文 user_id、收卡邮箱、$100、本年已发 / 申请中 / 合计、mark-sent（附「两次确认、1 小时内可 undo」）/ undo / cancel 命令；**合计 ≥ 门槛 − $100**（含这一张；门槛 =
+邮件异步发（不拖 201，panic 也兜住）：主题 `[YardMate] Referral gift card request #<id> ($<整数金额>)`（纯 ASCII，如 `#17 ($50)`），
+正文 user_id、收卡邮箱、这张卡的金额、「买一张这个金额的自定义金额电子卡」、本年已发 / 申请中 / 合计、mark-sent（附「两次确认、1 小时内可 undo」）/ undo / cancel 命令；**合计 ≥ 门槛 − `W9MarginCents`（$100，固定余量，不随卡面变）**（含这一张；门槛 =
 `referral_settings.w9_threshold_cents`，migration 019，默认 200000 = $2,000，2026 年起的 1099 门槛；在发信的 goroutine 里读，读不到按 $2,000 记日志）时加
 `W-9 FIRST (先收 W-9 再发；已经收过……就照发)`，写出门槛金额、要求加密收 W-9、模板在 rewards.md `### 税务：W-9`；不写 1099 表名（NEC / MISC 待会计确认）。邮件丢了不影响记录，`deploy/referral-payout.sh list` 兜底。
 
@@ -226,7 +226,9 @@ webhook 鉴权十种头 / 未配置 / 坏 body / 64 KB；文档每条记与不�
 退款只 void pending；退款先到 → 留记录、晚到的扣费及其重发答 voided、别的交易不受影响；库错误 500；
 入账只动到期 pending；余额口径（cancelled 回余额、不为负）；时间 RFC 3339 无小数秒；
 payout 三个错误码 + 201、头 / 鉴权 / 未配置、邮箱黑白名单、共享设备桶（邮箱错不扣次数）、20 路并发只成一张、库错误 502、无邮件 / 邮件失败照 201、
-邮件正文与 W-9 阈值（默认门槛 $2,000：$1,800 无、$1,900 有、$2,100 有、去年的不算；门槛改 $2,100 时 $1,900 无 / $2,000 有；读设置失败按 $2,000；不出现 1099-NEC / $600）、主题纯 ASCII；
+邮件正文与 W-9 阈值（默认门槛 $2,000：$1,800 无、$1,900 有、$2,100 有、去年的不算；门槛改 $2,100 时 $1,900 无 / $2,000 有；读设置失败按 $2,000；不出现 1099-NEC / $600；$500 卡：$1,300 / $1,350 已发无，$1,400 / $1,600 已发有）、主题纯 ASCII 带金额；
+兑换金额（`PayoutAmountFor` 表：<$20 → 0、$20、$29.99 → $20、$51.30 → $50、$480、$499.99 → $490、$500、$3,000 → $500；$231.30 → 一张 $230 剩 $1.30；$715 → $500、发出后 $210、再剩 $5 → below_threshold）；
+PG：$180 → 一张 $180；$800 → 一张 $500，缓冲过后下一张 $300；
 PG `TestPGW9Threshold`（默认 200000、改了即读到）。
 防刷（016）：webhook `held` 状态照记（首购 / 续费）；申请邮件审核行逐项（朋友数 / 带来钱的 / 设备去重含重复与没记设备 / 退款笔数只数退款 / 各作废原因含 0 和其他 / held）、
 全不同的写法、读审核数据失败邮件照发且 201；PG：退款写 `void_reason = refunded`、`ReviewStats` 各口径（016 跑两遍）。
@@ -254,7 +256,7 @@ SQL（按线上顺序 013 → 014 → 015，015 跑两遍）在真库上的测�
 - `claimed` 状态的朋友付费也算（§2.1）是对文档「已兑换」的实现解释，文档没写到这个竞态。
 - `is_family_share` 不算是按「真扣费」推的，文档字段表里没有这个字段。
 - `payout_in_progress` 先于 `below_threshold` 判断；文档两条 409 没定先后。
-- W-9 提醒按「本年已发 + 申请中（含这一张）≥ $500」算，比「之前已到 $500 的下一次」早一张提醒。
+- W-9 提醒按「本年已发 + 申请中（含这一张）≥ 门槛 − $100」算（2026-10-22 门槛 $2,000、卡面改成 $20–$500 后余量固定 $100，跨门槛那张一定带提醒）。
 - 乱序：退款先于购买到达 —— 已处理（§2.1，`reward_voided_txns`，产品已定：按已作废、答 200）。
 - 只认 `app_user_id`，**不查** `aliases` / `original_app_user_id`：朋友若用匿名 id 付了费、之后才被 RevenueCat 合并到 Supabase id，
   那笔事件的 `app_user_id` 可能还是 `$RCAnonymousID:…` → not_referee、不记。填码必须登录（JWT），之后的扣费一般就是 Supabase id，

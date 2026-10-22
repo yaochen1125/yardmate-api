@@ -88,7 +88,7 @@ func TestSummaryBalanceRules(t *testing.T) {
 		t.Fatalf("latest payout = %+v", s.Payout)
 	}
 
-	// The operator cancels the requested one: its $100 is back, no write to
+	// The operator cancels the requested one: its amount is back, no write to
 	// the ledger needed.
 	store.mu.Lock()
 	req.State = PayoutCancelled

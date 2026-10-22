@@ -267,8 +267,9 @@ rather than adding a second) — keep it in lockstep with the swiftui source.
 
 `rewards/SPEC.md`. A friend's real charge (RevenueCat `INITIAL_PURCHASE` /
 `RENEWAL`, `NORMAL` / `INTRO`, price > 0, `PRODUCTION`) credits the referrer
-30% of Apple's payout; it clears after 90 days; $100 of cleared balance buys
-one Amazon.com gift card, **sent by hand**. Everything below is staging first,
+30% of Apple's payout; it clears after 90 days; from $20 of cleared balance
+the referrer can ask for one Amazon.com gift card of the largest whole $10, up
+to $500 (the change stays in the balance), **sent by hand**. Everything below is staging first,
 then prod.
 
 **Turning it on**
@@ -306,14 +307,15 @@ then prod.
    `update referral_settings set w9_threshold_cents = <cents> where id = 1;`
    (staging, then prod). Migration 019 is safe in any order: without it the
    mail assumes $2,000.
-2. Within 3 business days buy a $100 Amazon.com eGift card and deliver it to
-   the address in the mail.
+2. Within 3 business days buy an Amazon.com eGift card for the amount in the
+   mail (subject `… request #17 ($50)`; use Amazon's custom amount) and deliver
+   it to the address in the mail.
 3. `SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… deploy/referral-payout.sh mark-sent 17`
    — it lists the request, asks you to retype `17`, then to type `yes` (both in a
-   terminal; it refuses piped input). For one hour the app still shows "Gift card
-   on its way" and `… deploy/referral-payout.sh undo 17` puts it back to
+   terminal; it refuses piped input). For one hour the app still shows "$50 gift
+   card on its way" and `… deploy/referral-payout.sh undo 17` puts it back to
    requested (our record only — an Amazon order already sent is handled on
-   Amazon). After the hour the app shows `Sent {date}` and undo refuses.
+   Amazon). After the hour the app shows `$50 gift card sent {date}` and undo refuses.
    If the referrer changes the address before you mark it (the app allows that
    while the request is still requested), a mail `[YardMate] Referral gift card
    request #17: email changed` gives old → new, and mark-sent shows the new one
@@ -324,7 +326,7 @@ then prod.
    refused by the server (they never receive Amazon's mail).
 4. Not sending after all (bad address, no W-9): `… deploy/referral-payout.sh cancel 17`
    (requested only — undo a marked one first)
-   — the $100 is back in their balance by definition (balance = cleared
+   — the card's amount is back in their balance by definition (balance = cleared
    credits − requested − sent), no ledger edit.
 5. Missed a mail / mail not configured: `… deploy/referral-payout.sh list`
    shows every open request plus the ones still inside their undo hour
