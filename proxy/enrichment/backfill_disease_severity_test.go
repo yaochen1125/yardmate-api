@@ -352,9 +352,9 @@ func TestSniffSeverity(t *testing.T) {
 		{sevStrptr("General care"), ""},
 		{sevStrptr("mild but can turn severe"), ""}, // ambiguous → no badge
 		// Whole-word matching: a disease term must not leak a severity signal.
-		{sevStrptr("For mildew cases"), ""},                 // "mild" inside "mildew" must NOT match
-		{sevStrptr("For severe mildew cases"), "severe"},    // mildew must not make it ambiguous
-		{sevStrptr("Powdery mildew (mild cases)"), "mild"},  // real standalone "mild" still matches
+		{sevStrptr("For mildew cases"), ""},                // "mild" inside "mildew" must NOT match
+		{sevStrptr("For severe mildew cases"), "severe"},   // mildew must not make it ambiguous
+		{sevStrptr("Powdery mildew (mild cases)"), "mild"}, // real standalone "mild" still matches
 		{sevStrptr("Downy mildew, severe spread"), "severe"},
 		{nil, ""},
 		{sevStrptr(""), ""},
