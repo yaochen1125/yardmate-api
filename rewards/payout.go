@@ -141,14 +141,19 @@ func (s *Service) notifyOperator(po Payout, year YearTotals, calendarYear int) {
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 		review, err := store.ReviewStats(ctx, po.UserID)
+		threshold, terr := store.W9ThresholdCents(ctx)
 		cancel()
+		if terr != nil || threshold <= 0 {
+			log.Printf("referral payout #%d: w9_threshold_cents unavailable (%v, %d); using %s", po.ID, terr, threshold, usd(DefaultW9ThresholdCents))
+			threshold = DefaultW9ThresholdCents
+		}
 		var rv *Review
 		if err != nil {
 			log.Printf("referral payout #%d: review numbers unavailable (mail says so): %v", po.ID, err)
 		} else {
 			rv = &review
 		}
-		subject, body := composePayoutMail(po, year, rv, calendarYear)
+		subject, body := composePayoutMail(po, year, rv, calendarYear, threshold)
 		if err := m.Alert(subject, body); err != nil {
 			log.Printf("referral payout #%d: operator mail failed (request stored; deploy/referral-payout.sh list): %v", po.ID, err)
 		}
@@ -157,8 +162,10 @@ func (s *Service) notifyOperator(po Payout, year YearTotals, calendarYear int) {
 
 // composePayoutMail renders the operator notice. Subject is plain ASCII
 // (Alert does no RFC 2047 encoding); the user's email address only ever goes
-// in the body.
-func composePayoutMail(po Payout, year YearTotals, rv *Review, calendarYear int) (subject, body string) {
+// in the body. w9Threshold is the 1099 filing threshold; the W-9 line shows
+// from one card below it. It names no 1099 form: NEC or MISC is for the
+// accountant to say (rewards.md ## 待确认).
+func composePayoutMail(po Payout, year YearTotals, rv *Review, calendarYear int, w9Threshold int64) (subject, body string) {
 	subject = fmt.Sprintf("[YardMate] Referral gift card request #%d", po.ID)
 	var b strings.Builder
 	b.WriteString("A referrer asked for a gift card.\n\n")
@@ -171,9 +178,11 @@ func composePayoutMail(po Payout, year YearTotals, rv *Review, calendarYear int)
 	fmt.Fprintf(&b, "  Sent:                    %s\n", usd(year.SentCents))
 	fmt.Fprintf(&b, "  Requested (incl. this):  %s\n", usd(year.RequestedCents))
 	fmt.Fprintf(&b, "  Total:                   %s\n\n", usd(year.Total()))
-	if year.Total() >= W9WarnCents {
-		fmt.Fprintf(&b, "W-9 FIRST (先收 W-9 再发): this user is at %s or more in gift cards this year,\n", usd(W9WarnCents))
-		b.WriteString("and 1099-NEC is required from $600. Collect a W-9 before sending this card.\n\n")
+	if warn := w9Threshold - PayoutAmountCents; year.Total() >= warn {
+		fmt.Fprintf(&b, "W-9 FIRST (先收 W-9 再发；已经收过这个人的 W-9 且信息没变就照发): this user is at %s or more\n", usd(warn))
+		fmt.Fprintf(&b, "in gift cards this year; the 1099 filing threshold is %s (referral_settings.w9_threshold_cents).\n", usd(w9Threshold))
+		b.WriteString("Collect a W-9 before sending this card, through an encrypted channel, never as an email\n")
+		b.WriteString("attachment (it carries their SSN). Request email template: rewards.md ### 税务：W-9.\n\n")
 	}
 	writeReview(&b, rv)
 	b.WriteString("Within 3 business days: buy the card, email the code to the address above, then\n")

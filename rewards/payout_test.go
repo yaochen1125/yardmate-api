@@ -2,6 +2,7 @@ package rewards
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -232,22 +233,40 @@ func TestPayoutCancelledMoneyComesBack(t *testing.T) {
 func TestPayoutMailW9Threshold(t *testing.T) {
 	thisYear := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
 	lastYear := time.Date(2025, 12, 31, 23, 0, 0, 0, time.UTC)
+	n := func(k int, at time.Time) []time.Time {
+		out := make([]time.Time, k)
+		for i := range out {
+			out[i] = at
+		}
+		return out
+	}
+	readFailed := errors.New("column w9_threshold_cents does not exist")
 	cases := []struct {
 		name      string
 		sentAt    []time.Time
+		threshold int64 // referral_settings.w9_threshold_cents; 0 = default
+		readErr   error
 		total     string
 		wantW9    bool
 		sentTotal string
+		wantLimit string // the threshold the W-9 line names
 	}{
-		{"first card", nil, "$100.00", false, "$0.00"},
-		{"three sent this year → $400", []time.Time{thisYear, thisYear, thisYear}, "$400.00", false, "$300.00"},
-		{"four sent this year → $500", []time.Time{thisYear, thisYear, thisYear, thisYear}, "$500.00", true, "$400.00"},
-		{"six sent this year → $700", []time.Time{thisYear, thisYear, thisYear, thisYear, thisYear, thisYear}, "$700.00", true, "$600.00"},
-		{"last year's cards do not count", []time.Time{lastYear, lastYear, lastYear, lastYear, lastYear}, "$100.00", false, "$0.00"},
+		{"first card", nil, 0, nil, "$100.00", false, "$0.00", ""},
+		{"17 sent this year → $1,800", n(17, thisYear), 0, nil, "$1800.00", false, "$1700.00", ""},
+		{"18 sent this year → $1,900", n(18, thisYear), 0, nil, "$1900.00", true, "$1800.00", "$2000.00"},
+		{"20 sent this year → $2,100", n(20, thisYear), 0, nil, "$2100.00", true, "$2000.00", "$2000.00"},
+		{"last year's cards do not count", n(19, lastYear), 0, nil, "$100.00", false, "$0.00", ""},
+		{"threshold raised to $2,100: $1,900 is quiet", n(18, thisYear), 210000, nil, "$1900.00", false, "$1800.00", ""},
+		{"threshold raised to $2,100: $2,000 warns", n(19, thisYear), 210000, nil, "$2000.00", true, "$1900.00", "$2100.00"},
+		{"settings unreadable → $2,000", n(18, thisYear), 0, readFailed, "$1900.00", true, "$1800.00", "$2000.00"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			svc, store, mailer := newTestSvc(t0)
+			if c.threshold > 0 {
+				store.w9Threshold = c.threshold
+			}
+			store.w9Err = c.readErr
 			store.addReferral(referrer, referee, "rewarded", t0.Add(-400*24*time.Hour))
 			store.credit(referrer, "a1", "t1", int64(len(c.sentAt)+1)*10000, LedgerAvailable, t0)
 			for _, at := range c.sentAt {
@@ -260,8 +279,14 @@ func TestPayoutMailW9Threshold(t *testing.T) {
 			if !strings.Contains(body, "Total:                   "+c.total) || !strings.Contains(body, "Sent:                    "+c.sentTotal) {
 				t.Fatalf("totals wrong:\n%s", body)
 			}
-			if got := strings.Contains(body, "W-9 FIRST (先收 W-9 再发)"); got != c.wantW9 {
+			if got := strings.Contains(body, "W-9 FIRST (先收 W-9 再发"); got != c.wantW9 {
 				t.Fatalf("W-9 line = %v, want %v:\n%s", got, c.wantW9, body)
+			}
+			if c.wantW9 && !strings.Contains(body, "the 1099 filing threshold is "+c.wantLimit) {
+				t.Fatalf("threshold not named as %s:\n%s", c.wantLimit, body)
+			}
+			if strings.Contains(body, "1099-NEC") || strings.Contains(body, "$600") {
+				t.Fatalf("mail still names 1099-NEC / $600:\n%s", body)
 			}
 		})
 	}
@@ -358,7 +383,7 @@ func TestPayoutConcurrentRequestsMakeOne(t *testing.T) {
 
 func TestPayoutMailSubjectIsASCII(t *testing.T) {
 	subject, _ := composePayoutMail(Payout{ID: 17, UserID: referrer, AmountCents: 10000, Email: "é@example.com", RequestedAt: t0},
-		YearTotals{RequestedCents: 10000}, nil, 2026)
+		YearTotals{RequestedCents: 10000}, nil, 2026, DefaultW9ThresholdCents)
 	if subject != "[YardMate] Referral gift card request #17" {
 		t.Fatalf("subject = %q", subject)
 	}

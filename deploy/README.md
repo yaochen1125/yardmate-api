@@ -295,8 +295,16 @@ then prod.
 **A gift-card request arrives** (mail `[YardMate] Referral gift card request
 #17` to `FEEDBACK_EMAIL_TO`, same account as `/v1/feedback`):
 
-1. If the mail says `W-9 FIRST`, the user is at $500+ in cards this calendar
-   year: collect a W-9 before sending (1099-NEC from $600).
+1. If the mail says `W-9 FIRST`, the user is one card below the 1099 filing
+   threshold this calendar year (`referral_settings.w9_threshold_cents`,
+   migration 019; $2,000 from 2026, so the line shows from $1,900): collect a
+   W-9 before sending — unless their W-9 is already on file (stored by user id),
+   then send as usual. Ask through an encrypted channel, never as an email
+   attachment (it carries their SSN); the request email template is in
+   rewards.md `### 税务：W-9`. Every January set the new IRS figure:
+   `update referral_settings set w9_threshold_cents = <cents> where id = 1;`
+   (staging, then prod). Migration 019 is safe in any order: without it the
+   mail assumes $2,000.
 2. Within 3 business days buy a $100 Amazon.com eGift card and deliver it to
    the address in the mail.
 3. `SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… deploy/referral-payout.sh mark-sent 17`

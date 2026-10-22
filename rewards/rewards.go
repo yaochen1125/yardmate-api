@@ -35,10 +35,14 @@ const (
 	PayoutAmountCents = 10000
 	// ThresholdCents is the redeemable balance a request needs.
 	ThresholdCents = 10000
-	// W9WarnCents: from this much in gift cards in one calendar year (sent +
-	// requested, this request included), the operator mail says to collect a
-	// W-9 before sending — 1099-NEC is due at $600 (rewards.md ## 特殊情况).
-	W9WarnCents = 50000
+	// DefaultW9ThresholdCents is the 1099 filing threshold used when
+	// referral_settings.w9_threshold_cents (migration 019) cannot be read:
+	// $2,000 for payments from 2026 (One Big Beautiful Bill Act; indexed for
+	// inflation from 2027 — the operator updates the row each January).
+	// The operator mail says W-9 FIRST one card early: from threshold − one
+	// card in one calendar year (sent + requested, this request included)
+	// (rewards.md ### 税务：W-9).
+	DefaultW9ThresholdCents = 200000
 	// RefundWindow is how long a credit stays pending: Apple's refund window.
 	RefundWindow = 90 * 24 * time.Hour
 

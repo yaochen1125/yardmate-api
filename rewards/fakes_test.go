@@ -27,7 +27,10 @@ type memStore struct {
 	nextID  int64
 
 	// error knobs
-	findErr, recordErr, voidErr, matureErr, balanceErr, payoutErr, reviewErr, progressErr error
+	findErr, recordErr, voidErr, matureErr, balanceErr, payoutErr, reviewErr, progressErr, w9Err error
+
+	// w9Threshold is referral_settings.w9_threshold_cents.
+	w9Threshold int64
 
 	// redeemed is referrals.redeemed_at by referral id (Progress only).
 	redeemed map[int64]time.Time
@@ -55,7 +58,7 @@ type ledgerRow struct {
 
 func newMemStore(now time.Time) *memStore {
 	return &memStore{clock: now, users: map[string]bool{}, refs: map[string]Referral{}, voided: map[string]bool{},
-		redeemed: map[int64]time.Time{}}
+		redeemed: map[int64]time.Time{}, w9Threshold: DefaultW9ThresholdCents}
 }
 
 func (m *memStore) addReferral(referrer, referee, state string, claimedAt time.Time) Referral {
@@ -281,6 +284,12 @@ func (m *memStore) RequestPayout(_ context.Context, userID, email string, amount
 		}
 	}
 	return *p, y, nil
+}
+
+func (m *memStore) W9ThresholdCents(context.Context) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.w9Threshold, m.w9Err
 }
 
 // ReviewStats replays the PG query over reviewRefs (and the ledger).
