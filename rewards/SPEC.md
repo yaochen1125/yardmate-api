@@ -150,14 +150,6 @@ pending_cents   = sum(pending 账本)
 - 推荐人删：`referral_users` 行没了 → `reward_ledger.referrer` / `reward_payouts.user_id` **级联删**（余额作废；requested 的照发，运营看邮件，脚本 mark-sent 会报「不存在」）。
 - 朋友删：`referrals` 那行级联没了 → `reward_ledger.referee` / `referral_id` **置空**，推荐人已记的钱不动；之后该 app_user_id 的事件 not_referee。
 
-### 2.7 标记已发的 1 小时缓冲（migration 018，rewards.md `### 标记已发`）
-
-- `reward_payouts.undo_until`：`reward_payout_mark_sent(p_id, p_email)` 置 `state = sent, sent_at = now(), undo_until = now() + 1 hour`，只在 `state = requested` 且 `email = p_email`（脚本列给运营看的那个）时改；`reward_payout_undo(p_id)` 只在 `state = sent and undo_until > now()` 时改回 `requested`、清 `sent_at` / `undo_until`。两个都是 SQL 函数，脚本经 PostgREST `/rest/v1/rpc/` 调，只 grant 给 service_role。
-- 缓冲期对外一律是 `requested`：`payoutColumns`（`Balance.Latest`、`RequestPayout` 的返回）在 SQL 里把 `state = sent and undo_until > now()` 读成 `requested`、`sent_at` 读成 null；`RequestPayout` 的「有没有在路上」也算上它。全部用数据库 `now()`，不用 Go 的 `s.now()`。
-- 余额口径不变（`requested` / `sent` 都扣）；年度合计按库里的真实 `state`，缓冲中算「已发」、年份按 `sent_at`（标记时间）。
-- 撤回回 `requested` 不会撞 partial unique index：缓冲期里同一人建不出第二张 `requested`。
-- `cancel` 只认 `requested`（PATCH 带 `state=eq.requested`）：缓冲中的先 `undo`。
-
 ### 2.5 幂等 / 并发
 
 - RevenueCat 重发同一事件（同 `event.id`）或同一笔交易换了 `event.id` 又来 → `rc_event_id`、`transaction_id` 两个唯一索引，
@@ -190,6 +182,14 @@ coalesce(reissued_at, claimed_at)`，走 `referrals_referrer_idx`）和他的账
 - `next_*` = 最早 `available_at` 的那笔 pending。
 - 排序 paying（next 升序）→ free_month（结束升序）→ unredeemed（加入降序），同值按 referral id；最多 50 行。
 - 用 `Service.now`（应用时钟）判免费月，不用库的 `now()`。
+
+### 2.7 标记已发的 1 小时缓冲（migration 018，rewards.md `### 标记已发`）
+
+- `reward_payouts.undo_until`：`reward_payout_mark_sent(p_id, p_email)` 置 `state = sent, sent_at = now(), undo_until = now() + 1 hour`，只在 `state = requested` 且 `email = p_email`（脚本列给运营看的那个）时改；`reward_payout_undo(p_id)` 只在 `state = sent and undo_until > now()` 时改回 `requested`、清 `sent_at` / `undo_until`。两个都是 SQL 函数，脚本经 PostgREST `/rest/v1/rpc/` 调，只 grant 给 service_role。
+- 缓冲期对外一律是 `requested`：`payoutColumns`（`Balance.Latest`、`RequestPayout` 的返回）在 SQL 里把 `state = sent and undo_until > now()` 读成 `requested`、`sent_at` 读成 null；`RequestPayout` 的「有没有在路上」也算上它。全部用数据库 `now()`，不用 Go 的 `s.now()`。
+- 余额口径不变（`requested` / `sent` 都扣）；年度合计按库里的真实 `state`，缓冲中算「已发」、年份按 `sent_at`（标记时间）。
+- 撤回回 `requested` 不会撞 partial unique index：缓冲期里同一人建不出第二张 `requested`。
+- `cancel` 只认 `requested`（PATCH 带 `state=eq.requested`）：缓冲中的先 `undo`。
 
 ### 2.8 改收卡邮箱（`ChangePayoutEmail`，migration 020，rewards.md `### 邮箱：确认、拼写提示、修改`）
 
