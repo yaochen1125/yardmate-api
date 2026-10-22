@@ -107,12 +107,12 @@ mark_sent() {
   echo
 
   local typed
-  read -r -p "第一次确认：再输一遍编号：" typed
+  read -r -p "第一次确认：再输一遍编号：" typed || { echo; echo "没有输入，退出，没改任何东西" >&2; exit 1; }
   if [ "$typed" != "$id" ]; then
     echo "编号不一致，退出，没改任何东西" >&2
     exit 1
   fi
-  read -r -p "第二次确认：已经在亚马逊买好 \$$(printf '%s' "$row" | jq -r '.[0].amount_cents / 100') 礼品卡、发到上面这个邮箱了？输入 yes：" typed
+  read -r -p "第二次确认：已经在亚马逊买好 \$$(printf '%s' "$row" | jq -r '.[0].amount_cents / 100') 礼品卡、发到上面这个邮箱了？输入 yes：" typed || { echo; echo "没有输入，退出，没改任何东西" >&2; exit 1; }
   if [ "$typed" != "yes" ]; then
     echo "没有输入 yes，退出，没改任何东西" >&2
     exit 1
