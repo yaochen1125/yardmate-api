@@ -30,6 +30,15 @@ const progressMaxRows = 50
 // ListClaimed), and the offer code it got has expired long before (≤ 6 months).
 const unredeemedWindow = 200 * 24 * time.Hour
 
+// freeMonthGrace keeps a free_month row for three days after the free month
+// ends with nothing credited yet: a friend who bought premium.yearly.3d
+// during the free month (a downgrade, effective at its end) may sit in its
+// 3-day free trial before the first charge, and a charge's webhook can land a
+// few minutes late. The row then shows the grace's end as
+// free_month_ends_at — the app drops a free_month row whose date has passed
+// (rewards.md ### 每条推荐的进度).
+const freeMonthGrace = 3 * 24 * time.Hour
+
 // planOf maps a store product id to its plan. The old
 // "com.chenyao.plantapp.premium.monthly" is a YEARLY product despite its
 // name (yardmate-swiftui RemoteFlags.DefaultPaywallProducts). Anything else
@@ -216,7 +225,10 @@ func Progress(refs []TrackReferral, credits []TrackCredit, now time.Time) (Count
 		}
 		end := FreeMonthEnd(start)
 		if !now.Before(end) {
-			continue // free month over and nothing paid: Joined only
+			end = end.Add(freeMonthGrace)
+			if !now.Before(end) {
+				continue // free month (and the grace) over and nothing paid: Joined only
+			}
 		}
 		counts.FreeMonth++
 		ends := rfc3339(end)

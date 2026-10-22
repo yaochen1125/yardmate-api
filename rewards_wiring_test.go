@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/yaochen1125/yardmate-api/attest"
 	"github.com/yaochen1125/yardmate-api/ratelimit"
+	"github.com/yaochen1125/yardmate-api/referral"
 	"github.com/yaochen1125/yardmate-api/secrets"
 )
 
@@ -112,5 +115,20 @@ func TestReferralPayoutRouteRegistered(t *testing.T) {
 		if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "not_configured") {
 			t.Fatalf("unconfigured %s: %d %s", path, w.Code, w.Body.String())
 		}
+	}
+}
+
+// The webhook's on-the-spot redeem reaches referral settlement through main:
+// a server without RevenueCat configured says "not ready" (→ 503, RevenueCat
+// redelivers), never a verdict that would drop the charge.
+func TestChargeRedeemerWiring(t *testing.T) {
+	vault, err := secrets.Parse(strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := chargeRedeemer{buildReferralService(vault, nil, nil)}
+	_, err = r.RedeemForCharge(context.Background(), 1, "66666666-7777-8888-9999-aaaaaaaaaaaa", time.Now(), "com.chenyao.plantapp.premium.yearly")
+	if !errors.Is(err, referral.ErrChargeNotReady) {
+		t.Fatalf("err = %v, want referral.ErrChargeNotReady", err)
 	}
 }

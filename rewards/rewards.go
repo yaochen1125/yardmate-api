@@ -25,6 +25,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/yaochen1125/yardmate-api/ratelimit"
@@ -71,6 +72,26 @@ const (
 // auth user id. Same verifier the referral endpoints use (main wires it).
 type Authenticator func(r *http.Request) (userID string, err error)
 
+// ChargeVerdict is a Redeemer's answer for a charge that beat settlement.
+type ChargeVerdict int
+
+const (
+	ChargeRedeemed   ChargeVerdict = iota // the referral is redeemed now: credit the charge
+	ChargeNotCounted                      // the charged subscription began before the claim: never credited
+	ChargeVoided                          // settlement ① voided the referral (gate 3)
+)
+
+// Redeemer runs referral settlement step ① for one claimed referral on the
+// spot: a RENEWAL charged while the referral is still claimed — the friend
+// upgraded out of the free month before the 10-minute loop redeemed them
+// (rewards.md ### 记账来源). Satisfied, through main, by
+// referral.Service.RedeemForCharge; an error means "not now" and the webhook
+// answers 503 so RevenueCat redelivers. This package does not import
+// referral (SPEC §1).
+type Redeemer interface {
+	RedeemForCharge(ctx context.Context, referralID int64, referee string, claimedAt time.Time, productID string) (ChargeVerdict, error)
+}
+
 // Mailer sends the operator notice for a new payout request. Satisfied by
 // *enrichment.FeedbackMailer (same account as /v1/feedback).
 type Mailer interface {
@@ -89,6 +110,10 @@ type Options struct {
 	// shared so /payout spends from the same 5 / 24 h. nil → a private bucket
 	// with the same policy.
 	DeviceBucket *ratelimit.Bucket
+	// AllowSandbox (REVENUECAT_WEBHOOK_ALLOW_SANDBOX, staging only) makes the
+	// webhook book SANDBOX events like PRODUCTION ones, so a sandbox purchase
+	// on staging can be followed end to end. Never on prod.
+	AllowSandbox bool
 	Interval     time.Duration // maturing cadence (default 10 min)
 	StartupDelay time.Duration // before the first maturing pass (default 1 min)
 }
@@ -99,11 +124,20 @@ type Service struct {
 	store  Store
 	auth   Authenticator
 	secret string
-	mailer Mailer
-	bucket *ratelimit.Bucket
+	// allowSandbox: Options.AllowSandbox.
+	allowSandbox bool
+	mailer       Mailer
+	bucket       *ratelimit.Bucket
 	// webhookIP is the webhook's per-IP bucket (WebhookLimiter), swept by
 	// the maturing pass.
 	webhookIP *ratelimit.Bucket
+	// redeemer settles a claimed referral whose RENEWAL beat settlement
+	// (SetRedeemer); nil → such a RENEWAL answers 503 until the loop has
+	// redeemed it.
+	redeemer Redeemer
+	// productChanges counts referees' PRODUCT_CHANGE events since start, for
+	// the reconciliation log line.
+	productChanges atomic.Int64
 
 	interval     time.Duration
 	startupDelay time.Duration
@@ -128,6 +162,7 @@ func New(store Store, auth Authenticator, opt Options) *Service {
 		store:        store,
 		auth:         auth,
 		secret:       strings.TrimSpace(opt.WebhookSecret),
+		allowSandbox: opt.AllowSandbox,
 		mailer:       opt.Mailer,
 		bucket:       opt.DeviceBucket,
 		webhookIP:    ratelimit.NewBucket(webhookIPLimit, webhookIPWindow),
@@ -263,6 +298,10 @@ func (s *Service) Rewards(ctx context.Context, userID string) (any, error) {
 
 // CanRead reports whether the /me hook can be injected (a store exists).
 func (s *Service) CanRead() bool { return s != nil && s.store != nil }
+
+// SetRedeemer wires referral settlement into the webhook (main does it once
+// at startup, before serving).
+func (s *Service) SetRedeemer(r Redeemer) { s.redeemer = r }
 
 // Start launches the maturing loop until ctx ends. A no-op (logged) without a
 // store.
