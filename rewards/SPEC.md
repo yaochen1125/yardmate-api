@@ -244,7 +244,7 @@ PG `TestPGProgress`：两条查询的口径（void 不出、删号后 referral_i
 `/payout` 也拒收隐藏地址。PG `TestPGChangePayoutEmail`：没申请 409、改了盖 `email_changed_at`、同一地址不改、
 mark_sent 用旧邮箱改不到 / 用新邮箱改到、缓冲中读成 requested 但 `email_editable` false 且改邮箱 409、undo 后又能改。
 
-`go test .`：两条路由已注册、未配置答 503 / 401；webhook 不占 `/v1` 的 IP 桶、自己 600 / min 后 429。`go test ./referral/`：`/me` 有 / 无 / 失败三种、共享桶。
+`go test .`：三条路由（webhook、`/payout`、`/payout/email`）已注册、未配置答 503 / 401；webhook 不占 `/v1` 的 IP 桶、自己 600 / min 后 429。`go test ./referral/`：`/me` 有 / 无 / 失败三种、共享桶。
 
 SQL（按线上顺序 013 → 014 → 015，015 跑两遍）在真库上的测试（含 transaction_id 去重、退款先到、新表 RLS）：`REWARDS_PG_TEST_URL=postgres://…/scratch go test ./rewards/ -run PG -v`
 （临时 schema，跑完即删；**绝不要指向 staging / prod**）。**本 PR 写的时候本机没有 Postgres，这组还没实跑过。**
