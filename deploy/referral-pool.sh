@@ -8,6 +8,8 @@
 #      以及这批现在还发不发（usable = 到期日在 issue_margin_days 余量之外）
 #   2. 汇总：三个阈值（referral_settings）、可发数、余量不足的 free 数、最早到期日、
 #      告警判定（与 referral/pool.go 的口径一致：low_stock / expiring）
+#   3. 自动补货（migration 021；没跑 021 时这段只打一句提示）：补货设置 + 最近 10 次补货
+#      （code_restocks：环境、张数、到期日、苹果批次 ID、状态、新进池张数、发起 / 结束时间、失败原因）
 #
 # 只跑 select，不改任何东西。需要 psql（brew 的 libpq 也带）；没有的话
 # `deploy/referral-pool.sh --sql` 把 SQL 打出来，贴到 Supabase SQL Editor 跑。
@@ -59,8 +61,27 @@ select s.issue_margin_days                                   as margin_days,
   from s, a, p;
 SQL
 
+read -r -d '' RESTOCK_SETTINGS <<'SQL' || true
+select auto_restock_enabled, restock_below, restock_batch_size, restock_daily_max,
+       restock_lead_days, coalesce(restock_environment, '（空）') as restock_environment
+  from referral_settings where id = 1;
+SQL
+
+read -r -d '' RESTOCKS <<'SQL' || true
+select id, environment, number_of_codes                       as codes,
+       to_char(expires_at at time zone 'UTC', 'YYYY-MM-DD')   as expires,
+       coalesce(asc_batch_id, '')                             as batch,
+       state, imported_count                                  as imported,
+       to_char(started_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI')  as started_utc,
+       to_char(finished_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI') as finished_utc,
+       left(coalesce(error, ''), 120)                         as error
+  from code_restocks
+ order by started_at desc
+ limit 10;
+SQL
+
 if [[ "${1:-}" == "--sql" ]]; then
-    printf -- '-- 各批次\n%s\n\n-- 汇总\n%s\n' "$BATCHES" "$SUMMARY"
+    printf -- '-- 各批次\n%s\n\n-- 汇总\n%s\n\n-- 自动补货设置（021）\n%s\n\n-- 最近补货（021）\n%s\n' "$BATCHES" "$SUMMARY" "$RESTOCK_SETTINGS" "$RESTOCKS"
     exit 0
 fi
 
@@ -74,3 +95,10 @@ echo "== 各批次"
 "$psql_bin" "$SUPABASE_DB_URL" -X -q -v ON_ERROR_STOP=1 -c "$BATCHES"
 echo "== 汇总（alert 口径同 referral/pool.go；补货：deploy/supabase/import-codes.sh codes.csv \"Referral Friend Month\" YYYY-MM-DD）"
 "$psql_bin" "$SUPABASE_DB_URL" -X -q -v ON_ERROR_STOP=1 -x -c "$SUMMARY"
+# 021 还没跑时这两条会报 column / relation 不存在：只提示一句，不让整个脚本失败。
+echo "== 自动补货设置（referral/restock.go；deploy/README.md §10）"
+"$psql_bin" "$SUPABASE_DB_URL" -X -q -v ON_ERROR_STOP=1 -x -c "$RESTOCK_SETTINGS" 2>/dev/null \
+    || echo "（没有自动补货的列：migration 021_referral_auto_restock.sql 还没跑）"
+echo "== 最近补货（code_restocks，新的在前）"
+"$psql_bin" "$SUPABASE_DB_URL" -X -q -v ON_ERROR_STOP=1 -c "$RESTOCKS" 2>/dev/null \
+    || echo "（没有 code_restocks 表：migration 021_referral_auto_restock.sql 还没跑）"

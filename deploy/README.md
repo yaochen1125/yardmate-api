@@ -119,9 +119,10 @@ once a day per condition set when usable stock drops below
 expires within `expiry_warn_days` (30) AND too little would be left behind it;
 without the mail settings it only logs `WARN referral pool`. The same row also
 holds `issue_margin_days` (14, new codes must outlive it) and `swap_grace_days`
-(3, a re-claim swaps the code in hand only below it). Apple batches live six
-months (150 000 codes / quarter / app): import a new batch about every five
-months.
+(3, a re-claim swaps the code in hand only below it). Apple batches hold
+500–25,000 codes and live at most six months (1,000,000 codes / quarter / app,
+shared by all subscriptions — checked 2026-10-22): import a new batch about
+every five months, or turn on auto-restock (§10).
 
 Adding a new key:
 
@@ -390,7 +391,86 @@ referrer`, at most one per referrer per 24 h):
 The referrer never sees "under review": a held referral counts in
 `months_pending` ("on the way").
 
-## 10. References
+## 10. Referral code pool auto-restock (自动补货, default off)
+
+`referral/SPEC.md` §3.1; product rules in yardmate-swiftui `invite-friends.md
+### 码池自动补货`. When `referral_settings.auto_restock_enabled` is on, every
+settlement pass (10 min) generates a batch of one-time offer codes through the
+App Store Connect API and imports it into `code_pool` when usable stock is
+below `restock_below` (300), or the earliest usable batch expires within
+`restock_lead_days` (45) with too little behind it. At most one restock in
+flight, an hour apart, `restock_daily_max` (2) per UTC day; every failure and
+every success mails the `FEEDBACK_EMAIL_TO` inbox, subject tagged with the code
+environment (`[SANDBOX]` / `[PRODUCTION]`). With the switch off nothing calls
+Apple and `import-codes.sh` works exactly as before (it also works with the
+switch on — the two kinds of codes are the same in the pool).
+
+**Turning it on** (staging first, SANDBOX codes; then prod, PRODUCTION codes):
+
+1. **Migration 021**: `psql "$STAGING_SUPABASE_DB_URL" -f
+   proxy/enrichment/migrations/021_referral_auto_restock.sql` (after 013 / 014;
+   re-runnable), **before** the binary. Without it the new binary treats
+   auto-restock as off and logs `referral restock: off (migration
+   021_referral_auto_restock.sql not applied)` once.
+2. **Secrets** (`secrets-staging.env`, later `secrets.env`) — five keys, values
+   never in the repo or a chat:
+   - `ASC_KEY_ID` — the App Store Connect API key's Key ID (the App Manager key
+     already used for uploads, decided 2026-10-22).
+   - `ASC_ISSUER_ID` — App Store Connect → Users and Access → Integrations →
+     Issuer ID.
+   - `ASC_PRIVATE_KEY` — that key's `.p8` on ONE line with literal `\n` between
+     the PEM lines (like `APPLE_PRIVATE_KEY`).
+   - `ASC_REFERRAL_OFFER_ID` — the `Referral Friend Month` offer's id
+     (`bbce4503-29ee-4629-9a90-f55d8c2a6327` as of 2026-10-22).
+   - `ASC_OFFER_CODE_ENVIRONMENT` — `SANDBOX` on staging, `PRODUCTION` on prod.
+   Deploy. The log shows `referral restock: App Store Connect configured, code
+   environment SANDBOX …`, or `… not configured (missing [...])` naming what
+   is missing (never a value).
+3. **The database's own code environment** (each database once; must equal
+   `ASC_OFFER_CODE_ENVIRONMENT`, or every pass refuses and mails once a day):
+   `update referral_settings set restock_environment = 'SANDBOX' where id = 1;`
+   (`'PRODUCTION'` on prod).
+4. **Staging numbers** (approved 2026-10-22: one 10-code SANDBOX batch):
+   `update referral_settings set restock_batch_size = 10, restock_below = 5,
+   low_stock_threshold = 4 where id = 1;` (`low_stock_threshold` under
+   `restock_below`, or the low-stock alert fires before the restock does; the
+   settings check logs a WARN for that). Prod keeps the defaults (1,000 / 300 /
+   100); a PRODUCTION batch is clamped to Apple's 500–25,000.
+5. **Switch on**: `update referral_settings set auto_restock_enabled = true
+   where id = 1;` — takes effect on the next pass, no deploy.
+
+**Checking it on staging** (this generates real sandbox codes on Apple's side —
+only with the batch size above):
+
+- Usable sandbox stock must be under `restock_below` for it to fire:
+  `SUPABASE_DB_URL=… deploy/referral-pool.sh` shows usable, the restock
+  settings and the last restocks. If staging still has ≥ 5 usable codes, either
+  wait, or raise the trigger for one pass (`update referral_settings set
+  restock_below = <usable + 1> where id = 1;`, back to 5 afterwards — with
+  `restock_batch_size = 10` that is still one 10-code batch).
+- Nudge a pass instead of waiting up to 10 minutes: restart the service
+  (`sudo systemctl restart yardmate-api-staging`; the first pass runs a minute
+  after start); an authenticated `POST /v1/referral/redeemed` also nudges one.
+- Watch: `journalctl -u yardmate-api-staging -f | grep 'referral restock'` —
+  `restock N started`, `restock N created: App Store Connect batch …`,
+  `restock N imported: batch …, 10 values, 10 new in the pool …`; the inbox
+  gets `[YardMate] [SANDBOX] Referral code restock: added 10 codes, expires …`.
+  `deploy/referral-pool.sh` lists the new `Referral Friend Month` batch and the
+  `code_restocks` row as `imported`.
+- Then set the switch back off on staging unless you want it running there
+  (`auto_restock_enabled = false`).
+
+**When a mail arrives**: `not configured` / `code environment mismatch` — fix
+the secrets or the row; `Apple refused the batch (http_401|http_403)` — the key
+is revoked or lacks the role; `(http_4xx)` — Apple refused (e.g. the quarter's
+quota); `outcome unknown, no matching batch` — check the offer's one-time code
+batches in App Store Connect and, if a batch with that count / expiry exists,
+download its CSV and import it with `deploy/supabase/import-codes.sh` (safe to
+repeat); `batch <id> not imported in 6h` — same, for that batch id; `daily max
+reached` — restock by hand or raise `restock_daily_max`. A refused or failed
+restock is retried after an hour within the daily max.
+
+## 11. References
 
 - `attest/SPEC.md` — App Attest protocol implementation
 - `secrets/SPEC.md` — env file format + load semantics
@@ -400,3 +480,4 @@ The referrer never sees "under review": a held referral counts in
 - `deploy/deploy.sh` — the script
 - `rewards/SPEC.md` + `deploy/referral-payout.sh` — referral gift-card rewards (§8)
 - `referral/SPEC.md` + `deploy/referral-review.sh` — referral anti-abuse, held review (§9)
+- `referral/SPEC.md` §3.1 + `deploy/referral-pool.sh` — referral code pool auto-restock (§10)
