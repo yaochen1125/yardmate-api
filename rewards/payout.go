@@ -34,13 +34,15 @@ type payoutRequest struct {
 	Email string `json:"email"`
 }
 
-// HandlePayout is POST /v1/referral/payout {email}: $100 of redeemable
-// balance becomes one Amazon.com gift-card request (rewards.md ## 数据契约).
+// HandlePayout is POST /v1/referral/payout {email}: the redeemable balance
+// becomes one Amazon.com gift-card request for PayoutAmountFor(balance) —
+// $20 to $500 in whole $10, the rest stays (rewards.md ### 兑换金额).
 //
 // Order: headers + JWT (as /claim) → body → email shape → the shared
 // per-device try (/claim's 5 / 24 h bucket; a typo'd address does not spend
 // one) → one transaction that refuses payout_in_progress / below_threshold or
-// inserts the request → the operator mail, off the request path.
+// sizes the card from the balance it just read and inserts the request → the
+// operator mail, off the request path.
 func (s *Service) HandlePayout() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, ok := s.caller(w, r)
@@ -67,7 +69,7 @@ func (s *Service) HandlePayout() http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), storeTimeout)
 		defer cancel()
 		yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
-		po, year, err := s.store.RequestPayout(ctx, userID, email, PayoutAmountCents, ThresholdCents, yearStart)
+		po, year, err := s.store.RequestPayout(ctx, userID, email, yearStart)
 		switch {
 		case errors.Is(err, ErrPayoutInProgress):
 			writeError(w, http.StatusConflict, "payout_in_progress")
@@ -262,12 +264,13 @@ func (s *Service) notifyOperator(po Payout, year YearTotals, calendarYear int) {
 }
 
 // composePayoutMail renders the operator notice. Subject is plain ASCII
-// (Alert does no RFC 2047 encoding); the user's email address only ever goes
-// in the body. w9Threshold is the 1099 filing threshold; the W-9 line shows
-// from one card below it. It names no 1099 form: NEC or MISC is for the
+// (Alert does no RFC 2047 encoding) and carries the card's amount, which
+// varies now; the user's email address only ever goes in the body.
+// w9Threshold is the 1099 filing threshold; the W-9 line shows from
+// W9MarginCents below it. It names no 1099 form: NEC or MISC is for the
 // accountant to say (rewards.md ## 待确认).
 func composePayoutMail(po Payout, year YearTotals, rv *Review, calendarYear int, w9Threshold int64) (subject, body string) {
-	subject = fmt.Sprintf("[YardMate] Referral gift card request #%d", po.ID)
+	subject = fmt.Sprintf("[YardMate] Referral gift card request #%d (%s)", po.ID, cardUSD(po.AmountCents))
 	var b strings.Builder
 	b.WriteString("A referrer asked for a gift card.\n\n")
 	fmt.Fprintf(&b, "Request:      #%d\n", po.ID)
@@ -279,14 +282,15 @@ func composePayoutMail(po Payout, year YearTotals, rv *Review, calendarYear int,
 	fmt.Fprintf(&b, "  Sent:                    %s\n", usd(year.SentCents))
 	fmt.Fprintf(&b, "  Requested (incl. this):  %s\n", usd(year.RequestedCents))
 	fmt.Fprintf(&b, "  Total:                   %s\n\n", usd(year.Total()))
-	if warn := w9Threshold - PayoutAmountCents; year.Total() >= warn {
+	if warn := w9Threshold - W9MarginCents; year.Total() >= warn {
 		fmt.Fprintf(&b, "W-9 FIRST (先收 W-9 再发；已经收过这个人的 W-9 且信息没变就照发): this user is at %s or more\n", usd(warn))
 		fmt.Fprintf(&b, "in gift cards this year; the 1099 filing threshold is %s (referral_settings.w9_threshold_cents).\n", usd(w9Threshold))
 		b.WriteString("Collect a W-9 before sending this card, through an encrypted channel, never as an email\n")
 		b.WriteString("attachment (it carries their SSN). Request email template: rewards.md ### 税务：W-9.\n\n")
 	}
 	writeReview(&b, rv)
-	b.WriteString("Within 3 business days: buy the card, email the code to the address above, then\n")
+	fmt.Fprintf(&b, "Within 3 business days: buy a %s Amazon.com eGift card (custom amount), send it to the\n", usd(po.AmountCents))
+	b.WriteString("address above, then\n")
 	fmt.Fprintf(&b, "  deploy/referral-payout.sh mark-sent %d\n", po.ID)
 	b.WriteString("It lists the request, then asks you to retype the id and type yes. For one hour after\n")
 	b.WriteString("that the App still shows \"on its way\" and you can take it back (our record only; the\n")
@@ -348,6 +352,15 @@ func voidLine(by map[string]int) string {
 }
 
 // usd renders cents as "$1234.56" (no thousands grouping; operator text only).
+// cardUSD is a card amount for the subject: whole dollars ("$50"), since a
+// card is always a multiple of $10; anything else falls back to usd.
+func cardUSD(cents int64) string {
+	if cents > 0 && cents%100 == 0 {
+		return fmt.Sprintf("$%d", cents/100)
+	}
+	return usd(cents)
+}
+
 func usd(cents int64) string {
 	sign := ""
 	if cents < 0 {

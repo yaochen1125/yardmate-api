@@ -8,13 +8,14 @@
 #
 # list [state]   不带参数：要处理的——requested（最早的在前）+ 已标记、还在 1 小时缓冲里的。
 #                也可以是 requested / sent / cancelled，只列那一种。
-# mark-sent <id> 买好 Amazon.com $100 礼品卡、把码发到那个邮箱之后标记已发。先列出这条申请，
+# mark-sent <id> 按这条申请的金额（$20–$500，每张不一样，list / mark-sent 都会列出来）在亚马逊买好
+#                自定义金额的 Amazon.com 电子礼品卡、把码发到那个邮箱之后标记已发。先列出这条申请，
 #                再让你输一遍编号、再输 yes，两次都对才执行（必须在终端里手输，不能用管道喂）。
 #                执行后是「已发、待生效」：1 小时内可以 undo；这 1 小时里对方 App 仍显示
-#                「Gift card on its way」，过了 1 小时才显示「Sent {date}」（rewards.md ### 标记已发）。
+#                「$50 gift card on its way」，过了 1 小时才显示「$50 gift card sent {date}」（rewards.md ### 标记已发）。
 # undo <id>      标记后 1 小时内撤回成 requested。只撤我们的记录——亚马逊那边已经发出的卡，
 #                要去亚马逊那张礼品卡的订单里自己处理。过了 1 小时拒绝执行。
-# cancel <id>    不发了（邮箱明显不对 / 收不到 W-9 等）：requested → cancelled，那 $100 自然回到
+# cancel <id>    不发了（邮箱明显不对 / 收不到 W-9 等）：requested → cancelled，这张的金额自然回到
 #                对方余额（可兑余额只扣 requested + sent）。缓冲中的先 undo 再 cancel。
 #
 # mark-sent / undo 走数据库函数 reward_payout_mark_sent / reward_payout_undo（018），判断 + 更新
@@ -113,7 +114,7 @@ mark_sent() {
     echo "编号不一致，退出，没改任何东西" >&2
     exit 1
   fi
-  read -r -p "第二次确认：已经在亚马逊买好 \$$(printf '%s' "$row" | jq -r '.[0].amount_cents / 100') 礼品卡、发到上面这个邮箱了？输入 yes：" typed || { echo; echo "没有输入，退出，没改任何东西" >&2; exit 1; }
+  read -r -p "第二次确认：已经在亚马逊买好 \$$(printf '%s' "$row" | jq -r '.[0].amount_cents / 100') 的自定义金额礼品卡、发到上面这个邮箱了？输入 yes：" typed || { echo; echo "没有输入，退出，没改任何东西" >&2; exit 1; }
   if [ "$typed" != "yes" ]; then
     echo "没有输入 yes，退出，没改任何东西" >&2
     exit 1

@@ -43,13 +43,14 @@ func errOf(t *testing.T, w *httptest.ResponseRecorder) string {
 
 const okBody = `{"email":"friend@example.com"}`
 
-// richSvc: the referrer has $230.00 available, $12.00 pending.
+// richSvc: the referrer has $231.30 available, $12.00 pending: one $230 card
+// with $1.30 change (rewards.md ### 兑换金额).
 func richSvc(t *testing.T) (*Service, *memStore, *fakeMailer) {
 	t.Helper()
 	svc, store, mailer := newTestSvc(t0)
 	store.addReferral(referrer, referee, "rewarded", t0.Add(-200*24*time.Hour))
 	store.credit(referrer, "a1", "t1", 12000, LedgerAvailable, t0.Add(-time.Hour))
-	store.credit(referrer, "a2", "t2", 11000, LedgerAvailable, t0.Add(-time.Hour))
+	store.credit(referrer, "a2", "t2", 11130, LedgerAvailable, t0.Add(-time.Hour))
 	store.credit(referrer, "p1", "t3", 1200, LedgerPending, t0.Add(time.Hour))
 	return svc, store, mailer
 }
@@ -123,16 +124,16 @@ func TestPayoutCreated(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := resp.Payout
-	if p.ID == 0 || p.AmountCents != 10000 || p.State != PayoutRequested || p.RequestedAt != "2026-10-20T12:00:00Z" || p.SentAt != nil {
+	if p.ID == 0 || p.AmountCents != 23000 || p.State != PayoutRequested || p.RequestedAt != "2026-10-20T12:00:00Z" || p.SentAt != nil {
 		t.Fatalf("payout = %+v", p)
 	}
 	if got := store.payouts[0]; got.UserID != referrer || got.Email != "friend@example.com" {
 		t.Fatalf("stored = %+v", got)
 	}
 
-	// /me now shows $130.00 left and the request in progress.
+	// /me now shows the $1.30 change left and the request in progress.
 	s := summaryOf(t, svc, referrer)
-	if s.AvailableCents != 13000 || s.PendingCents != 1200 || s.LifetimeCents != 23000 ||
+	if s.AvailableCents != 130 || s.PendingCents != 1200 || s.LifetimeCents != 23130 ||
 		s.Payout == nil || s.Payout.State != PayoutRequested || s.Payout.ID != p.ID {
 		t.Fatalf("summary after payout = %+v / %+v", s, s.Payout)
 	}
@@ -141,7 +142,7 @@ func TestPayoutCreated(t *testing.T) {
 	if len(mailer.subjects) != 1 {
 		t.Fatalf("mails = %d", len(mailer.subjects))
 	}
-	wantSubject := "[YardMate] Referral gift card request #" + itoa(p.ID)
+	wantSubject := "[YardMate] Referral gift card request #" + itoa(p.ID) + " ($230)"
 	if mailer.subjects[0] != wantSubject {
 		t.Fatalf("subject = %q, want %q", mailer.subjects[0], wantSubject)
 	}
@@ -149,11 +150,12 @@ func TestPayoutCreated(t *testing.T) {
 	for _, want := range []string{
 		"User id:      " + referrer,
 		"Send to:      friend@example.com",
-		"$100.00 Amazon.com (US) gift card",
+		"$230.00 Amazon.com (US) gift card",
+		"buy a $230.00 Amazon.com eGift card (custom amount)",
 		"calendar year 2026 (UTC)",
 		"Sent:                    $0.00",
-		"Requested (incl. this):  $100.00",
-		"Total:                   $100.00",
+		"Requested (incl. this):  $230.00",
+		"Total:                   $230.00",
 		"deploy/referral-payout.sh mark-sent " + itoa(p.ID),
 		"deploy/referral-payout.sh cancel " + itoa(p.ID),
 	} {
@@ -162,7 +164,7 @@ func TestPayoutCreated(t *testing.T) {
 		}
 	}
 	if strings.Contains(body, "W-9") {
-		t.Errorf("W-9 line at $100:\n%s", body)
+		t.Errorf("W-9 line at $230:\n%s", body)
 	}
 }
 
@@ -171,7 +173,7 @@ func itoa(n int64) string { b, _ := json.Marshal(n); return string(b) }
 func TestPayoutBelowThreshold(t *testing.T) {
 	svc, store, mailer := newTestSvc(t0)
 	store.addReferral(referrer, referee, "rewarded", t0.Add(-200*24*time.Hour))
-	store.credit(referrer, "a1", "t1", 9999, LedgerAvailable, t0)
+	store.credit(referrer, "a1", "t1", 1999, LedgerAvailable, t0)
 	store.credit(referrer, "p1", "t2", 50000, LedgerPending, t0.Add(time.Hour)) // pending does not count
 	if w := callPayout(t, svc, okBody, nil); w.Code != http.StatusConflict || errOf(t, w) != "below_threshold" {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
@@ -187,11 +189,24 @@ func TestPayoutBelowThreshold(t *testing.T) {
 }
 
 func TestPayoutInProgress(t *testing.T) {
-	// $230: the first request goes through, the second (still $130 left) is
-	// refused while the first is requested; once it is sent, the next one works.
-	svc, store, _ := richSvc(t)
-	if w := callPayout(t, svc, okBody, nil); w.Code != http.StatusCreated {
-		t.Fatalf("first: %d", w.Code)
+	// $715: the first card is capped at $500; the second request (still $215
+	// left) is refused while the first is requested; once it is sent, the
+	// next one is the $210 left in whole $10; then $5 is under $20.
+	svc, store, _ := newTestSvc(t0)
+	store.addReferral(referrer, referee, "rewarded", t0.Add(-200*24*time.Hour))
+	store.credit(referrer, "a1", "t1", 71500, LedgerAvailable, t0.Add(-time.Hour))
+	amountOf := func(w *httptest.ResponseRecorder) int64 {
+		t.Helper()
+		var resp struct {
+			Payout PayoutView `json:"payout"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp.Payout.AmountCents
+	}
+	if w := callPayout(t, svc, okBody, nil); w.Code != http.StatusCreated || amountOf(w) != 50000 {
+		t.Fatalf("first: %d %s", w.Code, w.Body.String())
 	}
 	if w := callPayout(t, svc, okBody, nil); w.Code != http.StatusConflict || errOf(t, w) != "payout_in_progress" {
 		t.Fatalf("second: %d %s", w.Code, w.Body.String())
@@ -199,15 +214,68 @@ func TestPayoutInProgress(t *testing.T) {
 	store.mu.Lock()
 	store.payouts[0].State, store.payouts[0].SentAt = PayoutSent, t0
 	store.mu.Unlock()
-	if w := callPayout(t, svc, okBody, nil); w.Code != http.StatusCreated {
+	if w := callPayout(t, svc, okBody, nil); w.Code != http.StatusCreated || amountOf(w) != 21000 {
 		t.Fatalf("after sent: %d %s", w.Code, w.Body.String())
 	}
-	// $30 left now.
+	// $5 left now.
 	store.mu.Lock()
 	store.payouts[1].State, store.payouts[1].SentAt = PayoutSent, t0
 	store.mu.Unlock()
 	if w := callPayout(t, svc, okBody, nil); errOf(t, w) != "below_threshold" {
-		t.Fatalf("$30 left: %s", w.Body.String())
+		t.Fatalf("$5 left: %s", w.Body.String())
+	}
+	if s := summaryOf(t, svc, referrer); s.AvailableCents != 500 {
+		t.Fatalf("change left = %d, want 500", s.AvailableCents)
+	}
+}
+
+func TestPayoutAmountFor(t *testing.T) {
+	// rewards.md ### 兑换金额: $20 minimum, whole $10, $500 cap.
+	for _, c := range []struct{ redeemable, want int64 }{
+		{-100, 0}, {0, 0}, {1999, 0}, {2000, 2000}, {2999, 2000}, {5130, 5000},
+		{48000, 48000}, {49999, 49000}, {50000, 50000}, {50001, 50000}, {300000, 50000},
+	} {
+		if got := PayoutAmountFor(c.redeemable); got != c.want {
+			t.Errorf("PayoutAmountFor(%d) = %d, want %d", c.redeemable, got, c.want)
+		}
+	}
+}
+
+func TestPayoutW9WithBigCard(t *testing.T) {
+	// A $500 card: the W-9 line still goes by sent + requested ≥ threshold −
+	// $100, so the card that crosses $2,000 always carries it.
+	cases := []struct {
+		name   string
+		sent   []int64 // cards already sent this year
+		wantW9 bool
+	}{
+		{"$1,300 + $500 = $1,800", []int64{50000, 50000, 30000}, false},
+		{"$1,350 + $500 = $1,850", []int64{50000, 50000, 35000}, false},
+		{"$1,400 + $500 = $1,900", []int64{50000, 50000, 40000}, true},
+		{"$1,600 + $500 = $2,100 crosses", []int64{50000, 50000, 50000, 10000}, true},
+	}
+	thisYear := t0.Add(-24 * time.Hour)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			svc, store, mailer := newTestSvc(t0)
+			store.addReferral(referrer, referee, "rewarded", t0.Add(-400*24*time.Hour))
+			var spent int64
+			for _, amount := range c.sent {
+				store.payout(referrer, PayoutSent, thisYear.Add(-time.Hour), thisYear).AmountCents = amount
+				spent += amount
+			}
+			store.credit(referrer, "a1", "t1", spent+80000, LedgerAvailable, t0.Add(-time.Hour))
+			if w := callPayout(t, svc, okBody, nil); w.Code != http.StatusCreated {
+				t.Fatalf("%d %s", w.Code, w.Body.String())
+			}
+			body := mailer.bodies[0]
+			if !strings.Contains(body, "Amount:       $500.00 Amazon.com (US) gift card") {
+				t.Fatalf("not a $500 card:\n%s", body)
+			}
+			if got := strings.Contains(body, "W-9 FIRST (先收 W-9 再发"); got != c.wantW9 {
+				t.Fatalf("W-9 line = %v, want %v:\n%s", got, c.wantW9, body)
+			}
+		})
 	}
 }
 
@@ -386,7 +454,7 @@ func TestPayoutConcurrentRequestsMakeOne(t *testing.T) {
 func TestPayoutMailSubjectIsASCII(t *testing.T) {
 	subject, _ := composePayoutMail(Payout{ID: 17, UserID: referrer, AmountCents: 10000, Email: "é@example.com", RequestedAt: t0},
 		YearTotals{RequestedCents: 10000}, nil, 2026, DefaultW9ThresholdCents)
-	if subject != "[YardMate] Referral gift card request #17" {
+	if subject != "[YardMate] Referral gift card request #17 ($100)" {
 		t.Fatalf("subject = %q", subject)
 	}
 	for _, c := range subject {
