@@ -203,6 +203,13 @@ func (s *Service) restockStep(ctx context.Context, now time.Time, ps PoolStatus,
 	rs := status.Settings
 	if !rs.Enabled {
 		s.restockWarned = ""
+		// Off means off: Apple is not called, nothing is mailed. An unfinished
+		// row left behind is only pointed out in the log, once a UTC day.
+		if o := status.Open; o != nil && s.restockOffOpenDay != ymd(now) {
+			s.restockOffOpenDay = ymd(now)
+			log.Printf("WARN referral restock: auto_restock_enabled is off but restock %d is still %s (batch %q, %d %s codes, started %s); left alone while the switch is off — turn it back on to let it finish, or import the batch by hand (deploy/supabase/import-codes.sh)",
+				o.ID, o.State, o.BatchID, o.Codes, o.Environment, restockStamp(o.StartedAt))
+		}
 		return false, false
 	}
 	env := NormaliseOfferEnvironment(s.restock.Environment)
@@ -228,6 +235,16 @@ func (s *Service) restockStep(ctx context.Context, now time.Time, ps PoolStatus,
 	st := TakeStock(ps, now)
 	why := restockTrigger(st, rs.Below, plan.leadDays, now)
 	if why == "" {
+		return false, false
+	}
+	if rs.DailyMax <= 0 {
+		// restock_daily_max = 0 pauses auto-restock: nothing new is started
+		// and there is no "daily max" mail (an unfinished restock above is
+		// still finished; the low-stock alert works as usual).
+		if s.restockPausedDay != ymd(now) {
+			s.restockPausedDay = ymd(now)
+			log.Printf("referral restock: needed (%s) but paused (restock_daily_max = 0)", why)
+		}
 		return false, false
 	}
 	if status.StartedToday >= rs.DailyMax {
@@ -348,8 +365,12 @@ func (s *Service) finishRestock(ctx context.Context, now time.Time, open *Restoc
 		open.BatchID, open.State = batchID, RestockCreated
 	}
 	if now.Sub(open.StartedAt) >= restockImportWindow {
+		// One last try before giving up on the batch.
+		if busy, refreshed := s.importRestock(ctx, now, open, rep); !busy {
+			return false, refreshed // imported, or moved on by another process
+		}
 		reason := fmt.Sprintf("batch %s not imported within %s of the request", open.BatchID, restockImportWindow)
-		s.failRestock(ctx, now, open, reason, "restock:import_timeout:"+open.BatchID,
+		s.failRestock(ctx, now, open, reason, "batch:restock:import_timeout:"+open.BatchID,
 			restockSubject(open.Environment, "batch "+open.BatchID+" not imported in 6h"), importTimeoutMail(open, now), rep)
 		return false, false
 	}
@@ -362,9 +383,9 @@ func (s *Service) finishRestock(ctx context.Context, now time.Time, open *Restoc
 // restocks on one day ask for the same count and date). The earliest such
 // batch wins. why says what was seen when nothing matched.
 func (s *Service) reconcile(ctx context.Context, open *Restock, rep *Report) (batchID, why string) {
-	cctx, cancel := s.ascContext(ctx)
-	batches, err := s.restock.API.ListOneTimeCodeBatches(cctx, s.restock.OfferID)
-	cancel()
+	// No shared deadline over the whole list: the client bounds every page
+	// on its own (60 s each), so a long list is not cut short by one budget.
+	batches, err := s.restock.API.ListOneTimeCodeBatches(ctx, s.restock.OfferID)
 	if err != nil {
 		log.Printf("referral restock: restock %d: list batches: %v", open.ID, err)
 		rep.Errors++
@@ -409,15 +430,25 @@ func (s *Service) reconcile(ctx context.Context, open *Restock, rep *Report) (ba
 // than asked for) are fetched again next pass — never re-requested.
 func (s *Service) importRestock(ctx context.Context, now time.Time, open *Restock, rep *Report) (busy, refreshed bool) {
 	cctx, cancel := s.ascContext(ctx)
-	codes, err := s.restock.API.OneTimeCodeValues(cctx, open.BatchID)
+	codes, lines, err := s.restock.API.OneTimeCodeValues(cctx, open.BatchID)
 	cancel()
 	if err != nil {
 		log.Printf("referral restock: restock %d: fetch values of batch %s: %v; trying again next pass", open.ID, open.BatchID, err)
 		rep.Errors++
 		return true, false
 	}
+	// Counts only — never a code value.
+	log.Printf("referral restock: restock %d: batch %s values: %d non-empty CSV lines, %d codes recognised, %d asked for",
+		open.ID, open.BatchID, lines, len(codes), open.Codes)
 	if len(codes) < open.Codes {
-		log.Printf("referral restock: restock %d: batch %s has %d of %d code values so far; trying again next pass", open.ID, open.BatchID, len(codes), open.Codes)
+		if lines >= open.Codes {
+			// The CSV has enough lines but not enough of them look like codes:
+			// waiting will not fix that. Say so now (once per batch) instead of
+			// only at the 6-hour timeout; keep trying meanwhile.
+			log.Printf("WARN referral restock: restock %d: batch %s code values not recognised (%d lines, %d codes)", open.ID, open.BatchID, lines, len(codes))
+			s.restockBatchAlert(rep, "restock:values_unrecognised:"+open.BatchID,
+				restockSubject(open.Environment, "batch "+open.BatchID+" code values not recognised"), unrecognisedMail(open, lines, len(codes), now))
+		}
 		return true, false
 	}
 	inserted, err := s.store.ImportRestock(ctx, open.ID, codes, RestockOfferRefName, open.ExpiresAt, now)
@@ -433,13 +464,14 @@ func (s *Service) importRestock(ctx context.Context, now time.Time, open *Restoc
 	rep.Restocked += inserted
 	log.Printf("referral restock: restock %d imported: batch %s, %d values, %d new in the pool, %s, expires %s",
 		open.ID, open.BatchID, len(codes), inserted, open.Environment, ymd(open.ExpiresAt))
-	s.restockAlert(rep, "restock:imported:"+open.BatchID, now,
+	s.restockBatchAlert(rep, "restock:imported:"+open.BatchID,
 		restockSubject(open.Environment, fmt.Sprintf("added %d codes, expires %s", inserted, ymd(open.ExpiresAt))),
 		importedMail(open, len(codes), inserted, now))
 	return false, true
 }
 
-// failRestock closes the restock as failed and mails the operator under key.
+// failRestock closes the restock as failed and mails the operator under key
+// (a "batch:" key goes once per batch, any other once a day).
 func (s *Service) failRestock(ctx context.Context, now time.Time, open *Restock, reason, key, subject, body string, rep *Report) {
 	if err := s.store.FailRestock(ctx, open.ID, reason, now); err != nil {
 		log.Printf("referral restock: restock %d: record failure: %v", open.ID, err)
@@ -447,7 +479,31 @@ func (s *Service) failRestock(ctx context.Context, now time.Time, open *Restock,
 		return
 	}
 	log.Printf("WARN referral restock: restock %d failed: %s", open.ID, reason)
+	if k, ok := strings.CutPrefix(key, "batch:"); ok {
+		s.restockBatchAlert(rep, k, subject, body)
+		return
+	}
 	s.restockAlert(rep, key, now, subject, body)
+}
+
+// restockBatchAlert mails what carries an Apple batch id: once per key for
+// the life of the process, not once a day (a batch that keeps failing across
+// midnight is still one mail). In memory, like alertOnce: a restart may
+// repeat one; a failed send is not remembered, so the next pass retries.
+func (s *Service) restockBatchAlert(rep *Report, key, subject, body string) {
+	if s.alerter == nil || s.restockBatchMailed[key] {
+		return
+	}
+	if err := s.alerter.Alert(subject, body); err != nil {
+		log.Printf("referral restock alert mail: %v", err)
+		rep.Errors++
+		return
+	}
+	if s.restockBatchMailed == nil {
+		s.restockBatchMailed = map[string]bool{}
+	}
+	s.restockBatchMailed[key] = true
+	rep.RestockMails++
 }
 
 // restockAlert mails through the shared once-a-day dedup (alertOnce).
@@ -575,6 +631,19 @@ func importTimeoutMail(open *Restock, now time.Time) string {
 	b.WriteString("这批码在苹果那边已经存在（占季度额度）。手动导入：App Store Connect 下载这个批次的 CSV，然后\n")
 	b.WriteString(manualImportLine(ymd(open.ExpiresAt)))
 	b.WriteString("（重复导入安全）。可发仍不够时后端会再补一批。\n")
+	return b.String()
+}
+
+func unrecognisedMail(open *Restock, lines, codes int, now time.Time) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "推荐好友码池自动补货：苹果批次 %s 的码值格式认不出（%s）\n\n", open.BatchID, restockStamp(now))
+	b.WriteString(restockLine(open) + "\n")
+	fmt.Fprintf(&b, "苹果批次 ID：%s\n", open.BatchID)
+	fmt.Fprintf(&b, "取到的 CSV 有 %d 行非空，但只认出 %d 个码（要 %d 张）。认码规则同 import-codes.sh：每行第一个像 ^[A-Z0-9]{6,20}$ 的字段。\n", lines, codes, open.Codes)
+	b.WriteString("苹果的 CSV 格式可能变了：后端会继续试，要码满 6 小时还灌不进就记 failed。\n")
+	b.WriteString("请在 App Store Connect 下载这个批次的 CSV 看一眼格式；能认出的话手动导入（重复导入安全）：\n")
+	b.WriteString(manualImportLine(ymd(open.ExpiresAt)))
+	b.WriteString("（import-codes.sh 用的是同一条认码规则，格式真变了的话 CSV 要先整理一下；后端的解析也要跟着改。）\n\n每个批次只发一封。\n")
 	return b.String()
 }
 

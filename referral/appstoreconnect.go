@@ -94,10 +94,15 @@ type CreateCodesRequest struct {
 // OfferCodeAPI is the slice of App Store Connect auto-restock uses. An
 // interface so the restock tests run against a fake; ASCClient is the real
 // one. Errors are *ASCError (Uncertain says whether Apple may have acted).
+// The real client bounds every HTTP request itself (each page of a list
+// included); restock.go adds its own 60 s around the single-request calls.
 type OfferCodeAPI interface {
 	CreateOneTimeCodes(ctx context.Context, req CreateCodesRequest) (batchID string, err error)
 	ListOneTimeCodeBatches(ctx context.Context, offerID string) ([]OneTimeCodeBatch, error)
-	OneTimeCodeValues(ctx context.Context, batchID string) ([]string, error)
+	// OneTimeCodeValues returns the batch's codes and how many non-empty
+	// lines the CSV had (to tell "not ready yet" from "format not
+	// recognised").
+	OneTimeCodeValues(ctx context.Context, batchID string) (codes []string, lines int, err error)
 }
 
 // ASCError is a failed App Store Connect call.
@@ -166,7 +171,10 @@ type ASCClient struct {
 	key             *ecdsa.PrivateKey
 	base            string
 	http            *http.Client
-	now             func() time.Time
+	// callTimeout bounds every request on its own (context and HTTP client):
+	// one page of a list, one create, one values fetch.
+	callTimeout time.Duration
+	now         func() time.Time
 }
 
 // NewASCClient parses the .p8 (PKCS#8 PEM, P-256) and returns a client. The
@@ -197,15 +205,16 @@ func NewASCClient(keyID, issuerID string, p8 []byte) (*ASCClient, error) {
 			// answer like any other non-2xx.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
-		now: time.Now,
+		callTimeout: DefaultASCTimeout,
+		now:         time.Now,
 	}, nil
 }
 
 // SetBaseURL overrides https://api.appstoreconnect.apple.com (tests).
 func (c *ASCClient) SetBaseURL(u string) { c.base = strings.TrimRight(u, "/") }
 
-// SetTimeout overrides the per-call HTTP timeout (tests).
-func (c *ASCClient) SetTimeout(d time.Duration) { c.http.Timeout = d }
+// SetTimeout overrides the per-request timeout (tests).
+func (c *ASCClient) SetTimeout(d time.Duration) { c.http.Timeout, c.callTimeout = d, d }
 
 // token signs a fresh ES256 JWT: header {alg, kid, typ}, claims {iss, iat,
 // exp, aud}, signature r||s (32 bytes each, not DER).
@@ -248,6 +257,8 @@ func (c *ASCClient) do(ctx context.Context, op, method, target string, body []by
 	if err != nil {
 		return nil, 0, &ASCError{Op: op, Err: err}
 	}
+	ctx, cancel := context.WithTimeout(ctx, c.callTimeout)
+	defer cancel()
 	var wrote atomic.Bool
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 		WroteRequest: func(info httptrace.WroteRequestInfo) {
@@ -383,7 +394,8 @@ func (c *ASCClient) CreateOneTimeCodes(ctx context.Context, in CreateCodesReques
 }
 
 // ListOneTimeCodeBatches lists the offer's one-time code batches, following
-// links.next (same host only) for up to ascListPages pages of 200.
+// links.next (same host only) for up to ascListPages pages of 200. Every
+// page has its own timeout (do), not one budget for the whole list.
 func (c *ASCClient) ListOneTimeCodeBatches(ctx context.Context, offerID string) ([]OneTimeCodeBatch, error) {
 	const op = "list"
 	next := c.base + "/v1/subscriptionOfferCodes/" + url.PathEscape(offerID) + "/oneTimeUseCodes?limit=200"
@@ -439,28 +451,33 @@ func (c *ASCClient) ListOneTimeCodeBatches(ctx context.Context, offerID string) 
 // one code per line and no header; like import-codes.sh, every line yields
 // the first token that looks like a code (^[A-Z0-9]{6,20}$), anything else is
 // dropped, and duplicates are folded.
-func (c *ASCClient) OneTimeCodeValues(ctx context.Context, batchID string) ([]string, error) {
+func (c *ASCClient) OneTimeCodeValues(ctx context.Context, batchID string) ([]string, int, error) {
 	const op = "values"
 	raw, status, err := c.do(ctx, op, http.MethodGet,
 		c.base+"/v1/subscriptionOfferCodeOneTimeUseCodes/"+url.PathEscape(batchID)+"/values", nil, "text/csv", ascMaxCSV)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if status != http.StatusOK {
-		return nil, statusError(op, status, raw)
+		return nil, 0, statusError(op, status, raw)
 	}
-	return ParseOfferCodeCSV(raw), nil
+	codes, lines := ParseOfferCodeCSV(raw)
+	return codes, lines, nil
 }
 
 var offerCodeShape = regexp.MustCompile(`^[A-Z0-9]{6,20}$`)
 
 // ParseOfferCodeCSV picks the codes out of an App Store Connect export, the
-// way deploy/supabase/import-codes.sh does (BOM, quotes, CRLF tolerated).
-func ParseOfferCodeCSV(raw []byte) []string {
+// way deploy/supabase/import-codes.sh does (BOM, quotes, CRLF tolerated),
+// and counts the non-empty lines.
+func ParseOfferCodeCSV(raw []byte) (codes []string, lines int) {
 	text := strings.TrimPrefix(string(raw), "\uFEFF")
 	seen := map[string]bool{}
 	var out []string
 	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines++
+		}
 		line = strings.NewReplacer("\r", "", `"`, "").Replace(line)
 		for _, tok := range strings.FieldsFunc(line, func(r rune) bool { return r == ',' || r == '\t' || r == ' ' }) {
 			if offerCodeShape.MatchString(tok) {
@@ -472,5 +489,5 @@ func ParseOfferCodeCSV(raw []byte) []string {
 			}
 		}
 	}
-	return out
+	return out, lines
 }

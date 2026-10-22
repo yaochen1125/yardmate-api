@@ -260,17 +260,45 @@ func TestASCClientValuesParsesTheCSV(t *testing.T) {
 		w.Header().Set("Content-Type", "text/csv")
 		_, _ = w.Write([]byte("\uFEFFKX7P2M9QAB\r\n\"ZZ4R8T2WQC\"\r\n\nnot-a-code\nKX7P2M9QAB\nlower12345\nSHORT\nAB12CD34EF,2027-04-17\n"))
 	})
-	got, err := c.OneTimeCodeValues(context.Background(), "622548")
+	got, lines, err := c.OneTimeCodeValues(context.Background(), "622548")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := []string{"KX7P2M9QAB", "ZZ4R8T2WQC", "AB12CD34EF"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("codes = %v, want %v", got, want)
 	}
+	// Non-empty lines: everything but the blank one (junk lines count).
+	if lines != 7 {
+		t.Errorf("lines = %d, want 7", lines)
+	}
 
 	c, _, _ = newTestASC(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) })
-	if _, err := c.OneTimeCodeValues(context.Background(), "nope"); err == nil {
+	if _, _, err := c.OneTimeCodeValues(context.Background(), "nope"); err == nil {
 		t.Error("404 accepted")
+	}
+}
+
+func TestASCClientListGivesEveryPageItsOwnTimeout(t *testing.T) {
+	var srv *httptest.Server
+	var c *ASCClient
+	c, srv, _ = newTestASC(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(70 * time.Millisecond) // each page well inside 150 ms; three together are not
+		next := ""
+		switch r.URL.Query().Get("cursor") {
+		case "":
+			next = srv.URL + "/v1/subscriptionOfferCodes/o/oneTimeUseCodes?cursor=2"
+		case "2":
+			next = srv.URL + "/v1/subscriptionOfferCodes/o/oneTimeUseCodes?cursor=3"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data":  []map[string]any{{"id": "b" + r.URL.Query().Get("cursor"), "attributes": map[string]any{"numberOfCodes": 10, "createdDate": "2026-10-22T08:00:00Z"}}},
+			"links": map[string]any{"next": next},
+		})
+	})
+	c.SetTimeout(150 * time.Millisecond)
+	got, err := c.ListOneTimeCodeBatches(context.Background(), "o")
+	if err != nil || len(got) != 3 {
+		t.Fatalf("got %d batches, err %v (pages must not share one timeout)", len(got), err)
 	}
 }
 

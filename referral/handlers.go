@@ -138,6 +138,13 @@ type Service struct {
 	restock                 RestockConfig
 	restockWarned           string
 	restockUnmigratedLogged bool
+	// restockOffOpenDay / restockPausedDay: the UTC day the "switch off but
+	// a restock is unfinished" / "paused (restock_daily_max = 0)" line was
+	// last logged (once a day each). restockBatchMailed: mails carrying an
+	// Apple batch id already sent (once per batch, not per day).
+	restockOffOpenDay  string
+	restockPausedDay   string
+	restockBatchMailed map[string]bool
 }
 
 // New wires a Service. Pass nil for whatever is not configured.

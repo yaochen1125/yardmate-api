@@ -266,7 +266,7 @@ func TestAlertMailListsEveryBatchAndTheRestockLine(t *testing.T) {
 		batch("Referral Friend Month", 170*day, 60),
 	)
 	st := TakeStock(ps, base)
-	subject, body := alertMail(ps, st, base)
+	subject, body := alertMail(ps, st, base, "")
 	for _, r := range subject {
 		if r > 0x7e || r < 0x20 {
 			t.Fatalf("subject must stay printable ASCII: %q", subject)
@@ -286,7 +286,7 @@ func TestAlertMailListsEveryBatchAndTheRestockLine(t *testing.T) {
 			t.Errorf("body missing %q:\n%s", needle, body)
 		}
 	}
-	if _, body := alertMail(poolWith(poolDefaults()), TakeStock(poolWith(poolDefaults()), base), base); !strings.Contains(body, "码池是空的") || !strings.Contains(body, "最早到期：没有可发的码") {
+	if _, body := alertMail(poolWith(poolDefaults()), TakeStock(poolWith(poolDefaults()), base), base, ""); !strings.Contains(body, "码池是空的") || !strings.Contains(body, "最早到期：没有可发的码") {
 		t.Errorf("empty pool body:\n%s", body)
 	}
 }

@@ -217,6 +217,11 @@ type fakeASC struct {
 	valuesErr     error
 	// valuesShort hands out this many values fewer than the batch holds.
 	valuesShort int
+	// unrecognised: the CSV has every line, but none reads as a code.
+	unrecognised bool
+	// listHadDeadline: some list call came with a context deadline (the
+	// restock must not put one shared budget over the whole list).
+	listHadDeadline bool
 }
 
 func newFakeASC() *fakeASC { return &fakeASC{values: map[string][]string{}, nextID: 622600} }
@@ -259,29 +264,35 @@ func (f *fakeASC) CreateOneTimeCodes(_ context.Context, req CreateCodesRequest) 
 	return f.addBatch(req.NumberOfCodes, req.ExpirationDate, req.Environment, f.at), nil
 }
 
-func (f *fakeASC) ListOneTimeCodeBatches(_ context.Context, offerID string) ([]OneTimeCodeBatch, error) {
+func (f *fakeASC) ListOneTimeCodeBatches(ctx context.Context, offerID string) ([]OneTimeCodeBatch, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lists++
+	if _, ok := ctx.Deadline(); ok {
+		f.listHadDeadline = true
+	}
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
 	return append([]OneTimeCodeBatch(nil), f.batches...), nil
 }
 
-func (f *fakeASC) OneTimeCodeValues(_ context.Context, batchID string) ([]string, error) {
+func (f *fakeASC) OneTimeCodeValues(_ context.Context, batchID string) ([]string, int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.valueCalls++
 	if f.valuesErr != nil {
-		return nil, f.valuesErr
+		return nil, 0, f.valuesErr
 	}
 	v, ok := f.values[batchID]
 	if !ok {
-		return nil, &ASCError{Op: "values", Status: 404}
+		return nil, 0, &ASCError{Op: "values", Status: 404}
+	}
+	if f.unrecognised {
+		return nil, len(v), nil
 	}
 	if f.valuesShort > 0 && f.valuesShort < len(v) {
 		v = v[:len(v)-f.valuesShort]
 	}
-	return append([]string(nil), v...), nil
+	return append([]string(nil), v...), len(v), nil
 }

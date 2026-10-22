@@ -178,7 +178,7 @@ func (s *Service) watchPool(ctx context.Context, now time.Time, rep *Report) {
 	if s.alerter == nil {
 		return
 	}
-	subject, body := alertMail(ps, st, now)
+	subject, body := alertMail(ps, st, now, s.restock.Environment)
 	sent, err := s.alertOnce(st.conditions(), now, subject, body)
 	if err != nil {
 		log.Printf("referral pool alert mail: %v", err)
@@ -216,7 +216,10 @@ func (s *Service) alertOnce(key string, now time.Time, subject, body string) (bo
 // first batch dies, and the exact restock command. Subject stays ASCII (a
 // non-ASCII header would need RFC 2047 encoding); the body is UTF-8 Chinese
 // like every other ops note in this repo. Dates are UTC, like the dedup key.
-func alertMail(ps PoolStatus, st Stock, now time.Time) (subject, body string) {
+// env is ASC_OFFER_CODE_ENVIRONMENT (normalised) when set: the subject then
+// says [PRODUCTION] / [SANDBOX], so staging and prod mailing the same inbox
+// can be told apart; "" leaves the subject as it always was.
+func alertMail(ps PoolStatus, st Stock, now time.Time, env string) (subject, body string) {
 	var why []string
 	if st.LowStock {
 		why = append(why, fmt.Sprintf("low stock (%d usable)", st.Usable))
@@ -224,7 +227,11 @@ func alertMail(ps PoolStatus, st Stock, now time.Time) (subject, body string) {
 	if st.Expiring {
 		why = append(why, "expiring "+st.Earliest.UTC().Format("2006-01-02"))
 	}
-	subject = "[YardMate] Referral code pool: " + strings.Join(why, ", ")
+	tag := ""
+	if env != "" {
+		tag = "[" + env + "] "
+	}
+	subject = "[YardMate] " + tag + "Referral code pool: " + strings.Join(why, ", ")
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "推荐好友码池告警（%s）\n\n", now.UTC().Format("2006-01-02 15:04 UTC"))

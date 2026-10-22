@@ -81,8 +81,9 @@ func TestRestockOffNeverCallsAppStoreConnect(t *testing.T) {
 	if api.calls() != 0 || rep.RestockStarted != 0 {
 		t.Fatalf("switch off: %d App Store Connect calls, %+v", api.calls(), rep)
 	}
-	// The pool alert is what it always was: mailed, not held for the open row.
-	if rep.Alerted != 1 || len(al.sent) != 1 || !strings.HasPrefix(al.sent[0].subject, "[YardMate] Referral code pool: low stock (42 usable)") {
+	// The pool alert is what it always was — mailed, not held for the open
+	// row — with the code environment in the subject (ASC_OFFER_CODE_ENVIRONMENT is set).
+	if rep.Alerted != 1 || len(al.sent) != 1 || !strings.HasPrefix(al.sent[0].subject, "[YardMate] [SANDBOX] Referral code pool: low stock (42 usable)") {
 		t.Fatalf("pool alert changed with the switch off: %+v %+v", rep, al.sent)
 	}
 	if rows := store.restockRows(); rows[0].State != RestockCreated {
@@ -304,6 +305,9 @@ func TestRestockUnknownOutcomeIsReconciledAgainstTheBatchList(t *testing.T) {
 	if api.createCount() != 1 {
 		t.Errorf("creates = %d, want 1", api.createCount())
 	}
+	if api.listHadDeadline {
+		t.Error("the batch list was put under one shared deadline (the client times each page)")
+	}
 }
 
 func TestRestockReconcileNeverClaimsABatchAnotherRestockHolds(t *testing.T) {
@@ -395,7 +399,7 @@ func TestRestockCreatedResumesImportWithoutANewRequest(t *testing.T) {
 }
 
 func TestRestockFewerValuesThanAskedForWaits(t *testing.T) {
-	svc, store, api, _ := newRestock(EnvSandbox, restockOn(EnvSandbox), batch("Dec", 90*day, 42))
+	svc, store, api, al := newRestock(EnvSandbox, restockOn(EnvSandbox), batch("Dec", 90*day, 42))
 	api.valuesShort = 400
 	passAt(svc, store, api, base)
 	if rows := store.restockRows(); rows[0].State != RestockCreated {
@@ -405,6 +409,129 @@ func TestRestockFewerValuesThanAskedForWaits(t *testing.T) {
 	passAt(svc, store, api, base.Add(10*time.Minute))
 	if rows := store.restockRows(); rows[0].State != RestockImported || rows[0].ImportedCount != 1000 {
 		t.Fatalf("%+v", rows[0])
+	}
+	if len(mailsWith(al, "not recognised")) != 0 {
+		t.Errorf("a short CSV is not a format problem: %+v", al.sent)
+	}
+}
+
+func TestRestockLastTryAtSixHoursBeforeGivingUp(t *testing.T) {
+	svc, store, api, al := newRestock(EnvSandbox, restockOn(EnvSandbox), batch("Dec", 90*day, 42))
+	x := api.addBatch(1000, wantExpiry, EnvSandbox, base)
+	store.seedRestock(Restock{Environment: EnvSandbox, Codes: 1000, ExpiresAt: restockExpiry(base), BatchID: x, State: RestockCreated, StartedAt: base})
+	api.valuesErr = &ASCError{Op: "values", Status: 500, Uncertain: true}
+	passAt(svc, store, api, base.Add(5*time.Hour+50*time.Minute))
+	api.valuesErr = nil // Apple answers on the very last pass
+	rep := passAt(svc, store, api, base.Add(6*time.Hour))
+	if rows := store.restockRows(); rows[0].State != RestockImported || rep.Restocked != 1000 {
+		t.Fatalf("last try: %+v rep %+v", rows[0], rep)
+	}
+	if len(mailsWith(al, "not imported in 6h")) != 0 || len(mailsWith(al, "added 1000 codes")) != 1 {
+		t.Errorf("mails = %+v", al.sent)
+	}
+}
+
+func TestRestockUnrecognisedValuesMailOncePerBatch(t *testing.T) {
+	buf := captureLog(t)
+	svc, store, api, al := newRestock(EnvSandbox, restockOn(EnvSandbox), batch("Dec", 90*day, 42))
+	api.unrecognised = true
+	start := base.Add(20 * time.Hour)
+	passAt(svc, store, api, start)
+	rows := store.restockRows()
+	if rows[0].State != RestockCreated {
+		t.Fatalf("imported unreadable values: %+v", rows[0])
+	}
+	x := rows[0].BatchID
+	got := mailsWith(al, "[SANDBOX] Referral code restock: batch "+x+" code values not recognised")
+	if len(got) != 1 {
+		t.Fatalf("mails = %+v", al.sent)
+	}
+	for _, needle := range []string{"1000 行非空，但只认出 0 个码（要 1000 张）", "苹果批次 ID：" + x, `import-codes.sh codes.csv "Referral Friend Month" `} {
+		if !strings.Contains(got[0].body, needle) {
+			t.Errorf("missing %q:\n%s", needle, got[0].body)
+		}
+	}
+	if !strings.Contains(buf.String(), "batch "+x+" values: 1000 non-empty CSV lines, 0 codes recognised, 1000 asked for") {
+		t.Errorf("counts not logged:\n%s", buf.String())
+	}
+	// Keeps trying — across midnight (UTC) too — without a second mail.
+	for _, at := range []time.Duration{10 * time.Minute, 3*time.Hour + 50*time.Minute, 4*time.Hour + 10*time.Minute} {
+		passAt(svc, store, api, start.Add(at))
+	}
+	if len(mailsWith(al, "not recognised")) != 1 {
+		t.Fatalf("second mail for the same batch: %+v", al.sent)
+	}
+	passAt(svc, store, api, start.Add(6*time.Hour))
+	if rows := store.restockRows(); rows[0].State != RestockFailed || len(mailsWith(al, "batch "+x+" not imported in 6h")) != 1 {
+		t.Errorf("after 6 h: %+v mails %+v", rows[0], al.sent)
+	}
+	if strings.Contains(buf.String(), api.values[x][0]) {
+		t.Error("a code value reached the log")
+	}
+}
+
+func TestRestockSwitchedOffWithAnUnfinishedRowWarnsOnceADay(t *testing.T) {
+	buf := captureLog(t)
+	rs := restockOn(EnvSandbox)
+	rs.Enabled = false
+	svc, store, api, al := newRestock(EnvSandbox, rs, batch("Dec", 90*day, 500))
+	store.seedRestock(Restock{Environment: EnvSandbox, Codes: 1000, ExpiresAt: restockExpiry(base), BatchID: "622437", State: RestockCreated, StartedAt: base.Add(-time.Hour)})
+	passAt(svc, store, api, base)
+	passAt(svc, store, api, base.Add(10*time.Minute))
+	const line = "WARN referral restock: auto_restock_enabled is off but restock 1 is still created"
+	if n := strings.Count(buf.String(), line); n != 1 {
+		t.Fatalf("WARN %d times the first day:\n%s", n, buf.String())
+	}
+	passAt(svc, store, api, base.Add(day))
+	if n := strings.Count(buf.String(), line); n != 2 {
+		t.Errorf("WARN %d times after two days", n)
+	}
+	if api.calls() != 0 || len(al.sent) != 0 {
+		t.Errorf("switch off: %d calls, mails %+v", api.calls(), al.sent)
+	}
+	if rows := store.restockRows(); rows[0].State != RestockCreated {
+		t.Errorf("row touched: %+v", rows[0])
+	}
+}
+
+func TestRestockDailyMaxZeroPauses(t *testing.T) {
+	rs := restockOn(EnvSandbox)
+	rs.DailyMax = 0
+	svc, store, api, al := newRestock(EnvSandbox, rs, batch("Dec", 90*day, 42))
+	passAt(svc, store, api, base)
+	passAt(svc, store, api, base.Add(2*time.Hour))
+	if api.createCount() != 0 || len(store.restockRows()) != 0 {
+		t.Fatalf("paused but started: creates %d", api.createCount())
+	}
+	if len(mailsWith(al, "daily max")) != 0 {
+		t.Errorf("paused is not a daily-max alert: %+v", al.sent)
+	}
+	if len(mailsWith(al, "[SANDBOX] Referral code pool: low stock (42 usable)")) != 1 {
+		t.Errorf("low-stock alert not as usual: %+v", al.sent)
+	}
+	// An unfinished restock from before the pause is still finished.
+	x := api.addBatch(1000, wantExpiry, EnvSandbox, base)
+	store.seedRestock(Restock{Environment: EnvSandbox, Codes: 1000, ExpiresAt: restockExpiry(base), BatchID: x, State: RestockCreated, StartedAt: base.Add(3 * time.Hour)})
+	passAt(svc, store, api, base.Add(3*time.Hour+10*time.Minute))
+	if rows := store.restockRows(); rows[0].State != RestockImported || api.createCount() != 0 {
+		t.Errorf("unfinished restock while paused: %+v creates %d", rows[0], api.createCount())
+	}
+}
+
+func TestWatchPoolSubjectCarriesTheCodeEnvironmentWhenSet(t *testing.T) {
+	for env, want := range map[string]string{
+		"sandbox":    "[YardMate] [SANDBOX] Referral code pool: low stock (42 usable)",
+		"PRODUCTION": "[YardMate] [PRODUCTION] Referral code pool: low stock (42 usable)",
+		"":           "[YardMate] Referral code pool: low stock (42 usable)",
+		"prod":       "[YardMate] Referral code pool: low stock (42 usable)", // not a valid value: no tag
+	} {
+		store, al := newMemStore(), &fakeAlerter{}
+		store.pool = lowPool(42) // auto-restock off (memStore default)
+		svc := New(store, newFakeRC(), entID, okAuth, Options{Alerter: al, Restock: RestockConfig{Environment: env}})
+		settleAt(svc, store, base)
+		if len(al.sent) != 1 || al.sent[0].subject != want {
+			t.Errorf("env %q: %+v", env, al.sent)
+		}
 	}
 }
 
