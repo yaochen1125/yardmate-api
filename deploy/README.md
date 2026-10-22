@@ -439,6 +439,18 @@ switch on — the two kinds of codes are the same in the pool).
 5. **Switch on**: `update referral_settings set auto_restock_enabled = true
    where id = 1;` — takes effect on the next pass, no deploy.
 
+**Pausing**: `restock_daily_max = 0` pauses auto-restock — nothing new is
+started and there is no "daily max" mail (a restock already under way is still
+finished; the low-stock alert works as usual). Switching
+`auto_restock_enabled` off stops everything, including an unfinished restock:
+it is left as it is (no Apple calls, no mails) and the log says so once a day
+(`WARN referral restock: auto_restock_enabled is off but restock N is still
+created …`) — switch back on to let it finish, or import its batch by hand.
+
+Once `ASC_OFFER_CODE_ENVIRONMENT` is set, the old low-stock / expiring alert
+also carries it in the subject (`[YardMate] [SANDBOX] Referral code pool: …`),
+so staging and prod mailing the same inbox can be told apart.
+
 **Checking it on staging** (this generates real sandbox codes on Apple's side —
 only with the batch size above):
 
@@ -466,8 +478,12 @@ is revoked or lacks the role; `(http_4xx)` — Apple refused (e.g. the quarter's
 quota); `outcome unknown, no matching batch` — check the offer's one-time code
 batches in App Store Connect and, if a batch with that count / expiry exists,
 download its CSV and import it with `deploy/supabase/import-codes.sh` (safe to
-repeat); `batch <id> not imported in 6h` — same, for that batch id; `daily max
-reached` — restock by hand or raise `restock_daily_max`. A refused or failed
+repeat); `batch <id> not imported in 6h` — same, for that batch id (the 6-hour
+pass makes one last try first); `batch <id> code values not recognised` — the
+CSV has enough lines but too few look like codes (Apple changed the format?):
+download that batch's CSV, check it, import by hand if it reads; the backend
+keeps trying until the 6 hours are up; `daily max reached` — restock by hand or
+raise `restock_daily_max`. A refused or failed
 restock is retried after an hour within the daily max.
 
 ## 11. References

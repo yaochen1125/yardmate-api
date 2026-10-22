@@ -8,7 +8,8 @@
 #      以及这批现在还发不发（usable = 到期日在 issue_margin_days 余量之外）
 #   2. 汇总：三个阈值（referral_settings）、可发数、余量不足的 free 数、最早到期日、
 #      告警判定（与 referral/pool.go 的口径一致：low_stock / expiring）
-#   3. 自动补货（migration 021；没跑 021 时这段只打一句提示）：补货设置 + 最近 10 次补货
+#   3. 自动补货（migration 021；先查 information_schema，没跑 021 时这段只打一句提示，
+#      其他错误照常报）：补货设置 + 最近 10 次补货
 #      （code_restocks：环境、张数、到期日、苹果批次 ID、状态、新进池张数、发起 / 结束时间、失败原因）
 #
 # 只跑 select，不改任何东西。需要 psql（brew 的 libpq 也带）；没有的话
@@ -61,6 +62,17 @@ select s.issue_margin_days                                   as margin_days,
   from s, a, p;
 SQL
 
+# 021 跑没跑：先看 information_schema 里有没有那一列 / 那张表（只看当前 search_path 里的 schema），
+# 输出 "t|t" 之类（列|表）。不在才跳过那一段；其他错误（连不上、权限……）照常报出来、脚本失败。
+read -r -d '' RESTOCK_PRESENT <<'SQL' || true
+select exists (select 1 from information_schema.columns
+                where table_schema = any (current_schemas(false))
+                  and table_name = 'referral_settings' and column_name = 'auto_restock_enabled'),
+       exists (select 1 from information_schema.tables
+                where table_schema = any (current_schemas(false))
+                  and table_name = 'code_restocks');
+SQL
+
 read -r -d '' RESTOCK_SETTINGS <<'SQL' || true
 select auto_restock_enabled, restock_below, restock_batch_size, restock_daily_max,
        restock_lead_days, coalesce(restock_environment, '（空）') as restock_environment
@@ -95,10 +107,16 @@ echo "== 各批次"
 "$psql_bin" "$SUPABASE_DB_URL" -X -q -v ON_ERROR_STOP=1 -c "$BATCHES"
 echo "== 汇总（alert 口径同 referral/pool.go；补货：deploy/supabase/import-codes.sh codes.csv \"Referral Friend Month\" YYYY-MM-DD）"
 "$psql_bin" "$SUPABASE_DB_URL" -X -q -v ON_ERROR_STOP=1 -x -c "$SUMMARY"
-# 021 还没跑时这两条会报 column / relation 不存在：只提示一句，不让整个脚本失败。
+present=$("$psql_bin" "$SUPABASE_DB_URL" -X -q -t -A -v ON_ERROR_STOP=1 -c "$RESTOCK_PRESENT")
 echo "== 自动补货设置（referral/restock.go；deploy/README.md §10）"
-"$psql_bin" "$SUPABASE_DB_URL" -X -q -v ON_ERROR_STOP=1 -x -c "$RESTOCK_SETTINGS" 2>/dev/null \
-    || echo "（没有自动补货的列：migration 021_referral_auto_restock.sql 还没跑）"
+if [[ "${present%%|*}" == "t" ]]; then
+    "$psql_bin" "$SUPABASE_DB_URL" -X -q -v ON_ERROR_STOP=1 -x -c "$RESTOCK_SETTINGS"
+else
+    echo "（referral_settings 没有 auto_restock_enabled 列：migration 021_referral_auto_restock.sql 还没跑）"
+fi
 echo "== 最近补货（code_restocks，新的在前）"
-"$psql_bin" "$SUPABASE_DB_URL" -X -q -v ON_ERROR_STOP=1 -c "$RESTOCKS" 2>/dev/null \
-    || echo "（没有 code_restocks 表：migration 021_referral_auto_restock.sql 还没跑）"
+if [[ "${present##*|}" == "t" ]]; then
+    "$psql_bin" "$SUPABASE_DB_URL" -X -q -v ON_ERROR_STOP=1 -c "$RESTOCKS"
+else
+    echo "（没有 code_restocks 表：migration 021_referral_auto_restock.sql 还没跑）"
+fi

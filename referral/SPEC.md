@@ -248,7 +248,8 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
   成立 → 每轮一条 `WARN referral pool: …` 日志 + **每天每种条件组合最多一封邮件**（内存记当天已发的条件组合，
   条件来回翻也只各一封；日期按 UTC，重启后可能重复一封；发信失败不算发过、下轮重试）。
   邮件走 `FEEDBACK_SMTP_*` 同一账号到 `FEEDBACK_EMAIL_TO`（`FeedbackMailer` 由 main 建一次、`/v1/feedback` 和
-  本包共用），主题 ASCII（`[YardMate] Referral code pool: low stock (42 usable), expiring 2026-11-10`），
+  本包共用），主题 ASCII（`[YardMate] Referral code pool: low stock (42 usable), expiring 2026-11-10`；配了 `ASC_OFFER_CODE_ENVIRONMENT` 时
+  在 `[YardMate]` 后加 `[SANDBOX]` / `[PRODUCTION]`，见 §3.1），
   正文中文：各批剩余、最早到期日及其死后余量、补货命令。时区：去重键、日志、邮件里的日期全是 UTC，
   到期日是 import 时填的 `YYYY-MM-DDT00:00:00Z`，看起来会比本地日历早一天，正常。
   结算通过日志（`referral settle: … usable=N alerted=N …`）在有告警那轮也会打。
@@ -277,9 +278,11 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
 
 - **在哪跑**：`watchPool`（结算每轮看库存那一步）里，读完 `PoolStatus` 先 `restockStep`，有码灌进去就重读一次 `PoolStatus`，再判低库存 / 临期告警。
   `restockStep` 返回 `busy`（还有没收尾、没超时的补货）时这两种告警**只记 WARN 日志、不发邮件**。
-- **先后顺序**（每轮）：读 `RestockStatus`（021 没跑 → 当作关、只记一行日志，不计错）→ 开关关 → 什么都不做（不调苹果、不判超时）→
+- **先后顺序**（每轮）：读 `RestockStatus`（021 没跑 → 当作关、只记一行日志，不计错）→ 开关关 → 什么都不做（不调苹果、不判超时、不发邮件；
+  库里若还有没收尾的 `creating` / `created`，每个 UTC 日记一条 WARN 说它停在哪、要么开回开关让它收尾、要么手动导入）→
   设置组合检查（只 WARN，同一组问题只打一次）→ 配置缺 → 「没配置」告警 → 码环境不一致 / 库里为空 → 「码环境」告警 →
-  有没收尾的（`creating` / `created`）→ 收尾它，**这一轮不发起新的** → 判两条触发 → 每天上限 → 1 小时间隔 → 发起。
+  有没收尾的（`creating` / `created`）→ 收尾它，**这一轮不发起新的** → 判两条触发 → `restock_daily_max = 0` = **暂停**（不发起、不发「到上限」告警、
+  一天记一行日志；没收尾的照样收尾，低库存告警照旧）→ 每天上限 → 1 小时间隔 → 发起。
   没配置、码环境不一致不写库，所以不算发起；也不去碰没收尾的那一行（配置修好后再收尾 / 判超时）。
 - **两条触发**（同 `TakeStock` 口径）：`Usable < restock_below`；或 `Earliest` 在 `restock_lead_days` 天内（含当天）且 `AfterEarliest < restock_below`。
 - **发起**：`BeginRestock` 一条条件 `insert`（同一语句里再判一遍每天上限和 1 小时间隔），两个进程同时插 → partial unique index
@@ -292,18 +295,23 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
   | 401 / 403 / 其他 4xx / 3xx，或请求根本没写出去（DNS、连接被拒、TLS 握手失败——用 `httptrace.WroteRequest` 判） | 明确失败 | `failed` + 告警（不带批次 ID，按 `http_<状态码>` / `unreachable` 一天一封）|
   | 请求写出去之后超时 / 断连、5xx、2xx 但没有批次 ID、进程在 `creating` 途中重启 | 结果不确定 | 保持 `creating`，之后每轮对账 |
   记批次 ID 失败（库写不进）也保持 `creating`，下一轮对账自然找回这批。
-- **对账**：列这个 offer 的一次性码批次（`limit=200`，跟 `links.next`，只跟同 host，最多 10 页），候选 = `createdDate ≥ started_at − 5 分钟`、
+- **对账**：列这个 offer 的一次性码批次（`limit=200`，跟 `links.next`，只跟同 host，最多 10 页；**每一页单独 60 s**，客户端里按请求限时，不是整个列表共用一个 60 s），候选 = `createdDate ≥ started_at − 5 分钟`、
   `numberOfCodes` / `expirationDate` / `environment` 都相同；再去掉 `code_restocks` 里已有行认领的（`RestockBatchesTaken`）；
   剩下按 `createdDate` 取最早的一批 → `created`；`asc_batch_id` 的唯一约束兜底。发起满 30 分钟还没对上 → `failed` + 告警（一天一封）。
 - **取码值、灌池**：`GET …/values`（`Accept: text/csv`）→ 按 `import-codes.sh` 的口径逐行挑 `^[A-Z0-9]{6,20}$`、去重；
-  **拿到的码少于要的张数当「还没好」**，下一轮再取（不重新要码）；够了 → `ImportRestock` 一个事务：
-  `insert … on conflict (code) do nothing`（`offer_ref_name` = `Referral Friend Month`）+ 行转 `imported`、`imported_count` = 真正新进池的张数。
-  发起满 6 小时还没灌进去 → `failed` + 告警（带批次 ID，按批次各一封）。码值不进日志、不进邮件。
+  每次取都记一行日志：CSV 非空行数、认出的码数、要的张数（不记码值）。**拿到的码少于要的张数当「还没好」**，下一轮再取（不重新要码）；
+  但**非空行数 ≥ 要的张数、认出的码却不够** = 格式认不出，等也没用 → 马上发一封「码值格式认不出」告警（按批次只一封），之后照样每轮再试；
+  够了 → `ImportRestock` 一个事务：`insert … on conflict (code) do nothing`（`offer_ref_name` = `Referral Friend Month`）+ 行转 `imported`、
+  `imported_count` = 真正新进池的张数。发起满 6 小时那一轮**先最后再试一次**取码灌池，还不行才 `failed` + 告警（带批次 ID，按批次各一封）。
+  码值不进日志、不进邮件。
 - **告警 / 通知**：都走 `Alerter`（和码池告警同一个邮箱），去重沿用巡检的「当天已发 key」（内存，UTC 换日清，重启可能重发一封；发信失败不算发过）。
   key：`restock:not_configured` / `restock:environment` / `restock:daily_max` / `restock:create_failed:<kind>` / `restock:reconcile_timeout`（一天一封），
-  `restock:import_timeout:<批次>` / `restock:imported:<批次>`（按批次）。主题 `[YardMate] [SANDBOX] Referral code restock: …`（环境取 secrets 的，
+  `restock:values_unrecognised:<批次>` / `restock:import_timeout:<批次>` / `restock:imported:<批次>`（按批次：进程活着期间每批只一封，跨 UTC 日也不重发，
+  内存记、重启可能重发）。主题 `[YardMate] [SANDBOX] Referral code restock: …`（环境取 secrets 的，
   没有再取库里的，都没有写 `UNSET`）；正文中文，附手动导入命令。成功通知：张数（新进池）、环境、到期日、苹果批次 ID。
-  每天上限的告警只在可发仍 < `restock_below` 时发（只是提前补那条成立时不发）。码池低库存 / 临期告警的主题不变（不带环境）。
+  每天上限的告警只在可发仍 < `restock_below` 时发（只是提前补那条成立时不发）。
+  **码池低库存 / 临期告警**的主题在配了 `ASC_OFFER_CODE_ENVIRONMENT` 时也带环境（`[YardMate] [SANDBOX] Referral code pool: …`，
+  staging 和 prod 发到同一个邮箱能分清），没配（或不是两个合法值之一）时和原来一样不带。
 - **设置组合**（`planRestock`，只 WARN、照常补）：`restock_batch_size ≤ restock_below`；`restock_below ≤ low_stock_threshold`（阈值 > 0 时）；
   `restock_lead_days ≤ expiry_warn_days`（> 0 时）；PRODUCTION 批量不在 500–25,000（夹住）；`restock_lead_days + issue_margin_days ≥ 179`
   （提前天数夹到 `179 − issue_margin_days − 1`，如 170 → 164）。沙盒码不受 500 下限（staging 用 10 张）。
@@ -311,7 +319,8 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
   启动打一行 INFO（开关默认关，不是 WARN）。`appleP8Bytes` 读 `ASC_PRIVATE_KEY`，不支持 `_PATH`（产品文档只列了这五项）。
 - **迁移**：`021_referral_auto_restock.sql`（依赖 013 / 014，可重复跑）**先 staging 后 prod、先于二进制**。没跑 021 时新二进制把自动补货当作关
   （`ErrRestockNotMigrated`，只记一行日志），巡检和结算其它步照跑；旧二进制不认识这些列，回滚二进制不用回滚库。
-- 看现状：`deploy/referral-pool.sh` 多打一段「自动补货」：补货设置 + 最近 10 次补货。上线步骤见 `deploy/README.md` §10。
+- 看现状：`deploy/referral-pool.sh` 多打一段「自动补货」：补货设置 + 最近 10 次补货（先查 `information_schema` 判断 021 的列 / 表在不在，
+  不在只提示一句；其他错误照常报、脚本失败）。上线步骤见 `deploy/README.md` §10。
 
 ## 4. 测试
 
@@ -324,9 +333,12 @@ staging `SANDBOX`、prod `PRODUCTION` / 600 张全在一批且 40 天内到期 �
 6 小时没灌进 → `failed` + 告警带批次 ID、两批各一封 / 1 小时间隔（59 分钟不发、61 分钟发）+ 每天 2 次 + 第 3 次告警一封 + 第二天恢复 / 到上限但可发够了不发告警 /
 403 立刻 `failed`、原因带苹果的错误码、同种一天一封、1 小时后再试、连接被拒算 `unreachable` 另一封、第二天再发 / 没配置：不调苹果、不写库（不算发起）、一天一封、全空时列出缺的名字 /
 码环境库里为空或不一致：拒绝、一天一封、低库存告警照发 / PRODUCTION 批量 100 → 500 + WARN，SANDBOX 10 张不夹 / `planRestock` 五种组合 / 重复码忽略（998 + 邮件写忽略 2 张）/
-4 个服务并发结算 25 轮每轮只发起一次 / `RestockStatus` 出错计错不挡告警、`ErrRestockNotMigrated` 不计错 / 到期日按 UTC 日算。
+4 个服务并发结算 25 轮每轮只发起一次 / `RestockStatus` 出错计错不挡告警、`ErrRestockNotMigrated` 不计错 / 到期日按 UTC 日算 /
+复审修补：满 6 小时那一轮最后再试一次成功 → `imported`、不发超时告警 / 码值格式认不出：日志有行数和码数、按批次一封（跨 UTC 日不重发）、6 小时后照样 `failed`、码值不进日志 /
+开关关但有没收尾的行：WARN 每天一条、不调苹果不发邮件 / `restock_daily_max = 0` 暂停：不发起、不发上限告警、低库存告警照发、没收尾的照样收尾 /
+对账列批次不带共用的截止时间 / 码池告警主题按 `ASC_OFFER_CODE_ENVIRONMENT` 带环境（大小写不计；没配或写错不带）。
 `appstoreconnect_test.go`（httptest 假苹果）：JWT header / claims / r‖s 签名用公钥验得过 / 生成请求的路径、头、body 逐字段 / 401、403、409、422、429、302 明确失败（带苹果错误码）、500、503、201 没 id 不确定 /
-请求写出去后客户端超时、context 超时都是不确定 / 连接被拒是 `unreachable` / 列批次解析字段、跟同 host 的 next、不跟外域 / CSV（BOM、CRLF、引号、垃圾行、重复）/ 错误里没有 token / 坏 .p8（非 PEM、乱码、RSA、P-384、缺 ID）不回显 key /
+请求写出去后客户端超时、context 超时都是不确定 / 连接被拒是 `unreachable` / 列批次解析字段、跟同 host 的 next、不跟外域 / 三页各 70 ms、单页限时 150 ms 照样列全 / CSV（BOM、CRLF、引号、垃圾行、重复、非空行数）/ 错误里没有 token / 坏 .p8（非 PEM、乱码、RSA、P-384、缺 ID）不回显 key /
 真客户端 + 假苹果端到端（正常、502 后对账）。主包 `referral_wiring_test.go`：五项齐 / 各缺一项 / 环境写错 / .p8 坏 / 全空。
 021 的 SQL：`pgstore_restock_pg_test.go`（同一个 `REFERRAL_PG_TEST_URL` 门控）：021 跑两遍 + 默认值 + 各 check / 发起 → 只允许一条没收尾 → 记批次 → 已认领 → 灌池（已有码忽略、计数 2）→ 已 imported 不再灌 /
 间隔和每天上限在插入时再判 / 批次 ID 不能被第二行认领 / 8 路并发发起只成一个。**本机没有 Postgres，这三条 PG 测试只写了没跑过**（SKIP），上线前先在 scratch 库跑一遍再 staging 跑 021。
@@ -386,10 +398,10 @@ SQL 函数（013 + 014）：`pgstore_pg_test.go` 要一个空库（`REFERRAL_PG_
 - 收尾一条没收尾的补货（灌完或判失败）的那一轮**不接着发起新的**，下一轮（≤ 10 分钟）再判。
 - 6 小时按 `started_at`（发起要码的时间）算，不是按拿到批次 ID 的时间（021 没有单独的 created 时间列）。
 - 成功通知里的「N 张」= 真正新进码池的张数（另写苹果给了几个、几个库里已有被忽略）；成功通知发信失败不重发。
-- 码池低库存 / 临期告警的主题**没加**环境标签（产品文档「告警的邮件标题都带环境」按补货相关的告警理解）；正文多了一行「自动补货见 deploy/README.md §10」。
+- 码池低库存 / 临期告警正文多了一行「自动补货见 deploy/README.md §10」（主题带环境是复审定的，见 §3.1）。
 - 列批次最多跟 10 页（2,000 批）；超出的批次对账看不到（按每天最多 2 批，十年内到不了）。
 - 结果判定：返回 2xx 但读不出批次 ID 算「不确定」；3xx（不跟随重定向）算明确失败；不是 `ASCError` 的错误一律当「不确定」（宁可多对账 30 分钟，不重复生成）。
-- `restock_daily_max = 0` 等于永不发起，且可发 < `restock_below` 时每天发一封「上限」告警。
+- 开关关时没收尾的那一行**原样留着**（不判超时、不调苹果），只每天记 WARN；开回开关后再收尾，那时多半已过 30 分钟 / 6 小时，会直接走超时（6 小时那条先最后试一次）。
 
 
 - **第 3 道用 `subscription_key` 代替 `original_transaction_id`**（§2.4；2026-10-20 api#126 已定接受）：RevenueCat REST 拿不到原始交易号，
