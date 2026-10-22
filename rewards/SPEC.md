@@ -150,15 +150,6 @@ pending_cents   = sum(pending 账本)
 - 推荐人删：`referral_users` 行没了 → `reward_ledger.referrer` / `reward_payouts.user_id` **级联删**（余额作废；requested 的照发，运营看邮件，脚本 mark-sent 会报「不存在」）。
 - 朋友删：`referrals` 那行级联没了 → `reward_ledger.referee` / `referral_id` **置空**，推荐人已记的钱不动；之后该 app_user_id 的事件 not_referee。
 
-### 2.8 改收卡邮箱（`ChangePayoutEmail`，migration 020，rewards.md `### 邮箱：确认、拼写提示、修改`）
-
-1. 头 + JWT → body → `validEmail`（格式 + 拒收隐藏邮件地址；不过不扣次数）→ `/claim` 的设备桶。
-2. 一个事务：`select id, email from reward_payouts where user_id = $1 and state = 'requested' for update`（库里真 `requested`；缓冲中的已是 `sent`，自然找不到）。
-   没有 → `payout_not_editable`。新旧邮箱不分大小写一样 → 原样返回、不改、不发信。否则 `email = 新, email_changed_at = now()`。
-3. 行锁让它和 `reward_payout_mark_sent` 排先后：改邮箱先提交 → 运营那边按旧邮箱的 `mark_sent` 改不到（脚本提示重跑）；标记先提交 → 这里找不到 requested → 409。
-4. 改了才异步发「邮箱已改」：主题 `[YardMate] Referral gift card request #<id>: email changed`（纯 ASCII），正文申请号、用户 ID、旧 → 新、时间、
-   「没买就发新地址 / 已按旧地址发了别再买、先去亚马逊处理」、mark-sent 命令。脚本 `mark-sent` 在确认前列出「邮箱 {时间} 被用户改过」。
-
 ### 2.7 标记已发的 1 小时缓冲（migration 018，rewards.md `### 标记已发`）
 
 - `reward_payouts.undo_until`：`reward_payout_mark_sent(p_id, p_email)` 置 `state = sent, sent_at = now(), undo_until = now() + 1 hour`，只在 `state = requested` 且 `email = p_email`（脚本列给运营看的那个）时改；`reward_payout_undo(p_id)` 只在 `state = sent and undo_until > now()` 时改回 `requested`、清 `sent_at` / `undo_until`。两个都是 SQL 函数，脚本经 PostgREST `/rest/v1/rpc/` 调，只 grant 给 service_role。
@@ -199,6 +190,15 @@ coalesce(reissued_at, claimed_at)`，走 `referrals_referrer_idx`）和他的账
 - `next_*` = 最早 `available_at` 的那笔 pending。
 - 排序 paying（next 升序）→ free_month（结束升序）→ unredeemed（加入降序），同值按 referral id；最多 50 行。
 - 用 `Service.now`（应用时钟）判免费月，不用库的 `now()`。
+
+### 2.8 改收卡邮箱（`ChangePayoutEmail`，migration 020，rewards.md `### 邮箱：确认、拼写提示、修改`）
+
+1. 头 + JWT → body → `validEmail`（格式 + 拒收隐藏邮件地址；不过不扣次数）→ `/claim` 的设备桶。
+2. 一个事务：`select id, email from reward_payouts where user_id = $1 and state = 'requested' for update`（库里真 `requested`；缓冲中的已是 `sent`，自然找不到）。
+   没有 → `payout_not_editable`。新旧邮箱不分大小写一样 → 原样返回、不改、不发信。否则 `email = 新, email_changed_at = now()`。
+3. 行锁让它和 `reward_payout_mark_sent` 排先后：改邮箱先提交 → 运营那边按旧邮箱的 `mark_sent` 改不到（脚本提示重跑）；标记先提交 → 这里找不到 requested → 409。
+4. 改了才异步发「邮箱已改」：主题 `[YardMate] Referral gift card request #<id>: email changed`（纯 ASCII），正文申请号、用户 ID、旧 → 新、时间、
+   「没买就发新地址 / 已按旧地址发了别再买、先去亚马逊处理」、mark-sent 命令。脚本 `mark-sent` 在确认前列出「邮箱 {时间} 被用户改过」。
 
 ## 3. 配置与运维
 
