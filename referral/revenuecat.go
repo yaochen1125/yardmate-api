@@ -47,6 +47,10 @@ type Subscription struct {
 	// cancelled-but-not-refunded month still counts (docs ## 特殊情况).
 	UnsubscribeDetectedAt *time.Time `json:"unsubscribe_detected_at"`
 	IsSandbox             bool       `json:"is_sandbox"`
+	// Price is kept raw and read leniently (free): RevenueCat documents no
+	// schema for it on v1 subscriptions, and a shape we did not expect must
+	// not fail the whole customer-info decode.
+	Price json.RawMessage `json:"price"`
 }
 
 // Entitlement is one entry of subscriber.entitlements, keyed by identifier.
@@ -109,10 +113,30 @@ func (s *Subscriber) HasPaidHistory() bool {
 	return false
 }
 
+// free reports a record nobody paid for: a free trial (period_type trial —
+// the friend's Referral Friend Month is a FREE_TRIAL offer code) or a record
+// whose price RevenueCat gives as 0. Anything else counts as paid, so a
+// refund on a record we cannot place still voids (holdVerdict).
+func (s Subscription) free() bool {
+	if strings.EqualFold(s.PeriodType, "trial") {
+		return true
+	}
+	var p struct {
+		Amount *json.Number `json:"amount"`
+	}
+	if len(s.Price) == 0 || json.Unmarshal(s.Price, &p) != nil || p.Amount == nil {
+		return false
+	}
+	f, err := p.Amount.Float64()
+	return err == nil && f == 0
+}
+
 // StartedAfter finds a store subscription of this customer's own that began
 // after t (the claim time) — the referee's redemption, or them simply
 // subscribing after putting the code in, which also counts. Returns the
-// product key and the start time.
+// product key and the start time. An upgrade leaves two records with the same
+// start (the free month and the new plan); the smaller product id wins the
+// tie, so the answer does not depend on map order.
 func (s *Subscriber) StartedAfter(t time.Time) (key string, start time.Time, ok bool) {
 	if s == nil {
 		return "", time.Time{}, false
@@ -125,7 +149,7 @@ func (s *Subscriber) StartedAfter(t time.Time) (key string, start time.Time, ok 
 		if !has || !st.After(t) {
 			continue
 		}
-		if !ok || st.Before(start) {
+		if !ok || st.Before(start) || (st.Equal(start) && k < key) {
 			key, start, ok = k, st, true
 		}
 	}
@@ -168,13 +192,27 @@ func (s *Subscriber) SubscriptionKey(key string) string {
 	return store + ":" + st.UTC().Format(time.RFC3339Nano)
 }
 
-// Refunded reports whether the subscription under key was refunded.
+// Refunded reports whether the subscription chain under key (a product id
+// from StartedAfter) has a paid record that was refunded. All the customer's
+// store records with the same SubscriptionKey are one chain: after an upgrade
+// inside the free month RevenueCat holds the free month AND the new plan,
+// both with the same start, and the refund lands on the plan the friend paid
+// for — whichever record StartedAfter picked. A free record (the $0 free
+// month, marked refunded / upgraded or not) never counts.
 func (s *Subscriber) Refunded(key string) bool {
 	if s == nil {
 		return false
 	}
-	sub, found := s.Subscriptions[key]
-	return found && sub.RefundedAt != nil
+	chain := s.SubscriptionKey(key)
+	for k, sub := range s.Subscriptions {
+		if sub.RefundedAt == nil || sub.free() {
+			continue
+		}
+		if k == key || (chain != "" && sub.isStorePurchase() && s.SubscriptionKey(k) == chain) {
+			return true
+		}
+	}
+	return false
 }
 
 // Covered reports whether the customer currently holds Premium through a
