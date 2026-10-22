@@ -30,10 +30,10 @@
 | 来源 | 内容 |
 |---|---|
 | webhook 头 | `Authorization`：与 `REVENUECAT_WEBHOOK_SECRET` 常量时间比较，两边带不带 `Bearer ` 都行 |
-| webhook body（≤ 64 KB）| `{"event": {...}, "api_version": "1.0"}`；读 `id, type, environment, app_user_id, product_id, period_type, price, takehome_percentage, transaction_id, original_transaction_id, purchased_at_ms, cancel_reason`，另读 `is_family_share` |
+| webhook body（≤ 64 KB）| `{"event": {...}, "api_version": "1.0"}`；读 `id, type, environment, app_user_id, product_id, new_product_id, period_type, price, tax_percentage, commission_percentage, transaction_id, original_transaction_id, purchased_at_ms, cancel_reason`，另读 `is_family_share`；已弃用的 `takehome_percentage` 不读（2026-10-22）|
 | `/payout` 头 | 同 `/claim`：`Authorization: Bearer <Supabase access token>`、`X-Device-Install-Id`、`X-App-Version` |
 | `/payout`、`/payout/email` body | `{"email": "you@example.com"}` |
-| vault | `REVENUECAT_WEBHOOK_SECRET`；`SUPABASE_URL` / `SUPABASE_DB_URL`（与 referral 共用）；`FEEDBACK_SMTP_*` / `FEEDBACK_EMAIL_TO`（运营邮件，main 经 `mail_wiring.go` 建一次、与 feedback / 码池告警共用，缺了只记日志）；`REFERRAL_SETTLE_INTERVAL`（可选）|
+| vault | `REVENUECAT_WEBHOOK_SECRET`；`REVENUECAT_WEBHOOK_ALLOW_SANDBOX`（只给 staging：`true` 时 SANDBOX 事件也记账，方便沙盒走全流程；prod 绝不设）；`SUPABASE_URL` / `SUPABASE_DB_URL`（与 referral 共用）；`FEEDBACK_SMTP_*` / `FEEDBACK_EMAIL_TO`（运营邮件，main 经 `mail_wiring.go` 建一次、与 feedback / 码池告警共用，缺了只记日志）；`REFERRAL_SETTLE_INTERVAL`（可选）|
 | 库 | migration `015_referral_rewards.sql` 的 `reward_ledger` / `reward_voided_txns` / `reward_payouts`（依赖 013 的 `referral_users` / `referrals`；015 文件里「满 $100 申请一张」「一行 = 一张 $100」的注释和 `amount_cents default 10000` 是 2026-10-22 之前的规则，现行规则见 §2.3，不改已上线的迁移）；`016_referral_antiabuse.sql` 的 `reward_ledger.void_reason`、`referrals.claim_install_id` |
 
 ### 1.4 输出
@@ -69,16 +69,25 @@ RevenueCat 后台的投递记录里看得到；`voided` 既指退款作废了 pe
 
 `github.com/jackc/pgx/v5`（共享池）、`math/big`（金额精确十进制）、`net/mail`、本仓库 `ratelimit`。
 发信走 `*enrichment.FeedbackMailer.Alert`（经 `Mailer` 接口注入）。不引 `chi`、不 import `referral`（钩子方向是 referral 定义接口、这边实现）。
+反方向的一个钩子：`Redeemer`（本包定义，`rewards_wiring.go` 的 `chargeRedeemer` 把 `referral.Service.RedeemForCharge` 适配进来），
+给「claimed 时到的续费」当场跑一次结算 ①（§2.1）。
 
 ## 2. 规则
 
 ### 2.1 记账（webhook）
 
 ```
-environment != PRODUCTION                                   → 200 ignored_environment
+environment != PRODUCTION（ALLOW_SANDBOX 时 SANDBOX 也算）    → 200 ignored_environment
 type ∈ INITIAL_PURCHASE / RENEWAL:
     period_type ∉ {NORMAL, INTRO} / is_family_share / price ≤ 0 或缺 → 200 not_counted
     lower(app_user_id) 不是 uuid / 不是任何 referrals.referee   → 200 not_referee
+    推荐是 claimed、这笔是 RENEWAL 且 purchased_at > claimed_at（免费月里升级，扣费先于结算 ①）:
+        缺 event.id / transaction_id                          → 400 bad_event（不去认定）
+        Redeemer.RedeemForCharge(推荐, product_id)：
+            订阅开始早于填码 / 不是本人购买                   → 200 not_redeemed
+            当场被第 3 道作废                                  → 200 not_redeemed
+            RevenueCat 还没这个产品 / 查失败 / 没接 Redeemer   → 503 not_settled（RevenueCat 重发）
+            认定成功 → 重读推荐，仍算已兑换就往下记，否则      → 200 not_redeemed
     该推荐不算已兑换                                          → 200 not_redeemed
     缺 event.id / transaction_id                              → 400 bad_event
     这笔交易已在 reward_voided_txns（退款先到了）             → 200 voided（不写）
@@ -86,19 +95,27 @@ type ∈ INITIAL_PURCHASE / RENEWAL:
 type == CANCELLATION 且 cancel_reason == CUSTOMER_SUPPORT:
     同 transaction_id 的 pending → voided                     → 200 voided
     没有 pending → 交易号记进 reward_voided_txns              → 200 nothing_to_void
-其他（TRANSFER / EXPIRATION / PRODUCT_CHANGE / TEST / 别的 CANCELLATION …）→ 200 ignored_type
+type == PRODUCT_CHANGE:
+    不是任何推荐的朋友                                        → 200 not_referee
+    是 → 不记账，日志一行「referee PRODUCT_CHANGE #n since start (referral <state>): <product> -> <new_product>」→ 200 product_change
+其他（TRANSFER / EXPIRATION / TEST / 别的 CANCELLATION …）→ 200 ignored_type
 ```
 
 - **已兑换**：`referrals.state` ∈ `redeemed / qualified / held / saved / rewarded`（`held` = referral 防刷第 4 道的待审核，朋友已兑换，钱照记、照常过 90 天；
   reject 时由 SQL `referral_void` 连带作废）；另外 `claimed` 且这笔是 **`INITIAL_PURCHASE`**、`purchased_at` 晚于 `claimed_at` 也算
   —— 那正是 referral 结算第 ① 步十分钟内会认定为 redeemed 的情形，朋友填码后直接付费的第一笔不能被这十分钟竞态吃掉。
-  `claimed` 下的 `RENEWAL` **不算**（`not_redeemed`）：续费说明订阅早于填码，典型是小号领码后「恢复购买」把老订阅转过来，
-  算了就会每期都给推荐人记钱。真朋友的续费不受影响：referral 结算 ① 每 10 分钟一轮、批次轮转（referral 017，积压再多新来的也轮得到），
-  首购之后很快就认定 redeemed，第一次续费（最早一个月后）到的时候早已不是 `claimed`（2026-10-20 定：后端保持现状，产品文档跟着改）。`void` 不算。
+  `claimed` 下的 `RENEWAL`（2026-10-22 改）：原来一律不算，但朋友兑换免费月后、结算 ① 认定之前就**升级**到年付时，苹果立即按全价扣费，
+  RevenueCat 报的是新产品的 `RENEWAL`——回 200 不重发，这笔就永久丢了。现在交给 `Redeemer`（= referral 的
+  `RedeemForCharge`）：看 RevenueCat 里这个产品那条记录的 `original_purchase_date`（订阅链的开始，升级不变）——
+  早于填码 → 仍不算（小号领码后「恢复购买」把老订阅转过来，算了就会每期给推荐人记钱）；晚于填码 → 当场跑 ①（含第 3 道）再按已兑换记；
+  RevenueCat 还没这条 / 查失败 → 503，RevenueCat 约 80 分钟内重发 5 次，这期间结算 ① 也会认定，重发时就按已兑换记。
+  去重只靠账本（`rc_event_id`、`transaction_id` 唯一），503 的事件不留任何记录。`void` 不算。
 - **价格缺 / null**：不记，并打一行日志（只有事件类型和 period_type，不带任何 id）—— 真扣费没价格会悄悄少记推荐人一笔，留个痕。
-- **金额**：`credit_cents = round(price × takehome_percentage × 0.30 × 100)`，`price_usd_cents = round(price × 100)`，
-  在 JSON 原文的十进制上用 `big.Rat` 算、半数进位（float64 会把 4.5 算成 4.499…）。`takehome_percentage` 缺 / null → 0.85，
-  不在 (0, 1] → 0.85 并记日志。算出来 0 分（几美分的价格）→ 不记。典型值：$39.99 → 1020、$6.99 → 178、$0.29 intro → 7。
+- **金额**：`credit_cents = round(price × 实收比例 × 0.30 × 100)`，`price_usd_cents = round(price × 100)`，
+  在 JSON 原文的十进制上用 `big.Rat` 算、半数进位（float64 会把 4.5 算成 4.499…）。**实收比例 = 1 − `tax_percentage` − `commission_percentage`**
+  （2026-10-22 改；`takehome_percentage` 已弃用且不扣增值税，不再读）。任一缺 / null / 不在 [0, 1) / 两者之和 ≥ 1 → **0.70**，每次都记一行日志
+  （类型 + period_type + 原因，不带 id）。账本 `takehome_percentage` 列存实际用的比例（4 位小数文本）。算出来 0 分（几美分的价格）→ 不记。
+  典型值（美国：税 0、抽成 0.15）：$39.99 → 1020、$6.99 → 178、$0.29 intro → 7；兜底 0.70：$39.99 → 840。
 - **时间**：`purchased_at = purchased_at_ms`（缺 → 收到时间），`available_at = purchased_at + 90 天`。
 - **app_user_id**：RevenueCat 里是 Supabase uuid **大写**，库里是小写 → 统一 `ToLower` 再比。`$RCAnonymousID:…` 直接 not_referee。
 - **退款**只按 `transaction_id` 找 pending，不再看 app_user_id（账本里本来只有朋友的扣费；TRANSFER 之后来的退款也能找到）。
@@ -170,8 +187,9 @@ coalesce(reissued_at, claimed_at)`，走 `referrals_referrer_idx`）和他的账
 ```
 有一笔 pending / available 账本            → paying     计 Paying；还有 pending 才进清单
 否则 state = claimed                       → unredeemed 领码 / 换码 200 天内进清单（同结算 ① 的窗口），之后只计 Joined
-否则 now < FreeMonthEnd(redeemed_at)       → free_month 计 Free month；进清单
-否则（免费月过了、没记账）                    → 只计 Joined
+否则 now < FreeMonthEnd(redeemed_at)       → free_month 计 Free month；进清单；free_month_ends_at = FreeMonthEnd
+否则 now < FreeMonthEnd + 3 天（freeMonthGrace） → free_month 同上，但 free_month_ends_at = FreeMonthEnd + 3 天
+否则（免费月 + 3 天过了、没记账）              → 只计 Joined
 账本 referral_id 为空（朋友删号）            → 合成一行 joined_at = null、paying，不计人数
 账本 referral_id 不在没作废的推荐里（void）   → 跳过
 ```
@@ -182,6 +200,8 @@ coalesce(reissued_at, claimed_at)`，走 `referrals_referrer_idx`）和他的账
 - `next_*` = 最早 `available_at` 的那笔 pending。
 - 排序 paying（next 升序）→ free_month（结束升序）→ unredeemed（加入降序），同值按 referral id；最多 50 行。
 - 用 `Service.now`（应用时钟）判免费月，不用库的 `now()`。
+- **3 天宽限**（2026-10-22）：免费月里买 `premium.yearly.3d` 是降级，免费月结束才换、可能先有 3 天免费试用，这几天没有记账；扣费事件也可能晚几分钟。
+  App 不画 `free_month_ends_at` 已过的行，所以宽限期给「结束 + 3 天」——日期在结束那一刻往后跳 3 天，产品文档写明是已知妥协。
 
 ### 2.7 标记已发的 1 小时缓冲（migration 018，rewards.md `### 标记已发`）
 
@@ -222,7 +242,11 @@ coalesce(reissued_at, claimed_at)`，走 `referrals_referrer_idx`）和他的账
 
 `go test ./rewards/`（fakes 照 `referral/*_test.go` 风格，`memStore` 复刻 SQL 规则）：
 webhook 鉴权十种头 / 未配置 / 坏 body / 64 KB；文档每条记与不记（NORMAL / INTRO 记，TRIAL / PROMOTIONAL / $0 / null / 负价 / 家庭共享 / SANDBOX / 非朋友 / 匿名 id 不记，大小写）；
-各推荐状态（含 claimed 下首购前后、claimed 下续费不记、void）；金额四舍五入表（含正好 .5）；90 天；按 event id 和 transaction id 去重；
+各推荐状态（含 claimed 下首购前后、claimed 下填码前的续费不记、void）；
+免费月里升级（`upgrade_test.go`，按 RevenueCat 的顺序：PRODUCT_CHANGE → RENEWAL）：PRODUCT_CHANGE 只计数不记、RENEWAL 当场认定并记 1020、重发 duplicate 且不再认定 /
+认定不了 503 not_settled、不留记录，结算认定后重发记一笔 / 三种不记（订阅早于填码、第 3 道作废、认定后被别处作废）/ 没接 Redeemer 503、坏事件 400 不去认定、
+填码前的续费不问、claimed 首购照记不问、陌生人的 PRODUCT_CHANGE 不计数 / 到期才换（降级）：试用 $0 不记、扣费记一次 / ALLOW_SANDBOX 开关（默认不记、开了 SANDBOX 记、缺环境不记）；
+实收比例（1 − 税 − 抽成：0.65 → 780、抽成 0.30 → 840；两项都缺 / 只有弃用的 takehome / 缺一项 / null / 超范围 / 负数 / 和 ≥ 1 → 0.70 = 840）；金额四舍五入表（含正好 .5）；90 天；按 event id 和 transaction id 去重；
 退款只 void pending；退款先到 → 留记录、晚到的扣费及其重发答 voided、别的交易不受影响；库错误 500；
 入账只动到期 pending；余额口径（cancelled 回余额、不为负）；时间 RFC 3339 无小数秒；
 payout 三个错误码 + 201、头 / 鉴权 / 未配置、邮箱黑白名单、共享设备桶（邮箱错不扣次数）、20 路并发只成一张、库错误 502、无邮件 / 邮件失败照 201、
@@ -234,7 +258,7 @@ PG `TestPGW9Threshold`（默认 200000、改了即读到）。
 全不同的写法、读审核数据失败邮件照发且 201；PG：退款写 `void_reason = refunded`、`ReviewStats` 各口径（016 跑两遍）。
 
 进度（§2.6，`progress_test.go`）：对比稿那张卡（年付 5 天、月付两笔取最早、免费月、未兑换、免费月过期只算 Joined）、线上 JSON 逐字、
-全部到账移出清单 / 续费回来、免费月结束前一秒与正点、claimed 却已付费算 paying、删号朋友合一行不计人数、void 与 voided 跳过、
+全部到账移出清单 / 续费回来、免费月结束前一秒与正点（正点起 3 天宽限仍是 free_month、日期 = 结束 + 3 天，宽限结束只算 Joined，宽限内扣费转 paying）、claimed 却已付费算 paying、删号朋友合一行不计人数、void 与 voided 跳过、
 产品映射（含老 `premium.monthly`）与升级后取最近一笔、排序与 50 行上限、`/me` 带进度 / 读进度失败只去掉两个字段、
 `FreeMonthEnd` 月底表（含闰年 / 跨年 / 带时区）、未兑换 200 天窗口（含换过码）；
 PG `TestPGProgress`：两条查询的口径（void 不出、删号后 referral_id 为空仍在、voided 不出）。
@@ -261,7 +285,6 @@ SQL（按线上顺序 013 → 014 → 015，015 跑两遍）在真库上的测�
 - 只认 `app_user_id`，**不查** `aliases` / `original_app_user_id`：朋友若用匿名 id 付了费、之后才被 RevenueCat 合并到 Supabase id，
   那笔事件的 `app_user_id` 可能还是 `$RCAnonymousID:…` → not_referee、不记。填码必须登录（JWT），之后的扣费一般就是 Supabase id，
   影响面小；要补就在判 not_referee 前把 aliases 里的 uuid 也查一遍（注意别让一个事件命中两条推荐）。本 PR 不改。
-- `takehome_percentage` 的增值税问题：RevenueCat 对它的说明是扣完商店佣金、**未扣 VAT / 数字服务税**的比例，`price` 本身也含税
-  → 欧盟等含税地区按本公式算出的 30% 比苹果实际到账的 30% 偏高（大约高出该地税率那么多）。文档公式就是 price × takehome × 0.30，
-  本 PR 照文档不改；要按到手算需产品定口径（可考虑事件里的税率字段，是否每条都带未核实）。
+- ~~`takehome_percentage` 的增值税问题~~ → 2026-10-22 已改：实收比例 = 1 − `tax_percentage` − `commission_percentage`，缺字段按 0.70（§2.1）。
+  未核实：RevenueCat 的 `commission_percentage` 是按含税价还是去税价的比例（产品文档写明高增值税地区兜底可能略多分，接受）。
 - 朋友删账号后推荐人已记的钱保留（文档只写了推荐人删账号）。

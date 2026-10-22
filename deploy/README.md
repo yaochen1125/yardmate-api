@@ -288,6 +288,12 @@ then prod.
    value* = the same secret (with or without `Bearer ` — either side may carry
    it), all events. Sandbox events are accepted and ignored (`200
    ignored_environment`), so one webhook for both environments is fine.
+   **Staging only:** to follow a sandbox purchase end to end (offer code →
+   upgrade → ledger), add `REVENUECAT_WEBHOOK_ALLOW_SANDBOX=true` to
+   `secrets-staging.env` and point a second webhook (environment: Sandbox)
+   at `https://api-staging.yardmate.ai/v1/revenuecat/webhook` with staging's
+   own secret. The log then shows a `REVENUECAT_WEBHOOK_ALLOW_SANDBOX=true`
+   WARN line. Never set it on prod.
 4. "Send test event" in that screen → `200 {"status":"ignored_environment"}`
    (or `ignored_type`). `401` = secret mismatch; `503` = secret or database not
    configured (see `journalctl -u yardmate-api | grep "revenuecat webhook"`).
