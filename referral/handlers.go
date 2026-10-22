@@ -72,8 +72,9 @@ type Options struct {
 	ReadWindow   time.Duration
 	Interval     time.Duration // settlement cadence (default 10 min)
 	StartupDelay time.Duration // before the first settlement pass (default 1 min)
-	// Alerter receives the code-pool low-stock / expiry email (pool.go) and
-	// the gate-4 review email (review.go); nil = WARN log only.
+	// Alerter receives the code-pool low-stock / expiry email (pool.go), the
+	// auto-restock notices (restock.go) and the gate-4 review email
+	// (review.go); nil = WARN log only.
 	Alerter Alerter
 	// DeviceCheck is Apple's DeviceCheck (gate 1); nil = not configured,
 	// which in enforce mode makes every new claim device_check_unavailable.
@@ -87,6 +88,10 @@ type Options struct {
 	DeviceCheckAllowDevelopment bool
 	// DeviceCheckTimeout bounds each Apple call (default 3 s).
 	DeviceCheckTimeout time.Duration
+	// Restock is the App Store Connect side of code-pool auto-restock
+	// (restock.go); the switch itself is referral_settings.auto_restock_enabled.
+	// Zero value = not configured (harmless while the switch is off).
+	Restock RestockConfig
 }
 
 // Service owns the three handlers, their per-device buckets, and the
@@ -126,6 +131,13 @@ type Service struct {
 	// poolConfigWarned: the settings-problem line (pool.go) has been logged
 	// for the current misconfiguration; cleared once it is fixed.
 	poolConfigWarned bool
+
+	// auto-restock (restock.go): the App Store Connect config, the settings
+	// problems last logged (each distinct set once), and whether "021 not
+	// applied" has been logged. Settlement goroutine only.
+	restock                 RestockConfig
+	restockWarned           string
+	restockUnmigratedLogged bool
 }
 
 // New wires a Service. Pass nil for whatever is not configured.
@@ -154,6 +166,11 @@ func New(store Store, rc Subscribers, entitlement string, auth Authenticator, op
 	if opt.DeviceCheckTimeout <= 0 {
 		opt.DeviceCheckTimeout = DefaultDeviceCheckTimeout
 	}
+	if opt.Restock.CallTimeout <= 0 {
+		opt.Restock.CallTimeout = DefaultASCTimeout
+	}
+	opt.Restock.Environment = NormaliseOfferEnvironment(opt.Restock.Environment)
+	opt.Restock.OfferID = strings.TrimSpace(opt.Restock.OfferID)
 	return &Service{
 		store:        store,
 		rc:           rc,
@@ -170,6 +187,7 @@ func New(store Store, rc Subscribers, entitlement string, auth Authenticator, op
 		dcMode:       opt.DeviceCheckMode,
 		dcTimeout:    opt.DeviceCheckTimeout,
 		dcAllowDev:   opt.DeviceCheckAllowDevelopment,
+		restock:      opt.Restock,
 	}
 }
 

@@ -205,6 +205,90 @@ type PoolStatus struct {
 	Batches  []PoolBatch
 }
 
+// RestockSettings is the auto-restock half of referral_settings (migration
+// 021). Changing the row takes effect on the next pass — no deploy.
+type RestockSettings struct {
+	// Enabled is auto_restock_enabled (default false): off = App Store
+	// Connect is never called and the pool behaves exactly as before.
+	Enabled bool
+	// Below is restock_below (300): restock when usable stock is under it, or
+	// when what stays usable once the earliest batch dies would be.
+	Below int
+	// BatchSize is restock_batch_size (1,000; 1..25,000 in the table). For
+	// PRODUCTION codes it is clamped to Apple's 500..25,000.
+	BatchSize int
+	// DailyMax is restock_daily_max (2): restocks started per UTC day.
+	DailyMax int
+	// LeadDays is restock_lead_days (45): the earliest usable batch expiring
+	// within this many days counts as running out (restock early).
+	LeadDays int
+	// Environment is restock_environment: PRODUCTION / SANDBOX, "" when null
+	// (the migration leaves it null; each environment fills its own in).
+	Environment string
+}
+
+// Restock states (code_restocks.state, migration 021).
+const (
+	// RestockCreating: asking Apple for a batch — or the answer was lost
+	// and the batch list is being reconciled.
+	RestockCreating = "creating"
+	// RestockCreated: Apple named the batch (asc_batch_id); its codes are
+	// not in code_pool yet.
+	RestockCreated = "created"
+	// RestockImported: the batch is in code_pool.
+	RestockImported = "imported"
+	// RestockFailed: given up (error says why).
+	RestockFailed = "failed"
+)
+
+// Restock is one code_restocks row.
+type Restock struct {
+	ID          int64
+	Environment string
+	Codes       int       // number_of_codes asked for
+	ExpiresAt   time.Time // the expiration date, 00:00 UTC
+	BatchID     string    // asc_batch_id; "" until created
+	State       string
+	StartedAt   time.Time
+}
+
+// RestockStatus is what one pass decides from: the settings, the unfinished
+// restock (creating / created; at most one, the partial unique index says
+// so), how many restocks started since the UTC day began, and the last start.
+type RestockStatus struct {
+	Settings     RestockSettings
+	Open         *Restock
+	StartedToday int
+	LastStarted  time.Time // zero when none ever
+}
+
+// RestockStart is a new restock as BeginRestock records it, with the limits
+// it re-checks atomically.
+type RestockStart struct {
+	Environment string
+	Codes       int
+	ExpiresAt   time.Time
+	StartedAt   time.Time
+	DayStart    time.Time     // 00:00 UTC of StartedAt's day
+	DailyMax    int           // at most this many started since DayStart
+	MinGap      time.Duration // and none started within this of StartedAt
+}
+
+// Restock store refusals.
+var (
+	// ErrRestockNotMigrated: the auto-restock columns / table are not there
+	// yet (021 not applied). The pass treats auto-restock as off.
+	ErrRestockNotMigrated = errors.New("referral restock: migration 021 not applied")
+	// errRestockOpen: another restock is unfinished (creating / created).
+	errRestockOpen = errors.New("referral restock: another restock is unfinished")
+	// errRestockLimited: the daily max or the minimum gap, re-checked at
+	// insert time, said no (another process started one meanwhile).
+	errRestockLimited = errors.New("referral restock: daily max or minimum gap reached")
+	// errRestockNotCreated: the row is no longer created (another process
+	// finished or failed it).
+	errRestockNotCreated = errors.New("referral restock: restock is no longer created")
+)
+
 // named reports whether err is one of the refusals above, and which.
 func named(err error) (Failure, bool) {
 	var f Failure
@@ -304,4 +388,29 @@ type Store interface {
 	// RecordGranted marks ids rewarded and advances the ledger to until,
 	// adding len(ids) months, in one transaction.
 	RecordGranted(ctx context.Context, userID string, ids []int64, until time.Time) error
+
+	// --- code-pool auto-restock (restock.go, migration 021) ---
+
+	// RestockStatus reads the auto-restock settings, the unfinished restock
+	// and the start counts (dayStart = 00:00 UTC today).
+	// ErrRestockNotMigrated when 021 is missing.
+	RestockStatus(ctx context.Context, dayStart time.Time) (RestockStatus, error)
+	// BeginRestock records a new restock as creating and returns its id —
+	// only if no other is unfinished (errRestockOpen; the partial unique
+	// index decides between two processes) and the daily max / minimum gap
+	// still allow it (errRestockLimited).
+	BeginRestock(ctx context.Context, r RestockStart) (int64, error)
+	// RestockBatchesTaken reports which of these App Store Connect batch ids
+	// some code_restocks row already holds.
+	RestockBatchesTaken(ctx context.Context, batchIDs []string) (map[string]bool, error)
+	// MarkRestockCreated moves a creating restock to created with Apple's
+	// batch id; false when it was no longer creating.
+	MarkRestockCreated(ctx context.Context, id int64, batchID string) (bool, error)
+	// ImportRestock puts the batch's codes into code_pool (codes already
+	// there are ignored) and moves the restock to imported with the number
+	// actually inserted, in one transaction. errRestockNotCreated when the
+	// row is no longer created (nothing is inserted then).
+	ImportRestock(ctx context.Context, id int64, codes []string, offerRefName string, expiresAt, at time.Time) (inserted int, err error)
+	// FailRestock moves an unfinished restock to failed with the reason.
+	FailRestock(ctx context.Context, id int64, reason string, at time.Time) error
 }

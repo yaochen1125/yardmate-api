@@ -27,6 +27,9 @@ import (
 // An alert is a WARN log line every pass plus at most ONE email per day for
 // the same set of conditions (in memory; a restart may repeat one, which is
 // fine). A failed send is not counted as sent, so the next pass retries.
+//
+// Auto-restock (restock.go, default off) runs inside the watch, before the
+// verdict; while one of its restocks is under way the alert only logs.
 
 // restockCommand is the exact line the operator runs after exporting a new
 // batch from App Store Connect (deploy/supabase/import-codes.sh).
@@ -126,8 +129,12 @@ func SettingsProblem(s PoolSettings) string {
 	return ""
 }
 
-// watchPool is the per-pass step: read, assess, log, and email at most once
-// a day. Errors are counted on the report and never stop the pass.
+// watchPool is the per-pass step: read, run auto-restock (restock.go), then
+// assess, log, and email at most once a day. Restock goes first so the
+// verdict is about the pool after it; while a restock is under way (busy) the
+// low-stock / expiring alert is only logged — a mail would send the operator
+// to restock by hand on top of it. Errors are counted on the report and never
+// stop the pass.
 func (s *Service) watchPool(ctx context.Context, now time.Time, rep *Report) {
 	ps, err := s.store.PoolStatus(ctx)
 	if err != nil {
@@ -143,6 +150,15 @@ func (s *Service) watchPool(ctx context.Context, now time.Time, rep *Report) {
 	} else {
 		s.poolConfigWarned = false
 	}
+	busy, refreshed := s.restockStep(ctx, now, ps, rep)
+	if refreshed {
+		if fresh, err := s.store.PoolStatus(ctx); err != nil {
+			log.Printf("referral settle: pool status after restock: %v", err)
+			rep.Errors++
+		} else {
+			ps = fresh
+		}
+	}
 	st := TakeStock(ps, now)
 	rep.Usable = st.Usable
 	if !st.Alerting() {
@@ -155,27 +171,45 @@ func (s *Service) watchPool(ctx context.Context, now time.Time, rep *Report) {
 	log.Printf("WARN referral pool: %s usable=%d short=%d earliest=%s after_earliest=%d threshold=%d warn_days=%d margin_days=%d",
 		st.conditions(), st.Usable, st.Short, earliest, st.AfterEarliest,
 		ps.Settings.LowStockThreshold, ps.Settings.ExpiryWarnDays, ps.Settings.IssueMarginDays)
-
+	if busy {
+		log.Printf("referral pool: alert mail held back — an auto-restock is under way")
+		return
+	}
 	if s.alerter == nil {
 		return
 	}
-	// One mail per condition set per UTC day, flapping included: the set of
-	// keys sent today is remembered, and forgotten when the date changes.
-	if today := now.UTC().Format("2006-01-02"); today != s.alertDay {
-		s.alertDay, s.alertsSent = today, map[string]bool{}
-	}
-	key := st.conditions()
-	if s.alertsSent[key] {
-		return
-	}
 	subject, body := alertMail(ps, st, now)
-	if err := s.alerter.Alert(subject, body); err != nil {
+	sent, err := s.alertOnce(st.conditions(), now, subject, body)
+	if err != nil {
 		log.Printf("referral pool alert mail: %v", err)
 		rep.Errors++
 		return
 	}
+	if sent {
+		rep.Alerted++
+	}
+}
+
+// alertOnce mails subject / body unless key already went out today: one mail
+// per key per UTC day, flapping included — the keys sent today are
+// remembered (in memory; a restart may repeat one, which is fine) and
+// forgotten when the date changes. A failed send is not remembered, so the
+// next pass retries. No alerter → false, nil (the caller has logged).
+func (s *Service) alertOnce(key string, now time.Time, subject, body string) (bool, error) {
+	if s.alerter == nil {
+		return false, nil
+	}
+	if today := now.UTC().Format("2006-01-02"); today != s.alertDay {
+		s.alertDay, s.alertsSent = today, map[string]bool{}
+	}
+	if s.alertsSent[key] {
+		return false, nil
+	}
+	if err := s.alerter.Alert(subject, body); err != nil {
+		return false, err
+	}
 	s.alertsSent[key] = true
-	rep.Alerted++
+	return true, nil
 }
 
 // alertMail renders the operator email: what is left per batch, when the
@@ -228,9 +262,10 @@ func alertMail(ps PoolStatus, st Stock, now time.Time) (subject, body string) {
 	_ = tw.Flush()
 
 	b.WriteString("\n补货：App Store Connect → offer「Referral Friend Month」再生成一批一次性码\n")
-	b.WriteString("（每批最长 6 个月；每季度每 App 上限 15 万个），导出 CSV 后在 secrets 环境里跑：\n")
+	b.WriteString("（每批 500–25,000 张、最长 6 个月；每 App 每季度上限 100 万张，所有订阅共用），导出 CSV 后在 secrets 环境里跑：\n")
 	b.WriteString("  SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… " + restockCommand + "\n")
 	b.WriteString("先 staging 后 prod。看现状：deploy/referral-pool.sh\n\n")
 	b.WriteString("阈值在 referral_settings（issue_margin_days / swap_grace_days / low_stock_threshold / expiry_warn_days），改库即生效。\n")
+	b.WriteString("自动补货（默认关）：referral_settings.auto_restock_enabled，见 deploy/README.md §10。\n")
 	return subject, b.String()
 }

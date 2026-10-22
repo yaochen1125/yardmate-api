@@ -71,6 +71,7 @@ func buildReferralService(vault *secrets.Vault, db *enrichment.DB, mailer *enric
 		DeviceCheck:                 dc,
 		DeviceCheckMode:             mode,
 		DeviceCheckAllowDevelopment: deviceCheckAllowDevelopment(vault, mode),
+		Restock:                     buildRestockConfig(vault),
 	})
 	if !svc.Configured() {
 		log.Printf("WARN: referral not configured (missing %v); /v1/referral/* answers 503 not_configured", svc.Missing())
@@ -79,6 +80,62 @@ func buildReferralService(vault *secrets.Vault, db *enrichment.DB, mailer *enric
 			referral.DefaultClaimLimit, referral.DefaultClaimWindow, referral.DefaultReadLimit, referral.DefaultReadWindow)
 	}
 	return svc
+}
+
+// buildRestockConfig reads the App Store Connect side of code-pool
+// auto-restock (referral/restock.go): ASC_KEY_ID, ASC_ISSUER_ID,
+// ASC_PRIVATE_KEY (the .p8 on ONE line with literal "\n", like
+// APPLE_PRIVATE_KEY), ASC_REFERRAL_OFFER_ID and ASC_OFFER_CODE_ENVIRONMENT
+// (PRODUCTION | SANDBOX). The switch is referral_settings.auto_restock_enabled
+// (default false): with it off nothing here is ever used, so a missing piece
+// is only an INFO line; with it on, the settlement loop logs + mails "not
+// configured" (once a day) instead of restocking. Only names are logged,
+// never a value.
+func buildRestockConfig(vault *secrets.Vault) referral.RestockConfig {
+	cfg := referral.RestockConfig{
+		OfferID:     strings.TrimSpace(vault.Get("ASC_REFERRAL_OFFER_ID")),
+		Environment: referral.NormaliseOfferEnvironment(vault.Get("ASC_OFFER_CODE_ENVIRONMENT")),
+	}
+	keyID, issuerID := strings.TrimSpace(vault.Get("ASC_KEY_ID")), strings.TrimSpace(vault.Get("ASC_ISSUER_ID"))
+	rawKey := vault.Get("ASC_PRIVATE_KEY")
+	if keyID == "" {
+		cfg.Missing = append(cfg.Missing, "ASC_KEY_ID")
+	}
+	if issuerID == "" {
+		cfg.Missing = append(cfg.Missing, "ASC_ISSUER_ID")
+	}
+	if strings.TrimSpace(rawKey) == "" {
+		cfg.Missing = append(cfg.Missing, "ASC_PRIVATE_KEY")
+	}
+	if cfg.OfferID == "" {
+		cfg.Missing = append(cfg.Missing, "ASC_REFERRAL_OFFER_ID")
+	}
+	if cfg.Environment == "" {
+		if strings.TrimSpace(vault.Get("ASC_OFFER_CODE_ENVIRONMENT")) == "" {
+			cfg.Missing = append(cfg.Missing, "ASC_OFFER_CODE_ENVIRONMENT")
+		} else {
+			cfg.Missing = append(cfg.Missing, "ASC_OFFER_CODE_ENVIRONMENT (neither PRODUCTION nor SANDBOX)")
+		}
+	}
+	if keyID != "" && issuerID != "" && strings.TrimSpace(rawKey) != "" {
+		pemBytes, err := appleP8Bytes(rawKey, "", "ASC_PRIVATE_KEY")
+		if err == nil {
+			var c *referral.ASCClient
+			if c, err = referral.NewASCClient(keyID, issuerID, pemBytes); err == nil {
+				cfg.API = c
+			}
+		}
+		if err != nil {
+			// NewASCClient's errors never carry key material.
+			cfg.Missing = append(cfg.Missing, "ASC_PRIVATE_KEY (unusable: "+err.Error()+")")
+		}
+	}
+	if len(cfg.Missing) > 0 {
+		log.Printf("referral restock: App Store Connect not configured (missing %v) — auto-restock cannot run if referral_settings.auto_restock_enabled is turned on", cfg.Missing)
+	} else {
+		log.Printf("referral restock: App Store Connect configured, code environment %s (auto-restock still needs referral_settings.auto_restock_enabled + restock_environment)", cfg.Environment)
+	}
+	return cfg
 }
 
 // buildDeviceCheck wires gate 1 (referral/devicecheck.go). The .p8 is read
