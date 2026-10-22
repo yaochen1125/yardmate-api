@@ -68,7 +68,7 @@ func pgTest(t *testing.T) (*PGStore, *pgxpool.Pool, context.Context) {
 	})
 	// In the order production runs them; 015 and 016 twice: they must be re-runnable.
 	for _, f := range []string{"013_referral.sql", "014_referral_pool_margin.sql", "015_referral_rewards.sql", "015_referral_rewards.sql",
-		"016_referral_antiabuse.sql", "016_referral_antiabuse.sql", "018_reward_payout_undo.sql", "018_reward_payout_undo.sql", "019_referral_w9_threshold.sql", "019_referral_w9_threshold.sql"} {
+		"016_referral_antiabuse.sql", "016_referral_antiabuse.sql", "018_reward_payout_undo.sql", "018_reward_payout_undo.sql", "019_referral_w9_threshold.sql", "019_referral_w9_threshold.sql", "020_reward_payout_email_change.sql", "020_reward_payout_email_change.sql"} {
 		sql, err := os.ReadFile(filepath.Join("..", "proxy", "enrichment", "migrations", f))
 		if err != nil {
 			t.Fatalf("%s: %v", f, err)
@@ -193,6 +193,67 @@ func TestPGLedgerAndPayouts(t *testing.T) {
 	var left int
 	if err := pool.QueryRow(ctx, `select (select count(*) from reward_ledger) + (select count(*) from reward_payouts)`).Scan(&left); err != nil || left != 0 {
 		t.Fatalf("rows left after referrer deletion: %d %v", left, err)
+	}
+}
+
+// Changing the email of a requested payout (migration 020), and how it
+// orders with the operator's mark-sent (018).
+func TestPGChangePayoutEmail(t *testing.T) {
+	store, pool, ctx := pgTest(t)
+	refID := seedReferral(t, ctx, pool, referrer, referee, "redeemed")
+	past := time.Now().Add(-RefundWindow - time.Hour)
+	c := Credit{ReferralID: refID, Referrer: referrer, Referee: referee, EventID: "ev-e1", EventType: "RENEWAL",
+		TransactionID: "e1", ProductID: "com.chenyao.plantapp.premium.year", PeriodType: "NORMAL",
+		PriceUSDCents: 3999, Takehome: "0.8500", CreditCents: 15000, PurchasedAt: past, AvailableAt: past.Add(RefundWindow)}
+	if _, err := store.RecordCredit(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MatureDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.ChangePayoutEmail(ctx, referrer, "x@example.com"); !errors.Is(err, ErrPayoutNotEditable) {
+		t.Fatalf("no payout: %v", err)
+	}
+	yearStart := time.Date(time.Now().UTC().Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	po, _, err := store.RequestPayout(ctx, referrer, "old@example.com", PayoutAmountCents, ThresholdCents, yearStart)
+	if err != nil || !po.EmailEditable {
+		t.Fatalf("request: %+v %v", po, err)
+	}
+
+	got, old, changed, err := store.ChangePayoutEmail(ctx, referrer, "new@example.com")
+	if err != nil || !changed || old != "old@example.com" || got.Email != "new@example.com" || !got.EmailEditable || got.ID != po.ID {
+		t.Fatalf("change: %+v %q %v %v", got, old, changed, err)
+	}
+	var stamped *time.Time
+	if err := pool.QueryRow(ctx, `select email_changed_at from reward_payouts where id = $1`, po.ID).Scan(&stamped); err != nil || stamped == nil {
+		t.Fatalf("email_changed_at = %v %v", stamped, err)
+	}
+	if _, _, changed, err := store.ChangePayoutEmail(ctx, referrer, "NEW@example.com"); err != nil || changed {
+		t.Fatalf("same address again: changed=%v %v", changed, err)
+	}
+
+	// The operator was shown the old address: mark-sent refuses.
+	var n int
+	if err := pool.QueryRow(ctx, `select count(*) from reward_payout_mark_sent($1, 'old@example.com')`, po.ID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("mark_sent with the old address: %d %v", n, err)
+	}
+	if err := pool.QueryRow(ctx, `select count(*) from reward_payout_mark_sent($1, 'new@example.com')`, po.ID).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("mark_sent: %d %v", n, err)
+	}
+	// Inside the undo hour: reads requested, but not editable.
+	b, _ := store.Balance(ctx, referrer)
+	if b.Latest == nil || b.Latest.State != PayoutRequested || b.Latest.EmailEditable {
+		t.Fatalf("latest in buffer = %+v", b.Latest)
+	}
+	if _, _, _, err := store.ChangePayoutEmail(ctx, referrer, "third@example.com"); !errors.Is(err, ErrPayoutNotEditable) {
+		t.Fatalf("change in buffer: %v", err)
+	}
+	// Undo → editable again.
+	if err := pool.QueryRow(ctx, `select count(*) from reward_payout_undo($1)`, po.ID).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("undo: %d %v", n, err)
+	}
+	if b, _ := store.Balance(ctx, referrer); b.Latest == nil || !b.Latest.EmailEditable {
+		t.Fatalf("latest after undo = %+v", b.Latest)
 	}
 }
 

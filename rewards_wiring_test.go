@@ -102,13 +102,15 @@ func TestRevenueCatWebhookHasItsOwnIPLimit(t *testing.T) {
 }
 
 func TestReferralPayoutRouteRegistered(t *testing.T) {
-	r := httptest.NewRequest("POST", "/v1/referral/payout", strings.NewReader(`{"email":"a@example.com"}`))
-	r.Header.Set("X-Device-Install-Id", "4E7B1B6C-7B9F-4F3E-9C2E-1D3A5F6B7C8D")
-	r.Header.Set("X-App-Version", "2.2.0 (50)")
-	r.Header.Set("Authorization", "Bearer x")
-	w := httptest.NewRecorder()
-	rewardsTestServer(t, "").ServeHTTP(w, r)
-	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "not_configured") {
-		t.Fatalf("unconfigured payout: %d %s", w.Code, w.Body.String())
+	for _, path := range []string{"/v1/referral/payout", "/v1/referral/payout/email"} {
+		r := httptest.NewRequest("POST", path, strings.NewReader(`{"email":"a@example.com"}`))
+		r.Header.Set("X-Device-Install-Id", "4E7B1B6C-7B9F-4F3E-9C2E-1D3A5F6B7C8D")
+		r.Header.Set("X-App-Version", "2.2.0 (50)")
+		r.Header.Set("Authorization", "Bearer x")
+		w := httptest.NewRecorder()
+		rewardsTestServer(t, "").ServeHTTP(w, r)
+		if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "not_configured") {
+			t.Fatalf("unconfigured %s: %d %s", path, w.Code, w.Body.String())
+		}
 	}
 }

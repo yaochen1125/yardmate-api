@@ -114,16 +114,16 @@ func TestSummaryNeverNegative(t *testing.T) {
 
 func TestPayoutViewWireFormat(t *testing.T) {
 	loc := time.FixedZone("PDT", -7*3600)
-	v := viewOf(&Payout{ID: 17, AmountCents: 10000, State: PayoutSent,
+	v := viewOf(&Payout{ID: 17, AmountCents: 10000, State: PayoutSent, Email: "anna@gmail.com",
 		RequestedAt: time.Date(2026, 10, 20, 5, 6, 7, 123456789, loc),
 		SentAt:      time.Date(2026, 10, 22, 9, 0, 0, 999, time.UTC)})
 	raw, _ := json.Marshal(v)
-	want := `{"id":17,"amount_cents":10000,"state":"sent","requested_at":"2026-10-20T12:06:07Z","sent_at":"2026-10-22T09:00:00Z"}`
+	want := `{"id":17,"amount_cents":10000,"state":"sent","requested_at":"2026-10-20T12:06:07Z","sent_at":"2026-10-22T09:00:00Z","email":"anna@gmail.com","email_editable":false}`
 	if string(raw) != want {
 		t.Fatalf("wire = %s\nwant  %s", raw, want)
 	}
-	raw, _ = json.Marshal(viewOf(&Payout{ID: 1, AmountCents: 10000, State: PayoutRequested, RequestedAt: t0}))
-	if string(raw) != `{"id":1,"amount_cents":10000,"state":"requested","requested_at":"2026-10-20T12:00:00Z","sent_at":null}` {
+	raw, _ = json.Marshal(viewOf(&Payout{ID: 1, AmountCents: 10000, State: PayoutRequested, RequestedAt: t0, Email: "a@example.com", EmailEditable: true}))
+	if string(raw) != `{"id":1,"amount_cents":10000,"state":"requested","requested_at":"2026-10-20T12:00:00Z","sent_at":null,"email":"a@example.com","email_editable":true}` {
 		t.Fatalf("requested wire = %s", raw)
 	}
 }

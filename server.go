@@ -295,6 +295,8 @@ func newServer(
 				// the email shape check.
 				if rewardsSvc != nil {
 					r.Post("/payout", rewardsSvc.HandlePayout())
+					// Change the email of a requested payout (same JWT and bucket).
+					r.Post("/payout/email", rewardsSvc.HandlePayoutEmail())
 				}
 			})
 		}

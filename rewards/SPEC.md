@@ -14,6 +14,7 @@
 - `GET /v1/referral/me` 的 `rewards` 字段：经 `referral.RewardsReader` 注入（`Rewards`）；本包不碰 `/me` 别的字段。
 - `POST /v1/referral/payout`：可兑余额 ≥ $100 → 建一条 `requested` 申请（固定 $100）→ 给运营发邮件（`payout.go`）；
   邮件就是防刷第 5 道的人工审核，附这个推荐人的朋友数 / 朋友设备去重数 / 退款笔数 / 作废与待审核推荐数（`ReviewStats`，§2.3）。
+- `POST /v1/referral/payout/email`：申请中（库里真 `requested`，缓冲中不算）的推荐人改收卡邮箱 → 给运营发「邮箱已改」邮件（§2.8）。
 - 运营侧：`deploy/referral-payout.sh list | mark-sent <id> | undo <id> | cancel <id>`（PostgREST + service role；`mark-sent` 两次确认、标记后 1 小时内可 `undo`，§2.7）。
 
 ### 1.2 不负责什么
@@ -31,7 +32,7 @@
 | webhook 头 | `Authorization`：与 `REVENUECAT_WEBHOOK_SECRET` 常量时间比较，两边带不带 `Bearer ` 都行 |
 | webhook body（≤ 64 KB）| `{"event": {...}, "api_version": "1.0"}`；读 `id, type, environment, app_user_id, product_id, period_type, price, takehome_percentage, transaction_id, original_transaction_id, purchased_at_ms, cancel_reason`，另读 `is_family_share` |
 | `/payout` 头 | 同 `/claim`：`Authorization: Bearer <Supabase access token>`、`X-Device-Install-Id`、`X-App-Version` |
-| `/payout` body | `{"email": "you@example.com"}` |
+| `/payout`、`/payout/email` body | `{"email": "you@example.com"}` |
 | vault | `REVENUECAT_WEBHOOK_SECRET`；`SUPABASE_URL` / `SUPABASE_DB_URL`（与 referral 共用）；`FEEDBACK_SMTP_*` / `FEEDBACK_EMAIL_TO`（运营邮件，main 经 `mail_wiring.go` 建一次、与 feedback / 码池告警共用，缺了只记日志）；`REFERRAL_SETTLE_INTERVAL`（可选）|
 | 库 | migration `015_referral_rewards.sql` 的 `reward_ledger` / `reward_voided_txns` / `reward_payouts`（依赖 013 的 `referral_users` / `referrals`）；`016_referral_antiabuse.sql` 的 `reward_ledger.void_reason`、`referrals.claim_install_id` |
 
@@ -40,20 +41,23 @@
 `/me` 的 `rewards` → `{available_cents, pending_cents, lifetime_cents, payout, counts, referrals}`，`payout` = 最近一条（任何状态）或 `null`，
 时间字段 RFC 3339、UTC、整秒（`"2026-10-20T12:00:00Z"`），`sent_at` 没发时 `null`。
 `counts` / `referrals`（2026-10-21 加，§2.6）只加不改：读进度出错时两个都不出（只记日志），前四个照常；`referrals` 为空时也不出。
-`/payout` 201 → `{"payout": {...}}`（同上 object，`state == "requested"`）。webhook 200 → `{"status": "<outcome>"}`
+`payout` object 带 `email`（收卡邮箱）和 `email_editable`（库里真 `requested` 才 true，缓冲中 false）——2026-10-22 加，只加不改。
+`/payout` 201 → `{"payout": {...}}`（同上 object，`state == "requested"`、`email_editable == true`）。`/payout/email` 200 → 同形（新邮箱；新旧一样时原样返回）。webhook 200 → `{"status": "<outcome>"}`
 （`recorded` / `duplicate` / `voided` / `nothing_to_void` / `not_counted` / `not_referee` / `not_redeemed` / `ignored_type` / `ignored_environment`，
 RevenueCat 后台的投递记录里看得到；`voided` 既指退款作废了 pending，也指扣费晚于自己的退款到达、没入账）。错误体 `{"error":"<code>"}`：
 
 | 接口 | HTTP | code | 说明 |
 |---|---|---|---|
 | payout | 400 | `missing_device_id` / `missing_app_version` / `bad_json` | 请求形状（同 referral）|
-| payout | 400 | `invalid_email` | `net/mail` 解析不成裸地址（不许显示名 / 尖括号）、无 `@`、> 254 字符 |
+| payout | 400 | `invalid_email` | `net/mail` 解析不成裸地址（不许显示名 / 尖括号）、无 `@`、> 254 字符、域名是 `privaterelay.appleid.com`（不分大小写；Apple 隐藏邮件地址收不到亚马逊的邮件）|
 | payout | 401 | `unauthorized` | token 验签失败 |
 | payout | 409 | `payout_in_progress` | 已有 `requested`（**先于**余额判断：$100 申请中、余额 0 时也答这个）|
 | payout | 409 | `below_threshold` | 可兑余额 < $100（没当过推荐人也是这个）|
 | payout | 429 | `rate_limit_device` | `/claim` 的设备桶（共用次数）|
 | payout | 502 | `store_failed` | 库不可达 |
 | payout | 503 | `not_configured` | 缺库或缺 `SUPABASE_URL` |
+| payout/email | 400 / 401 / 429 / 502 / 503 | 同 payout | 头、`bad_json`、`invalid_email`（同一个 `validEmail`，不扣限流次数）、鉴权、设备桶、库、配置 |
+| payout/email | 409 | `payout_not_editable` | 调用者没有库里真 `requested` 的申请（没申请过 / 已标记含缓冲中 / 已取消）|
 | webhook | 400 | `bad_json` / `bad_event` | body 不是 JSON；要记账的事件缺 `id` / `transaction_id` 或价格大到放不进 int4 |
 | webhook | 401 | `unauthorized` | 头对不上 |
 | webhook | 429 | `rate_limit_ip` | 同一 IP 每分钟 > 600 次（自己的桶，不占 `/v1` 的 600 / h）|
@@ -146,14 +150,6 @@ pending_cents   = sum(pending 账本)
 - 推荐人删：`referral_users` 行没了 → `reward_ledger.referrer` / `reward_payouts.user_id` **级联删**（余额作废；requested 的照发，运营看邮件，脚本 mark-sent 会报「不存在」）。
 - 朋友删：`referrals` 那行级联没了 → `reward_ledger.referee` / `referral_id` **置空**，推荐人已记的钱不动；之后该 app_user_id 的事件 not_referee。
 
-### 2.7 标记已发的 1 小时缓冲（migration 018，rewards.md `### 标记已发`）
-
-- `reward_payouts.undo_until`：`reward_payout_mark_sent(p_id, p_email)` 置 `state = sent, sent_at = now(), undo_until = now() + 1 hour`，只在 `state = requested` 且 `email = p_email`（脚本列给运营看的那个）时改；`reward_payout_undo(p_id)` 只在 `state = sent and undo_until > now()` 时改回 `requested`、清 `sent_at` / `undo_until`。两个都是 SQL 函数，脚本经 PostgREST `/rest/v1/rpc/` 调，只 grant 给 service_role。
-- 缓冲期对外一律是 `requested`：`payoutColumns`（`Balance.Latest`、`RequestPayout` 的返回）在 SQL 里把 `state = sent and undo_until > now()` 读成 `requested`、`sent_at` 读成 null；`RequestPayout` 的「有没有在路上」也算上它。全部用数据库 `now()`，不用 Go 的 `s.now()`。
-- 余额口径不变（`requested` / `sent` 都扣）；年度合计按库里的真实 `state`，缓冲中算「已发」、年份按 `sent_at`（标记时间）。
-- 撤回回 `requested` 不会撞 partial unique index：缓冲期里同一人建不出第二张 `requested`。
-- `cancel` 只认 `requested`（PATCH 带 `state=eq.requested`）：缓冲中的先 `undo`。
-
 ### 2.5 幂等 / 并发
 
 - RevenueCat 重发同一事件（同 `event.id`）或同一笔交易换了 `event.id` 又来 → `rc_event_id`、`transaction_id` 两个唯一索引，
@@ -187,9 +183,27 @@ coalesce(reissued_at, claimed_at)`，走 `referrals_referrer_idx`）和他的账
 - 排序 paying（next 升序）→ free_month（结束升序）→ unredeemed（加入降序），同值按 referral id；最多 50 行。
 - 用 `Service.now`（应用时钟）判免费月，不用库的 `now()`。
 
+### 2.7 标记已发的 1 小时缓冲（migration 018，rewards.md `### 标记已发`）
+
+- `reward_payouts.undo_until`：`reward_payout_mark_sent(p_id, p_email)` 置 `state = sent, sent_at = now(), undo_until = now() + 1 hour`，只在 `state = requested` 且 `email = p_email`（脚本列给运营看的那个）时改；`reward_payout_undo(p_id)` 只在 `state = sent and undo_until > now()` 时改回 `requested`、清 `sent_at` / `undo_until`。两个都是 SQL 函数，脚本经 PostgREST `/rest/v1/rpc/` 调，只 grant 给 service_role。
+- 缓冲期对外一律是 `requested`：`payoutColumns`（`Balance.Latest`、`RequestPayout` 的返回）在 SQL 里把 `state = sent and undo_until > now()` 读成 `requested`、`sent_at` 读成 null；`RequestPayout` 的「有没有在路上」也算上它。全部用数据库 `now()`，不用 Go 的 `s.now()`。
+- 余额口径不变（`requested` / `sent` 都扣）；年度合计按库里的真实 `state`，缓冲中算「已发」、年份按 `sent_at`（标记时间）。
+- 撤回回 `requested` 不会撞 partial unique index：缓冲期里同一人建不出第二张 `requested`。
+- `cancel` 只认 `requested`（PATCH 带 `state=eq.requested`）：缓冲中的先 `undo`。
+
+### 2.8 改收卡邮箱（`ChangePayoutEmail`，migration 020，rewards.md `### 邮箱：确认、拼写提示、修改`）
+
+1. 头 + JWT → body → `validEmail`（格式 + 拒收隐藏邮件地址；不过不扣次数）→ `/claim` 的设备桶。
+2. 一个事务：`select id, email from reward_payouts where user_id = $1 and state = 'requested' for update`（库里真 `requested`；缓冲中的已是 `sent`，自然找不到）。
+   没有 → `payout_not_editable`。新旧邮箱不分大小写一样 → 原样返回、不改、不发信。否则 `email = 新, email_changed_at = now()`。
+3. 行锁让它和 `reward_payout_mark_sent` 排先后：改邮箱先提交 → 运营那边按旧邮箱的 `mark_sent` 改不到（脚本提示重跑）；标记先提交 → 这里找不到 requested → 409。
+4. 改了才异步发「邮箱已改」：主题 `[YardMate] Referral gift card request #<id>: email changed`（纯 ASCII），正文申请号、用户 ID、旧 → 新、时间、
+   「没买就发新地址 / 已按旧地址发了别再买、先去亚马逊处理」、mark-sent 命令。脚本 `mark-sent` 在确认前列出「邮箱 {时间} 被用户改过」。
+
 ## 3. 配置与运维
 
 - 迁移：`proxy/enrichment/migrations/015_referral_rewards.sql`（依赖 013，可重复跑），**先 staging 后 prod，且先于二进制**。
+  `020_reward_payout_email_change.sql`（`reward_payouts.email_changed_at`）先于二进制和新脚本：改邮箱要写这一列、脚本要读这一列。
   `019_referral_w9_threshold.sql`（`referral_settings.w9_threshold_cents`）先后都行：没跑时邮件按默认 $2,000 算并记日志。每年 1 月按 IRS 新值改这一列。
   `018_reward_payout_undo.sql`（`undo_until` + 两个 RPC 函数）同样先于二进制：新二进制的 SQL 读 `undo_until`，没跑 018 时 `/me` 的 `rewards` 读失败被省略、`/payout` 502。
   `016_referral_antiabuse.sql` 也先于二进制：退款作废写 `void_reason`、申请邮件读 `claim_install_id`，没跑 016 时退款事件答 500（RevenueCat 重试，跑了自愈）、
@@ -225,7 +239,12 @@ PG `TestPGProgress`：两条查询的口径（void 不出、删号后 referral_i
 
 标记缓冲（§2.7）：PG `TestPGMarkSentBufferAndUndo`：邮箱对不上不改、requested 不能 undo、标记后 `undo_until − sent_at = 1h`、重复标记不改、缓冲中 `Balance.Latest` 读成 requested 无 `sent_at` 且余额照扣、缓冲中 `/payout` 答 in progress、缓冲内 undo 回 requested 清两列、过了缓冲读成 sent 且 undo 拒绝、之后余额够可再申请。脚本 `deploy/referral-payout.sh` 用 shellcheck 检查，在 staging 上手跑（§3）。
 
-`go test .`：两条路由已注册、未配置答 503 / 401；webhook 不占 `/v1` 的 IP 桶、自己 600 / min 后 429。`go test ./referral/`：`/me` 有 / 无 / 失败三种、共享桶。
+改邮箱（§2.8，`payout_email_test.go`）：201 / `/me` 的 payout 带 `email` / `email_editable`（线上字段名）、改成功 200 + 库里换了 + 「邮箱已改」邮件（主题 ASCII、旧 → 新、mark-sent 命令）、
+同一地址换大小写 200 不发信、没申请 / 已发 / 已取消 409、格式错 / 隐藏地址（大小写）/ bad_json 400 且不扣设备桶、桶满 429、库错误 502、鉴权 401；
+`/payout` 也拒收隐藏地址。PG `TestPGChangePayoutEmail`：没申请 409、改了盖 `email_changed_at`、同一地址不改、
+mark_sent 用旧邮箱改不到 / 用新邮箱改到、缓冲中读成 requested 但 `email_editable` false 且改邮箱 409、undo 后又能改。
+
+`go test .`：三条路由（webhook、`/payout`、`/payout/email`）已注册、未配置答 503 / 401；webhook 不占 `/v1` 的 IP 桶、自己 600 / min 后 429。`go test ./referral/`：`/me` 有 / 无 / 失败三种、共享桶。
 
 SQL（按线上顺序 013 → 014 → 015，015 跑两遍）在真库上的测试（含 transaction_id 去重、退款先到、新表 RLS）：`REWARDS_PG_TEST_URL=postgres://…/scratch go test ./rewards/ -run PG -v`
 （临时 schema，跑完即删；**绝不要指向 staging / prod**）。**本 PR 写的时候本机没有 Postgres，这组还没实跑过。**

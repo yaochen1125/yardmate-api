@@ -3,6 +3,7 @@ package rewards
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -165,12 +166,13 @@ func (p *PGStore) MatureDue(ctx context.Context) (int64, error) {
 const payoutColumns = `id, user_id, amount_cents, email,
 	case when state = 'sent' and undo_until > now() then 'requested' else state end,
 	requested_at,
-	case when state = 'sent' and undo_until > now() then null else sent_at end`
+	case when state = 'sent' and undo_until > now() then null else sent_at end,
+	state = 'requested'`
 
 func scanPayout(row pgx.Row) (Payout, error) {
 	var po Payout
 	var sent *time.Time
-	if err := row.Scan(&po.ID, &po.UserID, &po.AmountCents, &po.Email, &po.State, &po.RequestedAt, &sent); err != nil {
+	if err := row.Scan(&po.ID, &po.UserID, &po.AmountCents, &po.Email, &po.State, &po.RequestedAt, &sent, &po.EmailEditable); err != nil {
 		return Payout{}, err
 	}
 	if sent != nil {
@@ -269,6 +271,47 @@ func (p *PGStore) RequestPayout(ctx context.Context, userID, email string, amoun
 		return Payout{}, YearTotals{}, err
 	}
 	return po, year, nil
+}
+
+// ChangePayoutEmail locks the user's requested row (FOR UPDATE) so it orders
+// with reward_payout_mark_sent, which updates the same row only while it is
+// requested and still has the email the operator was shown: whichever
+// commits first wins, and the other finds nothing to do.
+func (p *PGStore) ChangePayoutEmail(ctx context.Context, userID, email string) (Payout, string, bool, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return Payout{}, "", false, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var id int64
+	var old string
+	err = tx.QueryRow(ctx,
+		`select id, email from reward_payouts where user_id = $1 and state = 'requested' for update`, userID).
+		Scan(&id, &old)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Payout{}, "", false, ErrPayoutNotEditable
+	}
+	if err != nil {
+		return Payout{}, "", false, err
+	}
+	if strings.EqualFold(old, email) {
+		po, err := scanPayout(tx.QueryRow(ctx, `select `+payoutColumns+` from reward_payouts where id = $1`, id))
+		if err != nil {
+			return Payout{}, "", false, err
+		}
+		return po, old, false, tx.Commit(ctx)
+	}
+	po, err := scanPayout(tx.QueryRow(ctx,
+		`update reward_payouts set email = $2, email_changed_at = now() where id = $1
+		 returning `+payoutColumns, id, email))
+	if err != nil {
+		return Payout{}, "", false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Payout{}, "", false, err
+	}
+	return po, old, true, nil
 }
 
 func (p *PGStore) W9ThresholdCents(ctx context.Context) (int64, error) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 推荐奖励：礼品卡申请的运营脚本（rewards/SPEC.md；表来自 015，缓冲 / 撤回来自 018）。
+# 推荐奖励：礼品卡申请的运营脚本（rewards/SPEC.md；表来自 015，缓冲 / 撤回来自 018，改邮箱记录来自 020）。
 #
 #   SUPABASE_URL=https://xxx.supabase.co SUPABASE_SERVICE_ROLE_KEY=eyJ... deploy/referral-payout.sh list
 #   SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... deploy/referral-payout.sh mark-sent 17
@@ -34,7 +34,7 @@ cmd="${1:-}"
 rest="${SUPABASE_URL%/}/rest/v1"
 base="$rest/reward_payouts"
 auth=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY")
-cols="id,user_id,email,amount_cents,state,requested_at,sent_at,undo_until"
+cols="id,user_id,email,amount_cents,state,requested_at,sent_at,undo_until,email_changed_at"
 
 need_jq() {
   command -v jq > /dev/null || { echo "mark-sent / undo 需要 jq（brew install jq / apt install jq）" >&2; exit 1; }
@@ -104,6 +104,7 @@ mark_sent() {
 
   echo "要标记为已发的申请："
   printf '%s' "$row" | jq -r '.[0] | "  编号：    #\(.id)\n  收卡邮箱：\(.email)\n  金额：    $\(.amount_cents / 100)\n  申请时间：\(.requested_at)\n  用户 ID： \(.user_id)"'
+  printf '%s' "$row" | jq -r '.[0] | select(.email_changed_at != null) | "  ⚠️ 邮箱 \(.email_changed_at | .[0:16] | sub("T"; " ")) UTC 被用户改过，旧地址见「邮箱已改」通知邮件。上面是最新的；你发卡用的不是它就别确认。"'
   echo
 
   local typed

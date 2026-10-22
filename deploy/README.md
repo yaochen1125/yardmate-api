@@ -313,6 +313,14 @@ then prod.
    on its way" and `… deploy/referral-payout.sh undo 17` puts it back to
    requested (our record only — an Amazon order already sent is handled on
    Amazon). After the hour the app shows `Sent {date}` and undo refuses.
+   If the referrer changes the address before you mark it (the app allows that
+   while the request is still requested), a mail `[YardMate] Referral gift card
+   request #17: email changed` gives old → new, and mark-sent shows the new one
+   with a "changed by the user" line: not bought yet → send to the new address;
+   already sent to the old one → don't buy another, sort the order out on
+   Amazon. Migration 020 adds the column both of them use (before the binary).
+   Sign in with Apple private-relay addresses (`@privaterelay.appleid.com`) are
+   refused by the server (they never receive Amazon's mail).
 4. Not sending after all (bad address, no W-9): `… deploy/referral-payout.sh cancel 17`
    (requested only — undo a marked one first)
    — the $100 is back in their balance by definition (balance = cleared

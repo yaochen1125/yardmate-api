@@ -175,6 +175,10 @@ type PayoutView struct {
 	State       string  `json:"state"`
 	RequestedAt string  `json:"requested_at"`
 	SentAt      *string `json:"sent_at"`
+	// Email and EmailEditable (2026-10-22): the card's "To {email}" line
+	// and whether its Change shows. The address is the caller's own.
+	Email         string `json:"email"`
+	EmailEditable bool   `json:"email_editable"`
 }
 
 func viewOf(p *Payout) *PayoutView {
@@ -182,10 +186,12 @@ func viewOf(p *Payout) *PayoutView {
 		return nil
 	}
 	v := &PayoutView{
-		ID:          p.ID,
-		AmountCents: p.AmountCents,
-		State:       p.State,
-		RequestedAt: rfc3339(p.RequestedAt),
+		ID:            p.ID,
+		AmountCents:   p.AmountCents,
+		State:         p.State,
+		RequestedAt:   rfc3339(p.RequestedAt),
+		Email:         p.Email,
+		EmailEditable: p.EmailEditable,
 	}
 	if !p.SentAt.IsZero() {
 		sent := rfc3339(p.SentAt)

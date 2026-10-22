@@ -108,6 +108,10 @@ type Payout struct {
 	State       string
 	RequestedAt time.Time
 	SentAt      time.Time // zero unless sent
+	// EmailEditable: the row really is requested — not marked sent, not even
+	// inside the undo hour — so its owner may still change the email
+	// (POST /v1/referral/payout/email, rewards.md ### 邮箱：确认、拼写提示、修改).
+	EmailEditable bool
 }
 
 // Balance is the raw sums the /me block is computed from (see Summarize).
@@ -133,6 +137,9 @@ func (y YearTotals) Total() int64 { return y.SentCents + y.RequestedCents }
 var (
 	ErrBelowThreshold   = errors.New("below_threshold")
 	ErrPayoutInProgress = errors.New("payout_in_progress")
+	// ErrPayoutNotEditable: ChangePayoutEmail found no requested payout of
+	// the caller's (none, marked sent — undo hour included —, or cancelled).
+	ErrPayoutNotEditable = errors.New("payout_not_editable")
 )
 
 // Store is everything the webhook, the maturing loop, /me and /payout need
@@ -168,6 +175,12 @@ type Store interface {
 	RequestPayout(ctx context.Context, userID, email string, amount, threshold int64, yearStart time.Time) (Payout, YearTotals, error)
 	// ReviewStats reads the referrer's review numbers for the payout mail.
 	ReviewStats(ctx context.Context, userID string) (Review, error)
+	// ChangePayoutEmail sets the email of the user's requested payout (the
+	// one row the partial unique index allows) and stamps email_changed_at.
+	// The same address again (case-insensitively) changes nothing:
+	// changed=false and the payout as it is. No requested payout →
+	// ErrPayoutNotEditable. old is the address it replaced.
+	ChangePayoutEmail(ctx context.Context, userID, email string) (po Payout, old string, changed bool, err error)
 	// W9ThresholdCents reads referral_settings.w9_threshold_cents (migration
 	// 019): the 1099 filing threshold the payout mail's W-9 line is based on.
 	W9ThresholdCents(ctx context.Context) (int64, error)
