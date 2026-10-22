@@ -271,14 +271,14 @@ func (p *PGStore) RequestPayout(ctx context.Context, userID, email string, amoun
 	return po, year, nil
 }
 
-// ReviewStats: the gate-5 numbers for one referrer (rewards.md ### 入账与兑换).
-// Reads referrals' 016 columns (claim_install_id) and reward_ledger.void_reason.
 func (p *PGStore) W9ThresholdCents(ctx context.Context) (int64, error) {
 	var cents int64
 	err := p.pool.QueryRow(ctx, `select w9_threshold_cents from referral_settings where id = 1`).Scan(&cents)
 	return cents, err
 }
 
+// ReviewStats: the gate-5 numbers for one referrer (rewards.md ### 入账与兑换).
+// Reads referrals' 016 columns (claim_install_id) and reward_ledger.void_reason.
 func (p *PGStore) ReviewStats(ctx context.Context, userID string) (Review, error) {
 	rv := Review{VoidByReason: map[string]int{}}
 	if err := p.pool.QueryRow(ctx,
