@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -245,9 +246,33 @@ func (m *memStore) Balance(_ context.Context, userID string) (Balance, error) {
 	})
 	if len(mine) > 0 {
 		p := *mine[0]
+		p.EmailEditable = p.State == PayoutRequested
 		b.Latest = &p
 	}
 	return b, nil
+}
+
+// ChangePayoutEmail replays the PG transaction: the user's requested row only.
+func (m *memStore) ChangePayoutEmail(_ context.Context, userID, email string) (Payout, string, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.payoutErr != nil {
+		return Payout{}, "", false, m.payoutErr
+	}
+	for _, p := range m.payouts {
+		if p.UserID != userID || p.State != PayoutRequested {
+			continue
+		}
+		old := p.Email
+		changed := !strings.EqualFold(old, email)
+		if changed {
+			p.Email = email
+		}
+		out := *p
+		out.EmailEditable = true
+		return out, old, changed, nil
+	}
+	return Payout{}, "", false, ErrPayoutNotEditable
 }
 
 func (m *memStore) RequestPayout(_ context.Context, userID, email string, amount, threshold int64, yearStart time.Time) (Payout, YearTotals, error) {
@@ -269,7 +294,7 @@ func (m *memStore) RequestPayout(_ context.Context, userID, email string, amount
 		return Payout{}, YearTotals{}, ErrBelowThreshold
 	}
 	m.nextID++
-	p := &Payout{ID: m.nextID, UserID: userID, AmountCents: amount, Email: email, State: PayoutRequested, RequestedAt: m.clock}
+	p := &Payout{ID: m.nextID, UserID: userID, AmountCents: amount, Email: email, State: PayoutRequested, RequestedAt: m.clock, EmailEditable: true}
 	m.payouts = append(m.payouts, p)
 	var y YearTotals
 	for _, q := range m.payouts {

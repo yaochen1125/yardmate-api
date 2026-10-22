@@ -20,6 +20,11 @@ const (
 	payoutBodyCap = 4 << 10
 	// maxEmailLen is RFC 5321's path limit.
 	maxEmailLen = 254
+	// relayDomain is Sign in with Apple's private relay. It only forwards
+	// mail from sender domains the developer registered with Apple, so the
+	// Amazon gift-card email (and the operator's own mail) would bounce:
+	// refused as invalid_email (rewards.md ### 邮箱：确认、拼写提示、修改).
+	relayDomain = "privaterelay.appleid.com"
 )
 
 // Configured reports whether POST /v1/referral/payout can work.
@@ -80,6 +85,58 @@ func (s *Service) HandlePayout() http.HandlerFunc {
 	}
 }
 
+// HandlePayoutEmail is POST /v1/referral/payout/email {email}: the owner of a
+// requested payout changes where the card goes, until the operator marks it
+// sent (rewards.md ### 邮箱：确认、拼写提示、修改).
+//
+// Order as /payout: headers + JWT → body → email shape (a typo'd or relay
+// address spends no try) → the shared per-device bucket → the store, which
+// only touches the caller's own requested row (409 payout_not_editable when
+// there is none: never asked, marked sent — undo hour included —, or
+// cancelled). The same address again is a 200 with nothing changed and no
+// mail; a real change mails the operator old → new, off the request path.
+func (s *Service) HandlePayoutEmail() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, ok := s.caller(w, r)
+		if !ok {
+			return
+		}
+		var req payoutRequest
+		r.Body = http.MaxBytesReader(w, r.Body, payoutBodyCap)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_json")
+			return
+		}
+		email, ok := validEmail(req.Email)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "invalid_email")
+			return
+		}
+		now := s.now().UTC()
+		if allowed, retry := s.bucket.Allow(r.Header.Get("X-Device-Install-Id"), now); !allowed {
+			ratelimit.Write429(w, retry, "rate_limit_device")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), storeTimeout)
+		defer cancel()
+		po, old, changed, err := s.store.ChangePayoutEmail(ctx, userID, email)
+		switch {
+		case errors.Is(err, ErrPayoutNotEditable):
+			writeError(w, http.StatusConflict, "payout_not_editable")
+			return
+		case err != nil:
+			log.Printf("referral payout email: store error: %v", err)
+			writeError(w, http.StatusBadGateway, "store_failed")
+			return
+		}
+		if changed {
+			s.notifyEmailChanged(po, old, now)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"payout": viewOf(&po)})
+	}
+}
+
 // caller: the same two headers, configuration and bearer-token checks as the
 // referral endpoints, in the same order and with the same error codes.
 func (s *Service) caller(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -104,8 +161,10 @@ func (s *Service) caller(w http.ResponseWriter, r *http.Request) (string, bool) 
 }
 
 // validEmail: net/mail must parse it as a bare address (no display name, no
-// angle brackets, nothing it would rewrite) with an @. The server only checks
-// the shape (rewards.md); whether it can receive mail is the user's word.
+// angle brackets, nothing it would rewrite) with an @, and it must not be a
+// Sign in with Apple private relay address (relayDomain). Beyond that the
+// server only checks the shape (rewards.md); whether it can receive mail is
+// the user's word.
 func validEmail(raw string) (string, bool) {
 	e := strings.TrimSpace(raw)
 	if e == "" || len(e) > maxEmailLen || !strings.Contains(e, "@") {
@@ -115,7 +174,49 @@ func validEmail(raw string) (string, bool) {
 	if err != nil || addr.Name != "" || addr.Address != e {
 		return "", false
 	}
+	if at := strings.LastIndexByte(e, '@'); strings.EqualFold(e[at+1:], relayDomain) {
+		return "", false
+	}
 	return addr.Address, true
+}
+
+// notifyEmailChanged tells the operator a requested card now goes elsewhere.
+// Fire-and-forget like the request mail: the row is already committed and
+// mark-sent shows the current address (and that it was changed) anyway.
+func (s *Service) notifyEmailChanged(po Payout, old string, at time.Time) {
+	if s.mailer == nil {
+		log.Printf("referral payout #%d: email changed; operator mail disabled (FEEDBACK_SMTP_* unset)", po.ID)
+		return
+	}
+	m := s.mailer
+	s.async(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("referral payout #%d: email-change mail panic recovered: %v", po.ID, r)
+			}
+		}()
+		subject, body := composeEmailChangedMail(po, old, at)
+		if err := m.Alert(subject, body); err != nil {
+			log.Printf("referral payout #%d: email-change mail failed (change stored): %v", po.ID, err)
+		}
+	})
+}
+
+// composeEmailChangedMail: subject plain ASCII, addresses only in the body.
+func composeEmailChangedMail(po Payout, old string, at time.Time) (subject, body string) {
+	subject = fmt.Sprintf("[YardMate] Referral gift card request #%d: email changed", po.ID)
+	var b strings.Builder
+	b.WriteString("The referrer changed where their gift card goes.\n\n")
+	fmt.Fprintf(&b, "Request:      #%d\n", po.ID)
+	fmt.Fprintf(&b, "User id:      %s\n", po.UserID)
+	fmt.Fprintf(&b, "Old email:    %s\n", old)
+	fmt.Fprintf(&b, "New email:    %s\n", po.Email)
+	fmt.Fprintf(&b, "Changed at:   %s\n\n", rfc3339(at))
+	b.WriteString("Not bought yet: send it to the NEW address.\n")
+	b.WriteString("Already sent to the old address: do not buy another card; handle the order on Amazon first.\n\n")
+	b.WriteString("When it is sent (mark-sent shows the current address and that it was changed):\n")
+	fmt.Fprintf(&b, "  deploy/referral-payout.sh mark-sent %d\n", po.ID)
+	return subject, b.String()
 }
 
 // notifyOperator mails the request to the operator inbox (same account as

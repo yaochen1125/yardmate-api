@@ -41,7 +41,7 @@ func errOf(t *testing.T, w *httptest.ResponseRecorder) string {
 	return s
 }
 
-const okBody = `{"email":"friend@privaterelay.appleid.com"}`
+const okBody = `{"email":"friend@example.com"}`
 
 // richSvc: the referrer has $230.00 available, $12.00 pending.
 func richSvc(t *testing.T) (*Service, *memStore, *fakeMailer) {
@@ -88,6 +88,8 @@ func TestPayoutInvalidEmail(t *testing.T) {
 		"Friend <friend@example.com>", "<friend@example.com>", "friend@example.com\r\nBcc: x@evil.com",
 		"a b@example.com", "friend@example.com, other@example.com",
 		strings.Repeat("a", 250) + "@x.co",
+		// Sign in with Apple's private relay drops Amazon's mail: refused, any case.
+		"friend@privaterelay.appleid.com", "First.Last+yardmate@PrivateRelay.AppleID.com",
 	}
 	for _, e := range bad {
 		svc, store, mailer := richSvc(t)
@@ -100,7 +102,7 @@ func TestPayoutInvalidEmail(t *testing.T) {
 			t.Errorf("%q: stored or mailed", e)
 		}
 	}
-	good := []string{"friend@example.com", "First.Last+yardmate@privaterelay.appleid.com", "  padded@example.com  "}
+	good := []string{"friend@example.com", "First.Last+yardmate@icloud.com", "  padded@example.com  ", "x@relay.appleid.com.example"}
 	for _, e := range good {
 		if got, ok := validEmail(e); !ok || got != strings.TrimSpace(e) {
 			t.Errorf("validEmail(%q) = %q %v", e, got, ok)
@@ -124,7 +126,7 @@ func TestPayoutCreated(t *testing.T) {
 	if p.ID == 0 || p.AmountCents != 10000 || p.State != PayoutRequested || p.RequestedAt != "2026-10-20T12:00:00Z" || p.SentAt != nil {
 		t.Fatalf("payout = %+v", p)
 	}
-	if got := store.payouts[0]; got.UserID != referrer || got.Email != "friend@privaterelay.appleid.com" {
+	if got := store.payouts[0]; got.UserID != referrer || got.Email != "friend@example.com" {
 		t.Fatalf("stored = %+v", got)
 	}
 
@@ -146,7 +148,7 @@ func TestPayoutCreated(t *testing.T) {
 	body := mailer.bodies[0]
 	for _, want := range []string{
 		"User id:      " + referrer,
-		"Send to:      friend@privaterelay.appleid.com",
+		"Send to:      friend@example.com",
 		"$100.00 Amazon.com (US) gift card",
 		"calendar year 2026 (UTC)",
 		"Sent:                    $0.00",
