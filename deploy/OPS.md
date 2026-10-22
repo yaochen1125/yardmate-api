@@ -17,8 +17,10 @@
 | `watchdog/yardmate-healthcheck.sh` | `/usr/local/bin/` | 每 2 分钟探活 + nginx 自愈兜底 |
 | `watchdog/yardmate-notify.sh` | `/usr/local/bin/` | 发告警邮件（msmtp → Gmail） |
 | `watchdog/yardmate-healthcheck.{service,timer}` | `/etc/systemd/system/` | 驱动上面那个脚本 |
+| `ops-agent/yardmate-ops-agent.py` | `/usr/local/bin/` | 告警邮件里那几个按钮的后端 |
+| `ops-agent/yardmate-ops-agent.service` | `/etc/systemd/system/` | 跑上面那个服务 |
 
-**不纳管**：`/etc/yardmate-alert/smtp-pass`（密钥）、certbot 维护的证书、`/etc/nginx/nginx.conf`（发行版默认未改动）、`sites-available/` 里的 `default` 和 `id-photo*`（与 YardMate 无关的历史遗留，未链接到 sites-enabled 所以不生效）。
+**不纳管**：`/etc/yardmate-alert/smtp-pass` 和 `/etc/yardmate-alert/ops-secret`（密钥）、certbot 维护的证书、`/etc/nginx/nginx.conf`（发行版默认未改动）、`sites-available/` 里的 `default` 和 `id-photo*`（与 YardMate 无关的历史遗留，未链接到 sites-enabled 所以不生效）。
 
 ## 用法
 
@@ -93,6 +95,40 @@ nginx 倒下
 收件人写在 `watchdog/yardmate-notify.sh` 的 `RECIPIENTS`（空格分隔）。SMTP 密码在服务器 `/etc/yardmate-alert/smtp-pass`，不入 git；该文件缺失时 notify 脚本静默跳过（exit 0），不会让 systemd 报错。
 
 自愈成功也会发邮件 —— 静默自愈会掩盖一个反复发生却没人知道的问题。
+
+## 手机上的介入手段（告警邮件按钮）
+
+自愈覆盖不了的场景（配置写错、crash loop、发版翻车），以前只能开电脑 ssh。现在每封告警邮件底部都带四个链接：
+
+| 动作 | 性质 | 说明 |
+|---|---|---|
+| 查看状态 | 只读，24 小时有效，可反复点 | 服务状态、公网 healthz、磁盘内存、nginx/api 最近日志 |
+| 重启 nginx | 一次性，15 分钟 | watchdog 的兜底（比如它因配置语法错误拒绝自动重试） |
+| 重启 yardmate-api | 一次性，15 分钟 | 覆盖「进程活着但行为不对」 |
+| 回滚到上一个版本 | 一次性，15 分钟 | 换回 `yardmate-api.prev` 并重启。crash loop 是自动重启唯一救不了的 |
+
+密钥 `/etc/yardmate-alert/ops-secret`（0600，32 字节随机）。轮换它会让所有在途链接立即失效 —— 邮件泄露时就该这么做：
+
+```bash
+ssh root@5.78.183.252 'head -c 32 /dev/urandom | base64 > /etc/yardmate-alert/ops-secret'
+```
+
+### 四道防线，各挡一种真实的失败方式
+
+1. **只监听 `127.0.0.1:8090`**，公网经 nginx 的 `/ops/` 白名单进来，那条 location 限流卡到 `1r/s burst=5`（实测第 7 次起 429）。正常使用频率是「一天零次，出事时点几下」，所以可以卡得比 API 严得多。
+2. **HMAC-SHA256 签名**，改动链接里任何一个字符都会被拒。
+3. **写操作一次性 + 15 分钟过期**；nonce 记在 `/run`（tmpfs，重启即清，反正 token 更短命）。
+4. **GET 只出确认页，POST 才执行。** 这条最容易被漏掉：Gmail 会预抓取邮件内容，企业邮件网关会主动访问链接做安全扫描。GET 直接执行的话，一封「nginx 挂了」的告警可能在你看到之前就自己把服务重启了。
+
+### 一个反直觉的实现细节
+
+`restart-nginx` 是**异步**执行的（先把结果页发完，再延后 1 秒动手）。因为这个请求本身正是经 nginx 进来的 —— 同步重启会把你自己这条 TCP 连接掐掉，浏览器只显示「无法访问此网站」。操作其实成功了，但手机上看起来像失败，而一次性链接已经用掉，人会以为搞砸了、开始慌。所以它的结果页给的是一个「查看状态」链接，让你几秒后自己确认。
+
+`restart-api` / `rollback-api` 不影响自身连接，同步执行并直接显示结果。
+
+### 边界
+
+这是**四个预设动作**，不是远程 shell。有意为之：一个能跑任意命令的入口，制造的问题比它能解决的多。要做别的，还是 ssh。
 
 ## 排查顺序
 
