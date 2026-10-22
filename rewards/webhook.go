@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"math/big"
@@ -17,28 +18,38 @@ import (
 const (
 	// webhookBodyCap: a RevenueCat event is a few KB; 64 KB is generous.
 	webhookBodyCap = 64 << 10
-	webhookTimeout = 10 * time.Second
+	// webhookTimeout covers a RevenueCat lookup (10 s client timeout) for a
+	// RENEWAL that beats settlement (redeemCharge) plus the store calls;
+	// RevenueCat itself waits 60 s.
+	webhookTimeout = 20 * time.Second
 
-	// defaultTakehome when the event carries none: the Small Business Program
-	// rate (Apple keeps 15%).
-	defaultTakehome = "0.85"
+	// fallbackTakehome is the payout rate when the event lacks
+	// tax_percentage / commission_percentage (or they make no sense): Apple's
+	// standard 30% commission with no tax — below a US small-business charge
+	// (0.85), so the referrer is rather underpaid than overpaid (above it only
+	// in high-VAT storefronts; rewards.md ### 记账来源).
+	fallbackTakehome = "0.70"
 )
 
 // shareRate is the referrer's cut of what Apple pays out: 30%.
 var shareRate = big.NewRat(30, 100)
 
 // rcEvent is the part of a RevenueCat webhook event this package reads
-// (rewards.md ## 数据契约). price / takehome_percentage stay json.Number so
-// the money arithmetic below is done on the exact decimal RevenueCat sent.
+// (rewards.md ## 数据契约). price and the percentages stay json.Number so the
+// money arithmetic below is done on the exact decimal RevenueCat sent. The
+// deprecated takehome_percentage is not read: it is before VAT.
 type rcEvent struct {
-	ID                    string      `json:"id"`
-	Type                  string      `json:"type"`
-	Environment           string      `json:"environment"`
-	AppUserID             string      `json:"app_user_id"`
-	ProductID             string      `json:"product_id"`
+	ID          string `json:"id"`
+	Type        string `json:"type"`
+	Environment string `json:"environment"`
+	AppUserID   string `json:"app_user_id"`
+	ProductID   string `json:"product_id"`
+	// NewProductID is PRODUCT_CHANGE's target product (logged only).
+	NewProductID          string      `json:"new_product_id"`
 	PeriodType            string      `json:"period_type"`
 	Price                 json.Number `json:"price"`
-	TakehomePercentage    json.Number `json:"takehome_percentage"`
+	TaxPercentage         json.Number `json:"tax_percentage"`
+	CommissionPercentage  json.Number `json:"commission_percentage"`
 	TransactionID         string      `json:"transaction_id"`
 	OriginalTransactionID string      `json:"original_transaction_id"`
 	PurchasedAtMs         int64       `json:"purchased_at_ms"`
@@ -65,11 +76,17 @@ const (
 	outDuplicate          = "duplicate" // event id already in the ledger
 	outVoided             = "voided"
 	outNothingToVoid      = "nothing_to_void"
+	outProductChange      = "product_change" // a referee's PRODUCT_CHANGE: logged, never credited
 )
 
 // errBadEvent: a counted event without the fields we key on. 400, not 500 —
 // a redelivery will not grow them.
 var errBadEvent = errors.New("bad_event")
+
+// errNotSettled: a referee's RENEWAL arrived while the referral is still
+// claimed and could not be redeemed on the spot (redeemCharge). 503 so
+// RevenueCat redelivers; the settlement loop redeems it within minutes.
+var errNotSettled = errors.New("not_settled")
 
 // HandleWebhook is POST /v1/revenuecat/webhook. RevenueCat retries anything
 // but a 2xx, so: our own failures are 500 (retry), a request we will never
@@ -105,6 +122,10 @@ func (s *Service) HandleWebhook() http.HandlerFunc {
 		defer cancel()
 		out, err := s.handleEvent(ctx, body.Event)
 		switch {
+		case errors.Is(err, errNotSettled):
+			log.Printf("revenuecat webhook: %s for a referral not settled yet (503, RevenueCat will retry): %v", safeType(body.Event.Type), err)
+			writeError(w, http.StatusServiceUnavailable, "not_settled")
+			return
 		case errors.Is(err, errBadEvent):
 			log.Printf("revenuecat webhook: %s event missing id / transaction_id / sane price", safeType(body.Event.Type))
 			writeError(w, http.StatusBadRequest, "bad_event")
@@ -143,12 +164,14 @@ func stripBearer(v string) string {
 
 // handleEvent applies the rules of rewards.md ## 实现方式 to one event.
 func (s *Service) handleEvent(ctx context.Context, ev rcEvent) (string, error) {
-	if ev.Environment != "PRODUCTION" {
+	if ev.Environment != "PRODUCTION" && !(s.allowSandbox && ev.Environment == "SANDBOX") {
 		return outIgnoredEnvironment, nil
 	}
 	switch ev.Type {
 	case "INITIAL_PURCHASE", "RENEWAL":
 		return s.credit(ctx, ev)
+	case "PRODUCT_CHANGE":
+		return s.productChange(ctx, ev)
 	case "CANCELLATION":
 		if ev.CancelReason != "CUSTOMER_SUPPORT" { // only an Apple refund
 			return outIgnoredType, nil
@@ -198,19 +221,29 @@ func (s *Service) credit(ctx context.Context, ev rcEvent) (string, error) {
 		purchased = time.UnixMilli(ev.PurchasedAtMs).UTC()
 	}
 	if !eligible(ref, ev.Type, purchased) {
-		return outNotRedeemed, nil
+		if !chargeBeforeSettlement(ref, ev.Type, purchased, s.now()) {
+			return outNotRedeemed, nil
+		}
+		if ev.ID == "" || ev.TransactionID == "" {
+			return "", errBadEvent
+		}
+		if out, err := s.redeemCharge(ctx, ref, ev); out != "" || err != nil {
+			return out, err
+		}
+		// Redeemed: read the referral again — the settlement loop may have
+		// moved it on, or voided it, meanwhile.
+		if ref, found, err = s.store.ReferralByReferee(ctx, referee); err != nil {
+			return "", err
+		}
+		if !found || !eligible(ref, ev.Type, purchased) {
+			return outNotRedeemed, nil
+		}
 	}
 	if ev.ID == "" || ev.TransactionID == "" {
 		return "", errBadEvent
 	}
 
-	takehome, ok := decimal(ev.TakehomePercentage)
-	if !ok {
-		takehome, _ = decimal(defaultTakehome)
-	} else if takehome.Sign() <= 0 || takehome.Cmp(big.NewRat(1, 1)) > 0 {
-		log.Printf("revenuecat webhook: takehome_percentage %s out of (0,1]; using %s", ev.TakehomePercentage, defaultTakehome)
-		takehome, _ = decimal(defaultTakehome)
-	}
+	takehome := takehomeOf(ev)
 	priceCents, okP := roundCents(new(big.Rat).Mul(price, big.NewRat(100, 1)))
 	creditCents, okC := CreditCents(price, takehome)
 	if !okP || !okC {
@@ -295,6 +328,93 @@ func eligible(ref Referral, evType string, purchased time.Time) bool {
 	}
 }
 
+// chargeBeforeSettlement: a RENEWAL charged after the claim while the
+// referral is still claimed — the friend upgraded out of the free month
+// before settlement ① redeemed them. Whether its subscription began after
+// the claim is RevenueCat's to say (redeemCharge). Only inside settlement
+// ①'s window (unredeemedWindow from the last code issue): past it ① has given
+// up on the referral and a charge must not revive it.
+func chargeBeforeSettlement(ref Referral, evType string, purchased, now time.Time) bool {
+	issued := ref.IssuedAt
+	if issued.IsZero() {
+		issued = ref.ClaimedAt
+	}
+	return ref.State == refClaimed && evType == "RENEWAL" && purchased.After(ref.ClaimedAt) &&
+		now.Sub(issued) <= unredeemedWindow
+}
+
+// redeemCharge asks the referral package to run settlement ① for this
+// referral now (Redeemer). "" + nil: redeemed, go on and credit. Otherwise
+// the outcome to answer, or errNotSettled for a 503.
+func (s *Service) redeemCharge(ctx context.Context, ref Referral, ev rcEvent) (string, error) {
+	if s.redeemer == nil {
+		return "", fmt.Errorf("%w: no referral settlement wired", errNotSettled)
+	}
+	v, err := s.redeemer.RedeemForCharge(ctx, ref.ID, ref.Referee, ref.ClaimedAt, ev.ProductID)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", errNotSettled, err)
+	}
+	switch v {
+	case ChargeRedeemed:
+		return "", nil
+	case ChargeVoided:
+		log.Printf("revenuecat webhook: %s: referral voided on the spot (duplicate_apple_id); not credited", ev.Type)
+		return outNotRedeemed, nil
+	default: // ChargeNotCounted: the subscription began before the claim
+		return outNotRedeemed, nil
+	}
+}
+
+// takehomeOf is the share of the price Apple pays out:
+// 1 − tax_percentage − commission_percentage. Either one missing, tax outside
+// [0, 1) (0 is real: no US sales tax), commission outside (0, 1) (Apple always
+// takes a cut; 0 means the estimate is missing), or nothing left →
+// fallbackTakehome, logged every time.
+func takehomeOf(ev rcEvent) *big.Rat {
+	fallback := func(why string) *big.Rat {
+		log.Printf("revenuecat webhook: %s %s: %s; payout rate %s", safeType(ev.Type), ev.PeriodType, why, fallbackTakehome)
+		r, _ := decimal(fallbackTakehome)
+		return r
+	}
+	tax, okT := decimal(ev.TaxPercentage)
+	com, okC := decimal(ev.CommissionPercentage)
+	if !okT || !okC {
+		return fallback("tax_percentage / commission_percentage missing")
+	}
+	one := big.NewRat(1, 1)
+	if tax.Sign() < 0 || tax.Cmp(one) >= 0 || com.Sign() <= 0 || com.Cmp(one) >= 0 {
+		return fallback("tax_percentage / commission_percentage out of range")
+	}
+	r := new(big.Rat).Sub(one, tax)
+	r.Sub(r, com)
+	if r.Sign() <= 0 {
+		return fallback("tax + commission leave nothing")
+	}
+	return r
+}
+
+// productChange logs a referee's PRODUCT_CHANGE with a running count, for
+// reconciling against the RENEWAL that should follow an upgrade (some
+// upgrades are reported to deliver only the PRODUCT_CHANGE). Never credited:
+// its price is 0 and the change itself charges nothing.
+func (s *Service) productChange(ctx context.Context, ev rcEvent) (string, error) {
+	referee := strings.ToLower(strings.TrimSpace(ev.AppUserID))
+	if !isUUID(referee) {
+		return outNotReferee, nil
+	}
+	ref, found, err := s.store.ReferralByReferee(ctx, referee)
+	if err != nil {
+		return "", err
+	}
+	if !found {
+		return outNotReferee, nil
+	}
+	n := s.productChanges.Add(1)
+	log.Printf("revenuecat webhook: referee PRODUCT_CHANGE #%d since start (referral %s): %s -> %s",
+		n, safeType(ref.State), safeProduct(ev.ProductID), safeProduct(ev.NewProductID))
+	return outProductChange, nil
+}
+
 // CreditCents is round(price × takehome × 0.30 × 100), half away from zero,
 // on exact decimals. ok=false when the result does not fit the ledger column.
 func CreditCents(price, takehome *big.Rat) (int64, bool) {
@@ -325,6 +445,22 @@ func decimal(n json.Number) (*big.Rat, bool) {
 	}
 	r, ok := new(big.Rat).SetString(string(n))
 	return r, ok
+}
+
+// safeProduct keeps a product id in a log line short and printable.
+func safeProduct(id string) string {
+	if id == "" {
+		return "-"
+	}
+	if len(id) > 64 {
+		id = id[:64]
+	}
+	for _, c := range id {
+		if !(c == '_' || c == '.' || c == '-' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+			return "?"
+		}
+	}
+	return id
 }
 
 // safeType keeps a log line's event type to something short and printable.

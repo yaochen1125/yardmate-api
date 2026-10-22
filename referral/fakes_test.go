@@ -366,7 +366,7 @@ func (m *memStore) MarkRedeemed(_ context.Context, id int64, at time.Time, key s
 	defer m.mu.Unlock()
 	r := m.refs[id]
 	if r.State != StateClaimed {
-		return false, errors.New("not claimed")
+		return false, nil // referral_mark_redeemed: 'skipped'
 	}
 	if key != "" {
 		dup := m.usedKeys[key]

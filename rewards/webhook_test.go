@@ -22,7 +22,8 @@ func purchase(id string) map[string]any {
 		"product_id":              "com.chenyao.plantapp.premium.year",
 		"period_type":             "NORMAL",
 		"price":                   39.99,
-		"takehome_percentage":     0.85,
+		"tax_percentage":          0.0,
+		"commission_percentage":   0.15,
 		"transaction_id":          "2000000111111111",
 		"original_transaction_id": "2000000111111111",
 		"purchased_at_ms":         t0.Add(24 * time.Hour).UnixMilli(),
@@ -208,10 +209,18 @@ func TestWebhookCountsWhatTheDocCounts(t *testing.T) {
 	}{
 		{"monthly renewal", with(purchase("e"), "type", "RENEWAL", "price", 6.99), outRecorded, 178},
 		{"intro first month $0.29", with(purchase("e"), "period_type", "INTRO", "price", 0.29), outRecorded, 7},
-		{"takehome missing → 0.85", with(purchase("e"), "takehome_percentage", nil), outRecorded, 1020},
-		{"takehome null → 0.85", with(purchase("e"), "takehome_percentage", json.RawMessage("null")), outRecorded, 1020},
-		{"takehome 0.70", with(purchase("e"), "takehome_percentage", 0.7), outRecorded, 840},
-		{"takehome out of range → 0.85", with(purchase("e"), "takehome_percentage", 1.5), outRecorded, 1020},
+		// payout rate = 1 − tax_percentage − commission_percentage; anything
+		// missing or senseless → 0.70 (rewards.md ### 记账来源).
+		{"VAT 0.2 + commission 0.15 → 0.65", with(purchase("e"), "tax_percentage", 0.2), outRecorded, 780},
+		{"standard commission 0.30", with(purchase("e"), "commission_percentage", 0.3), outRecorded, 840},
+		{"both missing → 0.70", with(purchase("e"), "tax_percentage", nil, "commission_percentage", nil), outRecorded, 840},
+		{"only the deprecated takehome → 0.70", with(purchase("e"), "tax_percentage", nil, "commission_percentage", nil, "takehome_percentage", 0.85), outRecorded, 840},
+		{"tax missing → 0.70", with(purchase("e"), "tax_percentage", nil), outRecorded, 840},
+		{"commission null → 0.70", with(purchase("e"), "commission_percentage", json.RawMessage("null")), outRecorded, 840},
+		{"commission out of range → 0.70", with(purchase("e"), "commission_percentage", 1.5), outRecorded, 840},
+		{"negative tax → 0.70", with(purchase("e"), "tax_percentage", -0.1), outRecorded, 840},
+		{"no commission → 0.70", with(purchase("e"), "commission_percentage", 0), outRecorded, 840},
+		{"tax + commission ≥ 1 → 0.70", with(purchase("e"), "tax_percentage", 0.6, "commission_percentage", 0.4), outRecorded, 840},
 		{"price as a string", with(purchase("e"), "price", "39.99"), outRecorded, 1020},
 		{"trial", with(purchase("e"), "period_type", "TRIAL", "price", 0), outNotCounted, 0},
 		{"trial with a price", with(purchase("e"), "period_type", "TRIAL"), outNotCounted, 0},
@@ -228,7 +237,8 @@ func TestWebhookCountsWhatTheDocCounts(t *testing.T) {
 		{"lower-case id still matches", with(purchase("e"), "app_user_id", referee), outRecorded, 1020},
 		{"expiration", with(purchase("e"), "type", "EXPIRATION"), outIgnoredType, 0},
 		{"transfer", with(purchase("e"), "type", "TRANSFER"), outIgnoredType, 0},
-		{"product change", with(purchase("e"), "type", "PRODUCT_CHANGE"), outIgnoredType, 0},
+		// A referee's PRODUCT_CHANGE is logged with a count, never credited.
+		{"product change", with(purchase("e"), "type", "PRODUCT_CHANGE", "price", 0, "new_product_id", "com.chenyao.plantapp.premium.yearly"), outProductChange, 0},
 		{"non-renewing", with(purchase("e"), "type", "NON_RENEWING_PURCHASE"), outIgnoredType, 0},
 		{"test event", with(purchase("e"), "type", "TEST"), outIgnoredType, 0},
 		{"unsubscribe is not a refund", with(purchase("e"), "type", "CANCELLATION", "cancel_reason", "UNSUBSCRIBE"), outIgnoredType, 0},
@@ -274,14 +284,12 @@ func TestWebhookReferralStates(t *testing.T) {
 		{"rewarded", "INITIAL_PURCHASE", t0.Add(time.Hour), outRecorded},
 		{"redeemed", "RENEWAL", t0.Add(time.Hour), outRecorded},
 		{"void", "INITIAL_PURCHASE", t0.Add(time.Hour), outNotRedeemed},
-		// Not yet moved to redeemed by the settlement loop: only a FIRST
-		// purchase after the claim counts (what step ① will confirm within
-		// ten minutes). A renewal while still claimed is a subscription that
-		// predates the claim — e.g. one a second account pulled over with
-		// Restore Purchases — and must not pay the referrer every period.
+		// Not yet moved to redeemed by the settlement loop: a FIRST purchase
+		// after the claim counts (what step ① will confirm within ten
+		// minutes). A renewal charged before the claim never does. A renewal
+		// after it goes through the Redeemer (TestWebhookRenewalBeforeSettlement).
 		{"claimed", "INITIAL_PURCHASE", t0.Add(time.Hour), outRecorded},
 		{"claimed", "INITIAL_PURCHASE", t0.Add(-time.Hour), outNotRedeemed},
-		{"claimed", "RENEWAL", t0.Add(time.Hour), outNotRedeemed},
 		{"claimed", "RENEWAL", t0.Add(-time.Hour), outNotRedeemed},
 	}
 	for _, c := range cases {

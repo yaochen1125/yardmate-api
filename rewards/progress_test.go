@@ -154,10 +154,29 @@ func TestProgressFreeMonthBoundary(t *testing.T) {
 	if counts.FreeMonth != 1 || len(list) != 1 || list[0].Phase != PhaseFreeMonth {
 		t.Fatalf("just before the end: %+v %+v", counts, list)
 	}
-	// Ended and nothing paid: Joined only, not listed.
-	counts, list = Progress(refs, nil, end)
+	if got := *list[0].FreeMonthEndsAt; got != rfc3339(end) {
+		t.Fatalf("just before the end: ends %s, want %s", got, rfc3339(end))
+	}
+	// Ended, nothing paid yet: still listed for the 3-day grace (a downgrade
+	// to premium.yearly.3d may run its free trial first), with the grace's
+	// end as the date — the app drops a free_month row whose date has passed.
+	graceEnd := end.Add(freeMonthGrace)
+	for _, at := range []time.Time{end, graceEnd.Add(-time.Second)} {
+		counts, list = Progress(refs, nil, at)
+		if counts != (Counts{Joined: 1, FreeMonth: 1}) || len(list) != 1 || list[0].Phase != PhaseFreeMonth ||
+			*list[0].FreeMonthEndsAt != rfc3339(graceEnd) {
+			t.Fatalf("in the grace (%s): %+v %+v", at, counts, list)
+		}
+	}
+	// Grace over and nothing paid: Joined only, not listed.
+	counts, list = Progress(refs, nil, graceEnd)
 	if counts != (Counts{Joined: 1}) || len(list) != 0 {
-		t.Fatalf("at the end: %+v %+v", counts, list)
+		t.Fatalf("after the grace: %+v %+v", counts, list)
+	}
+	// The trial's charge arrives inside the grace: paying.
+	counts, list = Progress(refs, []TrackCredit{pending(1, 1020, productYearly, end.Add(3*24*time.Hour))}, end.Add(3*24*time.Hour+time.Minute))
+	if counts != (Counts{Joined: 1, Paying: 1}) || len(list) != 1 || list[0].Phase != PhasePaying {
+		t.Fatalf("after the trial's charge: %+v %+v", counts, list)
 	}
 	// The conversion charge arrives: paying again.
 	counts, list = Progress(refs, []TrackCredit{pending(1, 178, productMonthly, end)}, end.Add(time.Minute))

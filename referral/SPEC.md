@@ -16,6 +16,8 @@
 - 防刷五道里后端的四道（§2.4）：DeviceCheck、推荐人设备、同一订阅只算一次（结算 ①）、速度闸 → `held` + 运营邮件（结算 ②、`review.go`）。
 - `POST /v1/referral/redeemed`：App 回报「兑了」→ 只是让结算早点去查，不作凭据。
 - 结算定时器（每 10 分钟）：查 RevenueCat 推进状态，给推荐人赠会员（`settle.go`）。
+- 当场认定（`RedeemForCharge`，`redeem_now.go`，2026-10-22）：rewards 的 webhook 收到 claimed 推荐的朋友在填码之后的 `RENEWAL`
+  （免费月里升级到年付，扣费先于结算 ①）时，经 main 的 `chargeRedeemer` 调过来，替这一条推荐跑一次 ①（§2）。
 - 码池巡检（结算每轮一次，`pool.go`）：算「可发」库存（free 且到期日在发码余量之外）、最早到期日、
   各批剩余；低库存 / 临期 → WARN 日志 + 每天最多一封告警邮件。
 - 码池自动补货（021，**默认关**，`restock.go` + `appstoreconnect.go`，§3.1）：巡检那一步里先补货再判告警——
@@ -90,7 +92,9 @@ B 在苹果兑换 ──▶ B /redeemed（记 redeem_reported_at（每次报都�
 结算 ①：每轮 200 条按轮转顺序取（上次查之后又报过 /redeemed 的 → 没查过的 → 最久没查的），查完一条记 last_checked_at；
         RC 上 B 有 store 订阅且 original_purchase_date > claimed_at → redeemed（redeemed_at = 那个时间，记 subscription_key）；
         同一 subscription_key 已被另一条没作废的推荐 / 删号留存表占用 → void（duplicate_apple_id，名下的钱一起作废）
-结算 ②：redeemed_at + hold_days ≤ now，且该订阅 refunded_at 为空 → qualified；退款 / 订阅没了 → void；
+当场 ①：webhook 的 RedeemForCharge(推荐, 扣费的 product_id)：RC 上这个产品那条记录的 original_purchase_date ≤ claimed_at（或不是本人购买）→ 不算；
+        > claimed_at → 照 ① 走 StartedAfter + referral_mark_redeemed（含第 3 道）；RC 还没这条 / 查失败 → ErrChargeNotReady（webhook 回 503）
+结算 ②：redeemed_at + hold_days ≤ now，且这条订阅链没有真付过钱的记录被退款 → qualified；退款 / 订阅没了 → void；
         推荐人在这一条理论成功时间（redeemed_at + hold_days）之前 velocity_window_hours 内已成功（含 held）≥ velocity_limit 条
         → held（等运营），新 held 给运营发信
 结算 ③：运营 approve 出来的（reviewed_at 有值）先按 ② 再查一次朋友的退款 / 订阅，不过就 void；
@@ -132,6 +136,13 @@ RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidStr
   ① 每条 RC 答了就逐条 `MarkClaimedChecked`（时间用这一轮的开始时刻，这一轮里来的报告下一轮仍算「之后」；逐条写，一轮超时也往前转）；
   RC 查失败的不记，留在前面。`ListSavers` 按推荐人 `min(coalesce(last_checked_at, -infinity))`，④ 仍被覆盖的 `MarkSaverChecked`；
   `MarkSaved` 清空 `last_checked_at`（那是 claimed 时 ① 记的）。
+- **当场 ① 和结算 ① 同时认定同一条**：`referral_mark_redeemed` 先锁行、不是 claimed 就 `skipped`，只有一方生效；第 3 道只查 `id <> 自己`，
+  不会把自己判成重复。`RedeemForCharge` 碰到 skipped 也答「已认定」，由 rewards 重读推荐状态再决定记不记（被作废了就不记）。
+- **一条订阅链多条记录**（2026-10-22）：免费月里升级后，RC 的 `subscriptions` 里同一条链有免费月（`premium.month`）和新产品两条，
+  `original_purchase_date` 相同。`StartedAfter` 同一开始时间取产品 id 小的（以前按 map 随机顺序）；② 的 `Refunded(key)` 看这条链
+  （同一 `SubscriptionKey` 的本人 store 记录 + key 那条本身）里任何一条**付过钱的**记录有 `refunded_at` → 作废。「没付钱」= `period_type` 是 `trial`，
+  或记录里有 `price.amount` 且为 0（RC v1 没给 `price` 的 schema，`price` 按原始 JSON 存、读不懂当付过钱；绝不让它解析失败拖垮整条 Subscriber）。
+  RevenueCat 文档说苹果升级的部分退款不写 `refunded_at`；免费月那条实际的 `period_type` / `refunded_at` 待沙盒核实。
 - 赠送先 RC 后账本；账本写失败会大声记日志，下一轮**再赠一次**（宁多发不少发）。
 - `end_time_ms` 与现有赠送到期相差 < 2h 会被 RC 当重复忽略；我们每次至少 +30d。
 
@@ -349,6 +360,11 @@ staging `SANDBOX`、prod `PRODUCTION` / 600 张全在一批且 40 天内到期 �
 `settle_review_test.go`：claimed 超过一批（250 条）第二轮拿到没查过的 + 新来的被认定 / 查过之后又报 /redeemed 的插到没查过的前面 / RC 查失败不记 /
 saver 超过一批第二轮轮到新 saver、`MarkSaved` 清空 / held 期间退款或订阅没了 → approve 后 void 不发、没退款照常发 /
 相隔 26 小时兑换的积压同一轮认定不 held / 同一小时兑换、晚 3 天认定照样 held、邮件按理论时间 / 窗口外的老成功不进邮件。
+免费月里换套餐（2026-10-22，`redeem_now_test.go`）：升级后当场认定 → redeemed_at = 免费月开始、key = store + 开始时间、重发仍答已认定、
+结算 ① 不再认定、第 6 天不发、第 7 天发一个月且只发一次 / 订阅早于填码（恢复购买）不算、仍 claimed / RC 没这个产品、RC 出错、没配 RC 都是 not ready /
+当场第 3 道作废 / 家人共享不算 / 降级（到期才换）照常认定、第 7 天发、换产品之后不再动 / 判退款看整条链（年付退款作废、两条都退作废、只有免费月带退款标记不作废、都没退不作废，各跑 40 次防 map 顺序）/
+`StartedAfter` 同开始时间稳定取同一条 / `free()`（trial、价格 0 → 没付钱；有价、没价、null、奇怪形状 → 付过钱，且解析不失败）。
+主包 `rewards_wiring_test.go`：`chargeRedeemer` 在没配 RC 时把 `ErrChargeNotReady` 原样传出。
 `revenuecat_test.go`：连不上 / 超时的错误里没有 app user id 和路径、操作名在、`errors.Is(DeadlineExceeded)`；主包 `account_delete_logs_test.go` 删账号同理；
 `referral_wiring_test.go`：`DEVICECHECK_ALLOW_DEVELOPMENT` 五种写法。
 017 的 SQL（`pgstore_review_pg_test.go`，同一个 `REFERRAL_PG_TEST_URL` 门控）：017 可重跑 + 各代函数签名都在 / `ListClaimed` 轮转 + 报告插队 + 非 claimed 不记 /

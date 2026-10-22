@@ -67,7 +67,7 @@ func (m *memStore) addReferral(referrer, referee, state string, claimedAt time.T
 	defer m.mu.Unlock()
 	m.nextID++
 	m.users[referrer], m.users[referee] = true, true
-	r := Referral{ID: m.nextID, Referrer: referrer, Referee: referee, State: state, ClaimedAt: claimedAt}
+	r := Referral{ID: m.nextID, Referrer: referrer, Referee: referee, State: state, ClaimedAt: claimedAt, IssuedAt: claimedAt}
 	m.refs[referee] = r
 	return r
 }
