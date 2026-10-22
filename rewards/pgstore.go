@@ -206,7 +206,7 @@ func (p *PGStore) Balance(ctx context.Context, userID string) (Balance, error) {
 	return b, nil
 }
 
-func (p *PGStore) RequestPayout(ctx context.Context, userID, email string, amount, threshold int64, yearStart time.Time) (Payout, YearTotals, error) {
+func (p *PGStore) RequestPayout(ctx context.Context, userID, email string, yearStart time.Time) (Payout, YearTotals, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return Payout{}, YearTotals{}, err
@@ -242,7 +242,10 @@ func (p *PGStore) RequestPayout(ctx context.Context, userID, email string, amoun
 	if inProgress {
 		return Payout{}, YearTotals{}, ErrPayoutInProgress
 	}
-	if available-spent < threshold {
+	// Sized here, under the row lock, from the balance just read: whatever
+	// the App showed was a preview (rewards.md ### 兑换金额).
+	amount := PayoutAmountFor(available - spent)
+	if amount <= 0 {
 		return Payout{}, YearTotals{}, ErrBelowThreshold
 	}
 

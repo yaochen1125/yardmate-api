@@ -11,9 +11,9 @@
 //     available (this file).
 //   - GET /v1/referral/me carries a "rewards" block (Rewards, injected into the
 //     referral package as its RewardsReader).
-//   - POST /v1/referral/payout: $100 of available balance → one gift-card
-//     request, mailed to the operator, sent by hand (payout.go,
-//     deploy/referral-payout.sh).
+//   - POST /v1/referral/payout: from $20 of available balance → one gift-card
+//     request for the largest whole $10 up to $500 (PayoutAmountFor), mailed
+//     to the operator, sent by hand (payout.go, deploy/referral-payout.sh).
 //
 // Money is integer cents end to end; the one multiplication is done on exact
 // decimals (math/big), never float64. Nothing here logs a user id, an email
@@ -31,18 +31,25 @@ import (
 )
 
 const (
-	// PayoutAmountCents is one gift card: always $100 (rewards.md ## 实现方式).
-	PayoutAmountCents = 10000
-	// ThresholdCents is the redeemable balance a request needs.
-	ThresholdCents = 10000
+	// MinPayoutCents is the redeemable balance a request needs: $20
+	// (rewards.md ### 兑换金额). The App keeps the same three numbers.
+	MinPayoutCents = 2000
+	// PayoutStepCents: every card is a whole multiple of $10; the change
+	// stays in the balance.
+	PayoutStepCents = 1000
+	// MaxPayoutCents caps one card at $500; the rest waits for the next one.
+	MaxPayoutCents = 50000
 	// DefaultW9ThresholdCents is the 1099 filing threshold used when
 	// referral_settings.w9_threshold_cents (migration 019) cannot be read:
 	// $2,000 for payments from 2026 (One Big Beautiful Bill Act; indexed for
 	// inflation from 2027 — the operator updates the row each January).
-	// The operator mail says W-9 FIRST one card early: from threshold − one
-	// card in one calendar year (sent + requested, this request included)
-	// (rewards.md ### 税务：W-9).
 	DefaultW9ThresholdCents = 200000
+	// W9MarginCents: the operator mail says W-9 FIRST from threshold − $100
+	// in one calendar year (sent + requested, this request included). A fixed
+	// margin, not "one card": cards are $20–$500 now, and the card that
+	// crosses the threshold is always at or past this line
+	// (rewards.md ### 税务：W-9).
+	W9MarginCents = 10000
 	// RefundWindow is how long a credit stays pending: Apple's refund window.
 	RefundWindow = 90 * 24 * time.Hour
 
@@ -202,10 +209,25 @@ func viewOf(p *Payout) *PayoutView {
 
 func rfc3339(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 
+// PayoutAmountFor is the card a redeemable balance buys right now
+// (rewards.md ### 兑换金额): the largest whole $10 up to $500, or 0 under $20.
+// $51.30 → $50, $480 → $480, $3,000 → $500; the change and anything over
+// $500 stay in the balance. No choice for the user.
+func PayoutAmountFor(redeemableCents int64) int64 {
+	if redeemableCents < MinPayoutCents {
+		return 0
+	}
+	amount := redeemableCents / PayoutStepCents * PayoutStepCents
+	if amount > MaxPayoutCents {
+		amount = MaxPayoutCents
+	}
+	return amount
+}
+
 // Summarize turns the store's sums into the wire block: redeemable =
 // available ledger − (requested + sent payouts), never below zero; lifetime =
 // everything that ever became available (redeemed or not). A cancelled payout
-// is in neither sum, so its $100 is back in the balance without a write.
+// is in neither sum, so its amount is back in the balance without a write.
 func Summarize(b Balance) Summary {
 	avail := b.AvailableLedgerCents - b.SpentCents
 	if avail < 0 {

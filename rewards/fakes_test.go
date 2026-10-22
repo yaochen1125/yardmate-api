@@ -82,12 +82,16 @@ func (m *memStore) credit(referrer, eventID, txn string, cents int64, state stri
 	}, State: state})
 }
 
+// seedPayoutCents is what payout() seeds: a $100 card, as every request was
+// before the amount varied (rewards.md ### 兑换金额).
+const seedPayoutCents = 10000
+
 // payout seeds a payout row directly.
 func (m *memStore) payout(userID, state string, requestedAt, sentAt time.Time) *Payout {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.nextID++
-	p := &Payout{ID: m.nextID, UserID: userID, AmountCents: PayoutAmountCents, Email: "seed@example.com",
+	p := &Payout{ID: m.nextID, UserID: userID, AmountCents: seedPayoutCents, Email: "seed@example.com",
 		State: state, RequestedAt: requestedAt, SentAt: sentAt}
 	m.payouts = append(m.payouts, p)
 	return p
@@ -275,7 +279,7 @@ func (m *memStore) ChangePayoutEmail(_ context.Context, userID, email string) (P
 	return Payout{}, "", false, ErrPayoutNotEditable
 }
 
-func (m *memStore) RequestPayout(_ context.Context, userID, email string, amount, threshold int64, yearStart time.Time) (Payout, YearTotals, error) {
+func (m *memStore) RequestPayout(_ context.Context, userID, email string, yearStart time.Time) (Payout, YearTotals, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.payoutErr != nil {
@@ -290,7 +294,8 @@ func (m *memStore) RequestPayout(_ context.Context, userID, email string, amount
 		}
 	}
 	available, _, spent := m.sumsLocked(userID)
-	if available-spent < threshold {
+	amount := PayoutAmountFor(available - spent)
+	if amount <= 0 {
 		return Payout{}, YearTotals{}, ErrBelowThreshold
 	}
 	m.nextID++

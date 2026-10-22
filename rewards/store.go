@@ -168,11 +168,12 @@ type Store interface {
 	// Balance reads the sums behind the /me rewards block.
 	Balance(ctx context.Context, userID string) (Balance, error)
 	// RequestPayout atomically: refuses with ErrPayoutInProgress when the user
-	// already has a requested payout, with ErrBelowThreshold when the
-	// redeemable balance is under threshold, else inserts a requested payout
-	// of amount and returns it with the user's totals for the calendar year
-	// starting at yearStart.
-	RequestPayout(ctx context.Context, userID, email string, amount, threshold int64, yearStart time.Time) (Payout, YearTotals, error)
+	// already has a requested payout (or one in its undo hour), with
+	// ErrBelowThreshold when PayoutAmountFor(redeemable balance) is 0 (under
+	// $20), else inserts a requested payout of that amount — sized from the
+	// balance read in the same transaction — and returns it with the user's
+	// totals for the calendar year starting at yearStart.
+	RequestPayout(ctx context.Context, userID, email string, yearStart time.Time) (Payout, YearTotals, error)
 	// ReviewStats reads the referrer's review numbers for the payout mail.
 	ReviewStats(ctx context.Context, userID string) (Review, error)
 	// ChangePayoutEmail sets the email of the user's requested payout (the
