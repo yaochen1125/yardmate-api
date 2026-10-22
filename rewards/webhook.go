@@ -359,8 +359,10 @@ func (s *Service) redeemCharge(ctx context.Context, ref Referral, ev rcEvent) (s
 }
 
 // takehomeOf is the share of the price Apple pays out:
-// 1 − tax_percentage − commission_percentage. Either one missing, outside
-// [0, 1), or leaving nothing → fallbackTakehome, logged every time.
+// 1 − tax_percentage − commission_percentage. Either one missing, tax outside
+// [0, 1) (0 is real: no US sales tax), commission outside (0, 1) (Apple always
+// takes a cut; 0 means the estimate is missing), or nothing left →
+// fallbackTakehome, logged every time.
 func takehomeOf(ev rcEvent) *big.Rat {
 	fallback := func(why string) *big.Rat {
 		log.Printf("revenuecat webhook: %s %s: %s; payout rate %s", safeType(ev.Type), ev.PeriodType, why, fallbackTakehome)
@@ -373,8 +375,8 @@ func takehomeOf(ev rcEvent) *big.Rat {
 		return fallback("tax_percentage / commission_percentage missing")
 	}
 	one := big.NewRat(1, 1)
-	if tax.Sign() < 0 || tax.Cmp(one) >= 0 || com.Sign() < 0 || com.Cmp(one) >= 0 {
-		return fallback("tax_percentage / commission_percentage out of [0,1)")
+	if tax.Sign() < 0 || tax.Cmp(one) >= 0 || com.Sign() <= 0 || com.Cmp(one) >= 0 {
+		return fallback("tax_percentage / commission_percentage out of range")
 	}
 	r := new(big.Rat).Sub(one, tax)
 	r.Sub(r, com)

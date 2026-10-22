@@ -113,7 +113,7 @@ type == PRODUCT_CHANGE:
 - **价格缺 / null**：不记，并打一行日志（只有事件类型和 period_type，不带任何 id）—— 真扣费没价格会悄悄少记推荐人一笔，留个痕。
 - **金额**：`credit_cents = round(price × 实收比例 × 0.30 × 100)`，`price_usd_cents = round(price × 100)`，
   在 JSON 原文的十进制上用 `big.Rat` 算、半数进位（float64 会把 4.5 算成 4.499…）。**实收比例 = 1 − `tax_percentage` − `commission_percentage`**
-  （2026-10-22 改；`takehome_percentage` 已弃用且不扣增值税，不再读）。任一缺 / null / 不在 [0, 1) / 两者之和 ≥ 1 → **0.70**，每次都记一行日志
+  （2026-10-22 改；`takehome_percentage` 已弃用且不扣增值税，不再读）。任一缺 / null、税不在 [0, 1)（0 正常：美国不扣税）、抽成不在 (0, 1)（苹果总要抽，0 = 估值缺了）、两者之和 ≥ 1 → **0.70**，每次都记一行日志
   （类型 + period_type + 原因，不带 id）。账本 `takehome_percentage` 列存实际用的比例（4 位小数文本）。算出来 0 分（几美分的价格）→ 不记。
   典型值（美国：税 0、抽成 0.15）：$39.99 → 1020、$6.99 → 178、$0.29 intro → 7；兜底 0.70：$39.99 → 840。
 - **时间**：`purchased_at = purchased_at_ms`（缺 → 收到时间），`available_at = purchased_at + 90 天`。
@@ -198,7 +198,7 @@ coalesce(reissued_at, claimed_at)`，走 `referrals_referrer_idx`）和他的账
 - `FreeMonthEnd` = UTC 下 +1 个日历月，下个月没有这一天取月底（1-31 → 2-28 / 29；`time.AddDate` 会滚到 3 月，不能直接用）。
 - `plan` 取最近一笔（`purchased_at` 最大）的 `product_id`：`premium.yearly.3d` / `premium.yearly` / `premium.monthly`（老产品，实为年付）→ `yearly`，`premium.month` → `monthly`，其余不给。
 - `next_*` = 最早 `available_at` 的那笔 pending。
-- 排序 paying（next 升序）→ free_month（结束升序）→ unredeemed（加入降序），同值按 referral id；最多 50 行。
+- 排序 paying（next 升序）→ free_month（返回的 free_month_ends_at 升序，宽限里的按结束 + 3 天）→ unredeemed（加入降序），同值按 referral id；最多 50 行。
 - 用 `Service.now`（应用时钟）判免费月，不用库的 `now()`。
 - **3 天宽限**（2026-10-22）：免费月里买 `premium.yearly.3d` 是降级，免费月结束才换、可能先有 3 天免费试用，这几天没有记账；扣费事件也可能晚几分钟。
   App 不画 `free_month_ends_at` 已过的行，所以宽限期给「结束 + 3 天」——日期在结束那一刻往后跳 3 天，产品文档写明是已知妥协。
@@ -246,7 +246,7 @@ webhook 鉴权十种头 / 未配置 / 坏 body / 64 KB；文档每条记与不�
 免费月里升级（`upgrade_test.go`，按 RevenueCat 的顺序：PRODUCT_CHANGE → RENEWAL）：PRODUCT_CHANGE 只计数不记、RENEWAL 当场认定并记 1020、重发 duplicate 且不再认定 /
 认定不了 503 not_settled、不留记录，结算认定后重发记一笔 / 三种不记（订阅早于填码、第 3 道作废、认定后被别处作废）/ 没接 Redeemer 503、坏事件 400 不去认定、
 填码前的续费不问、claimed 首购照记不问、陌生人的 PRODUCT_CHANGE 不计数 / 到期才换（降级）：试用 $0 不记、扣费记一次 / ALLOW_SANDBOX 开关（默认不记、开了 SANDBOX 记、缺环境不记）；
-实收比例（1 − 税 − 抽成：0.65 → 780、抽成 0.30 → 840；两项都缺 / 只有弃用的 takehome / 缺一项 / null / 超范围 / 负数 / 和 ≥ 1 → 0.70 = 840）；金额四舍五入表（含正好 .5）；90 天；按 event id 和 transaction id 去重；
+实收比例（1 − 税 − 抽成：0.65 → 780、抽成 0.30 → 840；两项都缺 / 只有弃用的 takehome / 缺一项 / null / 超范围 / 负数 / 抽成 0 / 和 ≥ 1 → 0.70 = 840）；金额四舍五入表（含正好 .5）；90 天；按 event id 和 transaction id 去重；
 退款只 void pending；退款先到 → 留记录、晚到的扣费及其重发答 voided、别的交易不受影响；库错误 500；
 入账只动到期 pending；余额口径（cancelled 回余额、不为负）；时间 RFC 3339 无小数秒；
 payout 三个错误码 + 201、头 / 鉴权 / 未配置、邮箱黑白名单、共享设备桶（邮箱错不扣次数）、20 路并发只成一张、库错误 502、无邮件 / 邮件失败照 201、

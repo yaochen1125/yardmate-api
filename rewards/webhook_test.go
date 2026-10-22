@@ -219,6 +219,7 @@ func TestWebhookCountsWhatTheDocCounts(t *testing.T) {
 		{"commission null → 0.70", with(purchase("e"), "commission_percentage", json.RawMessage("null")), outRecorded, 840},
 		{"commission out of range → 0.70", with(purchase("e"), "commission_percentage", 1.5), outRecorded, 840},
 		{"negative tax → 0.70", with(purchase("e"), "tax_percentage", -0.1), outRecorded, 840},
+		{"no commission → 0.70", with(purchase("e"), "commission_percentage", 0), outRecorded, 840},
 		{"tax + commission ≥ 1 → 0.70", with(purchase("e"), "tax_percentage", 0.6, "commission_percentage", 0.4), outRecorded, 840},
 		{"price as a string", with(purchase("e"), "price", "39.99"), outRecorded, 1020},
 		{"trial", with(purchase("e"), "period_type", "TRIAL", "price", 0), outNotCounted, 0},
