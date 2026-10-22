@@ -125,8 +125,9 @@ pending_cents   = sum(pending 账本)
 4. 同事务读该用户**本自然年（UTC）**的 `sent`（按 `sent_at`，含缓冲中的）+ `requested`（含这一张）合计 → 进运营邮件。
 
 邮件异步发（不拖 201，panic 也兜住）：主题 `[YardMate] Referral gift card request #<id>`（纯 ASCII），
-正文 user_id、收卡邮箱、$100、本年已发 / 申请中 / 合计、mark-sent（附「两次确认、1 小时内可 undo」）/ undo / cancel 命令；**合计 ≥ $500**（含这一张）时加一行
-`W-9 FIRST (先收 W-9 再发)`。邮件丢了不影响记录，`deploy/referral-payout.sh list` 兜底。
+正文 user_id、收卡邮箱、$100、本年已发 / 申请中 / 合计、mark-sent（附「两次确认、1 小时内可 undo」）/ undo / cancel 命令；**合计 ≥ 门槛 − $100**（含这一张；门槛 =
+`referral_settings.w9_threshold_cents`，migration 019，默认 200000 = $2,000，2026 年起的 1099 门槛；在发信的 goroutine 里读，读不到按 $2,000 记日志）时加
+`W-9 FIRST (先收 W-9 再发；已经收过……就照发)`，写出门槛金额、要求加密收 W-9、模板在 rewards.md `### 税务：W-9`；不写 1099 表名（NEC / MISC 待会计确认）。邮件丢了不影响记录，`deploy/referral-payout.sh list` 兜底。
 
 **审核那几行**（防刷第 5 道，rewards.md `### 入账与兑换`；`ReviewStats` 在发信的 goroutine 里读，读失败邮件照发、写「numbers unavailable」）：
 
@@ -189,6 +190,7 @@ coalesce(reissued_at, claimed_at)`，走 `referrals_referrer_idx`）和他的账
 ## 3. 配置与运维
 
 - 迁移：`proxy/enrichment/migrations/015_referral_rewards.sql`（依赖 013，可重复跑），**先 staging 后 prod，且先于二进制**。
+  `019_referral_w9_threshold.sql`（`referral_settings.w9_threshold_cents`）先后都行：没跑时邮件按默认 $2,000 算并记日志。每年 1 月按 IRS 新值改这一列。
   `018_reward_payout_undo.sql`（`undo_until` + 两个 RPC 函数）同样先于二进制：新二进制的 SQL 读 `undo_until`，没跑 018 时 `/me` 的 `rewards` 读失败被省略、`/payout` 502。
   `016_referral_antiabuse.sql` 也先于二进制：退款作废写 `void_reason`、申请邮件读 `claim_install_id`，没跑 016 时退款事件答 500（RevenueCat 重试，跑了自愈）、
   邮件的审核行写「numbers unavailable」。
@@ -210,7 +212,8 @@ webhook 鉴权十种头 / 未配置 / 坏 body / 64 KB；文档每条记与不�
 退款只 void pending；退款先到 → 留记录、晚到的扣费及其重发答 voided、别的交易不受影响；库错误 500；
 入账只动到期 pending；余额口径（cancelled 回余额、不为负）；时间 RFC 3339 无小数秒；
 payout 三个错误码 + 201、头 / 鉴权 / 未配置、邮箱黑白名单、共享设备桶（邮箱错不扣次数）、20 路并发只成一张、库错误 502、无邮件 / 邮件失败照 201、
-邮件正文与 W-9 阈值（$400 无、$500 有、去年的不算）、主题纯 ASCII。
+邮件正文与 W-9 阈值（默认门槛 $2,000：$1,800 无、$1,900 有、$2,100 有、去年的不算；门槛改 $2,100 时 $1,900 无 / $2,000 有；读设置失败按 $2,000；不出现 1099-NEC / $600）、主题纯 ASCII；
+PG `TestPGW9Threshold`（默认 200000、改了即读到）。
 防刷（016）：webhook `held` 状态照记（首购 / 续费）；申请邮件审核行逐项（朋友数 / 带来钱的 / 设备去重含重复与没记设备 / 退款笔数只数退款 / 各作废原因含 0 和其他 / held）、
 全不同的写法、读审核数据失败邮件照发且 201；PG：退款写 `void_reason = refunded`、`ReviewStats` 各口径（016 跑两遍）。
 

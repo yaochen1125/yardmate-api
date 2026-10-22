@@ -168,6 +168,9 @@ type Store interface {
 	RequestPayout(ctx context.Context, userID, email string, amount, threshold int64, yearStart time.Time) (Payout, YearTotals, error)
 	// ReviewStats reads the referrer's review numbers for the payout mail.
 	ReviewStats(ctx context.Context, userID string) (Review, error)
+	// W9ThresholdCents reads referral_settings.w9_threshold_cents (migration
+	// 019): the 1099 filing threshold the payout mail's W-9 line is based on.
+	W9ThresholdCents(ctx context.Context) (int64, error)
 	// Progress reads what the card's counts and list are computed from
 	// (Progress in progress.go): the referrer's referrals that are not void,
 	// and their ledger rows that still count (pending / available, the

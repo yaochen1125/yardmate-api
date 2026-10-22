@@ -68,7 +68,7 @@ func pgTest(t *testing.T) (*PGStore, *pgxpool.Pool, context.Context) {
 	})
 	// In the order production runs them; 015 and 016 twice: they must be re-runnable.
 	for _, f := range []string{"013_referral.sql", "014_referral_pool_margin.sql", "015_referral_rewards.sql", "015_referral_rewards.sql",
-		"016_referral_antiabuse.sql", "016_referral_antiabuse.sql", "018_reward_payout_undo.sql", "018_reward_payout_undo.sql"} {
+		"016_referral_antiabuse.sql", "016_referral_antiabuse.sql", "018_reward_payout_undo.sql", "018_reward_payout_undo.sql", "019_referral_w9_threshold.sql", "019_referral_w9_threshold.sql"} {
 		sql, err := os.ReadFile(filepath.Join("..", "proxy", "enrichment", "migrations", f))
 		if err != nil {
 			t.Fatalf("%s: %v", f, err)
@@ -193,6 +193,20 @@ func TestPGLedgerAndPayouts(t *testing.T) {
 	var left int
 	if err := pool.QueryRow(ctx, `select (select count(*) from reward_ledger) + (select count(*) from reward_payouts)`).Scan(&left); err != nil || left != 0 {
 		t.Fatalf("rows left after referrer deletion: %d %v", left, err)
+	}
+}
+
+// The W-9 threshold row (migration 019): $2,000 by default, editable.
+func TestPGW9Threshold(t *testing.T) {
+	store, pool, ctx := pgTest(t)
+	if got, err := store.W9ThresholdCents(ctx); err != nil || got != DefaultW9ThresholdCents {
+		t.Fatalf("default = %d %v", got, err)
+	}
+	if _, err := pool.Exec(ctx, `update referral_settings set w9_threshold_cents = 210000 where id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.W9ThresholdCents(ctx); err != nil || got != 210000 {
+		t.Fatalf("after update = %d %v", got, err)
 	}
 }
 
