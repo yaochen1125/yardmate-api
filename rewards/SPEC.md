@@ -14,7 +14,7 @@
 - `GET /v1/referral/me` 的 `rewards` 字段：经 `referral.RewardsReader` 注入（`Rewards`）；本包不碰 `/me` 别的字段。
 - `POST /v1/referral/payout`：可兑余额 ≥ $100 → 建一条 `requested` 申请（固定 $100）→ 给运营发邮件（`payout.go`）；
   邮件就是防刷第 5 道的人工审核，附这个推荐人的朋友数 / 朋友设备去重数 / 退款笔数 / 作废与待审核推荐数（`ReviewStats`，§2.3）。
-- 运营侧：`deploy/referral-payout.sh list | mark-sent <id> | cancel <id>`（PostgREST + service role）。
+- 运营侧：`deploy/referral-payout.sh list | mark-sent <id> | undo <id> | cancel <id>`（PostgREST + service role；`mark-sent` 两次确认、标记后 1 小时内可 `undo`，§2.7）。
 
 ### 1.2 不负责什么
 
@@ -120,12 +120,12 @@ pending_cents   = sum(pending 账本)
 ### 2.3 兑换（`RequestPayout`，一个事务）
 
 1. `select … from referral_users where user_id = $1 for no key update` —— 同一人的并发申请在这里排队（no key update 不挡别的表插 FK）。没这行 → `below_threshold`。
-2. 有 `requested` → `payout_in_progress`；可兑余额 < 10000 → `below_threshold`。
+2. 有 `requested`，或有还在 1 小时缓冲里的 `sent`（`undo_until > now()`，§2.7）→ `payout_in_progress`；可兑余额 < 10000 → `below_threshold`。
 3. `insert reward_payouts (user_id, amount_cents = 10000, email)`；partial unique index `(user_id) where state = 'requested'` 兜底，撞了也答 `payout_in_progress`。
-4. 同事务读该用户**本自然年（UTC）**的 `sent`（按 `sent_at`）+ `requested`（含这一张）合计 → 进运营邮件。
+4. 同事务读该用户**本自然年（UTC）**的 `sent`（按 `sent_at`，含缓冲中的）+ `requested`（含这一张）合计 → 进运营邮件。
 
 邮件异步发（不拖 201，panic 也兜住）：主题 `[YardMate] Referral gift card request #<id>`（纯 ASCII），
-正文 user_id、收卡邮箱、$100、本年已发 / 申请中 / 合计、mark-sent / cancel 命令；**合计 ≥ $500**（含这一张）时加一行
+正文 user_id、收卡邮箱、$100、本年已发 / 申请中 / 合计、mark-sent（附「两次确认、1 小时内可 undo」）/ undo / cancel 命令；**合计 ≥ $500**（含这一张）时加一行
 `W-9 FIRST (先收 W-9 再发)`。邮件丢了不影响记录，`deploy/referral-payout.sh list` 兜底。
 
 **审核那几行**（防刷第 5 道，rewards.md `### 入账与兑换`；`ReviewStats` 在发信的 goroutine 里读，读失败邮件照发、写「numbers unavailable」）：
@@ -144,6 +144,14 @@ pending_cents   = sum(pending 账本)
 
 - 推荐人删：`referral_users` 行没了 → `reward_ledger.referrer` / `reward_payouts.user_id` **级联删**（余额作废；requested 的照发，运营看邮件，脚本 mark-sent 会报「不存在」）。
 - 朋友删：`referrals` 那行级联没了 → `reward_ledger.referee` / `referral_id` **置空**，推荐人已记的钱不动；之后该 app_user_id 的事件 not_referee。
+
+### 2.7 标记已发的 1 小时缓冲（migration 018，rewards.md `### 标记已发`）
+
+- `reward_payouts.undo_until`：`reward_payout_mark_sent(p_id, p_email)` 置 `state = sent, sent_at = now(), undo_until = now() + 1 hour`，只在 `state = requested` 且 `email = p_email`（脚本列给运营看的那个）时改；`reward_payout_undo(p_id)` 只在 `state = sent and undo_until > now()` 时改回 `requested`、清 `sent_at` / `undo_until`。两个都是 SQL 函数，脚本经 PostgREST `/rest/v1/rpc/` 调，只 grant 给 service_role。
+- 缓冲期对外一律是 `requested`：`payoutColumns`（`Balance.Latest`、`RequestPayout` 的返回）在 SQL 里把 `state = sent and undo_until > now()` 读成 `requested`、`sent_at` 读成 null；`RequestPayout` 的「有没有在路上」也算上它。全部用数据库 `now()`，不用 Go 的 `s.now()`。
+- 余额口径不变（`requested` / `sent` 都扣）；年度合计按库里的真实 `state`，缓冲中算「已发」、年份按 `sent_at`（标记时间）。
+- 撤回回 `requested` 不会撞 partial unique index：缓冲期里同一人建不出第二张 `requested`。
+- `cancel` 只认 `requested`（PATCH 带 `state=eq.requested`）：缓冲中的先 `undo`。
 
 ### 2.5 幂等 / 并发
 
@@ -181,6 +189,7 @@ coalesce(reissued_at, claimed_at)`，走 `referrals_referrer_idx`）和他的账
 ## 3. 配置与运维
 
 - 迁移：`proxy/enrichment/migrations/015_referral_rewards.sql`（依赖 013，可重复跑），**先 staging 后 prod，且先于二进制**。
+  `018_reward_payout_undo.sql`（`undo_until` + 两个 RPC 函数）同样先于二进制：新二进制的 SQL 读 `undo_until`，没跑 018 时 `/me` 的 `rewards` 读失败被省略、`/payout` 502。
   `016_referral_antiabuse.sql` 也先于二进制：退款作废写 `void_reason`、申请邮件读 `claim_install_id`，没跑 016 时退款事件答 500（RevenueCat 重试，跑了自愈）、
   邮件的审核行写「numbers unavailable」。
   表不存在时：webhook 记账答 500（RevenueCat 重试，迁移补上后自愈）、`/me` 省略 `rewards` 字段并记日志、`/payout` 502。
@@ -210,6 +219,8 @@ payout 三个错误码 + 201、头 / 鉴权 / 未配置、邮箱黑白名单、�
 产品映射（含老 `premium.monthly`）与升级后取最近一笔、排序与 50 行上限、`/me` 带进度 / 读进度失败只去掉两个字段、
 `FreeMonthEnd` 月底表（含闰年 / 跨年 / 带时区）、未兑换 200 天窗口（含换过码）；
 PG `TestPGProgress`：两条查询的口径（void 不出、删号后 referral_id 为空仍在、voided 不出）。
+
+标记缓冲（§2.7）：PG `TestPGMarkSentBufferAndUndo`：邮箱对不上不改、requested 不能 undo、标记后 `undo_until − sent_at = 1h`、重复标记不改、缓冲中 `Balance.Latest` 读成 requested 无 `sent_at` 且余额照扣、缓冲中 `/payout` 答 in progress、缓冲内 undo 回 requested 清两列、过了缓冲读成 sent 且 undo 拒绝、之后余额够可再申请。脚本 `deploy/referral-payout.sh` 用 shellcheck 检查，在 staging 上手跑（§3）。
 
 `go test .`：两条路由已注册、未配置答 503 / 401；webhook 不占 `/v1` 的 IP 桶、自己 600 / min 后 429。`go test ./referral/`：`/me` 有 / 无 / 失败三种、共享桶。
 

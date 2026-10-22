@@ -68,7 +68,7 @@ func pgTest(t *testing.T) (*PGStore, *pgxpool.Pool, context.Context) {
 	})
 	// In the order production runs them; 015 and 016 twice: they must be re-runnable.
 	for _, f := range []string{"013_referral.sql", "014_referral_pool_margin.sql", "015_referral_rewards.sql", "015_referral_rewards.sql",
-		"016_referral_antiabuse.sql", "016_referral_antiabuse.sql"} {
+		"016_referral_antiabuse.sql", "016_referral_antiabuse.sql", "018_reward_payout_undo.sql", "018_reward_payout_undo.sql"} {
 		sql, err := os.ReadFile(filepath.Join("..", "proxy", "enrichment", "migrations", f))
 		if err != nil {
 			t.Fatalf("%s: %v", f, err)
@@ -193,6 +193,114 @@ func TestPGLedgerAndPayouts(t *testing.T) {
 	var left int
 	if err := pool.QueryRow(ctx, `select (select count(*) from reward_ledger) + (select count(*) from reward_payouts)`).Scan(&left); err != nil || left != 0 {
 		t.Fatalf("rows left after referrer deletion: %d %v", left, err)
+	}
+}
+
+// mark-sent's hour of grace (migration 018, rewards.md ### 标记已发): the two
+// SQL functions the operator script calls, and how a payout inside the hour
+// reads everywhere else — still requested, no sent_at, /payout refused.
+func TestPGMarkSentBufferAndUndo(t *testing.T) {
+	store, pool, ctx := pgTest(t)
+	refID := seedReferral(t, ctx, pool, referrer, referee, "redeemed")
+	past := time.Now().Add(-RefundWindow - time.Hour)
+	for i, txn := range []string{"b1", "b2"} {
+		c := Credit{ReferralID: refID, Referrer: referrer, Referee: referee, EventID: "ev-" + txn, EventType: "RENEWAL",
+			TransactionID: txn, ProductID: "com.chenyao.plantapp.premium.year", PeriodType: "NORMAL",
+			PriceUSDCents: 3999, Takehome: "0.8500", CreditCents: 15000,
+			PurchasedAt: past, AvailableAt: past.Add(RefundWindow)}
+		if res, err := store.RecordCredit(ctx, c); err != nil || res != CreditInserted {
+			t.Fatalf("record %d: %v %v", i, res, err)
+		}
+	}
+	if _, err := store.MatureDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	yearStart := time.Date(time.Now().UTC().Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	po, _, err := store.RequestPayout(ctx, referrer, "a@example.com", PayoutAmountCents, ThresholdCents, yearStart)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+
+	markSent := func(email string) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `select count(*) from reward_payout_mark_sent($1, $2)`, po.ID, email).Scan(&n); err != nil {
+			t.Fatalf("mark_sent: %v", err)
+		}
+		return n
+	}
+	undo := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `select count(*) from reward_payout_undo($1)`, po.ID).Scan(&n); err != nil {
+			t.Fatalf("undo: %v", err)
+		}
+		return n
+	}
+	raw := func() (state string, sent, until *time.Time) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `select state, sent_at, undo_until from reward_payouts where id = $1`, po.ID).
+			Scan(&state, &sent, &until); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	// The email changed between the operator's look and the commit: nothing.
+	if n := markSent("other@example.com"); n != 0 {
+		t.Fatalf("mark_sent with a stale email changed %d rows", n)
+	}
+	if n := undo(); n != 0 {
+		t.Fatalf("undo of a requested payout changed %d rows", n)
+	}
+	if n := markSent("a@example.com"); n != 1 {
+		t.Fatalf("mark_sent changed %d rows", n)
+	}
+	state, sent, until := raw()
+	if state != PayoutSent || sent == nil || until == nil || until.Sub(*sent) != time.Hour {
+		t.Fatalf("after mark_sent: %s sent=%v until=%v", state, sent, until)
+	}
+	if n := markSent("a@example.com"); n != 0 {
+		t.Fatalf("second mark_sent changed %d rows", n)
+	}
+
+	// Inside the hour: requested to everyone else.
+	b, err := store.Balance(ctx, referrer)
+	if err != nil || b.Latest == nil || b.Latest.State != PayoutRequested || !b.Latest.SentAt.IsZero() {
+		t.Fatalf("balance in buffer = %+v latest=%+v err=%v", b, b.Latest, err)
+	}
+	if b.SpentCents != 10000 {
+		t.Fatalf("spent in buffer = %d, want 10000", b.SpentCents)
+	}
+	if _, _, err := store.RequestPayout(ctx, referrer, "a@example.com", PayoutAmountCents, ThresholdCents, yearStart); !errors.Is(err, ErrPayoutInProgress) {
+		t.Fatalf("request in buffer: %v", err)
+	}
+
+	// Undo inside the hour: back to requested, as if never marked.
+	if n := undo(); n != 1 {
+		t.Fatalf("undo changed %d rows", n)
+	}
+	if state, sent, until := raw(); state != PayoutRequested || sent != nil || until != nil {
+		t.Fatalf("after undo: %s sent=%v until=%v", state, sent, until)
+	}
+
+	// Mark again and let the hour pass: sent for real, undo refused.
+	if n := markSent("a@example.com"); n != 1 {
+		t.Fatalf("re-mark changed %d rows", n)
+	}
+	if _, err := pool.Exec(ctx, `update reward_payouts set undo_until = now() - interval '1 second' where id = $1`, po.ID); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = store.Balance(ctx, referrer)
+	if b.Latest == nil || b.Latest.State != PayoutSent || b.Latest.SentAt.IsZero() {
+		t.Fatalf("after the hour latest = %+v", b.Latest)
+	}
+	if n := undo(); n != 0 {
+		t.Fatalf("undo after the hour changed %d rows", n)
+	}
+	// Balance 30 000 − 10 000 sent = 20 000: a new request is allowed again.
+	if _, _, err := store.RequestPayout(ctx, referrer, "a@example.com", PayoutAmountCents, ThresholdCents, yearStart); err != nil {
+		t.Fatalf("request after the hour: %v", err)
 	}
 }
 

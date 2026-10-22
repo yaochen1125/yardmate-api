@@ -273,7 +273,10 @@ then prod.
 **Turning it on**
 
 1. Apply `proxy/enrichment/migrations/015_referral_rewards.sql` (after 013 and 014)
-   **before** the binary that uses it. Re-runnable.
+   **before** the binary that uses it. Re-runnable. Same for
+   `018_reward_payout_undo.sql` (mark-sent's one-hour undo: `reward_payouts.undo_until`
+   + the two RPC functions the script calls); without it `/me` drops `rewards` and
+   `/payout` answers 502.
 2. Generate a secret (`openssl rand -hex 32`), add
    `REVENUECAT_WEBHOOK_SECRET=<it>` to the secrets file, deploy. Unset → the
    webhook answers `503` and nothing is credited (the rest of the app is
@@ -297,12 +300,20 @@ then prod.
 2. Within 3 business days buy a $100 Amazon.com eGift card and deliver it to
    the address in the mail.
 3. `SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… deploy/referral-payout.sh mark-sent 17`
-   — the app shows `Sent {date}` on its next `/me`.
+   — it lists the request, asks you to retype `17`, then to type `yes` (both in a
+   terminal; it refuses piped input). For one hour the app still shows "Gift card
+   on its way" and `… deploy/referral-payout.sh undo 17` puts it back to
+   requested (our record only — an Amazon order already sent is handled on
+   Amazon). After the hour the app shows `Sent {date}` and undo refuses.
 4. Not sending after all (bad address, no W-9): `… deploy/referral-payout.sh cancel 17`
+   (requested only — undo a marked one first)
    — the $100 is back in their balance by definition (balance = cleared
    credits − requested − sent), no ledger edit.
 5. Missed a mail / mail not configured: `… deploy/referral-payout.sh list`
-   shows every open request (`list sent` / `list cancelled` for history).
+   shows every open request plus the ones still inside their undo hour
+   (`list requested` / `list sent` / `list cancelled` for one state). The
+   "inside the undo hour" label uses your computer's clock and is display
+   only; whether `undo` still works is decided by the database (`now()`).
 
 ## 9. Referral anti-abuse (防刷) — DeviceCheck, devices, one Apple ID once, velocity
 

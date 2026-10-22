@@ -155,7 +155,17 @@ func (p *PGStore) MatureDue(ctx context.Context) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
-const payoutColumns = `id, user_id, amount_cents, email, state, requested_at, sent_at`
+// payoutColumns reads a payout the way everyone outside the operator script
+// sees it. A payout marked sent less than an hour ago (undo_until > now(),
+// migration 018, rewards.md ### 标记已发) still reads as requested with no
+// sent_at: the App keeps showing "on its way", /payout keeps answering
+// payout_in_progress, and an undo inside the hour leaves no trace. now() is
+// the database clock — the same one reward_payout_mark_sent / _undo use — so
+// the API server's clock can never disagree with the undo deadline.
+const payoutColumns = `id, user_id, amount_cents, email,
+	case when state = 'sent' and undo_until > now() then 'requested' else state end,
+	requested_at,
+	case when state = 'sent' and undo_until > now() then null else sent_at end`
 
 func scanPayout(row pgx.Row) (Payout, error) {
 	var po Payout
@@ -217,7 +227,9 @@ func (p *PGStore) RequestPayout(ctx context.Context, userID, email string, amoun
 	var inProgress bool
 	var available, spent int64
 	if err := tx.QueryRow(ctx,
-		`select exists (select 1 from reward_payouts where user_id = $1 and state = 'requested'),
+		`select exists (select 1 from reward_payouts
+		                 where user_id = $1
+		                   and (state = 'requested' or (state = 'sent' and undo_until > now()))),
 		        coalesce((select sum(credit_cents) from reward_ledger
 		                   where referrer = $1 and state = 'available'), 0),
 		        coalesce((select sum(amount_cents) from reward_payouts
