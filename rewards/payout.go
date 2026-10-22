@@ -351,7 +351,6 @@ func voidLine(by map[string]int) string {
 	return strings.Join(parts, ", ")
 }
 
-// usd renders cents as "$1234.56" (no thousands grouping; operator text only).
 // cardUSD is a card amount for the subject: whole dollars ("$50"), since a
 // card is always a multiple of $10; anything else falls back to usd.
 func cardUSD(cents int64) string {
@@ -361,6 +360,7 @@ func cardUSD(cents int64) string {
 	return usd(cents)
 }
 
+// usd renders cents as "$1234.56" (no thousands grouping; operator text only).
 func usd(cents int64) string {
 	sign := ""
 	if cents < 0 {

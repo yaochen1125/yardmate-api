@@ -229,6 +229,30 @@ func TestPayoutInProgress(t *testing.T) {
 	}
 }
 
+func TestPayoutCardSizes(t *testing.T) {
+	// rewards.md ## 验收: what /payout creates and what /me has left.
+	for _, c := range []struct{ available, wantAmount, wantLeft int64 }{
+		{2000, 2000, 0}, {5130, 5000, 130}, {48000, 48000, 0}, {50000, 50000, 0}, {300000, 50000, 250000},
+	} {
+		svc, store, mailer := newTestSvc(t0)
+		store.addReferral(referrer, referee, "rewarded", t0.Add(-200*24*time.Hour))
+		store.credit(referrer, "a1", "t1", c.available, LedgerAvailable, t0.Add(-time.Hour))
+		w := callPayout(t, svc, okBody, nil)
+		var resp struct {
+			Payout PayoutView `json:"payout"`
+		}
+		if w.Code != http.StatusCreated || json.Unmarshal(w.Body.Bytes(), &resp) != nil || resp.Payout.AmountCents != c.wantAmount {
+			t.Fatalf("available %d: %d %s", c.available, w.Code, w.Body.String())
+		}
+		if s := summaryOf(t, svc, referrer); s.AvailableCents != c.wantLeft {
+			t.Fatalf("available %d: left %d, want %d", c.available, s.AvailableCents, c.wantLeft)
+		}
+		if want := "Amount:       " + usd(c.wantAmount) + " Amazon.com (US) gift card"; !strings.Contains(mailer.bodies[0], want) {
+			t.Fatalf("available %d: mail missing %q", c.available, want)
+		}
+	}
+}
+
 func TestPayoutAmountFor(t *testing.T) {
 	// rewards.md ### 兑换金额: $20 minimum, whole $10, $500 cap.
 	for _, c := range []struct{ redeemable, want int64 }{

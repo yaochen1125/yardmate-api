@@ -34,7 +34,7 @@
 | `/payout` 头 | 同 `/claim`：`Authorization: Bearer <Supabase access token>`、`X-Device-Install-Id`、`X-App-Version` |
 | `/payout`、`/payout/email` body | `{"email": "you@example.com"}` |
 | vault | `REVENUECAT_WEBHOOK_SECRET`；`SUPABASE_URL` / `SUPABASE_DB_URL`（与 referral 共用）；`FEEDBACK_SMTP_*` / `FEEDBACK_EMAIL_TO`（运营邮件，main 经 `mail_wiring.go` 建一次、与 feedback / 码池告警共用，缺了只记日志）；`REFERRAL_SETTLE_INTERVAL`（可选）|
-| 库 | migration `015_referral_rewards.sql` 的 `reward_ledger` / `reward_voided_txns` / `reward_payouts`（依赖 013 的 `referral_users` / `referrals`）；`016_referral_antiabuse.sql` 的 `reward_ledger.void_reason`、`referrals.claim_install_id` |
+| 库 | migration `015_referral_rewards.sql` 的 `reward_ledger` / `reward_voided_txns` / `reward_payouts`（依赖 013 的 `referral_users` / `referrals`；015 文件里「满 $100 申请一张」「一行 = 一张 $100」的注释和 `amount_cents default 10000` 是 2026-10-22 之前的规则，现行规则见 §2.3，不改已上线的迁移）；`016_referral_antiabuse.sql` 的 `reward_ledger.void_reason`、`referrals.claim_install_id` |
 
 ### 1.4 输出
 
