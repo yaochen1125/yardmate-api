@@ -219,9 +219,9 @@ type fakeASC struct {
 	valuesShort int
 	// unrecognised: the CSV has every line, but none reads as a code.
 	unrecognised bool
-	// listHadDeadline: some list call came with a context deadline (the
-	// restock must not put one shared budget over the whole list).
-	listHadDeadline bool
+	// listBudget: the time left on the context of the last list call (0 =
+	// no deadline). The restock gives the whole list three pages' worth.
+	listBudget time.Duration
 }
 
 func newFakeASC() *fakeASC { return &fakeASC{values: map[string][]string{}, nextID: 622600} }
@@ -268,8 +268,9 @@ func (f *fakeASC) ListOneTimeCodeBatches(ctx context.Context, offerID string) ([
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lists++
-	if _, ok := ctx.Deadline(); ok {
-		f.listHadDeadline = true
+	f.listBudget = 0
+	if d, ok := ctx.Deadline(); ok {
+		f.listBudget = time.Until(d)
 	}
 	if f.listErr != nil {
 		return nil, f.listErr

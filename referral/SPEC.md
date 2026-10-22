@@ -295,7 +295,7 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
   | 401 / 403 / 其他 4xx / 3xx，或请求根本没写出去（DNS、连接被拒、TLS 握手失败——用 `httptrace.WroteRequest` 判） | 明确失败 | `failed` + 告警（不带批次 ID，按 `http_<状态码>` / `unreachable` 一天一封）|
   | 请求写出去之后超时 / 断连、5xx、2xx 但没有批次 ID、进程在 `creating` 途中重启 | 结果不确定 | 保持 `creating`，之后每轮对账 |
   记批次 ID 失败（库写不进）也保持 `creating`，下一轮对账自然找回这批。
-- **对账**：列这个 offer 的一次性码批次（`limit=200`，跟 `links.next`，只跟同 host，最多 10 页；**每一页单独 60 s**，客户端里按请求限时，不是整个列表共用一个 60 s），候选 = `createdDate ≥ started_at − 5 分钟`、
+- **对账**：列这个 offer 的一次性码批次（`limit=200`，跟 `links.next`，只跟同 host，最多 10 页；**每一页单独 60 s**，客户端里按请求限时；整个列表另有 3 页份的总上限（`restockListBudgetPages × CallTimeout`，默认 3 分钟），慢的长列表不会吃掉同一轮后面的 RevenueCat 结算），候选 = `createdDate ≥ started_at − 5 分钟`、
   `numberOfCodes` / `expirationDate` / `environment` 都相同；再去掉 `code_restocks` 里已有行认领的（`RestockBatchesTaken`）；
   剩下按 `createdDate` 取最早的一批 → `created`；`asc_batch_id` 的唯一约束兜底。发起满 30 分钟还没对上 → `failed` + 告警（一天一封）。
 - **取码值、灌池**：`GET …/values`（`Accept: text/csv`）→ 按 `import-codes.sh` 的口径逐行挑 `^[A-Z0-9]{6,20}$`、去重；
@@ -336,7 +336,7 @@ staging `SANDBOX`、prod `PRODUCTION` / 600 张全在一批且 40 天内到期 �
 4 个服务并发结算 25 轮每轮只发起一次 / `RestockStatus` 出错计错不挡告警、`ErrRestockNotMigrated` 不计错 / 到期日按 UTC 日算 /
 复审修补：满 6 小时那一轮最后再试一次成功 → `imported`、不发超时告警 / 码值格式认不出：日志有行数和码数、按批次一封（跨 UTC 日不重发）、6 小时后照样 `failed`、码值不进日志 /
 开关关但有没收尾的行：WARN 每天一条、不调苹果不发邮件 / `restock_daily_max = 0` 暂停：不发起、不发上限告警、低库存告警照发、没收尾的照样收尾 /
-对账列批次不带共用的截止时间 / 码池告警主题按 `ASC_OFFER_CODE_ENVIRONMENT` 带环境（大小写不计；没配或写错不带）。
+对账列批次的总上限在 (2, 3] × CallTimeout / 码池告警主题按 `ASC_OFFER_CODE_ENVIRONMENT` 带环境（大小写不计；没配或写错不带）。
 `appstoreconnect_test.go`（httptest 假苹果）：JWT header / claims / r‖s 签名用公钥验得过 / 生成请求的路径、头、body 逐字段 / 401、403、409、422、429、302 明确失败（带苹果错误码）、500、503、201 没 id 不确定 /
 请求写出去后客户端超时、context 超时都是不确定 / 连接被拒是 `unreachable` / 列批次解析字段、跟同 host 的 next、不跟外域 / 三页各 70 ms、单页限时 150 ms 照样列全 / CSV（BOM、CRLF、引号、垃圾行、重复、非空行数）/ 错误里没有 token / 坏 .p8（非 PEM、乱码、RSA、P-384、缺 ID）不回显 key /
 真客户端 + 假苹果端到端（正常、502 后对账）。主包 `referral_wiring_test.go`：五项齐 / 各缺一项 / 环境写错 / .p8 坏 / 全空。

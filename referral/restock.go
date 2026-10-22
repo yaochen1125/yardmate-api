@@ -274,6 +274,9 @@ func (s *Service) warnRestockSettings(problems []string) {
 	}
 }
 
+// restockListBudgetPages: the reconcile list's overall budget, in pages.
+const restockListBudgetPages = 3
+
 func (s *Service) ascContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, s.restock.CallTimeout)
 }
@@ -383,9 +386,13 @@ func (s *Service) finishRestock(ctx context.Context, now time.Time, open *Restoc
 // restocks on one day ask for the same count and date). The earliest such
 // batch wins. why says what was seen when nothing matched.
 func (s *Service) reconcile(ctx context.Context, open *Restock, rep *Report) (batchID, why string) {
-	// No shared deadline over the whole list: the client bounds every page
-	// on its own (60 s each), so a long list is not cut short by one budget.
-	batches, err := s.restock.API.ListOneTimeCodeBatches(ctx, s.restock.OfferID)
+	// The client bounds every page on its own (CallTimeout each); the whole
+	// list gets three pages' worth, so a few slow pages still fit but a slow
+	// long list cannot eat the pass's RevenueCat settlement (one pass is 8
+	// minutes and the restock runs before it).
+	lctx, cancel := context.WithTimeout(ctx, restockListBudgetPages*s.restock.CallTimeout)
+	defer cancel()
+	batches, err := s.restock.API.ListOneTimeCodeBatches(lctx, s.restock.OfferID)
 	if err != nil {
 		log.Printf("referral restock: restock %d: list batches: %v", open.ID, err)
 		rep.Errors++

@@ -305,8 +305,10 @@ func TestRestockUnknownOutcomeIsReconciledAgainstTheBatchList(t *testing.T) {
 	if api.createCount() != 1 {
 		t.Errorf("creates = %d, want 1", api.createCount())
 	}
-	if api.listHadDeadline {
-		t.Error("the batch list was put under one shared deadline (the client times each page)")
+	// Three pages' worth over the whole list: more than one page's budget,
+	// but bounded, so it cannot eat the pass's RevenueCat time.
+	if call := svc.restock.CallTimeout; api.listBudget <= 2*call || api.listBudget > 3*call {
+		t.Errorf("list budget = %v, want within (2, 3] × %v", api.listBudget, call)
 	}
 }
 
