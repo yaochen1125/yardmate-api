@@ -95,3 +95,49 @@ func TestDeviceCheckAllowDevelopmentIsOffUnlessSet(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildRestockConfigReadsTheFiveASCKeys(t *testing.T) {
+	oneLine := strings.ReplaceAll(strings.TrimSpace(testDeviceCheckPEM(t)), "\n", `\n`)
+	all := "ASC_KEY_ID=TESTKEY001\nASC_ISSUER_ID=69a6de7e-test\nASC_PRIVATE_KEY=" + oneLine +
+		"\nASC_REFERRAL_OFFER_ID=offer-test-3\nASC_OFFER_CODE_ENVIRONMENT=sandbox\n"
+	cfg := buildRestockConfig(vaultOf(t, all))
+	if cfg.API == nil || len(cfg.Missing) != 0 || cfg.Environment != referral.EnvSandbox || cfg.OfferID != "offer-test-3" {
+		t.Fatalf("all five: api=%v missing=%v env=%q offer=%q", cfg.API != nil, cfg.Missing, cfg.Environment, cfg.OfferID)
+	}
+
+	cases := map[string]struct {
+		drop, want string
+	}{
+		"no key id":      {"ASC_KEY_ID=", "ASC_KEY_ID"},
+		"no issuer":      {"ASC_ISSUER_ID=", "ASC_ISSUER_ID"},
+		"no key":         {"ASC_PRIVATE_KEY=", "ASC_PRIVATE_KEY"},
+		"no offer":       {"ASC_REFERRAL_OFFER_ID=", "ASC_REFERRAL_OFFER_ID"},
+		"no environment": {"ASC_OFFER_CODE_ENVIRONMENT=", "ASC_OFFER_CODE_ENVIRONMENT"},
+	}
+	for name, c := range cases {
+		var lines []string
+		for _, l := range strings.Split(strings.TrimSpace(all), "\n") {
+			if !strings.HasPrefix(l, c.drop) {
+				lines = append(lines, l)
+			}
+		}
+		cfg := buildRestockConfig(vaultOf(t, strings.Join(lines, "\n")+"\n"))
+		if !strings.Contains(strings.Join(cfg.Missing, ","), c.want) {
+			t.Errorf("%s: missing = %v", name, cfg.Missing)
+		}
+	}
+
+	bad := strings.Replace(all, "ASC_OFFER_CODE_ENVIRONMENT=sandbox", "ASC_OFFER_CODE_ENVIRONMENT=prod", 1)
+	if cfg := buildRestockConfig(vaultOf(t, bad)); cfg.Environment != "" || !strings.Contains(strings.Join(cfg.Missing, ","), "neither PRODUCTION nor SANDBOX") {
+		t.Errorf("odd environment: %+v", cfg.Missing)
+	}
+	broken := strings.Replace(all, "ASC_PRIVATE_KEY="+oneLine, "ASC_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----\\nnot-a-key\\n-----END PRIVATE KEY-----", 1)
+	cfg = buildRestockConfig(vaultOf(t, broken))
+	if cfg.API != nil || !strings.Contains(strings.Join(cfg.Missing, ","), "ASC_PRIVATE_KEY (unusable") || strings.Contains(strings.Join(cfg.Missing, ","), "not-a-key") {
+		t.Errorf("broken key: api=%v missing=%v", cfg.API != nil, cfg.Missing)
+	}
+	// Nothing set (the switch is off by default): still a service.
+	if cfg := buildRestockConfig(vaultOf(t, "")); cfg.API != nil || len(cfg.Missing) != 5 {
+		t.Errorf("empty vault: %+v", cfg.Missing)
+	}
+}

@@ -65,6 +65,10 @@ type memStore struct {
 	usedKeys       map[string]bool // referral_used_subscriptions
 	digestErr      error
 	notifyErr      error
+
+	// auto-restock (021): referral_settings columns, code_restocks, and the
+	// codes in code_pool — see restock_fakes_test.go.
+	rs memRestocks
 }
 
 type memClaim struct {
@@ -286,7 +290,13 @@ func (m *memStore) DeleteUser(_ context.Context, userID string) error {
 
 func (m *memStore) ExpireCodes(context.Context) (int64, error) { return m.expired, nil }
 
-func (m *memStore) PoolStatus(context.Context) (PoolStatus, error) { return m.pool, m.poolErr }
+func (m *memStore) PoolStatus(context.Context) (PoolStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ps := m.pool
+	ps.Batches = append([]PoolBatch(nil), m.pool.Batches...)
+	return ps, m.poolErr
+}
 
 // fakeAlerter records every alert; err makes each send fail.
 type fakeAlerter struct {
