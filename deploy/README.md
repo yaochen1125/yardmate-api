@@ -311,7 +311,9 @@ then prod.
    credits − requested − sent), no ledger edit.
 5. Missed a mail / mail not configured: `… deploy/referral-payout.sh list`
    shows every open request plus the ones still inside their undo hour
-   (`list requested` / `list sent` / `list cancelled` for one state).
+   (`list requested` / `list sent` / `list cancelled` for one state). The
+   "inside the undo hour" label uses your computer's clock and is display
+   only; whether `undo` still works is decided by the database (`now()`).
 
 ## 9. Referral anti-abuse (防刷) — DeviceCheck, devices, one Apple ID once, velocity
 

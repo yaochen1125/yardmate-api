@@ -42,7 +42,19 @@ need_jq() {
 
 now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# 数据库给的 UTC 时间（PostgREST 的 timestamptz，如 2026-10-22T10:00:00.123+00:00）→ 运营电脑本地 HH:MM。
+# macOS（BSD date）和 Linux（GNU date）各一种写法；都不认就打 ?。
+local_hm() {
+  local iso="${1:0:19}" epoch
+  if epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "$iso" +%s 2>/dev/null); then
+    date -r "$epoch" +%H:%M
+  else
+    date -d "${iso}Z" +%H:%M 2>/dev/null || echo "?"
+  fi
+}
+
 # 一行一条；缓冲中的（state = sent 且 undo_until 还没到）标出来。没有 jq 就原样打 JSON。
+# 这里的「缓冲中」按运营电脑的时钟判断，只用来显示；能不能撤回以 undo 的结果为准（库里用 now()）。
 show() {
   if command -v jq > /dev/null; then
     jq -r --arg now "$(now_utc)" '.[] |
@@ -113,11 +125,11 @@ mark_sent() {
     echo "#$id 刚刚变过（已被标记 / 取消，或用户改了邮箱），没改任何东西。重新跑一次 mark-sent 看最新的。" >&2
     exit 1
   fi
-  local until
-  until=$(printf '%s' "$out" | jq -r '.[0].undo_until | .[0:16] | sub("T"; " ")')
+  local until_iso
+  until_iso=$(printf '%s' "$out" | jq -r '.[0].undo_until')
   echo "#$id → 已发、待生效"
   printf '%s' "$out" | show
-  echo "1 小时缓冲：$until UTC（本机时间约 $(date -v+1H +%H:%M 2>/dev/null || date -d '+1 hour' +%H:%M)）之前可以撤回："
+  echo "1 小时缓冲：$(printf '%s' "${until_iso:0:16}" | tr T ' ') UTC（本机时间 $(local_hm "$until_iso")）之前可以撤回："
   echo "  deploy/referral-payout.sh undo $id"
 }
 
