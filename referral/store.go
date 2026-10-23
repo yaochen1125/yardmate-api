@@ -42,6 +42,10 @@ type Standing struct {
 type PendingOffer struct {
 	OfferCode  string `json:"offer_code"`
 	FriendCode string `json:"friend_code"`
+	// OfferVariant is the group the friend is in (023: "month" / "year"),
+	// which decides the renewal terms the app shows. Absent from an older
+	// database; the app then shows the monthly terms.
+	OfferVariant string `json:"offer_variant,omitempty"`
 }
 
 // Referral is one A→B record as the settlement loop sees it.
@@ -182,6 +186,13 @@ const (
 // (migration 014). Changing the row takes effect on the next claim / pass —
 // no deploy.
 type PoolSettings struct {
+	// OfferYearPct / OfferRefYear (023): the yearly group's share of new
+	// friends and the code_pool.offer_ref_name its codes carry. Codes under
+	// any other name are the monthly group's. 0 / "" on a database without
+	// 023 — everything is the monthly group, as before.
+	OfferYearPct  int
+	OfferRefMonth string
+	OfferRefYear  string
 	// IssueMarginDays: /claim only hands out NEW codes that expire later than
 	// now + this many days, so the friend has time to redeem (default 14).
 	IssueMarginDays int
@@ -216,6 +227,11 @@ type PoolBatch struct {
 type PoolStatus struct {
 	Settings PoolSettings
 	Batches  []PoolBatch
+	// UnredeemedYear (023): yearly-group referrals still holding an
+	// unredeemed code. The yearly stock is watched while this is > 0 even
+	// when the share is back at 0, so their expiring codes can still be
+	// swapped.
+	UnredeemedYear int
 }
 
 // RestockSettings is the auto-restock half of referral_settings (migration
@@ -329,6 +345,11 @@ type Store interface {
 	// redemption the app has reported is kept until it actually expires. nil
 	// when there is none or none can be handed out. Only ever the caller's own.
 	PendingOffer(ctx context.Context, userID, installID string) (*PendingOffer, error)
+	// OfferVariant is the experiment group of this user's referral as a
+	// friend (023, invite-friends.md ### 兑换码分组实验): "month" or "year".
+	// "month" when the referral predates the experiment, there is none, or
+	// the column does not exist yet.
+	OfferVariant(ctx context.Context, userID string) (string, error)
 	// Claim re-checks 2–4 atomically, records referrer→referee (with the
 	// claiming device) and hands back an Apple one-time code from the pool;
 	// a re-claim gets the code it already has (or a swap; never once the

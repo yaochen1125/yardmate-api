@@ -57,6 +57,9 @@ const (
 	claimRCTimeout = 8 * time.Second
 	meRCTimeout    = 5 * time.Second
 	storeTimeout   = 10 * time.Second
+	// variantTimeout bounds the extra read of the friend's experiment group
+	// after a successful claim (023).
+	variantTimeout = 3 * time.Second
 )
 
 // Authenticator verifies the request's bearer token and returns the Supabase
@@ -308,6 +311,12 @@ func (s *Service) HandleMe() http.HandlerFunc {
 	}
 }
 
+// variantClaimer is a Store that returns the experiment group of the code
+// it hands out in the same transaction (PGStore, 023).
+type variantClaimer interface {
+	ClaimWithVariant(ctx context.Context, userID, code, installID string, gate *ClaimGate) (string, string, error)
+}
+
 type claimRequest struct {
 	Code string `json:"code"`
 	// SubscribedBefore is the app having found a Premium subscription of this
@@ -315,6 +324,11 @@ type claimRequest struct {
 	// re-checks RevenueCat, and the App Store offer (new subscribers only) is
 	// the real gate. What this saves is a code off the shelf for nothing.
 	SubscribedBefore bool `json:"subscribed_before"`
+	// OfferVariantAware is an app build that shows the renewal terms of the
+	// experiment group it is told (023). Builds without it would show the
+	// monthly terms for a yearly code, so a new referral from them always
+	// lands in the monthly group.
+	OfferVariantAware bool `json:"offer_variant_aware"`
 	// DeviceToken is DCDevice.generateToken() base64 (gate 1). Absent on the
 	// simulator or when the app could not get one.
 	DeviceToken string `json:"device_token"`
@@ -388,7 +402,7 @@ func (s *Service) HandleClaim() http.HandlerFunc {
 			return
 		}
 		if kind == ClaimAgain {
-			s.finishClaim(w, r.Context(), userID, code, installID, nil)
+			s.finishClaim(w, r.Context(), userID, code, installID, nil, req.OfferVariantAware)
 			return
 		}
 
@@ -427,7 +441,7 @@ func (s *Service) HandleClaim() http.HandlerFunc {
 			writeError(w, status, refuse)
 			return
 		}
-		s.finishClaim(w, claimCtx, userID, code, installID, gate)
+		s.finishClaim(w, claimCtx, userID, code, installID, gate, req.OfferVariantAware)
 	}
 }
 
@@ -436,19 +450,43 @@ func (s *Service) HandleClaim() http.HandlerFunc {
 // re-read after a failed set) on top of the database's own budget, so the
 // transaction never runs out under an Apple call that has already been
 // sent.
-func (s *Service) finishClaim(w http.ResponseWriter, parent context.Context, userID, code, installID string, gate *ClaimGate) {
+func (s *Service) finishClaim(w http.ResponseWriter, parent context.Context, userID, code, installID string, gate *ClaimGate, variantAware bool) {
 	budget := storeTimeout
 	if gate != nil {
 		budget += deviceLockWait + 3*s.dcTimeout
 	}
 	ctx, cancel := context.WithTimeout(parent, budget)
 	defer cancel()
-	offer, err := s.store.Claim(ctx, userID, code, installID, gate)
+	if !variantAware {
+		ctx = WithForceMonth(ctx)
+	}
+	var offer, variant string
+	var err error
+	if vc, ok := s.store.(variantClaimer); ok {
+		// The group of the code actually handed out, from the same
+		// transaction (023) — never a second read that could disagree.
+		offer, variant, err = vc.ClaimWithVariant(ctx, userID, code, installID, gate)
+	} else {
+		offer, err = s.store.Claim(ctx, userID, code, installID, gate)
+	}
 	if err != nil {
 		fail(w, err, "claim")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"offer_code": offer})
+	if variant == "" {
+		// A store that cannot say in the same breath (the in-memory test
+		// store): read it after. A failed read answers month — the code is
+		// already handed out, so don't fail over it.
+		vctx, vcancel := context.WithTimeout(parent, variantTimeout)
+		v, verr := s.store.OfferVariant(vctx, userID)
+		vcancel()
+		if verr != nil {
+			log.Printf("referral claim: offer variant unavailable, answering month: %v", verr)
+			v = VariantMonth
+		}
+		variant = v
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"offer_code": offer, "offer_variant": variant})
 }
 
 // deviceGate is step 6 up to the point where Apple has to be asked. No

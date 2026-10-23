@@ -19,6 +19,11 @@ type memStore struct {
 	// end. mu alone is released around the gate's Apple calls, so without
 	// deviceMu two gated claims could both check before either sets.
 	deviceMu sync.Mutex
+	// variant / variantErr: what OfferVariant answers (023).
+	variant    string
+	variantErr error
+	// gotForceMonth: whether the last Claim's ctx was marked WithForceMonth.
+	gotForceMonth bool
 
 	// handler knobs
 	meStanding Standing
@@ -175,6 +180,18 @@ func (m *memStore) PendingOffer(_ context.Context, userID, installID string) (*P
 	return m.pending, m.pendingErr
 }
 
+func (m *memStore) OfferVariant(_ context.Context, userID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.variantErr != nil {
+		return VariantMonth, m.variantErr
+	}
+	if m.variant == "" {
+		return VariantMonth, nil
+	}
+	return m.variant, nil
+}
+
 func (m *memStore) ClaimCheck(_ context.Context, userID, code, installID string) (ClaimKind, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -213,6 +230,7 @@ func (m *memStore) Claim(ctx context.Context, userID, code, installID string, ga
 	}
 	m.mu.Lock()
 	m.claimCalls++
+	m.gotForceMonth = ForceMonth(ctx)
 	m.gotUser, m.gotCode, m.gotInstall = userID, code, installID
 	if m.claimErr != nil {
 		err := m.claimErr
