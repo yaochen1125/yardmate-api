@@ -256,6 +256,9 @@ func alertMail(ps PoolStatus, st Stock, now time.Time, env string) (subject, bod
 // mail names its own offer and import command, and has no auto-restock line.
 func alertMailFor(ps PoolStatus, st Stock, now time.Time, env, variant string) (subject, body string) {
 	offer := "Referral Friend Month"
+	if ps.Settings.OfferRefMonth != "" {
+		offer = ps.Settings.OfferRefMonth
+	}
 	if variant == VariantYear {
 		offer = ps.Settings.OfferRefYear
 	}
@@ -316,7 +319,7 @@ func alertMailFor(ps PoolStatus, st Stock, now time.Time, env, variant string) (
 	_ = tw.Flush()
 
 	command := restockCommand
-	if variant == VariantYear {
+	if offer != "Referral Friend Month" {
 		command = `deploy/supabase/import-codes.sh codes.csv "` + offer + `" YYYY-MM-DD`
 	}
 	b.WriteString("\n补货：App Store Connect → offer「" + offer + "」再生成一批一次性码\n")

@@ -68,7 +68,7 @@ stats() {
   local rows
   rows=$(rpc referral_ab_stats)
   if [ "$(echo "$rows" | jq 'map(select(.claimed > 0)) | length')" = "0" ]; then
-    echo; echo "统计：还没有实验开始后领码的推荐。"
+    echo; echo "统计：还没有占比在 1–99 之间时领码的推荐（占比 0 或 100 时领码的不是随机分组，不算）。"
     return
   fi
   for v in month year; do

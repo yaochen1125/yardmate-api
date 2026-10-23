@@ -41,14 +41,14 @@ alter table referrals
 -- ---------------------------------------------------------------- ③ 分组
 
 -- 同一个账号每次算出来一样：md5 前 8 个十六进制位当无符号 32 位数对 100 取余，不随 Postgres 版本变。
--- 只在第一次领码时调，结果写进 referrals。
-create or replace function referral_offer_variant(p_user text) returns text
+-- 只在第一次领码时调，结果写进 referrals。占比由调用方传入：领码时只读一次，分组和
+-- offer_year_pct_at_claim 用的是同一个值（两次读之间运营改了占比也不会记错）。
+create or replace function referral_offer_variant(p_user text, p_pct int) returns text
 language plpgsql stable as $$
 declare
-    v_pct    int;
+    v_pct    int := p_pct;
     v_bucket int;
 begin
-    select offer_year_pct into v_pct from referral_settings where id = 1;
     -- 老 App 包不认识组别（请求没带 offer_variant_aware）→ Go 侧在事务里设 referral.force_month = on，一律月付。
     if coalesce(current_setting('referral.force_month', true), '') = 'on' then
         return 'month';
@@ -82,6 +82,7 @@ declare
     v_variant     text;          -- 023
     v_ref_month   text;
     v_ref_year    text;          -- 023：年付组兑换码在码池里的名字
+    v_pct         int;           -- 023：领码这一刻的年付组占比（只读一次）
 begin
     -- 2. 码认不出
     select user_id into v_referrer from referral_users where code = p_code;
@@ -126,14 +127,15 @@ begin
                    select 1 from referral_devices where user_id = v_referrer and install_id = v_install)) then
             raise exception 'own_code';
         end if;
-        v_variant := referral_offer_variant(p_user);            -- 023：第一次领码时定组
+        select offer_year_pct into v_pct from referral_settings where id = 1;   -- 023：只读一次
+        v_variant := referral_offer_variant(p_user, v_pct);     -- 023：第一次领码时定组
         insert into referral_users (user_id, code) values (p_user, referral_new_code())
             on conflict (user_id) do nothing;
         begin
             insert into referrals (referrer, referee, claim_install_id, offer_variant, offer_year_pct_at_claim)
                  values (v_referrer, p_user, v_install, v_variant,
                          case when coalesce(current_setting('referral.force_month', true), '') = 'on' then null
-                              else (select offer_year_pct from referral_settings where id = 1) end)
+                              else coalesce(v_pct, 0) end)
               returning * into v_ref;
         exception when unique_violation then
             raise exception 'already_claimed';
@@ -409,12 +411,13 @@ language sql stable as $$
       from cfg;
 $$;
 
-revoke execute on function referral_offer_variant(text)               from public, anon, authenticated;
+drop function if exists referral_offer_variant(text);   -- 早期草稿的单参数版本
+revoke execute on function referral_offer_variant(text, int)          from public, anon, authenticated;
 revoke execute on function referral_switch_unredeemed(text, boolean)  from public, anon, authenticated;
 revoke execute on function referral_ab_stats()                         from public, anon, authenticated;
 revoke execute on function referral_set_offer_year_pct(int)            from public, anon, authenticated;
 revoke execute on function referral_ab_overview()                      from public, anon, authenticated;
-grant  execute on function referral_offer_variant(text)               to service_role;
+grant  execute on function referral_offer_variant(text, int)          to service_role;
 grant  execute on function referral_switch_unredeemed(text, boolean)  to service_role;
 grant  execute on function referral_ab_stats()                         to service_role;
 grant  execute on function referral_set_offer_year_pct(int)            to service_role;

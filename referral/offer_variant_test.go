@@ -1,6 +1,7 @@
 package referral
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -92,5 +93,28 @@ func TestYearlyAlertMailNamesTheYearlyOffer(t *testing.T) {
 	subject, body = alertMailFor(ps, st, now, "", VariantMonth)
 	if strings.Contains(subject, "yearly") || !strings.Contains(body, `"Referral Friend Month"`) {
 		t.Fatalf("monthly mail changed: %q", subject)
+	}
+}
+
+// sameTxStore is the in-memory store plus ClaimWithVariant, like PGStore.
+type sameTxStore struct {
+	*memStore
+	answer string
+}
+
+func (s *sameTxStore) ClaimWithVariant(ctx context.Context, userID, code, installID string, gate *ClaimGate) (string, string, error) {
+	offer, err := s.memStore.Claim(ctx, userID, code, installID, gate)
+	return offer, s.answer, err
+}
+
+func TestClaimPrefersTheSameTransactionVariant(t *testing.T) {
+	_, mem, rc, dc := configuredDC()
+	mem.variant = VariantMonth // what a second read would say
+	mem.variantErr = errors.New("must not be read")
+	store := &sameTxStore{memStore: mem, answer: VariantYear}
+	svc := New(store, rc, entID, okAuth, Options{DeviceCheck: dc})
+	w := call(t, svc.HandleClaim(), "POST", `{"code":"YM-7KQ2","device_token":"tok","device_check_env":"production","offer_variant_aware":true}`, nil)
+	if w.Code != 200 || body(t, w)["offer_variant"] != VariantYear {
+		t.Fatalf("status %d %v, want the claim's own year", w.Code, body(t, w))
 	}
 }

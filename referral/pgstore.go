@@ -89,7 +89,10 @@ func (p *PGStore) PendingOffer(ctx context.Context, userID, installID string) (*
 	return &out, nil
 }
 
-// OfferVariant reads referrals.offer_variant (023) for this friend.
+// OfferVariant reads referrals.offer_variant (023) for this friend. The
+// /claim handler does NOT use it for PGStore: ClaimWithVariant answers the
+// group from the claim's own transaction. This is the Store-interface
+// fallback (the in-memory test store); don't wire it back in as a second read.
 func (p *PGStore) OfferVariant(ctx context.Context, userID string) (string, error) {
 	var v *string
 	err := p.pool.QueryRow(ctx, `select offer_variant from referrals where referee = $1`, userID).Scan(&v)

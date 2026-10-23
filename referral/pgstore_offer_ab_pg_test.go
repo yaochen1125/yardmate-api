@@ -126,14 +126,14 @@ func TestPGOfferVariantHashSplitsAboutEvenly(t *testing.T) {
 	var year int
 	if err := pool.QueryRow(ctx,
 		`select count(*) from generate_series(1, 2000) g
-		  where referral_offer_variant('user-' || g) = 'year'`).Scan(&year); err != nil {
+		  where referral_offer_variant('user-' || g, 50) = 'year'`).Scan(&year); err != nil {
 		t.Fatal(err)
 	}
 	if year < 880 || year > 1120 {
 		t.Fatalf("yearly = %d of 2000 at 50%%, want about half", year)
 	}
 	var a, b string
-	if err := pool.QueryRow(ctx, `select referral_offer_variant('same'), referral_offer_variant('same')`).Scan(&a, &b); err != nil || a != b {
+	if err := pool.QueryRow(ctx, `select referral_offer_variant('same', 50), referral_offer_variant('same', 50)`).Scan(&a, &b); err != nil || a != b {
 		t.Fatalf("same user twice = %q / %q %v", a, b, err)
 	}
 }
