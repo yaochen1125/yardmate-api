@@ -89,6 +89,19 @@ func (p *PGStore) PendingOffer(ctx context.Context, userID, installID string) (*
 	return &out, nil
 }
 
+// OfferVariant reads referrals.offer_variant (023) for this friend.
+func (p *PGStore) OfferVariant(ctx context.Context, userID string) (string, error) {
+	var v *string
+	err := p.pool.QueryRow(ctx, `select offer_variant from referrals where referee = $1`, userID).Scan(&v)
+	if errors.Is(err, pgx.ErrNoRows) || undefinedObject(err) {
+		return VariantMonth, nil
+	}
+	if err != nil {
+		return VariantMonth, err
+	}
+	return NormaliseVariant(v), nil
+}
+
 // ClaimCheck is referral_claim_check (016 / 022): judgement steps 2–4, read-only.
 func (p *PGStore) ClaimCheck(ctx context.Context, userID, code, installID string) (ClaimKind, error) {
 	var kind string
@@ -127,6 +140,14 @@ func (p *PGStore) Claim(ctx context.Context, userID, code, installID string, gat
 		return "", err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	// 023: an app build that does not know the experiment groups gets the
+	// monthly group for a new referral (transaction-local, so it never leaks
+	// to the next user of the pooled connection).
+	if ForceMonth(ctx) {
+		if _, err := tx.Exec(ctx, `select set_config('referral.force_month', 'on', true)`); err != nil {
+			return "", err
+		}
+	}
 	if gate != nil {
 		if _, err := tx.Exec(ctx, fmt.Sprintf("set local lock_timeout = '%dms'", deviceLockWait.Milliseconds())); err != nil {
 			return "", err
@@ -308,6 +329,21 @@ func (p *PGStore) PoolStatus(ctx context.Context) (PoolStatus, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return st, fmt.Errorf("pool batches: %w", err)
+	}
+	// 023: the experiment's share and the yearly group's code name. Missing
+	// columns (023 not run yet) leave both zero — one monthly pool, as before.
+	err = p.pool.QueryRow(ctx, `select offer_year_pct, offer_ref_month, offer_ref_year from referral_settings where id = 1`).
+		Scan(&st.Settings.OfferYearPct, &st.Settings.OfferRefMonth, &st.Settings.OfferRefYear)
+	if err != nil && !undefinedObject(err) {
+		return st, fmt.Errorf("pool settings (023): %w", err)
+	}
+	if err == nil {
+		if err := p.pool.QueryRow(ctx,
+			`select count(*) from referrals r join code_pool c on c.code = r.offer_code
+			  where r.state = 'claimed' and c.state = 'issued' and r.offer_variant = 'year'`).
+			Scan(&st.UnredeemedYear); err != nil {
+			return st, fmt.Errorf("pool unredeemed yearly: %w", err)
+		}
 	}
 	return st, nil
 }

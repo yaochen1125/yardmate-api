@@ -66,7 +66,7 @@ func pgTest(t *testing.T) (*PGStore, *pgxpool.Pool, context.Context) {
 			c.Close(ctx)
 		}
 	})
-	for _, f := range []string{"013_referral.sql", "014_referral_pool_margin.sql", "015_referral_rewards.sql", "016_referral_antiabuse.sql", "017_referral_review_fixes.sql", "022_referral_pending_offer.sql"} {
+	for _, f := range []string{"013_referral.sql", "014_referral_pool_margin.sql", "015_referral_rewards.sql", "016_referral_antiabuse.sql", "017_referral_review_fixes.sql", "022_referral_pending_offer.sql", "023_referral_offer_ab.sql"} {
 		sql, err := os.ReadFile(filepath.Join("..", "proxy", "enrichment", "migrations", f))
 		if err != nil {
 			t.Fatalf("%s: %v", f, err)
@@ -357,8 +357,9 @@ func TestPGPoolStatusGroupsByBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ps.Settings != (PoolSettings{IssueMarginDays: 14, SwapGraceDays: 3, LowStockThreshold: 100, ExpiryWarnDays: 30}) {
-		t.Errorf("settings = %+v, want the 014 defaults", ps.Settings)
+	if ps.Settings != (PoolSettings{IssueMarginDays: 14, SwapGraceDays: 3, LowStockThreshold: 100, ExpiryWarnDays: 30,
+		OfferRefMonth: "Referral Friend Month", OfferRefYear: "Referral Friend Year"}) {
+		t.Errorf("settings = %+v, want the 014 / 023 defaults", ps.Settings)
 	}
 	if len(ps.Batches) != 2 {
 		t.Fatalf("batches = %+v, want 2 (same name, two dates)", ps.Batches)

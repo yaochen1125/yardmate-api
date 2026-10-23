@@ -150,17 +150,42 @@ func (s *Service) watchPool(ctx context.Context, now time.Time, rep *Report) {
 	} else {
 		s.poolConfigWarned = false
 	}
-	busy, refreshed := s.restockStep(ctx, now, ps, rep)
+	// 023: the monthly and yearly groups never lend each other codes, so each
+	// is its own stock. Auto-restock only refills the monthly group (the
+	// yearly offer's codes are imported by hand for now).
+	month, year := ps.SplitByVariant()
+	busy, refreshed := s.restockStep(ctx, now, month, rep)
 	if refreshed {
 		if fresh, err := s.store.PoolStatus(ctx); err != nil {
 			log.Printf("referral settle: pool status after restock: %v", err)
 			rep.Errors++
 		} else {
 			ps = fresh
+			month, year = ps.SplitByVariant()
 		}
 	}
+	if names := ps.UnknownOfferNames(); len(names) > 0 {
+		// Codes under a name that is neither group's are handed out as
+		// monthly; a typo in a yearly import would mislabel the friend's terms.
+		log.Printf("WARN referral pool: code_pool names that are neither %q nor %q are treated as the monthly group: %v",
+			ps.Settings.OfferRefMonth, ps.Settings.OfferRefYear, names)
+	}
+	if ps.Settings.OfferYearPct > 0 || ps.UnredeemedYear > 0 {
+		s.watchVariant(now, year, VariantYear, false, rep)
+	}
+	s.watchVariant(now, month, VariantMonth, busy, rep)
+}
+
+// watchVariant logs and mails the low-stock / expiring alert for one group's
+// stock. The monthly group keeps the original alert key and subject; the
+// yearly one is tagged so both can go out the same day.
+func (s *Service) watchVariant(now time.Time, ps PoolStatus, variant string, busy bool, rep *Report) {
 	st := TakeStock(ps, now)
-	rep.Usable = st.Usable
+	if variant == VariantMonth {
+		rep.Usable = st.Usable
+	} else {
+		rep.UsableYear = st.Usable
+	}
 	if !st.Alerting() {
 		return
 	}
@@ -168,8 +193,8 @@ func (s *Service) watchPool(ctx context.Context, now time.Time, rep *Report) {
 	if !st.Earliest.IsZero() {
 		earliest = st.Earliest.UTC().Format("2006-01-02")
 	}
-	log.Printf("WARN referral pool: %s usable=%d short=%d earliest=%s after_earliest=%d threshold=%d warn_days=%d margin_days=%d",
-		st.conditions(), st.Usable, st.Short, earliest, st.AfterEarliest,
+	log.Printf("WARN referral pool (%s): %s usable=%d short=%d earliest=%s after_earliest=%d threshold=%d warn_days=%d margin_days=%d",
+		variant, st.conditions(), st.Usable, st.Short, earliest, st.AfterEarliest,
 		ps.Settings.LowStockThreshold, ps.Settings.ExpiryWarnDays, ps.Settings.IssueMarginDays)
 	if busy {
 		log.Printf("referral pool: alert mail held back — an auto-restock is under way")
@@ -179,7 +204,13 @@ func (s *Service) watchPool(ctx context.Context, now time.Time, rep *Report) {
 		return
 	}
 	subject, body := alertMail(ps, st, now, s.restock.Environment)
-	sent, err := s.alertOnce(st.conditions(), now, subject, body)
+	key := st.conditions()
+	if variant == VariantYear {
+		subject = strings.Replace(subject, "Referral code pool", "Referral code pool (yearly group)", 1)
+		body = "年付组（offer " + ps.Settings.OfferRefYear + "）。补货：import-codes.sh codes.csv \"" + ps.Settings.OfferRefYear + "\" YYYY-MM-DD\n\n" + body
+		key = "year:" + key
+	}
+	sent, err := s.alertOnce(key, now, subject, body)
 	if err != nil {
 		log.Printf("referral pool alert mail: %v", err)
 		rep.Errors++

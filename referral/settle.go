@@ -49,8 +49,10 @@ type Report struct {
 	Granted   int // referrals rewarded straight away (③)
 	Saved     int // referrals parked (③)
 	Flushed   int // saved referrals paid out (④)
-	Usable    int // free pool codes beyond the issue margin (pool.go), after any restock
-	Alerted   int // pool alert emails sent this pass (0 or 1)
+	Usable    int // free pool codes beyond the issue margin (pool.go), after any restock — the monthly group's (023)
+	// UsableYear: the same for the yearly group (023); 0 while the experiment is off.
+	UsableYear int
+	Alerted    int // pool alert emails sent this pass (0 or 1)
 	// auto-restock (restock.go)
 	RestockStarted int // restocks started (code_restocks rows created) this pass
 	Restocked      int // codes newly put into code_pool by a restock this pass
