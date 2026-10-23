@@ -11,7 +11,7 @@
 --      向后兼容）；回答多带 offer_variant。
 --      一组发完不借另一组（pool_empty）。其余规则一字不差照 022。
 --   ⑤ referral_pending_offer（同名同签名整体替换 022 的版本）：回答多带 offer_variant。
---   ⑥ referral_switch_unredeemed(p_to, p_execute)：把领了码没兑（也没报过 /redeemed）、不在目标组的推荐
+--   ⑥ referral_switch_unredeemed(p_to, p_execute)：把新版 App 领的、领了码没兑（也没报过 /redeemed）、不在目标组的推荐
 --      换成目标组的码，记 offer_variant_switched_at（这些推荐不进主统计）。
 --   ⑦ referral_ab_stats()：按组统计（领码、兑换、付费、续费、退款、每个领码 / 每个兑换的
 --      30 / 90 / 180 / 365 / 425 天实收）。只算领码那一刻占比在 1–99 之间（offer_year_pct_at_claim）、没被换过组的。
@@ -28,7 +28,7 @@
 alter table referral_settings
     add column if not exists offer_year_pct  int  not null default 0
         check (offer_year_pct between 0 and 100),                      -- 年付组占比；0 = 全部月付
-    add column if not exists offer_ab_started_at timestamptz,          -- 第一次从 0 调成 >0 的时间；统计只算这之后领码的
+    add column if not exists offer_ab_started_at timestamptz,          -- 第一次从 0 调成 >0 的时间；只做记录，统计不看它
     add column if not exists offer_ref_month text not null default 'Referral Friend Month',
     add column if not exists offer_ref_year  text not null default 'Referral Friend Year';
 
@@ -209,8 +209,9 @@ $$;
 
 -- ---------------------------------------------------------------- ⑥ 没兑的一键换组
 
--- p_to = 'month' / 'year'。候选 = 推荐 claimed、手上码 issued（没兑）、没报过 /redeemed（报过的可能已经兑了，
--- 换了白烧一张）、组别（null 算 month）不是 p_to。整个函数一个事务：任何一条取不到目标组的码就整体回滚。
+-- p_to = 'month' / 'year'。候选 = 新版 App 领的（offer_year_pct_at_claim 不为空：老推荐和老 App 包被强制月付的
+-- 都是空，老包不认识组别、换成年付码会照旧显示「每月」）、推荐 claimed、手上码 issued（没兑）、没报过 /redeemed
+-- （报过的可能已经兑了，换了白烧一张）、组别不是 p_to。整个函数一个事务：任何一条取不到目标组的码就整体回滚。
 -- p_execute = false 只数不动：{to, candidates, available}。true 时目标组可发的码（同发码余量口径）
 -- 不够候选数就一条都不动（raise 'not_enough_codes'）；够就逐条：老码划 expired（不放回去再发，防同一张
 -- 被两个人兑）、发一张目标组的码、组别改成 p_to、reissued_at 记到现在。回 {to, candidates, available, moved}。
@@ -238,6 +239,7 @@ begin
       from referrals r join code_pool c on c.code = r.offer_code
      where r.state = 'claimed' and c.state = 'issued'
        and r.redeem_reported_at is null
+       and r.offer_year_pct_at_claim is not null
        and coalesce(r.offer_variant, 'month') <> p_to;
     select count(*) into v_available
       from code_pool
@@ -256,6 +258,7 @@ begin
           from referrals r join code_pool c on c.code = r.offer_code
          where r.state = 'claimed' and c.state = 'issued'
            and r.redeem_reported_at is null
+           and r.offer_year_pct_at_claim is not null
            and coalesce(r.offer_variant, 'month') <> p_to
          order by r.id
            for update of r, c

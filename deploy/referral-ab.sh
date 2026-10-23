@@ -11,7 +11,7 @@
 #                      （每个领码的实收是主指标；365 天前不下「哪组收入更好」的结论）。
 # set <0-100>          改年付组占比。要再输一遍新数字确认。第一次从 0 改成大于 0 时库里记下实验开始时间。
 # switch-unredeemed <month|year>
-#                      把实验开始后领的、领了码还没兑、不在目标组的推荐换成目标组的码（老码作废，不再发）。
+#                      把新版 App 领的、领了码还没兑（也没报过 /redeemed）、不在目标组的推荐换成目标组的码（老码作废，不再发）。老推荐和老 App 包的推荐不换：老包会把年付码显示成「每月」。
 #                      先打印会动多少条、目标组的码够不够，输入 yes 才执行；码不够一条都不动。
 #
 # 先 staging（secrets-staging.env 里的 SUPABASE_URL / KEY）再 prod。凭据只从环境变量读，不回显。
@@ -114,7 +114,7 @@ case "$cmd" in
     confirm_tty
     dry=$(rpc referral_switch_unredeemed "{\"p_to\": \"$to\", \"p_execute\": false}")
     n=$(echo "$dry" | jq .candidates); a=$(echo "$dry" | jq .available)
-    echo "会把 $n 个「实验开始后领的、领了码还没兑、不在 $to 组」的推荐换成 $to 组；$to 组可发的码 $a 张。"
+    echo "会把 $n 个「新版 App 领的、领了码还没兑、不在 $to 组」的推荐换成 $to 组；$to 组可发的码 $a 张。"
     [ "$n" -gt 0 ] || { echo "没有要换的。"; exit 0; }
     [ "$a" -ge "$n" ] || { echo "码不够，一条都不动。先导入 $to 组的码。" >&2; exit 1; }
     read -r -p "输入 yes 执行：" ok

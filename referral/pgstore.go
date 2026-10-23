@@ -135,9 +135,17 @@ const deviceLockSQL = `select pg_advisory_xact_lock(hashtextextended('referral_d
 // while the pool code is still only ours, and a failed check or set rolls
 // the claim back with the code untouched (docs: 置位失败 → 回滚).
 func (p *PGStore) Claim(ctx context.Context, userID, code, installID string, gate *ClaimGate) (string, error) {
+	offer, _, err := p.ClaimWithVariant(ctx, userID, code, installID, gate)
+	return offer, err
+}
+
+// ClaimWithVariant is Claim plus the experiment group referral_claim put in
+// its answer (023) — the group of the code actually handed out, read in the
+// same transaction. "month" when the answer has none (database before 023).
+func (p *PGStore) ClaimWithVariant(ctx context.Context, userID, code, installID string, gate *ClaimGate) (string, string, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	// 023: an app build that does not know the experiment groups gets the
@@ -145,55 +153,56 @@ func (p *PGStore) Claim(ctx context.Context, userID, code, installID string, gat
 	// to the next user of the pooled connection).
 	if ForceMonth(ctx) {
 		if _, err := tx.Exec(ctx, `select set_config('referral.force_month', 'on', true)`); err != nil {
-			return "", err
+			return "", "", err
 		}
 	}
 	if gate != nil {
 		if _, err := tx.Exec(ctx, fmt.Sprintf("set local lock_timeout = '%dms'", deviceLockWait.Milliseconds())); err != nil {
-			return "", err
+			return "", "", err
 		}
 		if _, err := tx.Exec(ctx, deviceLockSQL); err != nil {
-			return "", claimFailure(err)
+			return "", "", claimFailure(err)
 		}
 		var kind string
 		if err := tx.QueryRow(ctx, `select referral_claim_check($1::text, $2::text, $3::text)`, userID, code, installID).Scan(&kind); err != nil {
-			return "", claimFailure(err)
+			return "", "", claimFailure(err)
 		}
 		if kind == "new" && gate.Check != nil {
 			if err := gate.Check(); err != nil {
-				return "", err
+				return "", "", err
 			}
 		}
 	}
 	var raw []byte
 	if err := tx.QueryRow(ctx, `select referral_claim($1::text, $2::text, $3::text)::text`, userID, code, installID).Scan(&raw); err != nil {
-		return "", claimFailure(err)
+		return "", "", claimFailure(err)
 	}
 	var out struct {
-		OfferCode string `json:"offer_code"`
-		Fresh     *bool  `json:"fresh"`
+		OfferCode    string  `json:"offer_code"`
+		Fresh        *bool   `json:"fresh"`
+		OfferVariant *string `json:"offer_variant"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", fmt.Errorf("referral_claim decode: %w", err)
+		return "", "", fmt.Errorf("referral_claim decode: %w", err)
 	}
 	if out.OfferCode == "" {
-		return "", Failure{Code: ErrPoolEmpty}
+		return "", "", Failure{Code: ErrPoolEmpty}
 	}
 	// The three-argument function always says; if it ever does not, treat it
 	// as new (setting bit0 on a re-claim only re-marks a friend's device).
 	fresh := out.Fresh == nil || *out.Fresh
 	if gate != nil && gate.Set != nil {
 		if err := gate.Set(fresh); err != nil {
-			return "", err
+			return "", "", err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		if gate != nil && fresh {
 			log.Printf("referral claim: commit failed AFTER the DeviceCheck set (bit0 may be set without a claim): %v", err)
 		}
-		return "", err
+		return "", "", err
 	}
-	return out.OfferCode, nil
+	return out.OfferCode, NormaliseVariant(out.OfferVariant), nil
 }
 
 // claimFailure is asFailure plus the device lock (or a row lock behind it)

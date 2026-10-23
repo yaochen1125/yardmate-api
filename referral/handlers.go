@@ -311,6 +311,12 @@ func (s *Service) HandleMe() http.HandlerFunc {
 	}
 }
 
+// variantClaimer is a Store that returns the experiment group of the code
+// it hands out in the same transaction (PGStore, 023).
+type variantClaimer interface {
+	ClaimWithVariant(ctx context.Context, userID, code, installID string, gate *ClaimGate) (string, string, error)
+}
+
 type claimRequest struct {
 	Code string `json:"code"`
 	// SubscribedBefore is the app having found a Premium subscription of this
@@ -454,20 +460,31 @@ func (s *Service) finishClaim(w http.ResponseWriter, parent context.Context, use
 	if !variantAware {
 		ctx = WithForceMonth(ctx)
 	}
-	offer, err := s.store.Claim(ctx, userID, code, installID, gate)
+	var offer, variant string
+	var err error
+	if vc, ok := s.store.(variantClaimer); ok {
+		// The group of the code actually handed out, from the same
+		// transaction (023) — never a second read that could disagree.
+		offer, variant, err = vc.ClaimWithVariant(ctx, userID, code, installID, gate)
+	} else {
+		offer, err = s.store.Claim(ctx, userID, code, installID, gate)
+	}
 	if err != nil {
 		fail(w, err, "claim")
 		return
 	}
-	// The group was fixed when this friend first claimed (023); the app
-	// shows the matching renewal terms. A failed read shows the monthly
-	// ones — the code itself is already handed out, so don't fail over it.
-	vctx, vcancel := context.WithTimeout(parent, variantTimeout)
-	variant, verr := s.store.OfferVariant(vctx, userID)
-	vcancel()
-	if verr != nil {
-		log.Printf("referral claim: offer variant unavailable, answering month: %v", verr)
-		variant = VariantMonth
+	if variant == "" {
+		// A store that cannot say in the same breath (the in-memory test
+		// store): read it after. A failed read answers month — the code is
+		// already handed out, so don't fail over it.
+		vctx, vcancel := context.WithTimeout(parent, variantTimeout)
+		v, verr := s.store.OfferVariant(vctx, userID)
+		vcancel()
+		if verr != nil {
+			log.Printf("referral claim: offer variant unavailable, answering month: %v", verr)
+			v = VariantMonth
+		}
+		variant = v
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"offer_code": offer, "offer_variant": variant})
 }

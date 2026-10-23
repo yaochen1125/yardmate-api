@@ -351,10 +351,10 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
 - **分组**：`referral_claim` 新建推荐时调 `referral_offer_variant(user)`：md5(用户 + `:offer_ab`) 前 8 个十六进制位当无符号数对 100 取余，小于 `referral_settings.offer_year_pct` → `year`。写进 `referrals.offer_variant`，领码时的占比写进 `offer_year_pct_at_claim`。重领、换码、`pending_offer` 一律沿用原组；老推荐（空）按 `month`。
 - **按组发码**：年付组只取 `offer_ref_name = offer_ref_year` 的码，月付组取其余所有码（别名批次、测试批次都算月付）。一组没码就 `pool_empty`，不借另一组。
 - **老 App 包**：请求没带 `offer_variant_aware: true` → handler 给 ctx 打 `WithForceMonth`，`PGStore.Claim` 在事务里 `set_config('referral.force_month','on', true)`，新建推荐一律月付、`offer_year_pct_at_claim` 记空。事务级设置，不会漏给连接池里的下一个请求（`TestPGForceMonthForUnawareApps`）。
-- **回答**：`/claim` 回 `{offer_code, offer_variant}`；组别在领码成功后另读一次（`Store.OfferVariant`，3 秒超时，读失败答 `month`、不让领码失败）。`/me` 的 `pending_offer` 带 `offer_variant`（023 换了 `referral_pending_offer`）。
+- **回答**：`/claim` 回 `{offer_code, offer_variant}`；组别取自 `referral_claim` 同一事务的回答（`PGStore.ClaimWithVariant`）；只有不支持它的 store（内存测试替身）才在领码后另读一次（`Store.OfferVariant`，读失败答 `month`）。`/me` 的 `pending_offer` 带 `offer_variant`（023 换了 `referral_pending_offer`）。
 - **库存和告警**：`watchPool` 把码池拆成两组（`PoolStatus.SplitByVariant`）。月付组照旧（告警 key、标题不变）；年付组在占比 > 0 或还有没兑的年付组推荐时才看，告警 key 前缀 `year:`、标题带 `yearly group`。不认识的码名（既不是月付名也不是年付名）每轮记一行 WARN。
 - **自动补货只补月付组**：`restockStep` 只拿到月付组的库存。两组各自补（`code_restocks` 加 `offer_ref_name`、唯一约束和每日上限按组）是下一步，见 §5。
-- **运营**：`deploy/referral-ab.sh`（PostgREST 调 023 的函数）：`show`（`referral_ab_overview` + `referral_ab_stats`）、`set`（`referral_set_offer_year_pct`，第一次从 0 调上去记 `offer_ab_started_at`）、`switch-unredeemed`（`referral_switch_unredeemed`：没兑、没报过 `/redeemed`、不在目标组的推荐换成目标组的码；老码划 `expired`；一个事务，码不够整体回滚）。
+- **运营**：`deploy/referral-ab.sh`（PostgREST 调 023 的函数）：`show`（`referral_ab_overview` + `referral_ab_stats`）、`set`（`referral_set_offer_year_pct`，第一次从 0 调上去记 `offer_ab_started_at`）、`switch-unredeemed`（`referral_switch_unredeemed`：新版 App 领的（`offer_year_pct_at_claim` 不为空）、没兑、没报过 `/redeemed`、不在目标组的推荐换成目标组的码；老码划 `expired`；一个事务，码不够整体回滚。老推荐 / 老 App 包的不换：老包会把年付码显示成「每月」）。
 - **统计**（`referral_ab_stats`）：只算 `offer_year_pct_at_claim` 在 1–99、没被换过组的推荐；剔除 `duplicate_apple_id` / `rejected` 作废的；每组按 30 / 90 / 180 / 365 / 425 天给「每个领码的实收」（主指标）和「每个兑换的实收」。
 - **迁移顺序**：023 依赖 022（api#140）。023 整体替换 022 的 `referral_claim` 和 `referral_pending_offer`；重跑 016 / 017 / 022 后要再跑 023。
 

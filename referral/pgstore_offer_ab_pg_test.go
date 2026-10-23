@@ -216,12 +216,13 @@ func TestPGSwitchUnredeemedAllOrNothing(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// 1 redeemed (never moved); 2 legacy, from before 023 (moved too: unredeemed monthly codes are what a
-	// switch to yearly is for); 3 plain monthly (moved); 4 reported /redeemed (may already be redeemed: skipped).
+	// 1 redeemed (never moved); 2 legacy / old app build (offer_year_pct_at_claim null: an old build shows
+	// "a month" for any code, so never moved); 3 plain monthly from a new build (moved); 4 reported /redeemed
+	// (may already be redeemed: skipped).
 	if _, err := pool.Exec(ctx, `update code_pool set state = 'redeemed' where code = (select offer_code from referrals where referee = $1)`, friendID(1)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `update referrals set offer_variant = null where referee = $1`, friendID(2)); err != nil {
+	if _, err := pool.Exec(ctx, `update referrals set offer_variant = null, offer_year_pct_at_claim = null where referee = $1`, friendID(2)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `update referrals set redeem_reported_at = now() where referee = $1`, friendID(4)); err != nil {
@@ -243,12 +244,11 @@ func TestPGSwitchUnredeemedAllOrNothing(t *testing.T) {
 		return m, nil
 	}
 	dry, err := switchTo(false)
-	if err != nil || dry["candidates"] != 2 || dry["available"] != 0 {
-		t.Fatalf("dry run = %v %v, want 2 candidates (friends 2 and 3) and 0 yearly codes", dry, err)
+	if err != nil || dry["candidates"] != 1 || dry["available"] != 0 {
+		t.Fatalf("dry run = %v %v, want 1 candidate (friend 3) and 0 yearly codes", dry, err)
 	}
-	pgSeed(t, pool, ctx, abYear, day90, "Y1") // one short
 	if _, err := switchTo(true); err == nil || !strings.Contains(err.Error(), "not_enough_codes") {
-		t.Fatalf("execute one code short: %v", err)
+		t.Fatalf("execute with no yearly codes: %v", err)
 	}
 	if v := pgVariantOf(t, pool, ctx, friendID(3)); v == nil || *v != VariantMonth {
 		t.Fatalf("friend 3 moved by a refused switch: %v", v)
@@ -256,10 +256,10 @@ func TestPGSwitchUnredeemedAllOrNothing(t *testing.T) {
 	old3, _ := pgReferral(t, pool, ctx, friendID(3))
 	pgSeed(t, pool, ctx, abYear, day90*2, "Y2")
 	got, err := switchTo(true)
-	if err != nil || got["moved"] != 2 {
+	if err != nil || got["moved"] != 1 {
 		t.Fatalf("execute = %v %v", got, err)
 	}
-	for _, f := range []int{2, 3} {
+	for _, f := range []int{3} {
 		if v := pgVariantOf(t, pool, ctx, friendID(f)); v == nil || *v != VariantYear {
 			t.Fatalf("friend %d variant = %v", f, v)
 		}
@@ -275,6 +275,9 @@ func TestPGSwitchUnredeemedAllOrNothing(t *testing.T) {
 		if v := pgVariantOf(t, pool, ctx, friendID(f)); v == nil || *v != VariantMonth {
 			t.Fatalf("friend %d should not move: %v", f, v)
 		}
+	}
+	if v := pgVariantOf(t, pool, ctx, friendID(2)); v != nil {
+		t.Fatalf("legacy friend 2 moved to %v", *v)
 	}
 }
 
@@ -380,5 +383,20 @@ func TestPGABStatsCountsTheExperimentOnly(t *testing.T) {
 	}
 	if m := got["month/30"]; m.claimed != 0 {
 		t.Fatalf("month = %+v, want the pre-start friend left out", m)
+	}
+}
+
+func TestPGClaimWithVariantAnswersFromTheSameTransaction(t *testing.T) {
+	st, pool, ctx := pgTest(t)
+	codeA := pgInviteCode(t, st, ctx, userA)
+	pgSeed(t, pool, ctx, abYear, day90, "Y1")
+	pgSetYearPct(t, pool, ctx, 100)
+	offer, variant, err := st.ClaimWithVariant(ctx, friendID(1), codeA, "", nil)
+	if err != nil || offer != "Y1" || variant != VariantYear {
+		t.Fatalf("claim = %q %q %v", offer, variant, err)
+	}
+	offer, variant, err = st.ClaimWithVariant(ctx, friendID(1), codeA, "", nil) // re-claim
+	if err != nil || offer != "Y1" || variant != VariantYear {
+		t.Fatalf("re-claim = %q %q %v", offer, variant, err)
 	}
 }
