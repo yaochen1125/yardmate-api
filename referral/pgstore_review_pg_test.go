@@ -343,16 +343,16 @@ func TestPGReclaimAfterRedeemingNeverBurnsAnotherCode(t *testing.T) {
 		t.Fatalf("OLD = %s, want expired (the case under test)", s)
 	}
 	// The app re-opens the code sheet (an automatic re-claim) at every later
-	// state: always OLD back, NEW stays on the shelf.
-	for _, state := range []string{StateRedeemed, StateQualified, StateHeld, StateSaved, StateRewarded} {
+	// state: already_claimed (022; 017 handed OLD back), NEW stays on the shelf.
+	for _, state := range []string{StateRedeemed, StateQualified, StateHeld, StateSaved, StateRewarded, StateVoid} {
 		if _, err := pool.Exec(ctx, `update referrals set state = $2 where id = $1`, id, state); err != nil {
 			t.Fatal(err)
 		}
-		if k, err := st.ClaimCheck(ctx, userB, codeA, ""); err != nil || k != ClaimAgain {
-			t.Fatalf("%s: check = %v %v, want again (no RevenueCat, no Apple)", state, k, err)
+		if _, err := st.ClaimCheck(ctx, userB, codeA, ""); !isFailure(err, ErrAlreadyClaimed) {
+			t.Fatalf("%s: check err = %v, want already_claimed", state, err)
 		}
-		if offer, err := st.Claim(ctx, userB, codeA, "", nil); err != nil || offer != "OLD" {
-			t.Errorf("%s: re-claim = %q, %v; want OLD", state, offer, err)
+		if offer, err := st.Claim(ctx, userB, codeA, "", nil); !isFailure(err, ErrAlreadyClaimed) {
+			t.Errorf("%s: re-claim = %q, %v; want already_claimed", state, offer, err)
 		}
 	}
 	if s := pgState(t, pool, ctx, "NEW"); s != "free" {

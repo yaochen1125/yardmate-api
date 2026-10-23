@@ -269,6 +269,18 @@ func (s *Service) HandleMe() http.HandlerFunc {
 			fail(w, err, "me")
 			return
 		}
+		// Claimed as a friend (database view, before RevenueCat): hand back the
+		// code they have not redeemed yet, so a reinstall / new phone can get
+		// back to "redeem it". Fail soft — a missing 022 or a hiccup only
+		// leaves the field out.
+		if !standing.CanClaim {
+			pending, err := s.store.PendingOffer(ctx, userID, r.Header.Get("X-Device-Install-Id"))
+			if err != nil {
+				log.Printf("referral me: pending offer lookup failed: %v", err)
+			} else {
+				standing.PendingOffer = pending
+			}
+		}
 		// The database only knows whether they have claimed; "never subscribed"
 		// is RevenueCat's to answer. Fail OPEN on an upstream hiccup: the entry
 		// shows and the claim itself re-checks with a hard answer.

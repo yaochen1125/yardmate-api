@@ -192,7 +192,7 @@ func TestPGClaimHookFailureRollsBack(t *testing.T) {
 	}
 }
 
-func TestPGVoidReferralKeepsItsCodeButNeverSwaps(t *testing.T) {
+func TestPGVoidReferralNeverSwaps(t *testing.T) {
 	st, pool, ctx := pgTest(t)
 	codeA := pgInviteCode(t, st, ctx, userA)
 	pgSeed(t, pool, ctx, "b20", 20*day, "OLD")
@@ -205,8 +205,9 @@ func TestPGVoidReferralKeepsItsCodeButNeverSwaps(t *testing.T) {
 		t.Fatal(err)
 	}
 	pgExpiresIn(t, pool, ctx, "OLD", 2*day) // inside the swap grace
-	if offer, err := st.Claim(ctx, userB, codeA, "", nil); err != nil || offer != "OLD" {
-		t.Errorf("re-claim of a void referral = %q, %v; want OLD (no swap)", offer, err)
+	// 022: already_claimed (016 / 017 handed OLD back); either way no swap.
+	if offer, err := st.Claim(ctx, userB, codeA, "", nil); !isFailure(err, ErrAlreadyClaimed) {
+		t.Errorf("re-claim of a void referral = %q, %v; want already_claimed (no swap)", offer, err)
 	}
 	if s := pgState(t, pool, ctx, "NEW"); s != "free" {
 		t.Errorf("NEW = %s, want left on the shelf", s)

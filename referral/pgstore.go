@@ -68,7 +68,28 @@ func (p *PGStore) Me(ctx context.Context, userID, installID string) (Standing, e
 	return out, nil
 }
 
-// ClaimCheck is referral_claim_check (016): judgement steps 2–4, read-only.
+// PendingOffer calls referral_pending_offer (022). It may swap the code (the
+// re-claim path of referral_claim), so it runs as its own statement — one
+// implicit transaction.
+func (p *PGStore) PendingOffer(ctx context.Context, userID, installID string) (*PendingOffer, error) {
+	var raw []byte
+	if err := p.pool.QueryRow(ctx, `select referral_pending_offer($1::text, $2::text)::text`, userID, installID).Scan(&raw); err != nil {
+		return nil, fmt.Errorf("referral_pending_offer: %w", err)
+	}
+	if raw == nil {
+		return nil, nil
+	}
+	var out PendingOffer
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("referral_pending_offer decode: %w", err)
+	}
+	if out.OfferCode == "" || out.FriendCode == "" {
+		return nil, nil
+	}
+	return &out, nil
+}
+
+// ClaimCheck is referral_claim_check (016 / 022): judgement steps 2–4, read-only.
 func (p *PGStore) ClaimCheck(ctx context.Context, userID, code, installID string) (ClaimKind, error) {
 	var kind string
 	if err := p.pool.QueryRow(ctx, `select referral_claim_check($1::text, $2::text, $3::text)`, userID, code, installID).Scan(&kind); err != nil {

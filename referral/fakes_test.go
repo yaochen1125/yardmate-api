@@ -23,6 +23,10 @@ type memStore struct {
 	// handler knobs
 	meStanding Standing
 	meErr      error
+	// pending / pendingErr answer PendingOffer; pendingCalls counts them.
+	pending      *PendingOffer
+	pendingErr   error
+	pendingCalls int
 	claimOffer string
 	claimErr   error
 	checkErr   error
@@ -159,6 +163,13 @@ func (m *memStore) Me(_ context.Context, userID, installID string) (Standing, er
 	m.gotUser = userID
 	m.meInstalls = append(m.meInstalls, installID)
 	return m.meStanding, m.meErr
+}
+
+func (m *memStore) PendingOffer(_ context.Context, userID, installID string) (*PendingOffer, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pendingCalls++
+	return m.pending, m.pendingErr
 }
 
 func (m *memStore) ClaimCheck(_ context.Context, userID, code, installID string) (ClaimKind, error) {
