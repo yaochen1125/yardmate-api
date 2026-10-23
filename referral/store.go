@@ -29,6 +29,19 @@ type Standing struct {
 	// Rewards is the gift-card block (rewards.md ## 数据契约), filled by the
 	// injected RewardsReader; absent when none is injected or it failed.
 	Rewards any `json:"rewards,omitempty"`
+	// PendingOffer is the Apple code this user claimed as a friend and has not
+	// redeemed yet, so a reinstall / new phone can get back to "redeem it"
+	// (invite-friends.md ### 领了码没兑，换机 / 重装后找回). Absent when there is
+	// none, or the lookup failed.
+	PendingOffer *PendingOffer `json:"pending_offer,omitempty"`
+}
+
+// PendingOffer is a friend's claimed-but-unredeemed Apple code (already
+// swapped when it was expired or close to it) plus the friend's code they put
+// in (YM-XXXX).
+type PendingOffer struct {
+	OfferCode  string `json:"offer_code"`
+	FriendCode string `json:"friend_code"`
 }
 
 // Referral is one A→B record as the settlement loop sees it.
@@ -310,6 +323,12 @@ type Store interface {
 	// already_claimed / own_code (their own code, or installID is a device
 	// the code's owner has used) as a Failure, else ClaimNew or ClaimAgain.
 	ClaimCheck(ctx context.Context, userID, code, installID string) (ClaimKind, error)
+	// PendingOffer is the code this user claimed as a friend and has not
+	// redeemed (referral still claimed), swapped first when expired or within
+	// swap_grace_days the way a re-claim would be — except a code whose
+	// redemption the app has reported is kept until it actually expires. nil
+	// when there is none or none can be handed out. Only ever the caller's own.
+	PendingOffer(ctx context.Context, userID, installID string) (*PendingOffer, error)
 	// Claim re-checks 2–4 atomically, records referrer→referee (with the
 	// claiming device) and hands back an Apple one-time code from the pool;
 	// a re-claim gets the code it already has (or a swap; never once the

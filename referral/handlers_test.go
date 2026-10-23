@@ -203,6 +203,43 @@ func TestMeReturnsTheStandingAndAsksRevenueCatAboutCanClaim(t *testing.T) {
 	}
 }
 
+func TestMePendingOfferOnlyForClaimedAndFailsSoft(t *testing.T) {
+	svc, store, _ := configured()
+	store.pending = &PendingOffer{OfferCode: "XK7P2M9Q", FriendCode: "YM-7KQ2"}
+
+	// Never claimed (database can_claim true): not even asked.
+	w := call(t, svc.HandleMe(), "GET", "", nil)
+	if _, ok := body(t, w)["pending_offer"]; ok || store.pendingCalls != 0 {
+		t.Errorf("unclaimed: pending_offer present=%v calls=%d, want absent 0", ok, store.pendingCalls)
+	}
+
+	// Claimed: the pending code and friend's code come back.
+	store.meStanding.CanClaim = false
+	w = call(t, svc.HandleMe(), "GET", "", nil)
+	var got Standing
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got.PendingOffer == nil || *got.PendingOffer != *store.pending {
+		t.Errorf("claimed: pending_offer = %+v, want %+v", got.PendingOffer, store.pending)
+	}
+	if store.pendingInstall != device {
+		t.Errorf("pending install id = %q, want %q", store.pendingInstall, device)
+	}
+
+	// None to hand out: the field is left out.
+	store.pending = nil
+	w = call(t, svc.HandleMe(), "GET", "", nil)
+	if _, ok := body(t, w)["pending_offer"]; ok {
+		t.Error("no pending offer: field must be absent")
+	}
+
+	// Lookup failing (022 not applied, hiccup): still 200, field left out.
+	store.pendingErr = errors.New("function referral_pending_offer does not exist")
+	w = call(t, svc.HandleMe(), "GET", "", nil)
+	if _, ok := body(t, w)["pending_offer"]; w.Code != 200 || ok {
+		t.Errorf("lookup error: %d pending present=%v, want 200 absent", w.Code, ok)
+	}
+}
+
 func TestMeStoreDownIsStoreFailed(t *testing.T) {
 	svc, store, _ := configured()
 	store.meErr = errors.New("connection refused")

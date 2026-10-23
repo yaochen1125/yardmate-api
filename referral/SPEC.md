@@ -54,7 +54,8 @@
 
 ### 1.4 输出
 
-`/me` → `{code, invited, months_earned, months_pending, months_saved, can_claim}`；
+`/me` → `{code, invited, months_earned, months_pending, months_saved, can_claim}`，作为朋友有一条推荐还在 `claimed` 时多一个
+`pending_offer: {offer_code, friend_code}`（022，换机 / 重装后找回待兑换码；见 §2.2）；
 `claim` → `{offer_code}`；`redeemed` → `{status:"ok"}`。错误体 `{"error":"<code>"}`：
 
 | HTTP | code | 谁给的 |
@@ -118,10 +119,15 @@ RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidStr
 ### 2.2 幂等 / 并发
 
 - 造码、领码是 plpgsql 函数（`raise exception` 整体回滚；`for update skip locked` 取库存）。
-- 同一人同一码再 claim → 拿回同一张；**推荐已不在 `claimed`**（redeemed / qualified / held / saved / rewarded / void）**永远原样回**、不换码不扣库存
-  （017：码在到期前兑了、`ExpireCodes` 先划了 expired、结算 ① 之后才认定 —— 以前会走到换码再发一张）；码池那张 redeemed 也原样回；
-  issued 且 `expires_at > now + swap_grace_days`（默认 3 天）也原样回。换码阈值故意**小于**发码余量：等于的话每张快到余量线的码都会被再 claim 换掉、白烧第二张。
+- 同一人同一码再 claim → 拿回同一张；**推荐已不在 `claimed`**（redeemed / qualified / held / saved / rewarded / void）→ `already_claimed`
+  （022；017 是原样回老码——不换码不扣库存这点不变，但 App 会停在「领到码」摆一张用不了的码。017 防的是码在到期前兑了、`ExpireCodes`
+  先划了 expired、结算 ① 之后才认定时换码再发一张）；码池那张 redeemed 原样回；issued 且 `expires_at > now + swap_grace_days`（默认 3 天）
+  也原样回；**报过 `/redeemed`（`redeem_reported_at`）的 issued 码只要没过期也原样回、临期不换**（022：可能已兑掉、结算还没认定）。换码阈值故意**小于**发码余量：等于的话每张快到余量线的码都会被再 claim 换掉、白烧第二张。
   读推荐行 `for update`（017），和结算 ① 的 `referral_mark_redeemed` 串行。
+- `/me` 的 `pending_offer`（022 `referral_pending_offer(user, install)`）：库里 `can_claim` 为 false（填过码）才调。推荐还在 `claimed`、
+  有码、码池那张不是 redeemed → 拿当初的朋友码走一遍上面的重领（三参数 `referral_claim`，换不换码全按重领规矩），回
+  `{offer_code, friend_code}`；拒绝（pool_empty、同一瞬间被兑换 / 作废）→ null。只回调用者自己。Go 侧失败（没跑 022 / 出错）只记日志、
+  不回这个字段，`/me` 照常 200。重领不算进 `/claim` 的设备桶、不问 RC、不问 DeviceCheck（重领本来就不问）。
 - 要换（老码过期 / 不足宽限 / 状态不对 / 行没了）时**先选替换码再动老码**（老码行 `for update` 锁住）：
   选到 → 老码划 expired、`referrals.offer_code` 换新、`reissued_at = now()`（`ListClaimed` 的 200 天窗口按
   `coalesce(reissued_at, claimed_at)` 算，不然很晚才兑的会掉出去）；`claimed_at` 不动——结算 ① 认「订阅起始晚于第一次填码」，
@@ -150,7 +156,8 @@ RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidStr
 
 1. 鉴权 401、请求形状 400（`missing_device_id` / `missing_app_version` / `bad_json` / `bad_code`）、设备桶 429
 2. `unknown_code`
-3. 这个账号填过：同一个码 → 回手上那张（快过期换新，014 规则；**不查 RevenueCat、不查 DeviceCheck**，换台设备也拿得回）；别的码 → `already_claimed`
+3. 这个账号填过：同一个码且推荐还在 `claimed` → 回手上那张（快过期换新，014 规则；**不查 RevenueCat、不查 DeviceCheck**，换台设备也拿得回）；
+   别的码，或同一个码但推荐已不在 `claimed`（022）→ `already_claimed`
 4. `own_code`：码是自己的，或当前 `X-Device-Install-Id` 在码主人 `referral_devices` 里
 5. `not_new_user`：`subscribed_before` 或 RevenueCat 有 store 订阅史
 6. DeviceCheck（§2.4 第 1 道）：没配 / 没 token 在事务外判；问苹果在事务里、设备锁下
@@ -160,7 +167,7 @@ RevenueCat 的 app user id = Supabase user id **大写**（iOS 传 `UUID.uuidStr
 新填码的事务拿到设备锁后再 `referral_claim_check` 一遍（同账号另一台设备刚提交 → 当重领，不问苹果），
 真领时三参数 `referral_claim` 在事务里原子地再判一遍（晚的那个拿到 `fresh = false`，不再置位）。
 和 #123/#124 的区别：`subscribed_before` 从「限流之前」挪到第 5 步（会扣一次当天次数——App 本来就不会让订阅过的人看到填码入口）；
-重领不再先问 RevenueCat（以前兑换过的人重领会被 RC 答成 `not_new_user`）。作废了的推荐重领只回老码、**不换码**（免得被拒的人天天重领烧库存）。
+重领不再先问 RevenueCat（以前兑换过的人重领会被 RC 答成 `not_new_user`）。作废了的推荐重领回 `already_claimed`（022；之前只回老码），**不换码**（免得被拒的人天天重领烧库存）。
 
 ### 2.4 防刷（文档 `### 防刷` 五道，后端管前四道 + 第 5 道的数据）
 
@@ -236,6 +243,10 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
   `017_referral_review_fixes.sql`（依赖 013–016，可重复跑）**先于二进制、先 staging 后 prod**：新二进制读写 `referrals.last_checked_at`、
   `reviewed_at`；没跑 017 时结算 ① ③ ④ 的列表每轮报错（`/me`、`/claim` 照常）。017 只同名同签名替换 `referral_claim(text,text,text)` 和
   `referral_qualify(bigint)`，016 那版二进制照常调，回滚二进制不用回滚库。⚠️ 017 之后若重跑 016，会把这两个函数换回 016 版——重跑 016 后再跑一遍 017。
+  `022_referral_pending_offer.sql`（依赖 013–017，可重复跑）**先于二进制、先 staging 后 prod**：新增 `referral_pending_offer(text,text)`，
+  同名同签名替换 `referral_claim_check(text,text,text)` 和 `referral_claim(text,text,text)`（已不在 claimed 的重领 → already_claimed；
+  报过 /redeemed 的没过期不换）。没跑 022 时新二进制的 `/me` 每次记一行日志、不回 `pending_offer`，其余照常；旧二进制照常调，回滚二进制不用回滚库。
+  ⚠️ 022 之后若重跑 016 或 017，会把这两个函数换回旧版——重跑后再跑一遍 022。
   删账号路径把「表不存在」当无事可删（42P01 → nil），所以顺序反了也不会把删账号打成 500。
 - `referral_settings` 改库即生效，不用发版：
 
@@ -334,6 +345,11 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
   不在只提示一句；其他错误照常报、脚本失败）。上线步骤见 `deploy/README.md` §10。
 
 ## 4. 测试
+
+换机找回待兑换码（022）：`handlers_test.go` `TestMePendingOfferOnlyForClaimedAndFailsSoft`（没填过码不查、填过码回码 + 朋友码、没有 / 查失败不回字段且 200）；
+`pgstore_pending_pg_test.go`（本机 postgresql@17 实跑）：claimed 回原码 + 朋友码、推荐人自己问不到、宽限内换新老码 expired、码池 redeemed / 推荐 redeemed / void 不回、
+报过 /redeemed 临期 /me 与重领都不换、过期才换、码池空临期回老码过期回空、022 可重跑；`TestPGReclaimAfterRedeemingNeverBurnsAnotherCode` /
+`TestPGVoidReferralNeverSwaps` 改为 already_claimed。
 
 自动补货（021）：`restock_test.go`（memStore 复刻 021 的两条唯一约束 + `fakeASC`）：开关关不调苹果、留着的 `created` 不动、低库存告警照旧 /
 可发 < 300 发起一批（1,000 张、到期 当天 + 179 天、offer / 环境对）→ 灌池 → `imported` → 成功通知（张数、环境、到期日、批次 ID，不含码值）→ 同轮低库存告警不发 /
