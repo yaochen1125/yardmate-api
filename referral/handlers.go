@@ -252,6 +252,10 @@ func (s *Service) DeleteUser(ctx context.Context, userID string) error {
 	return s.store.DeleteUser(ctx, userID)
 }
 
+// pendingOfferTimeout bounds /me's pending-offer lookup (a possible swap
+// under the referral row lock). Past it the field is left out.
+const pendingOfferTimeout = 3 * time.Second
+
 // HandleMe is GET /v1/referral/me: the caller's own code (made on first ask)
 // and where their invitations have got to.
 func (s *Service) HandleMe() http.HandlerFunc {
@@ -273,8 +277,12 @@ func (s *Service) HandleMe() http.HandlerFunc {
 		// code they have not redeemed yet, so a reinstall / new phone can get
 		// back to "redeem it". Fail soft — a missing 022 or a hiccup only
 		// leaves the field out.
+		// Its own short budget: a re-claim may wait on the referral row's lock
+		// (settlement), and must not eat the time attachRewards needs.
 		if !standing.CanClaim {
-			pending, err := s.store.PendingOffer(ctx, userID, r.Header.Get("X-Device-Install-Id"))
+			pCtx, pCancel := context.WithTimeout(ctx, pendingOfferTimeout)
+			pending, err := s.store.PendingOffer(pCtx, userID, r.Header.Get("X-Device-Install-Id"))
+			pCancel()
 			if err != nil {
 				log.Printf("referral me: pending offer lookup failed: %v", err)
 			} else {

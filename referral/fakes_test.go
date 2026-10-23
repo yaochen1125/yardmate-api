@@ -27,17 +27,19 @@ type memStore struct {
 	pending      *PendingOffer
 	pendingErr   error
 	pendingCalls int
-	claimOffer   string
-	claimErr     error
-	checkErr     error
-	redeemErr    error
-	gotUser      string
-	gotCode      string
-	gotInstall   string
-	gotOffer     string
-	deleted      []string
-	meInstalls   []string // install ids /me was called with, in order
-	claimCalls   int      // Claim calls that reached the "database"
+	// pendingInstall is the install id the last PendingOffer got.
+	pendingInstall string
+	claimOffer     string
+	claimErr       error
+	checkErr       error
+	redeemErr      error
+	gotUser        string
+	gotCode        string
+	gotInstall     string
+	gotOffer       string
+	deleted        []string
+	meInstalls     []string // install ids /me was called with, in order
+	claimCalls     int      // Claim calls that reached the "database"
 
 	// claim emulation (handler tests of the judgement order). When codes is
 	// nil, ClaimCheck says ClaimNew and Claim hands out claimOffer (fresh),
@@ -169,6 +171,7 @@ func (m *memStore) PendingOffer(_ context.Context, userID, installID string) (*P
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pendingCalls++
+	m.pendingInstall = installID
 	return m.pending, m.pendingErr
 }
 

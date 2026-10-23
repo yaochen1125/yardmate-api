@@ -221,6 +221,9 @@ func TestMePendingOfferOnlyForClaimedAndFailsSoft(t *testing.T) {
 	if got.PendingOffer == nil || *got.PendingOffer != *store.pending {
 		t.Errorf("claimed: pending_offer = %+v, want %+v", got.PendingOffer, store.pending)
 	}
+	if store.pendingInstall != device {
+		t.Errorf("pending install id = %q, want %q", store.pendingInstall, device)
+	}
 
 	// None to hand out: the field is left out.
 	store.pending = nil

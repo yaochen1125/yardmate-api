@@ -110,6 +110,14 @@ func TestPGReportedRedeemKeepsTheCodeUntilItExpires(t *testing.T) {
 	if p, err := st.PendingOffer(ctx, userB, ""); err != nil || p == nil || p.OfferCode != "D120" {
 		t.Fatalf("reported + dead: %+v, %v; want swapped to D120", p, err)
 	}
+	// Reported, dead, and nothing left to swap to: nothing.
+	if err := st.ReportRedeemed(ctx, userB, "D120"); err != nil {
+		t.Fatal(err)
+	}
+	pgExpiresIn(t, pool, ctx, "D120", -time.Hour)
+	if p, err := st.PendingOffer(ctx, userB, ""); err != nil || p != nil {
+		t.Errorf("reported + dead + empty pool: %+v, %v; want nil", p, err)
+	}
 }
 
 func TestPGPendingOfferPoolEmptyAndDeadIsNothing(t *testing.T) {
