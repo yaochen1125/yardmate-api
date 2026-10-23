@@ -38,7 +38,8 @@ func (ps PoolStatus) SplitByVariant() (month, year PoolStatus) {
 	return month, year
 }
 
-// UnknownOfferNames lists code_pool.offer_ref_name values that are neither the
+// UnknownOfferNames lists code_pool.offer_ref_name values (of batches that
+// still have free codes) that are neither the
 // monthly nor the yearly group's configured name (023). They are handed out
 // as monthly codes; listed so a mistyped yearly import is noticed. Empty
 // without 023.
@@ -49,7 +50,7 @@ func (ps PoolStatus) UnknownOfferNames() []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, b := range ps.Batches {
-		if b.Name == ps.Settings.OfferRefYear || b.Name == ps.Settings.OfferRefMonth || seen[b.Name] {
+		if b.Free == 0 || b.Name == ps.Settings.OfferRefYear || b.Name == ps.Settings.OfferRefMonth || seen[b.Name] {
 			continue
 		}
 		seen[b.Name] = true

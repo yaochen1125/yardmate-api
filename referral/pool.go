@@ -203,11 +203,9 @@ func (s *Service) watchVariant(now time.Time, ps PoolStatus, variant string, bus
 	if s.alerter == nil {
 		return
 	}
-	subject, body := alertMail(ps, st, now, s.restock.Environment)
+	subject, body := alertMailFor(ps, st, now, s.restock.Environment, variant)
 	key := st.conditions()
 	if variant == VariantYear {
-		subject = strings.Replace(subject, "Referral code pool", "Referral code pool (yearly group)", 1)
-		body = "年付组（offer " + ps.Settings.OfferRefYear + "）。补货：import-codes.sh codes.csv \"" + ps.Settings.OfferRefYear + "\" YYYY-MM-DD\n\n" + body
 		key = "year:" + key
 	}
 	sent, err := s.alertOnce(key, now, subject, body)
@@ -251,6 +249,16 @@ func (s *Service) alertOnce(key string, now time.Time, subject, body string) (bo
 // says [PRODUCTION] / [SANDBOX], so staging and prod mailing the same inbox
 // can be told apart; "" leaves the subject as it always was.
 func alertMail(ps PoolStatus, st Stock, now time.Time, env string) (subject, body string) {
+	return alertMailFor(ps, st, now, env, VariantMonth)
+}
+
+// alertMailFor is alertMail for one experiment group (023): the yearly group's
+// mail names its own offer and import command, and has no auto-restock line.
+func alertMailFor(ps PoolStatus, st Stock, now time.Time, env, variant string) (subject, body string) {
+	offer := "Referral Friend Month"
+	if variant == VariantYear {
+		offer = ps.Settings.OfferRefYear
+	}
 	var why []string
 	if st.LowStock {
 		why = append(why, fmt.Sprintf("low stock (%d usable)", st.Usable))
@@ -262,10 +270,18 @@ func alertMail(ps PoolStatus, st Stock, now time.Time, env string) (subject, bod
 	if env != "" {
 		tag = "[" + env + "] "
 	}
-	subject = "[YardMate] " + tag + "Referral code pool: " + strings.Join(why, ", ")
+	group := ""
+	if variant == VariantYear {
+		group = " (yearly group)"
+	}
+	subject = "[YardMate] " + tag + "Referral code pool" + group + ": " + strings.Join(why, ", ")
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "推荐好友码池告警（%s）\n\n", now.UTC().Format("2006-01-02 15:04 UTC"))
+	if variant == VariantYear {
+		fmt.Fprintf(&b, "推荐好友码池告警 · 年付组（%s）\n\n", now.UTC().Format("2006-01-02 15:04 UTC"))
+	} else {
+		fmt.Fprintf(&b, "推荐好友码池告警（%s）\n\n", now.UTC().Format("2006-01-02 15:04 UTC"))
+	}
 	fmt.Fprintf(&b, "可发（free 且到期日在 %d 天余量之外）：%d 张", ps.Settings.IssueMarginDays, st.Usable)
 	if st.LowStock {
 		fmt.Fprintf(&b, "，低于阈值 %d", ps.Settings.LowStockThreshold)
@@ -299,11 +315,22 @@ func alertMail(ps PoolStatus, st Stock, now time.Time, env string) (subject, bod
 	}
 	_ = tw.Flush()
 
-	b.WriteString("\n补货：App Store Connect → offer「Referral Friend Month」再生成一批一次性码\n")
+	command := restockCommand
+	if variant == VariantYear {
+		command = `deploy/supabase/import-codes.sh codes.csv "` + offer + `" YYYY-MM-DD`
+	}
+	b.WriteString("\n补货：App Store Connect → offer「" + offer + "」再生成一批一次性码\n")
 	b.WriteString("（每批 500–25,000 张、最长 6 个月；每 App 每季度上限 100 万张，所有订阅共用），导出 CSV 后在 secrets 环境里跑：\n")
-	b.WriteString("  SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… " + restockCommand + "\n")
+	b.WriteString("  SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… " + command + "\n")
+	if variant == VariantYear {
+		b.WriteString("码名必须和「" + offer + "」一字不差，写错会被当成月付码发出去；导入后跑 deploy/referral-ab.sh show 核对。\n")
+	}
 	b.WriteString("先 staging 后 prod。看现状：deploy/referral-pool.sh\n\n")
 	b.WriteString("阈值在 referral_settings（issue_margin_days / swap_grace_days / low_stock_threshold / expiry_warn_days），改库即生效。\n")
-	b.WriteString("自动补货（默认关）：referral_settings.auto_restock_enabled，见 deploy/README.md §10。\n")
+	if variant == VariantYear {
+		b.WriteString("年付组不自动补货（分组实验第一版），只能手动导入。\n")
+	} else {
+		b.WriteString("自动补货（默认关）：referral_settings.auto_restock_enabled，见 deploy/README.md §10。\n")
+	}
 	return subject, b.String()
 }

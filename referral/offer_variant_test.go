@@ -2,7 +2,9 @@ package referral
 
 import (
 	"errors"
+	"strings"
 	"testing"
+	"time"
 )
 
 // 023: /claim answers the friend's experiment group; app builds that do not
@@ -69,5 +71,26 @@ func TestSplitByVariantAndUnknownNames(t *testing.T) {
 	m, y := old.SplitByVariant()
 	if len(m.Batches) != 4 || len(y.Batches) != 0 || len(old.UnknownOfferNames()) != 0 {
 		t.Fatalf("pre-023 split = %d / %d, unknown %v", len(m.Batches), len(y.Batches), old.UnknownOfferNames())
+	}
+}
+
+func TestYearlyAlertMailNamesTheYearlyOffer(t *testing.T) {
+	now := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	ps := PoolStatus{Settings: PoolSettings{LowStockThreshold: 100, ExpiryWarnDays: 30, IssueMarginDays: 14,
+		OfferRefMonth: "Referral Friend Month", OfferRefYear: "Referral Friend Year"}}
+	st := TakeStock(ps, now)
+	subject, body := alertMailFor(ps, st, now, "SANDBOX", VariantYear)
+	if !strings.Contains(subject, "(yearly group)") || !strings.Contains(subject, "[SANDBOX]") {
+		t.Fatalf("subject = %q", subject)
+	}
+	if !strings.Contains(body, `import-codes.sh codes.csv "Referral Friend Year"`) || strings.Contains(body, "Referral Friend Month") {
+		t.Fatalf("yearly body mentions the wrong offer:\n%s", body)
+	}
+	if strings.Contains(body, "auto_restock_enabled") {
+		t.Fatal("yearly body points at auto-restock, which does not refill the yearly group")
+	}
+	subject, body = alertMailFor(ps, st, now, "", VariantMonth)
+	if strings.Contains(subject, "yearly") || !strings.Contains(body, `"Referral Friend Month"`) {
+		t.Fatalf("monthly mail changed: %q", subject)
 	}
 }

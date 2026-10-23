@@ -32,7 +32,8 @@ auth=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABAS
 
 # 调一个库函数（023），body 是 JSON 参数。出错时把数据库的报错打出来（不含凭据）。
 rpc() {
-  local fn="$1" body="${2:-{\}}" out code
+  local fn="$1" body="${2:-}" out code
+  [ -n "$body" ] || body='{}'
   out=$(curl -sS -w '\n%{http_code}' -X POST "$rest/rpc/$fn" "${auth[@]}" \
           -H "Content-Type: application/json" -d "$body")
   code="${out##*$'\n'}"
@@ -100,7 +101,7 @@ case "$cmd" in
     ;;
   set)
     new="${2:-}"
-    [[ "$new" =~ ^[0-9]+$ ]] && [ "$new" -le 100 ] || usage
+    [[ "$new" =~ ^(0|[1-9][0-9]?|100)$ ]] || usage
     confirm_tty
     overview | head -2
     echo

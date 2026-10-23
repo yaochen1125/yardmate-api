@@ -312,11 +312,14 @@ language sql stable as $$
         select l.referral_id, l.purchased_at, l.state, coalesce(l.void_reason, '') as void_reason,
                round(l.price_usd_cents * l.takehome_percentage)::bigint as proceeds
           from reward_ledger l join refs on refs.id = l.referral_id
+    ), led_by_ref as (
+        select referral_id, count(*) as charges, bool_or(void_reason = 'refunded') as was_refunded
+          from led group by referral_id
     ), per as (
         select refs.id, refs.offer_variant, refs.claimed_at, refs.redeemed_at,
-               (select count(*) from led where led.referral_id = refs.id) as charges,
-               exists (select 1 from led where led.referral_id = refs.id and led.void_reason = 'refunded') as was_refunded
-          from refs
+               coalesce(lb.charges, 0) as charges,
+               coalesce(lb.was_refunded, false) as was_refunded
+          from refs left join led_by_ref lb on lb.referral_id = refs.id
     ), windows as (
         select unnest(array[30, 90, 180, 365, 425]) as days
     ), variants as (
@@ -401,7 +404,8 @@ language sql stable as $$
         'unredeemed_year',  (select count(*) from referrals r join code_pool c on c.code = r.offer_code
                               where r.state = 'claimed' and c.state = 'issued' and r.offer_variant = 'year'),
         'unknown_names', coalesce((select json_agg(distinct c.offer_ref_name) from code_pool c
-                                    where c.offer_ref_name not in (cfg.offer_ref_month, cfg.offer_ref_year)), '[]'::json))
+                                    where c.state = 'free'
+                                      and c.offer_ref_name not in (cfg.offer_ref_month, cfg.offer_ref_year)), '[]'::json))
       from cfg;
 $$;
 

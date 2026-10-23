@@ -52,7 +52,7 @@ type Report struct {
 	Usable    int // free pool codes beyond the issue margin (pool.go), after any restock — the monthly group's (023)
 	// UsableYear: the same for the yearly group (023); 0 while the experiment is off.
 	UsableYear int
-	Alerted    int // pool alert emails sent this pass (0 or 1)
+	Alerted    int // pool alert emails sent this pass (0–2: monthly and yearly group, 023)
 	// auto-restock (restock.go)
 	RestockStarted int // restocks started (code_restocks rows created) this pass
 	Restocked      int // codes newly put into code_pool by a restock this pass
@@ -112,8 +112,8 @@ func (s *Service) runPass(ctx context.Context) {
 	rep := s.Settle(pctx)
 	if rep.Errors > 0 || rep.Redeemed+rep.Voided+rep.Qualified+rep.Held+rep.Granted+rep.Saved+rep.Flushed > 0 || rep.Expired > 0 || rep.Alerted+rep.Reviewed > 0 ||
 		rep.RestockStarted+rep.Restocked+rep.RestockMails > 0 {
-		log.Printf("referral settle: expired=%d redeemed=%d voided=%d duplicate=%d qualified=%d held=%d granted=%d saved=%d flushed=%d usable=%d alerted=%d reviewed=%d restock_started=%d restocked=%d restock_mails=%d errors=%d",
-			rep.Expired, rep.Redeemed, rep.Voided, rep.Duplicate, rep.Qualified, rep.Held, rep.Granted, rep.Saved, rep.Flushed, rep.Usable, rep.Alerted, rep.Reviewed,
+		log.Printf("referral settle: expired=%d redeemed=%d voided=%d duplicate=%d qualified=%d held=%d granted=%d saved=%d flushed=%d usable=%d usable_year=%d alerted=%d reviewed=%d restock_started=%d restocked=%d restock_mails=%d errors=%d",
+			rep.Expired, rep.Redeemed, rep.Voided, rep.Duplicate, rep.Qualified, rep.Held, rep.Granted, rep.Saved, rep.Flushed, rep.Usable, rep.UsableYear, rep.Alerted, rep.Reviewed,
 			rep.RestockStarted, rep.Restocked, rep.RestockMails, rep.Errors)
 	}
 	// The per-device buckets are this package's own; sweep them here rather

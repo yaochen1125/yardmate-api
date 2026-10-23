@@ -106,10 +106,10 @@ func TestPGOfferVariantGroupsNeverLendCodes(t *testing.T) {
 	if _, err := pool.Exec(ctx, `update code_pool set state = 'expired' where offer_ref_name = $1`, abMonth); err != nil {
 		t.Fatal(err)
 	}
-	pgSeed(t, pool, ctx, "Referral Friend Month (staging test)", day90, "S1")
+	pgSeed(t, pool, ctx, "Referral Friend Month (staging test)", day90, "S1", "S2")
 	offer, err := st.Claim(ctx, friendID(2), codeA, "", nil)
-	if err != nil || offer != "S1" {
-		t.Fatalf("monthly friend = %q %v, want the alias batch's S1 (never the yearly Y1)", offer, err)
+	if err != nil || (offer != "S1" && offer != "S2") {
+		t.Fatalf("monthly friend = %q %v, want an alias batch code (never the yearly Y1)", offer, err)
 	}
 	ps, err := st.PoolStatus(ctx)
 	if err != nil {
@@ -398,5 +398,55 @@ func TestPGClaimWithVariantAnswersFromTheSameTransaction(t *testing.T) {
 	offer, variant, err = st.ClaimWithVariant(ctx, friendID(1), codeA, "", nil) // re-claim
 	if err != nil || offer != "Y1" || variant != VariantYear {
 		t.Fatalf("re-claim = %q %q %v", offer, variant, err)
+	}
+}
+
+func TestPGABStatsExclusions(t *testing.T) {
+	st, pool, ctx := pgTest(t)
+	codeA := pgInviteCode(t, st, ctx, userA)
+	pgSeed(t, pool, ctx, abYear, day90, "Y1", "Y2", "Y3", "Y4")
+	pgSetYearPct(t, pool, ctx, 100)
+	for i := 1; i <= 4; i++ {
+		if _, err := st.Claim(ctx, friendID(i), codeA, "", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `update referrals set offer_year_pct_at_claim = 50`); err != nil {
+		t.Fatal(err)
+	}
+	// 1 counted; 2 void as duplicate_apple_id (dropped); 3 void as no_subscription (kept); 4 switched (own column).
+	if _, err := pool.Exec(ctx, `update referrals set state = 'void', void_reason = 'duplicate_apple_id' where referee = $1`, friendID(2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `update referrals set state = 'void', void_reason = 'no_subscription', redeemed_at = now() - interval '40 days' where referee = $1`, friendID(3)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `update referrals set offer_variant_switched_at = now() where referee = $1`, friendID(4)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `update referrals set claimed_at = now() - interval '40 days'`); err != nil {
+		t.Fatal(err)
+	}
+	// Friend 3 paid once, then that charge was refunded and voided: counted as paid + refunded, not as proceeds.
+	id3 := pgReferralID(t, pool, ctx, friendID(3))
+	if _, err := pool.Exec(ctx,
+		`insert into reward_ledger (referral_id, referrer, referee, rc_event_id, event_type, transaction_id,
+		                            period_type, price_usd_cents, takehome_percentage, credit_cents,
+		                            purchased_at, available_at, state, void_reason)
+		 values ($1, $2, $3, 'ev-r', 'RENEWAL', 'tx-r', 'NORMAL', 3999, 0.85, 1020, now() - interval '35 days', now(), 'voided', 'refunded')`,
+		id3, userA, friendID(3)); err != nil {
+		t.Fatal(err)
+	}
+	var claimed, redeemed, paid, refunded, switched, cohort int
+	var proceeds int64
+	if err := pool.QueryRow(ctx,
+		`select claimed, redeemed, paid, refunded, switched, claim_cohort, claim_proceeds_cents
+		   from referral_ab_stats() where variant = 'year' and window_days = 30`).
+		Scan(&claimed, &redeemed, &paid, &refunded, &switched, &cohort, &proceeds); err != nil {
+		t.Fatal(err)
+	}
+	if claimed != 2 || redeemed != 1 || paid != 1 || refunded != 1 || switched != 1 || cohort != 2 || proceeds != 0 {
+		t.Fatalf("year/30 = claimed %d redeemed %d paid %d refunded %d switched %d cohort %d proceeds %d",
+			claimed, redeemed, paid, refunded, switched, cohort, proceeds)
 	}
 }
