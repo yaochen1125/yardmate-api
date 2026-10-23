@@ -5,7 +5,7 @@
 --   ① 设置：referral_settings.offer_year_pct（年付组占比 0–100，默认 0 = 全部月付）、
 --      offer_ref_month / offer_ref_year（两组兑换码在 code_pool.offer_ref_name 里的名字）。
 --   ② referrals.offer_variant：'month' / 'year'，朋友第一次领码成功时写死；老推荐为 null，一律算 month。
---   ③ referral_offer_variant(p_user)：按账号哈希出 0–99，小于 offer_year_pct → 'year'，否则 'month'。
+--   ③ referral_offer_variant(p_user, p_pct)：占比由 referral_claim 只读一次后传进来；按账号哈希出 0–99，小于 offer_year_pct → 'year'，否则 'month'。
 --   ④ referral_claim（三参数，同名同签名整体替换 022 的版本）：只从本组那种码里取——年付组只取
 --      offer_ref_name = offer_ref_year 的码，月付组取其余所有码（老码、手动导入的、名字不一样的都算月付，
 --      向后兼容）；回答多带 offer_variant。

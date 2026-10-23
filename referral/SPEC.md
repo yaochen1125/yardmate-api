@@ -348,7 +348,7 @@ partial unique index（`subscription_key where state <> 'void'`）兜底。
 
 产品规则在 yardmate-swiftui `docs/releases/v1/main-navigation/more/invite-friends/invite-friends.md` `### 兑换码分组实验（月付组 / 年付组）`。后端这一侧：
 
-- **分组**：`referral_claim` 新建推荐时调 `referral_offer_variant(user)`：md5(用户 + `:offer_ab`) 前 8 个十六进制位当无符号数对 100 取余，小于 `referral_settings.offer_year_pct` → `year`。写进 `referrals.offer_variant`，领码时的占比写进 `offer_year_pct_at_claim`。重领、换码、`pending_offer` 一律沿用原组；老推荐（空）按 `month`。
+- **分组**：`referral_claim` 新建推荐时只读一次占比，调 `referral_offer_variant(user, pct)`：md5(用户 + `:offer_ab`) 前 8 个十六进制位当无符号数对 100 取余，小于 `referral_settings.offer_year_pct` → `year`。写进 `referrals.offer_variant`，领码时的占比写进 `offer_year_pct_at_claim`。重领、换码、`pending_offer` 一律沿用原组；老推荐（空）按 `month`。
 - **按组发码**：年付组只取 `offer_ref_name = offer_ref_year` 的码，月付组取其余所有码（别名批次、测试批次都算月付）。一组没码就 `pool_empty`，不借另一组。
 - **老 App 包**：请求没带 `offer_variant_aware: true` → handler 给 ctx 打 `WithForceMonth`，`PGStore.Claim` 在事务里 `set_config('referral.force_month','on', true)`，新建推荐一律月付、`offer_year_pct_at_claim` 记空。事务级设置，不会漏给连接池里的下一个请求（`TestPGForceMonthForUnawareApps`）。
 - **回答**：`/claim` 回 `{offer_code, offer_variant}`；组别取自 `referral_claim` 同一事务的回答（`PGStore.ClaimWithVariant`）；只有不支持它的 store（内存测试替身）才在领码后另读一次（`Store.OfferVariant`，读失败答 `month`）。`/me` 的 `pending_offer` 带 `offer_variant`（023 换了 `referral_pending_offer`）。
