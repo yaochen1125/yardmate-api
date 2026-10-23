@@ -27,17 +27,17 @@ type memStore struct {
 	pending      *PendingOffer
 	pendingErr   error
 	pendingCalls int
-	claimOffer string
-	claimErr   error
-	checkErr   error
-	redeemErr  error
-	gotUser    string
-	gotCode    string
-	gotInstall string
-	gotOffer   string
-	deleted    []string
-	meInstalls []string // install ids /me was called with, in order
-	claimCalls int      // Claim calls that reached the "database"
+	claimOffer   string
+	claimErr     error
+	checkErr     error
+	redeemErr    error
+	gotUser      string
+	gotCode      string
+	gotInstall   string
+	gotOffer     string
+	deleted      []string
+	meInstalls   []string // install ids /me was called with, in order
+	claimCalls   int      // Claim calls that reached the "database"
 
 	// claim emulation (handler tests of the judgement order). When codes is
 	// nil, ClaimCheck says ClaimNew and Claim hands out claimOffer (fresh),
